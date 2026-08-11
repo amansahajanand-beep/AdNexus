@@ -1,0 +1,71 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+.env.production
+.env.development
+!.env.example
+!**/.env.example
+
+# Google / GAM credentials
+credentials/
+**/credentials.json
+**/client_secret*.json
+*.p12
+*.key
+*.pem
+ssl/
+
+# Local runtime data
+backend/data/
+backend/logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# Build output
+frontend/build/
+frontend/dist/
+backend/dist/
+coverage/
+
+# Logs & debug
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Caches
+.cache/
+**/.cache/
+.eslintcache
+.parcel-cache/
+.turbo/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temp / scratch
+tmp/
+temp/
+backend/tmp-*.js
+
+# Archives
+*.zip
+*.tar.gz
+*.rar
+
+# Redis / dumps
+dump.rdb
+*.dump

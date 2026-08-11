@@ -1,0 +1,22 @@
+{
+  "short_name": "AdNexus",
+  "name": "AdNexus Live Dashboard",
+  "description": "AdNexus — real-time ad revenue analytics and reporting",
+  "icons": [
+    {
+      "src": "favicon.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "adnexus-logo.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#0f172a",
+  "background_color": "#0f172a"
+}

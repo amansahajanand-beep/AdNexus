@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    container_name: gam-backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    volumes:
+      - ./backend/logs:/app/logs
+    networks:
+      - gam-net
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  frontend:
+    build: ./frontend
+    container_name: gam-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+    networks:
+      - gam-net
+    volumes:
+      - ./ssl:/etc/nginx/ssl:ro   # SSL certs mount karein
+
+networks:
+  gam-net:
+    driver: bridge
