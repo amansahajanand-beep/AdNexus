@@ -221,6 +221,104 @@ function getInventoryScopeCacheKey(user) {
   ].join('|');
 }
 
+function toNormList(value) {
+  if (value == null || value === '') return [];
+  const arr = Array.isArray(value) ? value : [value];
+  return arr.map((v) => norm(v)).filter(Boolean);
+}
+
+function clampToScopeSet(values, set) {
+  if (!set?.size) return [];
+  if (!values.length) return [];
+  return values.filter((v) => set.has(norm(v)));
+}
+
+function listCoversScopeSet(values, set) {
+  if (!set?.size) return false;
+  if (!values.length) return false;
+  const have = new Set(values.map((v) => norm(v)));
+  for (const item of set) {
+    if (!have.has(item)) return false;
+  }
+  return true;
+}
+
+/**
+ * Inventory dims for scoped-child SQL / lean queries.
+ *
+ * Assigning domains + sites + apps together must NOT become AND filters —
+ * lean rows rarely match domain AND site AND app, so Dashboard/Reporting go empty.
+ *
+ * Rules:
+ * - Clamp any request values to the user's assignment
+ * - If the request is empty: sites > domains for web, plus apps (compat-union handles web|app)
+ * - If request includes full assigned domains AND full assigned sites: keep sites only
+ * - Drop oversized lists (LIKE ANY hangs); prefer sites, then capped domains
+ */
+function resolveScopedSqlInventoryOpts(user, filters = {}) {
+  const { MAX_INVENTORY_FILTER_VALUES } = require('./inventoryFilters');
+  const max = MAX_INVENTORY_FILTER_VALUES || 200;
+  const scope = getUserInventoryScope(user);
+  if (!scope) {
+    return {
+      domains: toNormList(filters.domain),
+      sites: toNormList(filters.site),
+      apps: toNormList(filters.domainId),
+      adUnitNames: toNormList(filters.domainName),
+      webInventoryOr: false,
+    };
+  }
+
+  const reqDomains = toNormList(filters.domain);
+  const reqSites = toNormList(filters.site);
+  const reqApps = toNormList(filters.domainId);
+  const reqAdUnits = toNormList(filters.domainName);
+  const anyRequest = reqDomains.length || reqSites.length || reqApps.length || reqAdUnits.length;
+
+  let domains = clampToScopeSet(reqDomains, scope.domains);
+  let sites = clampToScopeSet(reqSites, scope.sites);
+  let apps = clampToScopeSet(reqApps, scope.appIds);
+  let adUnitNames = reqAdUnits;
+
+  if (!anyRequest) {
+    domains = [];
+    sites = [];
+    apps = [];
+    adUnitNames = [];
+    if (scope.sites?.size) sites = [...scope.sites];
+    else if (scope.domains?.size) domains = [...scope.domains];
+    if (scope.appIds?.size) apps = [...scope.appIds];
+  } else if (
+    domains.length
+    && sites.length
+    && listCoversScopeSet(domains, scope.domains)
+    && listCoversScopeSet(sites, scope.sites)
+  ) {
+    // Full domain+site assignment applied together — prefer sites (more specific).
+    domains = [];
+  }
+
+  // Domains/sites use LIKE ANY and hang when huge; prefer sites, cap domains.
+  // Apps use equality ANY — still cap so sanitizeInventoryFilters does not wipe them to []
+  // (oversized lists are treated as "All", which would leak network-wide SQL to children).
+  if (sites.length > max) sites = sites.slice(0, max);
+  if (!sites.length && domains.length > max) domains = domains.slice(0, max);
+  if (sites.length && domains.length > max) domains = [];
+  if (apps.length > max) apps = apps.slice(0, max);
+
+  return {
+    domains,
+    sites,
+    apps,
+    adUnitNames,
+    // Domain+site together (partial picks) match either dim, not intersection.
+    webInventoryOr: domains.length > 0 && sites.length > 0,
+    // Always equality on inv_* for scoped SQL — LIKE ANY was the main reason domain users
+    // were seconds slower than admin on the same rollup path.
+    skipAdUnitLike: true,
+  };
+}
+
 function scopeRowsToUser(rows = [], user, siteCtx = null) {
   const scope = getUserInventoryScope(user);
   if (scope === null) return rows;
@@ -496,6 +594,7 @@ module.exports = {
   getAllowedDomainSet,
   getUserInventoryScope,
   getInventoryScopeCacheKey,
+  resolveScopedSqlInventoryOpts,
   userHasAssignedDomains,
   userHasAssignedInventory,
   rowMatchesUserScope,

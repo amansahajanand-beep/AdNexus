@@ -124,10 +124,18 @@ export default function Reporting() {
   const [startDate, setStartDate] = useState(() => initDates.startDate);
   const [endDate, setEndDate] = useState(() => initDates.endDate);
   const [country, setCountry] = useState(() => normalizeCountry(saved?.country));
-  const [domainName, setDomainName] = useState(() => saved?.domainName ?? invDraft.domainName);
-  const [domainId, setDomainId] = useState(() => saved?.domainId ?? invDraft.domainId);
-  const [domain, setDomain] = useState(() => saved?.domain ?? invDraft.domain);
-  const [site, setSite] = useState(() => saved?.site ?? invDraft.site);
+  const [domainName, setDomainName] = useState(() => (
+    filterVisibility.isScopedUser ? invDraft.domainName : (saved?.domainName ?? invDraft.domainName)
+  ));
+  const [domainId, setDomainId] = useState(() => (
+    filterVisibility.isScopedUser ? invDraft.domainId : (saved?.domainId ?? invDraft.domainId)
+  ));
+  const [domain, setDomain] = useState(() => (
+    filterVisibility.isScopedUser ? invDraft.domain : (saved?.domain ?? invDraft.domain)
+  ));
+  const [site, setSite] = useState(() => (
+    filterVisibility.isScopedUser ? invDraft.site : (saved?.site ?? invDraft.site)
+  ));
   const [catalog, setCatalog] = useState([]);
   const [catalogLists, setCatalogLists] = useState({ domainRoots: [], siteHosts: [], sitesByDomain: {}, adUnitsByHost: {}, appIds: [] });
   const [noDomainsAssigned, setNoDomainsAssigned] = useState(false);
@@ -159,6 +167,15 @@ export default function Reporting() {
       if (o.reportMetrics?.length) return o;
       return { ...o, reportMetrics: [...DEFAULT_REPORT_METRICS] };
     };
+    // Domain user: never restore auto-applied full inventory — dates + default metrics only.
+    if (filterVisibility.isScopedUser) {
+      return ensureDefaultMetrics({
+        ...buildDefaultApplied(),
+        startDate: saved?.applied?.startDate || saved?.startDate || todayInit.startDate,
+        endDate: saved?.applied?.endDate || saved?.endDate || todayInit.endDate,
+        ...EMPTY_INVENTORY_FILTERS,
+      });
+    }
     if (saved?.applied) return ensureDefaultMetrics(saved.applied);
     if (scopedAutoLoad) return ensureDefaultMetrics(buildScopedApplied());
     return ensureDefaultMetrics(buildDefaultApplied());

@@ -1,4 +1,5 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const { cache } = require('../gamClient');
 const logger = require('../utils/logger');
@@ -12,6 +13,7 @@ const {
   scopeCatalogOptionsForUser,
   getUserInventoryScope,
   userHasAssignedInventory,
+  resolveScopedSqlInventoryOpts,
 } = require('../utils/permissions');
 const { todayInTZ, dateRangeInTZ, dateRangeYMDInTZ } = require('../utils/datetime');
 const { resolveAppFields, buildAppPackageMapsFromGamRows, buildAppPackageMapsFromMobileApps, mergeAppPackageMapData, mapsToPlain, packageListFromMapData, enrichRowsWithAppPackages, rehydrateAppPackageMaps, isLikelyAppPackage, isMobileAppRow } = require('../utils/appIdentity');
@@ -585,7 +587,14 @@ function filterCacheKey({
   startDate, endDate, country, domainId, domainName, domain, site,
   reportDimensions, reportMetrics,
 }) {
-  const part = v => asArray(v).slice().sort().join('|');
+  // Upstash Redis rejects keys > 32KB. Full assigned domain/site/app lists
+  // easily exceed that when joined with "|", so hash any oversized part.
+  const part = (v) => {
+    const sorted = asArray(v).map((x) => String(x)).slice().sort();
+    const joined = sorted.join('|');
+    if (Buffer.byteLength(joined, 'utf8') <= 512) return joined;
+    return `h${crypto.createHash('sha256').update(joined).digest('hex').slice(0, 24)}x${sorted.length}`;
+  };
   return [
     startDate, endDate, part(country),
     part(domainId), part(domainName), part(domain), part(site),
@@ -1733,10 +1742,11 @@ function prepareScopedOverviewRows(allRows, user) {
   const scope = getUserInventoryScope(user);
   if (!scope) return enrichRowsForInventoryScope(allRows, user);
 
+  // Prefer sites over domains for web; never AND domains+sites+apps (empties KPIs).
   const invFilters = {};
   if (scope.sites?.size) invFilters.site = [...scope.sites];
-  else if (scope.appIds?.size) invFilters.domainId = [...scope.appIds];
   else if (scope.domains?.size) invFilters.domain = [...scope.domains];
+  else if (scope.appIds?.size) invFilters.domainId = [...scope.appIds];
 
   if (!Object.keys(invFilters).length) {
     return prepareDomainUserRows(allRows, user);
@@ -1744,8 +1754,8 @@ function prepareScopedOverviewRows(allRows, user) {
 
   let rows = prepareScopedReportRows(allRows, invFilters, user);
 
-  // Assigned sites + apps: add mobile-app rows tied to assigned sites (not network-wide).
-  if (scope.sites?.size && scope.appIds?.size) {
+  // Domains/sites + apps: add mobile-app rows (web∪app), not network-wide.
+  if ((scope.sites?.size || scope.domains?.size) && scope.appIds?.size) {
     const siteCtx = buildScopeSiteContextForUser(user);
     const scoped = scopeRowsToUser(enrichRowsForInventoryScope(allRows, user), user, siteCtx);
     const appRows = applyScopedOverviewSiteTightening(
@@ -2377,14 +2387,17 @@ function emptyDashboardCompatPayload(filters, currency) {
  * compatible dim/metric subset — and flag what could not be combined.
  */
 async function fetchLeanDashboardBundleCompatible(svc, startDate, endDate, baseOpts) {
-  const primary = await svc.fetchLeanDashboardBundleFromDB(startDate, endDate, baseOpts);
-  if (primary) return { bundle: primary, skipped: [], usedOpts: baseOpts };
-
   const hasWeb = (baseOpts.domains?.length || 0)
     || (baseOpts.sites?.length || 0)
     || (baseOpts.adUnitNames?.length || 0);
   const hasApp = (baseOpts.apps?.length || 0) > 0;
-  if (!hasWeb || !hasApp) return null;
+
+  // Mixed web+app: skip the doomed AND query — go straight to parallel union (faster).
+  if (!(hasWeb && hasApp)) {
+    const primary = await svc.fetchLeanDashboardBundleFromDB(startDate, endDate, baseOpts);
+    if (primary) return { bundle: primary, skipped: [], usedOpts: baseOpts };
+    return null;
+  }
 
   const webOpts = { ...baseOpts, apps: [] };
   const appOpts = {
@@ -2454,7 +2467,6 @@ async function fetchLeanDashboardBundleCompatible(svc, startDate, endDate, baseO
         truncated: (webRows.length + appRows.length) > rows.length,
       },
     },
-    // Nothing dropped — AND combination was incompatible, so both families ran separately.
     skipped: ['Domain/Site + App ID (combined)'],
     usedOpts: baseOpts,
     effectiveFilters: {
@@ -2519,12 +2531,40 @@ async function handleDashboardOverview(req, res) {
   try {
     const token = await getToken();
 
-    // Admin / unfiltered overview: SQL aggregates — avoid loading 100k detail rows.
-    if (!isScopedUser && !invFilterActive) {
+    // Admin / domain-user overview: same fast SQL SUM path (rollups).
+    // Domain users pass assigned inventory opts so KPIs stay tenant-scoped without loading grain rows.
+    {
       const svc = getSyncSvc();
       if (svc?.fetchLeanOverviewTotalsFromDB) {
         try {
-          const totals = await svc.fetchLeanOverviewTotalsFromDB(filters.startDate, filters.endDate);
+          const t0 = Date.now();
+          let overviewOpts = {};
+          if (isScopedUser && userHasAssignedInventory(req.user)) {
+            const scoped = resolveScopedSqlInventoryOpts(
+              req.user,
+              invFilterActive ? filters : {}
+            );
+            overviewOpts = {
+              domains: scoped.domains,
+              sites: scoped.sites,
+              apps: scoped.apps,
+              adUnitNames: scoped.adUnitNames,
+              webInventoryOr: scoped.webInventoryOr,
+              skipAdUnitLike: scoped.skipAdUnitLike,
+            };
+          } else if (invFilterActive) {
+            overviewOpts = {
+              domains: toFilterArray(filters.domain),
+              sites: toFilterArray(filters.site),
+              apps: toFilterArray(filters.domainId),
+              adUnitNames: toFilterArray(filters.domainName),
+            };
+          }
+          const totals = await svc.fetchLeanOverviewTotalsFromDB(
+            filters.startDate,
+            filters.endDate,
+            overviewOpts
+          );
           if (totals) {
             const impressions = totals.impressions || 0;
             const revenue = totals.revenue || 0;
@@ -2553,11 +2593,82 @@ async function handleDashboardOverview(req, res) {
             logger.info(
               `Overview from PostgreSQL ${totals.source === 'rollup' ? 'rollups' : 'aggregates'} (${totals.rowCount} rows summed)`
               + ` ${filters.startDate}..${filters.endDate} revenue=${revenue} impressions=${impressions}`
+              + (isScopedUser ? ` user=${req.user.username}` : '')
+              + ` in ${Date.now() - t0}ms`
             );
             return res.json(applyOverviewVisibility({ summary, isMock: false, currency }, req.user));
           }
         } catch (aggErr) {
           logger.warn('Overview SQL aggregate failed, falling through:', aggErr.message);
+        }
+      }
+    }
+
+    // Legacy fallback only if SQL totals miss — avoid for domain users when possible.
+    if (isScopedUser && userHasAssignedInventory(req.user)) {
+      const svc = getSyncSvc();
+      if (typeof svc?.fetchLeanDashboardBundleFromDB === 'function') {
+        try {
+          const t0 = Date.now();
+          const scoped = resolveScopedSqlInventoryOpts(
+            req.user,
+            invFilterActive ? filters : {}
+          );
+          const compat = await fetchLeanDashboardBundleCompatible(
+            svc,
+            filters.startDate,
+            filters.endDate,
+            {
+              domains: scoped.domains,
+              sites: scoped.sites,
+              apps: scoped.apps,
+              adUnitNames: scoped.adUnitNames,
+              webInventoryOr: scoped.webInventoryOr,
+              skipAdUnitLike: scoped.skipAdUnitLike,
+              currency,
+              tableLimit: 50,
+              selectedDomains: scoped.domains,
+            }
+          );
+          if (compat?.bundle?.summary) {
+            const b = compat.bundle.summary;
+            const impressions = Math.round(Number(b.impressions) || 0);
+            const revenue = +Number(b.revenue || 0).toFixed(2);
+            const ecpm = impressions > 0
+              ? +((revenue / impressions) * 1000).toFixed(2)
+              : (Number(b.ecpm) || 0);
+            const summary = {
+              totalEarning: revenue,
+              totalEarningChange: 0,
+              selectRange: revenue,
+              selectRangeChange: 0,
+              last7Days: revenue,
+              last7DaysChange: 0,
+              pageViews: impressions,
+              pageViewsChange: 0,
+              impressions,
+              impressionsChange: 0,
+              clicks: 0,
+              clicksChange: 0,
+              revenue,
+              revenueChange: 0,
+              ecpm,
+              ecpmChange: 0,
+              viewability: Number(b.viewability) || 0,
+              viewabilityChange: 0,
+              currency: currency || b.currency,
+            };
+            logger.info(
+              `Overview scoped lean SQL user=${req.user.username}`
+              + ` source=${compat.bundle.source || 'lean'}`
+              + ` revenue=${revenue} impressions=${impressions}`
+              + ` range=${filters.startDate}..${filters.endDate}`
+              + ` in ${Date.now() - t0}ms`
+            );
+            return res.json(applyOverviewVisibility({ summary, isMock: false, currency }, req.user));
+          }
+        } catch (scopedErr) {
+          logger.warn('Overview scoped lean SQL failed, falling through:', scopedErr.message);
         }
       }
     }
@@ -2729,27 +2840,17 @@ async function handleDashboard(req, res) {
       let domains = toFilterArray(filters.domain);
       let sites = toFilterArray(filters.site);
       let apps = toFilterArray(filters.domainId);
+      let webInventoryOr = false;
+      let skipAdUnitLike = false;
       // Scoped children must never see network-wide SQL aggregates.
+      // Domains+sites+apps must not be AND'd — that returns empty for assigned-all users.
       if (isScopedChild) {
-        const scope = getUserInventoryScope(req.user);
-        if (scope?.domains?.size) {
-          const allowed = [...scope.domains];
-          domains = domains.length
-            ? domains.filter((d) => scope.domains.has(String(d).toLowerCase()))
-            : allowed;
-        }
-        if (scope?.sites?.size) {
-          const allowed = [...scope.sites];
-          sites = sites.length
-            ? sites.filter((s) => scope.sites.has(String(s).toLowerCase()))
-            : allowed;
-        }
-        if (scope?.appIds?.size) {
-          const allowed = [...scope.appIds];
-          apps = apps.length
-            ? apps.filter((a) => scope.appIds.has(String(a).toLowerCase()))
-            : allowed;
-        }
+        const scoped = resolveScopedSqlInventoryOpts(req.user, filters);
+        domains = scoped.domains;
+        sites = scoped.sites;
+        apps = scoped.apps;
+        webInventoryOr = !!scoped.webInventoryOr;
+        skipAdUnitLike = !!scoped.skipAdUnitLike;
       }
       const compat = await fetchLeanDashboardBundleCompatible(svc, filters.startDate, filters.endDate, {
         domains,
@@ -2760,11 +2861,12 @@ async function handleDashboard(req, res) {
         currency,
         tableLimit: MAX_DASHBOARD_CLIENT_ROWS,
         selectedDomains: domains,
+        webInventoryOr,
+        skipAdUnitLike,
       });
       if (compat?.bundle) {
         const bundle = compat.bundle;
-        // Single-side fallback: re-scope with filters that actually ran.
-        // Union (web∪app): rows are already filtered per side — don't AND again.
+        // SQL already applied inventory scope — skip heavy catalog re-filter (that made domain users slower than admin).
         const rowFilters = bundle.source === 'compat-union'
           ? { ...filters, domain: [], site: [], domainName: [], domainId: [] }
           : {
@@ -2774,10 +2876,13 @@ async function handleDashboard(req, res) {
             domainName: compat.usedOpts?.adUnitNames ?? filters.domainName,
             domainId: compat.usedOpts?.apps ?? filters.domainId,
           };
-        const scopedRows = prepareScopedReportRows(bundle.rows, rowFilters, req.user);
+        const scopedRows = (isScopedChild && (bundle.source === 'rollup' || bundle.source === 'compat-union' || bundle.source === 'lean'))
+          ? normalizeReportRows(bundle.rows || [])
+          : prepareScopedReportRows(bundle.rows, rowFilters, req.user);
         logger.info(
           `Dashboard ${bundle.source === 'rollup' ? 'rollup' : (bundle.source || 'lean SQL')} bundle ${filters.startDate}..${filters.endDate}`
           + ` grain≈${bundle.grainCount} table=${scopedRows.length}`
+          + (isScopedChild ? ` user=${req.user.username}` : '')
           + (compat.skipped?.length ? ` compatSkipped=[${compat.skipped.join(', ')}]` : '')
           + ` in ${Date.now() - t0}ms`
         );
@@ -2813,6 +2918,31 @@ async function handleDashboard(req, res) {
         } catch (_) { /* ignore */ }
         return res.json(payload);
       }
+      // Scoped children: same speed as admin — never block on GAM when rollup SQL misses.
+      // Enqueue backfill in the background; return empty KPIs immediately.
+      if (isScopedChild) {
+        logger.info(
+          `Dashboard scoped SQL miss ${filters.startDate}..${filters.endDate}`
+          + ` user=${req.user.username} — empty response (no GAM wait) in ${Date.now() - t0}ms`
+        );
+        enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
+        const empty = applyVisibility({
+          summary: {
+            impressions: 0,
+            revenue: 0,
+            ecpm: 0,
+            viewability: 0,
+            currency: currency || 'USD',
+          },
+          rows: [],
+          trend: [],
+          charts: { revenue: [], device: [], country: [], performance: [] },
+          isMock: false,
+          pagination: { totalRows: 0, truncated: false },
+        }, req.user, visibilityOpts);
+        cache.set(dashRespKey, empty, Math.min(60, REPORT_CACHE_TTL));
+        return res.json(empty);
+      }
       // Mixed web+app with no compatible subset → Reporting-style empty warning (don't hang on GAM).
       if (hasMixedWebAndAppFilters({
         domain: domains,
@@ -2830,24 +2960,22 @@ async function handleDashboard(req, res) {
     }
   } catch (bundleErr) {
     logger.warn(`Dashboard lean SQL bundle failed, falling back: ${bundleErr.message}`);
-  }
-
-  const appFilterActive = toFilterArray(filters.domainId).length > 0;
-  if (isScopedChild && appFilterActive) {
-    try {
-      const token = await getToken();
-      const { rows: allRows } = await loadReportRowsCacheAside(filters, token, {
-        cachePrefix: 'report_dashboard_raw_v3',
-        fastMode: true,
-        persistOnGam: true,
-        enqueueSyncOnMiss: true,
-        asyncOnMiss: true,
-        logLabel: 'Dashboard app-filter',
-      });
-      return res.json(buildScoped(allRows, currency, false));
-    } catch (err) {
-      logger.error('Dashboard scoped app-filter error:', err.message);
-      return res.status(500).json({ error: err.message });
+    if (isScopedChild) {
+      enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
+      return res.json(applyVisibility({
+        summary: {
+          impressions: 0,
+          revenue: 0,
+          ecpm: 0,
+          viewability: 0,
+          currency: currency || 'USD',
+        },
+        rows: [],
+        trend: [],
+        charts: { revenue: [], device: [], country: [], performance: [] },
+        isMock: false,
+        pagination: { totalRows: 0, truncated: false },
+      }, req.user, visibilityOpts));
     }
   }
 
@@ -3150,27 +3278,16 @@ async function handleDetailedReport(req, res) {
     let domains = toFilterArray(filters.domain);
     let sites = toFilterArray(filters.site);
     let apps = toFilterArray(filters.domainId);
+    let webInventoryOr = false;
+    let skipAdUnitLike = false;
     const isScopedChild = req.user?.role !== 'admin' && userHasAssignedInventory(req.user);
     if (isScopedChild) {
-      const scope = getUserInventoryScope(req.user);
-      if (scope?.domains?.size) {
-        const allowed = [...scope.domains];
-        domains = domains.length
-          ? domains.filter((d) => scope.domains.has(String(d).toLowerCase()))
-          : allowed;
-      }
-      if (scope?.sites?.size) {
-        const allowed = [...scope.sites];
-        sites = sites.length
-          ? sites.filter((s) => scope.sites.has(String(s).toLowerCase()))
-          : allowed;
-      }
-      if (scope?.appIds?.size) {
-        const allowed = [...scope.appIds];
-        apps = apps.length
-          ? apps.filter((a) => scope.appIds.has(String(a).toLowerCase()))
-          : allowed;
-      }
+      const scoped = resolveScopedSqlInventoryOpts(req.user, filters);
+      domains = scoped.domains;
+      sites = scoped.sites;
+      apps = scoped.apps;
+      webInventoryOr = !!scoped.webInventoryOr;
+      skipAdUnitLike = !!scoped.skipAdUnitLike;
     }
     const invOpts = {
       domains,
@@ -3181,6 +3298,8 @@ async function handleDetailedReport(req, res) {
       currency,
       tableLimit: 5000,
       selectedDomains: domains,
+      webInventoryOr,
+      skipAdUnitLike,
     };
 
     // ── Inventory-only: reuse Dashboard lean/rollup path ─────────────────────

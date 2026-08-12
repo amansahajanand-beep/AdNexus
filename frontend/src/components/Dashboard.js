@@ -85,6 +85,15 @@ function toNumber(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** True when a chart series has at least one positive value to plot. */
+function hasChartData(series = [], valueKeys = ['value', 'revenue', 'impressions', 'ecpm', 'score']) {
+  if (!Array.isArray(series) || !series.length) return false;
+  return series.some((row) => {
+    if (row == null || typeof row !== 'object') return toNumber(row) > 0;
+    return valueKeys.some((k) => toNumber(row[k]) > 0);
+  });
+}
+
 function readValue(row, keys = [], fallbackKeys = []) {
   if (!row || typeof row !== 'object') return null;
   const candidates = [...new Set([...keys, ...fallbackKeys].flatMap((key) => {
@@ -358,28 +367,52 @@ export default function Dashboard() {
   const [preset, setPreset] = useState(() => saved?.preset ?? 'today');
   const [startDate, setStartDate] = useState(() => initDates.startDate);
   const [endDate, setEndDate] = useState(() => initDates.endDate);
-  const [domainName, setDomainName] = useState(() => saved?.domainName ?? invDraft.domainName);
-  const [domainId, setDomainId] = useState(() => saved?.domainId ?? invDraft.domainId);
-  const [domain, setDomain] = useState(() => saved?.domain ?? invDraft.domain);
-  const [site, setSite] = useState(() => saved?.site ?? invDraft.site);
+  const [domainName, setDomainName] = useState(() => (
+    filterVisibility.isScopedUser ? invDraft.domainName : (saved?.domainName ?? invDraft.domainName)
+  ));
+  const [domainId, setDomainId] = useState(() => (
+    filterVisibility.isScopedUser ? invDraft.domainId : (saved?.domainId ?? invDraft.domainId)
+  ));
+  const [domain, setDomain] = useState(() => (
+    filterVisibility.isScopedUser ? invDraft.domain : (saved?.domain ?? invDraft.domain)
+  ));
+  const [site, setSite] = useState(() => (
+    filterVisibility.isScopedUser ? invDraft.site : (saved?.site ?? invDraft.site)
+  ));
   const [catalog, setCatalog] = useState([]);
   const [catalogLists, setCatalogLists] = useState({ domainRoots: [], siteHosts: [], sitesByDomain: {}, adUnitsByHost: {}, appIds: [] });
   const [noDomainsAssigned, setNoDomainsAssigned] = useState(false);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [applied, setApplied] = useState(() => {
+    // Domain user: dates only — never restore auto-applied full inventory assignment.
+    if (filterVisibility.isScopedUser) {
+      return {
+        ...defaultApplied,
+        startDate: saved?.applied?.startDate || saved?.startDate || todayInit.startDate,
+        endDate: saved?.applied?.endDate || saved?.endDate || todayInit.endDate,
+      };
+    }
     if (saved?.applied) return saved.applied;
     if (scopedAutoLoad) return buildScopedDashboardApplied(user, todayInit);
     return defaultApplied;
   });
   const [filterApplied, setFilterApplied] = useState(() => {
+    if (filterVisibility.isScopedUser) return false;
     if (saved?.filterApplied != null) return saved.filterApplied;
     return scopedAutoLoad;
   });
 
-  const [overviewData, setOverviewData] = useState(() => saved?.overviewData ?? null);
-  const [detailData, setDetailData] = useState(() => (cacheFresh ? saved?.detailData : null) ?? null);
-  const [overviewLoading, setOverviewLoading] = useState(() => !saved?.overviewData);
+  const [overviewData, setOverviewData] = useState(() => (
+    filterVisibility.isScopedUser ? null : (saved?.overviewData ?? null)
+  ));
+  const [detailData, setDetailData] = useState(() => (
+    filterVisibility.isScopedUser ? null : ((cacheFresh ? saved?.detailData : null) ?? null)
+  ));
+  const [overviewLoading, setOverviewLoading] = useState(() => (
+    filterVisibility.isScopedUser ? true : !saved?.overviewData
+  ));
   const [detailLoading, setDetailLoading] = useState(() => {
+    if (filterVisibility.isScopedUser) return false;
     if (cacheFresh && saved?.filterApplied) return true;
     return scopedAutoLoad && canGenerate;
   });
@@ -1414,6 +1447,7 @@ export default function Dashboard() {
 
       {hasInventoryFilter && !detailLoading && hasFilteredReportData && (
         <>
+          {hasChartData(dailySeries, ['revenue', 'impressions']) && (
           <div className="chart-card wide">
             <div className="chart-header">
               <h3 className="chart-title">Revenue growth &amp; impressions</h3>
@@ -1424,41 +1458,40 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
-            {dailySeries.length === 0 ? (
-              <div className="gam-report-empty chart-empty">
-                <p className="gam-report-empty-title">No data available</p>
-              </div>
-            ) : (
-              <ResponsiveContainer width="100%" height={isNarrow ? 220 : 260}>
-                <AreaChart data={dailySeries} margin={{ top: 10, right: isNarrow ? 8 : 20, left: 0, bottom: 5 }}>
-                  <defs>
-                    <linearGradient id="dashEarnGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.25} />
-                      <stop offset="95%" stopColor="#1a73e8" stopOpacity={0} />
-                    </linearGradient>
-                    <linearGradient id="dashImpsGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#34a853" stopOpacity={0.2} />
-                      <stop offset="95%" stopColor="#34a853" stopOpacity={0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                  <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-                  <YAxis yAxisId="left" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                    tickFormatter={v => money(v, currency)} width={isNarrow ? 48 : 72} />
-                  <YAxis yAxisId="right" orientation="right" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                    tickFormatter={v => num(v)} width={isNarrow ? 46 : 64} />
-                  <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
-                    formatter={(v, name) => (name === 'Revenue' ? [money(v, currency), 'Revenue'] : [num(v), 'Impressions'])} />
-                  <Area yAxisId="left" type="monotone" dataKey="revenue" stroke="#1a73e8" strokeWidth={2}
-                    fill="url(#dashEarnGrad)" dot={false} activeDot={{ r: 4 }} name="Revenue" />
-                  <Area yAxisId="right" type="monotone" dataKey="impressions" stroke="#34a853" strokeWidth={2}
-                    fill="url(#dashImpsGrad)" dot={false} activeDot={{ r: 4 }} name="Impressions" />
-                </AreaChart>
-              </ResponsiveContainer>
-            )}
+            <ResponsiveContainer width="100%" height={isNarrow ? 220 : 260}>
+              <AreaChart data={dailySeries} margin={{ top: 10, right: isNarrow ? 8 : 20, left: 0, bottom: 5 }}>
+                <defs>
+                  <linearGradient id="dashEarnGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.25} />
+                    <stop offset="95%" stopColor="#1a73e8" stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="dashImpsGrad" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#34a853" stopOpacity={0.2} />
+                    <stop offset="95%" stopColor="#34a853" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                <YAxis yAxisId="left" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
+                  tickFormatter={v => money(v, currency)} width={isNarrow ? 48 : 72} />
+                <YAxis yAxisId="right" orientation="right" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
+                  tickFormatter={v => num(v)} width={isNarrow ? 46 : 64} />
+                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                  formatter={(v, name) => (name === 'Revenue' ? [money(v, currency), 'Revenue'] : [num(v), 'Impressions'])} />
+                <Area yAxisId="left" type="monotone" dataKey="revenue" stroke="#1a73e8" strokeWidth={2}
+                  fill="url(#dashEarnGrad)" dot={false} activeDot={{ r: 4 }} name="Revenue" />
+                <Area yAxisId="right" type="monotone" dataKey="impressions" stroke="#34a853" strokeWidth={2}
+                  fill="url(#dashImpsGrad)" dot={false} activeDot={{ r: 4 }} name="Impressions" />
+              </AreaChart>
+            </ResponsiveContainer>
           </div>
+          )}
 
+          {(hasChartData(shareSeries.revenue) || hasChartData(shareSeries.device) || hasChartData(shareSeries.country)
+            || (showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']))
+            || (showRevenueCharts && !showEcpmCharts && hasChartData(siteShareSeries))) && (
           <div className="charts-grid">
+            {hasChartData(shareSeries.revenue) && (
             <div className="chart-card">
               <div className="chart-header">
                 <h3 className="chart-title">Revenue share</h3>
@@ -1472,250 +1505,225 @@ export default function Dashboard() {
                         : 'Top 10 domains'}
                 </span>
               </div>
-              {shareSeries.revenue.length === 0 ? (
-                <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No share data</p></div>
-              ) : (
-                <ResponsiveContainer width="100%" height={220}>
-                  <PieChart>
-                    <Pie data={shareSeries.revenue} dataKey="value" nameKey="name" innerRadius={48} outerRadius={78} paddingAngle={2}>
-                      {shareSeries.revenue.map((entry, idx) => <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />)}
-                    </Pie>
-                    <Tooltip formatter={(value) => [money(value, currency), 'Revenue']} />
-                    <Legend />
-                  </PieChart>
-                </ResponsiveContainer>
-              )}
+              <ResponsiveContainer width="100%" height={220}>
+                <PieChart>
+                  <Pie data={shareSeries.revenue} dataKey="value" nameKey="name" innerRadius={48} outerRadius={78} paddingAngle={2}>
+                    {shareSeries.revenue.map((entry, idx) => <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />)}
+                  </Pie>
+                  <Tooltip formatter={(value) => [money(value, currency), 'Revenue']} />
+                  <Legend />
+                </PieChart>
+              </ResponsiveContainer>
             </div>
+            )}
 
+            {hasChartData(shareSeries.device) && (
             <div className="chart-card">
               <div className="chart-header">
                 <h3 className="chart-title">Device share</h3>
                 <span className="filter-section-hint">Laptop · Mobile · Tablet</span>
               </div>
-              {shareSeries.device.length === 0 ? (
-                <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No share data</p></div>
-              ) : (
-                <ResponsiveContainer width="100%" height={240}>
-                  <BarChart data={shareSeries.device} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                    <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={72} tick={{ fontSize: 11 }} axisLine={false} />
-                    <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Device']} />
-                    <Bar dataKey="value" radius={[0, 6, 6, 0]}>
-                      {shareSeries.device.map((entry, idx) => (
-                        <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
-                      ))}
-                    </Bar>
-                    <Legend
-                      layout="horizontal"
-                      verticalAlign="bottom"
-                      align="center"
-                      payload={shareSeries.device.map((entry, idx) => ({
-                        value: entry.name,
-                        type: 'square',
-                        color: SHARE_COLORS[idx % SHARE_COLORS.length],
-                      }))}
-                      formatter={(value) => <span style={{ color: '#333', fontSize: 11 }}>{value}</span>}
-                    />
-                  </BarChart>
-                </ResponsiveContainer>
-              )}
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={shareSeries.device} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis type="number" tick={false} axisLine={false} />
+                  <YAxis dataKey="name" type="category" width={72} tick={{ fontSize: 11 }} axisLine={false} />
+                  <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Device']} />
+                  <Bar dataKey="value" radius={[0, 6, 6, 0]}>
+                    {shareSeries.device.map((entry, idx) => (
+                      <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
+                    ))}
+                  </Bar>
+                  <Legend
+                    layout="horizontal"
+                    verticalAlign="bottom"
+                    align="center"
+                    payload={shareSeries.device.map((entry, idx) => ({
+                      value: entry.name,
+                      type: 'square',
+                      color: SHARE_COLORS[idx % SHARE_COLORS.length],
+                    }))}
+                    formatter={(value) => <span style={{ color: '#333', fontSize: 11 }}>{value}</span>}
+                  />
+                </BarChart>
+              </ResponsiveContainer>
             </div>
+            )}
 
+            {hasChartData(shareSeries.country) && (
             <div className="chart-card">
               <div className="chart-header">
                 <h3 className="chart-title">Country share</h3>
                 <span className="filter-section-hint">Top 10 countries</span>
               </div>
-              {shareSeries.country.length === 0 ? (
-                <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No share data</p></div>
-              ) : (
-                <ResponsiveContainer width="100%" height={260}>
-                  <PieChart>
-                    <Pie
-                      data={shareSeries.country}
-                      dataKey="value"
-                      nameKey="name"
-                      innerRadius={48}
-                      outerRadius={78}
-                      paddingAngle={2}
-                      label={isNarrow
-                        ? false
-                        : ({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)`}
-                      labelLine={isNarrow ? false : { stroke: '#9aa0a6', strokeWidth: 1 }}
-                    >
-                      {shareSeries.country.map((entry, idx) => (
-                        <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      formatter={(value, name) => [money(value, currency), name || 'Country']}
-                    />
-                    <Legend
-                      layout="horizontal"
-                      verticalAlign="bottom"
-                      align="center"
-                      formatter={(value) => <span style={{ color: '#333', fontSize: 11 }}>{value}</span>}
-                    />
-                  </PieChart>
-                </ResponsiveContainer>
-              )}
+              <ResponsiveContainer width="100%" height={260}>
+                <PieChart>
+                  <Pie
+                    data={shareSeries.country}
+                    dataKey="value"
+                    nameKey="name"
+                    innerRadius={48}
+                    outerRadius={78}
+                    paddingAngle={2}
+                    label={isNarrow
+                      ? false
+                      : ({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)`}
+                    labelLine={isNarrow ? false : { stroke: '#9aa0a6', strokeWidth: 1 }}
+                  >
+                    {shareSeries.country.map((entry, idx) => (
+                      <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
+                    ))}
+                  </Pie>
+                  <Tooltip
+                    formatter={(value, name) => [money(value, currency), name || 'Country']}
+                  />
+                  <Legend
+                    layout="horizontal"
+                    verticalAlign="bottom"
+                    align="center"
+                    formatter={(value) => <span style={{ color: '#333', fontSize: 11 }}>{value}</span>}
+                  />
+                </PieChart>
+              </ResponsiveContainer>
             </div>
+            )}
 
-            {showEcpmCharts ? (
+            {showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']) ? (
               <div className="chart-card">
                 <div className="chart-header">
                   <h3 className="chart-title">Daily eCPM</h3>
                   <span className="filter-section-hint">Revenue / impressions × 1000</span>
                 </div>
-                {dailyWithEcpm.length === 0 ? (
-                  <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No data available</p></div>
-                ) : (
-                  <ResponsiveContainer width="100%" height={260}>
-                    <LineChart data={dailyWithEcpm} margin={{ top: 10, right: 8, left: 0, bottom: 5 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                      <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-                      <YAxis tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                        tickFormatter={(v) => money(v, currency)} width={isNarrow ? 48 : 64} />
-                      <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
-                        formatter={(v) => [money(v, currency), 'eCPM']} />
-                      <Line type="monotone" dataKey="ecpm" name="eCPM" stroke="#8e24aa" strokeWidth={2} dot={{ r: 3 }} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                )}
+                <ResponsiveContainer width="100%" height={260}>
+                  <LineChart data={dailyWithEcpm} margin={{ top: 10, right: 8, left: 0, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                    <YAxis tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
+                      tickFormatter={(v) => money(v, currency)} width={isNarrow ? 48 : 64} />
+                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                      formatter={(v) => [money(v, currency), 'eCPM']} />
+                    <Line type="monotone" dataKey="ecpm" name="eCPM" stroke="#8e24aa" strokeWidth={2} dot={{ r: 3 }} />
+                  </LineChart>
+                </ResponsiveContainer>
               </div>
-            ) : showRevenueCharts ? (
+            ) : (showRevenueCharts && hasChartData(siteShareSeries)) ? (
               <div className="chart-card">
                 <div className="chart-header">
                   <h3 className="chart-title">Top sites</h3>
                   <span className="filter-section-hint">Top 10 by revenue</span>
                 </div>
-                {siteShareSeries.length === 0 ? (
-                  <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No share data</p></div>
-                ) : (
-                  <ResponsiveContainer width="100%" height={260}>
-                    <BarChart data={siteShareSeries} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                      <XAxis type="number" tick={false} axisLine={false} />
-                      <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
-                      <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
-                      <Bar dataKey="value" radius={[0, 6, 6, 0]}>
-                        {siteShareSeries.map((entry, idx) => (
-                          <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                )}
+                <ResponsiveContainer width="100%" height={260}>
+                  <BarChart data={siteShareSeries} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <XAxis type="number" tick={false} axisLine={false} />
+                    <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
+                    <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
+                    <Bar dataKey="value" radius={[0, 6, 6, 0]}>
+                      {siteShareSeries.map((entry, idx) => (
+                        <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
             ) : null}
           </div>
+          )}
 
+          {hasChartData(performanceSeries, ['score', 'value']) && (
           <div className="chart-card wide">
             <div className="chart-header">
               <h3 className="chart-title">Ad performance</h3>
               <span className="filter-section-hint">Compact score by ad unit</span>
             </div>
-            {performanceSeries.length === 0 ? (
-              <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No performance rows</p></div>
-            ) : (
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={performanceSeries} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                  <XAxis type="number" tick={false} axisLine={false} />
-                  <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
-                  <Tooltip formatter={(value) => [Number(value).toFixed(0), 'Performance score']} />
-                  <Bar dataKey="score" radius={[0, 6, 6, 0]} fill="#b91c1c" />
-                </BarChart>
-              </ResponsiveContainer>
-            )}
+            <ResponsiveContainer width="100%" height={240}>
+              <BarChart data={performanceSeries} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <XAxis type="number" tick={false} axisLine={false} />
+                <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
+                <Tooltip formatter={(value) => [Number(value).toFixed(0), 'Performance score']} />
+                <Bar dataKey="score" radius={[0, 6, 6, 0]} fill="#b91c1c" />
+              </BarChart>
+            </ResponsiveContainer>
           </div>
+          )}
 
-          {showEcpmCharts && (
+          {showEcpmCharts && hasChartData(dailyWithEcpm, ['revenue', 'ecpm']) && (
             <div className="chart-card wide">
               <div className="chart-header">
                 <h3 className="chart-title">Revenue vs eCPM</h3>
                 <span className="filter-section-hint">Daily revenue bars with eCPM overlay</span>
               </div>
-              {dailyWithEcpm.length === 0 ? (
-                <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No data available</p></div>
-              ) : (
-                <ResponsiveContainer width="100%" height={isNarrow ? 220 : 260}>
-                  <ComposedChart data={dailyWithEcpm} margin={{ top: 10, right: isNarrow ? 8 : 20, left: 0, bottom: 5 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                    <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-                    <YAxis yAxisId="left" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                      tickFormatter={(v) => money(v, currency)} width={isNarrow ? 48 : 72} />
-                    <YAxis yAxisId="right" orientation="right" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                      tickFormatter={(v) => money(v, currency)} width={isNarrow ? 46 : 64} />
-                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
-                      formatter={(v, name) => [money(v, currency), name]} />
-                    <Legend />
-                    <Bar yAxisId="left" dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[4, 4, 0, 0]} />
-                    <Line yAxisId="right" type="monotone" dataKey="ecpm" name="eCPM" stroke="#f29900" strokeWidth={2} dot={false} />
-                  </ComposedChart>
-                </ResponsiveContainer>
-              )}
+              <ResponsiveContainer width="100%" height={isNarrow ? 220 : 260}>
+                <ComposedChart data={dailyWithEcpm} margin={{ top: 10, right: isNarrow ? 8 : 20, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+                  <YAxis yAxisId="left" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
+                    tickFormatter={(v) => money(v, currency)} width={isNarrow ? 48 : 72} />
+                  <YAxis yAxisId="right" orientation="right" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
+                    tickFormatter={(v) => money(v, currency)} width={isNarrow ? 46 : 64} />
+                  <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                    formatter={(v, name) => [money(v, currency), name]} />
+                  <Legend />
+                  <Bar yAxisId="left" dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[4, 4, 0, 0]} />
+                  <Line yAxisId="right" type="monotone" dataKey="ecpm" name="eCPM" stroke="#f29900" strokeWidth={2} dot={false} />
+                </ComposedChart>
+              </ResponsiveContainer>
             </div>
           )}
 
+          {((showRevenueCharts && showEcpmCharts && hasChartData(siteShareSeries))
+            || ((showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']))) && (
           <div className="charts-grid">
-            {showRevenueCharts && showEcpmCharts && (
+            {showRevenueCharts && showEcpmCharts && hasChartData(siteShareSeries) && (
               <div className="chart-card">
                 <div className="chart-header">
                   <h3 className="chart-title">Top sites</h3>
                   <span className="filter-section-hint">Top 10 by revenue</span>
                 </div>
-                {siteShareSeries.length === 0 ? (
-                  <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No share data</p></div>
-                ) : (
-                  <ResponsiveContainer width="100%" height={240}>
-                    <BarChart data={siteShareSeries} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                      <XAxis type="number" tick={false} axisLine={false} />
-                      <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
-                      <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
-                      <Bar dataKey="value" radius={[0, 6, 6, 0]}>
-                        {siteShareSeries.map((entry, idx) => (
-                          <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
-                        ))}
-                      </Bar>
-                    </BarChart>
-                  </ResponsiveContainer>
-                )}
+                <ResponsiveContainer width="100%" height={240}>
+                  <BarChart data={siteShareSeries} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <XAxis type="number" tick={false} axisLine={false} />
+                    <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
+                    <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
+                    <Bar dataKey="value" radius={[0, 6, 6, 0]}>
+                      {siteShareSeries.map((entry, idx) => (
+                        <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
             )}
 
-            {(showRevenueCharts || showImpressionCharts) && (
+            {(showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']) && (
               <div className="chart-card">
                 <div className="chart-header">
                   <h3 className="chart-title">Ad unit mix</h3>
                   <span className="filter-section-hint">Revenue and impressions by ad unit</span>
                 </div>
-                {adUnitMixSeries.length === 0 ? (
-                  <div className="gam-report-empty chart-empty"><p className="gam-report-empty-title">No performance rows</p></div>
-                ) : (
-                  <ResponsiveContainer width="100%" height={240}>
-                    <BarChart data={adUnitMixSeries} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                      <XAxis type="number" tick={false} axisLine={false} />
-                      <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
-                      <Tooltip formatter={(value, name) => (
-                        name === 'Revenue' ? [money(value, currency), name] : [num(value), name]
-                      )} />
-                      <Legend />
-                      {showRevenueCharts && (
-                        <Bar dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[0, 6, 6, 0]} />
-                      )}
-                      {showImpressionCharts && (
-                        <Bar dataKey="impressions" name="Impressions" fill="#34a853" radius={[0, 6, 6, 0]} />
-                      )}
-                    </BarChart>
-                  </ResponsiveContainer>
-                )}
+                <ResponsiveContainer width="100%" height={240}>
+                  <BarChart data={adUnitMixSeries} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <XAxis type="number" tick={false} axisLine={false} />
+                    <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
+                    <Tooltip formatter={(value, name) => (
+                      name === 'Revenue' ? [money(value, currency), name] : [num(value), name]
+                    )} />
+                    <Legend />
+                    {showRevenueCharts && (
+                      <Bar dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[0, 6, 6, 0]} />
+                    )}
+                    {showImpressionCharts && (
+                      <Bar dataKey="impressions" name="Impressions" fill="#34a853" radius={[0, 6, 6, 0]} />
+                    )}
+                  </BarChart>
+                </ResponsiveContainer>
               </div>
             )}
           </div>
+          )}
         </>
       )}
 

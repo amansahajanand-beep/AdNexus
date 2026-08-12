@@ -189,9 +189,11 @@ function rowMatchesInventoryFilters(row, { apps = [], adUnits = [], domains = []
 }
 
 /**
- * Scoped child users: web dimensions AND together; app IDs separate.
- * When both web and app filters are present, a row matches if it passes web OR app checks
- * (same rule as permissions rowMatchesUserScope).
+ * Scoped child users: match assignment like permissions (OR across families).
+ * - Domain + site together → row matches if it hits site OR domain (not AND).
+ *   Lean rows often have domain without site host; AND empties Dashboard/Reporting
+ *   when admins assign domains + sites (+ apps) together.
+ * - Web + app together → mobile-app rows use app match; web rows use web match.
  */
 function rowMatchesScopedInventoryFilter(row, { apps = [], adUnits = [], domains = [], siteUrls = [] } = {}, matchOpts = {}) {
   const hasDom = domains.length > 0;
@@ -203,11 +205,18 @@ function rowMatchesScopedInventoryFilter(row, { apps = [], adUnits = [], domains
   if (!hasWebFilter && !hasApp) return true;
 
   // Site-only filter = web inventory; do not attribute mobile-app rows via ad-unit name guessing.
-  if (hasSite && !hasApp && isMobileAppRow(row)) return false;
+  if (hasSite && !hasApp && !hasDom && isMobileAppRow(row)) return false;
 
-  const webOk = (!hasDom || rowMatchesDomainFilter(row, domains))
-    && (!hasSite || rowMatchesSiteFilter(row, siteUrls, matchOpts))
-    && (!hasAd || adUnits.includes(row.site));
+  let webOk = true;
+  if (hasDom || hasSite) {
+    const siteOk = hasSite && rowMatchesSiteFilter(row, siteUrls, matchOpts);
+    const domOk = hasDom && rowMatchesDomainFilter(row, domains);
+    if (hasDom && hasSite) webOk = siteOk || domOk;
+    else webOk = hasSite ? siteOk : domOk;
+  }
+  if (hasAd) {
+    webOk = webOk && adUnits.includes(row.site);
+  }
 
   const appOk = rowMatchesAppFilter(row, apps);
 

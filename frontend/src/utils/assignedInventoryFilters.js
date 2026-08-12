@@ -30,8 +30,11 @@ export function hasInventoryFilterSelection(applied) {
 export function buildAssignedInventoryFilters(user) {
   if (isAdmin(user) || !hasAssignedInventory(user)) return { ...EMPTY_INVENTORY_FILTERS };
   const scope = getAssignedInventoryScope(user);
+  // Prefer sites over domains when both are assigned — sending both as AND filters
+  // empties Dashboard/Reporting. Apps stay separate (backend unions web|app).
+  const hasSites = scope.allowedSites.length > 0;
   return {
-    domain: [...scope.allowedDomains],
+    domain: hasSites ? [] : [...scope.allowedDomains],
     site: [...scope.allowedSites],
     domainName: [],
     domainId: [...scope.allowedAppIds],
@@ -39,8 +42,9 @@ export function buildAssignedInventoryFilters(user) {
 }
 
 /**
- * Scoped users start with an empty inventory selection.
- * Overview loads full assigned scope on open; after Apply Filter, KPIs match the selected filters.
+ * Do not auto-fill or auto-apply assigned inventory in the UI.
+ * Overview uses assignment on the server when no filter is applied;
+ * chart/table waits until the user picks filters and clicks Apply.
  */
 export function shouldAutoLoadScopedInventory() {
   return false;
@@ -88,16 +92,8 @@ export function initialInventoryDraft(user, saved = {}) {
       domainId: saved.domainId ?? [],
     };
   }
-  if (draftHasInventorySelection(saved)) {
-    return {
-      domain: saved.domain ?? [],
-      site: saved.site ?? [],
-      domainName: saved.domainName ?? [],
-      domainId: saved.domainId ?? [],
-    };
-  }
-  // Scoped users start with an EMPTY selection (no filter applied by default);
-  // they pick from their assigned list, which is all the dropdowns even offer.
+  // Domain users: never restore a previous full assignment into the pickers.
+  // They must choose filters themselves; overview still uses assignment on the server.
   return { ...EMPTY_INVENTORY_FILTERS };
 }
 

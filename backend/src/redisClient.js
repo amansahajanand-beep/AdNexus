@@ -109,6 +109,10 @@ function createBullmqConnection(label = 'BullMQ Redis') {
 
 async function redisGet(key) {
   try {
+    if (Buffer.byteLength(String(key || ''), 'utf8') > 30000) {
+      logger.warn(`Redis GET skipped: key too large (${Buffer.byteLength(String(key), 'utf8')} bytes)`);
+      return null;
+    }
     const value = await redis.get(key);
 
     if (!value) {
@@ -119,6 +123,8 @@ async function redisGet(key) {
   } catch (err) {
     if (isTransientRedisError(err)) {
       logger.warn(`Redis GET skipped (reconnect) for ${key}: ${err.message}`);
+    } else if (/max key size/i.test(err.message || '')) {
+      logger.warn(`Redis GET skipped (key too large): ${err.message}`);
     } else {
       logger.warn(`Redis GET failed for ${key}: ${err.message}`);
     }
@@ -132,6 +138,10 @@ async function redisGet(key) {
 
 async function redisSet(key, value, ttlSeconds) {
   try {
+    if (Buffer.byteLength(String(key || ''), 'utf8') > 30000) {
+      logger.warn(`Redis SET skipped: key too large (${Buffer.byteLength(String(key), 'utf8')} bytes)`);
+      return false;
+    }
     const payload = JSON.stringify(value);
     const bytes = Buffer.byteLength(payload, 'utf8');
     if (bytes > MAX_REDIS_VALUE_BYTES) {
@@ -153,6 +163,8 @@ async function redisSet(key, value, ttlSeconds) {
   } catch (err) {
     if (isTransientRedisError(err)) {
       logger.warn(`Redis SET skipped (reconnect) for ${key}: ${err.message}`);
+    } else if (/max key size/i.test(err.message || '')) {
+      logger.warn(`Redis SET skipped (key too large): ${err.message}`);
     } else {
       logger.warn(`Redis SET failed for ${key}: ${err.message}`);
     }

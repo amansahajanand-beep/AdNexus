@@ -607,22 +607,35 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
       extra += ` AND ${adUnitExpr} = ANY($${params.length}::text[])`;
     }
 
+    const webParts = [];
     if (domains.length) {
       params.push(domains);
       const i = params.length;
-      extra += ` AND (
+      webParts.push(opts.skipAdUnitLike
+        ? `(${domainExpr} = ANY($${i}::text[]))`
+        : `(
         ${domainExpr} = ANY($${i}::text[])
         OR ${adUnitExpr} LIKE ANY(ARRAY(SELECT '%' || d || '%' FROM unnest($${i}::text[]) AS d))
-      )`;
+      )`);
     }
 
     if (sites.length) {
       params.push(sites);
       const i = params.length;
-      extra += ` AND (
+      webParts.push(opts.skipAdUnitLike
+        ? `(${siteExpr} = ANY($${i}::text[]))`
+        : `(
         ${siteExpr} = ANY($${i}::text[])
         OR ${adUnitExpr} LIKE ANY(ARRAY(SELECT '%' || s || '%' FROM unnest($${i}::text[]) AS s))
-      )`;
+      )`);
+    }
+
+    if (webParts.length === 1) {
+      extra += ` AND ${webParts[0]}`;
+    } else if (webParts.length > 1) {
+      extra += opts.webInventoryOr
+        ? ` AND (${webParts.join(' OR ')})`
+        : ` AND ${webParts[0]} AND ${webParts[1]}`;
     }
 
     if (apps.length) {
@@ -695,11 +708,47 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
 
 /**
  * Fast overview KPIs: SUM in SQL instead of loading 100k+ detail rows into Node.
+ * Optional inventory opts (domains/sites/apps) keep domain-user overview as fast as admin.
  * Returns null when no lean rows exist for the range.
  */
-async function fetchLeanOverviewTotalsFromDB(startDate, endDate) {
+async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
+  const hasWeb = (opts.domains?.length || 0)
+    || (opts.sites?.length || 0)
+    || (opts.adUnitNames?.length || 0);
+  const hasApp = (opts.apps?.length || 0) > 0;
+
+  // Web + app assignment: OR semantics — two fast SUMs in parallel (never AND).
+  if (hasWeb && hasApp) {
+    const [web, app] = await Promise.all([
+      fetchLeanOverviewTotalsFromDB(startDate, endDate, { ...opts, apps: [] }),
+      fetchLeanOverviewTotalsFromDB(startDate, endDate, {
+        ...opts,
+        domains: [],
+        sites: [],
+        adUnitNames: [],
+      }),
+    ]);
+    if (!web && !app) return null;
+    const impressions = (web?.impressions || 0) + (app?.impressions || 0);
+    const revenue = +(((web?.revenue || 0) + (app?.revenue || 0))).toFixed(2);
+    const viewableWeight = ((web?.viewability || 0) / 100) * (web?.impressions || 0)
+      + ((app?.viewability || 0) / 100) * (app?.impressions || 0);
+    const rowCount = (web?.rowCount || 0) + (app?.rowCount || 0);
+    if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
+    return {
+      impressions: Math.round(impressions),
+      revenue,
+      viewability: impressions > 0 ? +((viewableWeight / impressions) * 100).toFixed(1) : 0,
+      rowCount,
+      source: web?.source === 'rollup' || app?.source === 'rollup' ? 'rollup' : 'grain',
+    };
+  }
+
   // Prefer typed rollups (fast). Fall back to grain JSONB scan if rollups empty.
   try {
+    const filterParams = [startDate, endDate];
+    let filterExtra = ` AND report_date BETWEEN $1::date AND $2::date`;
+    filterExtra = appendRollupInventoryFilters(filterParams, filterExtra, opts);
     const { rows } = await query(
       `SELECT
          COALESCE(SUM(impressions), 0)::float8 AS impressions,
@@ -707,8 +756,8 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate) {
          COALESCE(SUM(viewable_weight), 0)::float8 AS viewable_weight,
          COALESCE(SUM(grain_count), 0)::int AS row_count
        FROM rollup_kpi_daily
-       WHERE report_date BETWEEN $1::date AND $2::date`,
-      [startDate, endDate]
+       WHERE TRUE${filterExtra}`,
+      filterParams
     );
     const t = rows[0] || {};
     const impressions = Number(t.impressions) || 0;
@@ -757,13 +806,10 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate) {
     ELSE ${viewableRawExpr}
   END`;
 
-  const run = async (table, from, to, excludeDates = null) => {
+  const run = async (table, from, to) => {
     const params = [from, to];
-    let extra = '';
-    if (excludeDates && excludeDates.length) {
-      params.push(excludeDates);
-      extra = ` AND report_date <> ALL($${params.length}::date[])`;
-    }
+    let extra = ` AND report_date BETWEEN $1::date AND $2::date`;
+    extra = appendLeanInventoryFilters(params, extra, opts);
     const { rows } = await query(
       `SELECT
          COALESCE(SUM(${impressionExpr}), 0)::float8 AS impressions,
@@ -771,7 +817,7 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate) {
          COALESCE(SUM((${impressionExpr}) * (${viewablePctExpr})), 0)::float8 AS viewable_weight,
          COUNT(*)::int AS row_count
        FROM ${table}
-       WHERE report_date BETWEEN $1::date AND $2::date${extra}`,
+       WHERE TRUE${extra}`,
       params
     );
     return rows[0] || { impressions: 0, revenue: 0, viewable_weight: 0, row_count: 0 };
@@ -999,21 +1045,34 @@ function appendRollupInventoryFilters(params, extra, opts = {}) {
     params.push(adUnitNames);
     clause += ` AND LOWER(inv_ad_unit) = ANY($${params.length}::text[])`;
   }
+  const webParts = [];
   if (domains.length) {
     params.push(domains);
     const i = params.length;
-    clause += ` AND (
+    webParts.push(opts.skipAdUnitLike
+      ? `(LOWER(inv_domain) = ANY($${i}::text[]))`
+      : `(
       LOWER(inv_domain) = ANY($${i}::text[])
       OR LOWER(inv_ad_unit) LIKE ANY(ARRAY(SELECT '%' || d || '%' FROM unnest($${i}::text[]) AS d))
-    )`;
+    )`);
   }
   if (sites.length) {
     params.push(sites);
     const i = params.length;
-    clause += ` AND (
+    webParts.push(opts.skipAdUnitLike
+      ? `(LOWER(inv_site) = ANY($${i}::text[]))`
+      : `(
       LOWER(inv_site) = ANY($${i}::text[])
       OR LOWER(inv_ad_unit) LIKE ANY(ARRAY(SELECT '%' || s || '%' FROM unnest($${i}::text[]) AS s))
-    )`;
+    )`);
+  }
+  if (webParts.length === 1) {
+    clause += ` AND ${webParts[0]}`;
+  } else if (webParts.length > 1) {
+    // Scoped children: domain+site assignment must OR (AND wipes lean rows).
+    clause += opts.webInventoryOr
+      ? ` AND (${webParts.join(' OR ')})`
+      : ` AND ${webParts[0]} AND ${webParts[1]}`;
   }
   if (apps.length) {
     params.push(apps);
@@ -1075,21 +1134,33 @@ function appendLeanInventoryFilters(params, extra, opts = {}) {
     params.push(adUnitNames);
     clause += ` AND ${adUnitExpr} = ANY($${params.length}::text[])`;
   }
+  const webParts = [];
   if (domains.length) {
     params.push(domains);
     const i = params.length;
-    clause += ` AND (
+    webParts.push(opts.skipAdUnitLike
+      ? `(${domainExpr} = ANY($${i}::text[]))`
+      : `(
       ${domainExpr} = ANY($${i}::text[])
       OR ${adUnitExpr} LIKE ANY(ARRAY(SELECT '%' || d || '%' FROM unnest($${i}::text[]) AS d))
-    )`;
+    )`);
   }
   if (sites.length) {
     params.push(sites);
     const i = params.length;
-    clause += ` AND (
+    webParts.push(opts.skipAdUnitLike
+      ? `(${siteExpr} = ANY($${i}::text[]))`
+      : `(
       ${siteExpr} = ANY($${i}::text[])
       OR ${adUnitExpr} LIKE ANY(ARRAY(SELECT '%' || s || '%' FROM unnest($${i}::text[]) AS s))
-    )`;
+    )`);
+  }
+  if (webParts.length === 1) {
+    clause += ` AND ${webParts[0]}`;
+  } else if (webParts.length > 1) {
+    clause += opts.webInventoryOr
+      ? ` AND (${webParts.join(' OR ')})`
+      : ` AND ${webParts[0]} AND ${webParts[1]}`;
   }
   if (apps.length) {
     params.push(apps);

@@ -65,14 +65,11 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
   const height = isNarrow ? 220 : 250;
   const wide = Boolean(chart.wide) || chart.type === 'column' && chart.title?.includes('by Date');
 
+  // No empty placeholder cards — only render charts that have data.
+  if (!chart.data?.length) return null;
+
   let body = null;
-  if (!chart.data?.length) {
-    body = (
-      <div className="gam-report-empty chart-empty">
-        <p className="gam-report-empty-title">No chart data</p>
-      </div>
-    );
-  } else if (chart.type === 'area') {
+  if (chart.type === 'area') {
     body = (
       <ResponsiveContainer width="100%" height={height}>
         <AreaChart data={chart.data} margin={{ top: 10, right: isNarrow ? 8 : 20, left: 0, bottom: 5 }}>
@@ -236,24 +233,12 @@ export default function ReportAutoCharts({
       rows,
       visibility,
       mode,
-    }),
+    }).filter((c) => Array.isArray(c?.data) && c.data.some((d) => Number(d?.value) > 0 || Number(d?.score) > 0)),
     [dimensions, metrics, rows, visibility, mode]
   );
 
-  if (!charts.length) {
-    return (
-      <div className="chart-card" style={{ marginTop: 16 }}>
-        <div className="chart-header">
-          <h3 className="chart-title">Charts</h3>
-          <span className="filter-section-hint">No suitable visualization</span>
-        </div>
-        <div className="gam-report-empty chart-empty">
-          <p className="gam-report-empty-title">No chart data</p>
-          <p className="gam-report-empty-hint">Select a numeric metric (and optionally a time or category dimension) to visualize.</p>
-        </div>
-      </div>
-    );
-  }
+  // Hide the whole charts block when this query has nothing to plot.
+  if (!charts.length) return null;
 
   const rangeLabel = startDate && endDate ? `${startDate} → ${endDate}` : '';
 
