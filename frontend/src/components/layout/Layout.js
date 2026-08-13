@@ -39,8 +39,18 @@ export default function Layout() {
     return () => document.removeEventListener('mousedown', onClick);
   }, []);
 
-  // Close the mobile nav drawer on route change.
   useEffect(() => { setMenuOpen(false); }, [location.pathname]);
+
+  useEffect(() => {
+    if (!menuOpen) return undefined;
+    const onKey = (e) => { if (e.key === 'Escape') setMenuOpen(false); };
+    document.addEventListener('keydown', onKey);
+    document.body.classList.add('sidebar-open');
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.classList.remove('sidebar-open');
+    };
+  }, [menuOpen]);
 
   const handleLogout = () => {
     logout();
@@ -63,8 +73,6 @@ export default function Layout() {
   const noInventoryAssigned = !!user && user.role !== 'admin' && !hasAssignedInventory(user);
   const noAccess = !!user && !isAdmin && (!hasAnyPage || noInventoryAssigned);
 
-  // GAM API version deprecation warning (shown only to admins, dismissible so
-  // it never blocks normal usage).
   const gv = networkInfo?.gamVersion;
   const verStatus = gv?.status;
   const showVerWarn = isAdmin && !verDismissed
@@ -79,36 +87,37 @@ export default function Layout() {
   })();
 
   return (
-    <div className="app">
+    <div className="app app-shell">
       {isMock && (
         <div className="mock-banner">
-          🔧 Mock Mode — Showing sample data. To load real data, add your ad network credentials to <code>.env</code> and restart the backend.
+          Mock Mode — Showing sample data. To load real data, add your ad network credentials to <code>.env</code> and restart the backend.
         </div>
       )}
 
       {showVerWarn && (
         <div className={`version-banner ${verStatus === 'sunset' ? 'critical' : ''}`}>
-          <span className="version-banner-text">⚠️ {verMessage}</span>
+          <span className="version-banner-text">{verMessage}</span>
           <button className="version-banner-close" onClick={() => setVerDismissed(true)} aria-label="Dismiss">✕</button>
         </div>
       )}
 
-      <header className="app-header">
-        <div className="header-left">
-          <button
-            type="button"
-            className="nav-toggle"
-            aria-label={menuOpen ? 'Close menu' : 'Open menu'}
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen(o => !o)}
-          >
-            {menuOpen ? '✕' : '☰'}
-          </button>
+      {menuOpen && (
+        <button
+          type="button"
+          className="sidebar-backdrop"
+          aria-label="Close menu"
+          onClick={() => setMenuOpen(false)}
+        />
+      )}
+
+      <div className="app-shell-body">
+      <aside className={`app-sidebar ${menuOpen ? 'open' : ''}`}>
+        <div className="sidebar-top">
           <BrandLogo />
           {networkInfo && <span className="network-label">{networkInfo.displayName}</span>}
         </div>
 
-        <nav className={`header-nav ${menuOpen ? 'open' : ''}`}>
+        <nav className="sidebar-nav">
           {navItems.map(item => (
             <NavLink
               key={item.to}
@@ -121,19 +130,19 @@ export default function Layout() {
           ))}
         </nav>
 
-        <div className="header-right">
+        <div className="sidebar-foot">
           <div className="live-dot header-live">
-            <span className="dot-pulse"></span>
+            <span className="dot-pulse" />
             {isMock ? 'Mock' : 'Live'}
           </div>
           <div className="user-menu" ref={userRef}>
-            <button className="user-btn" onClick={() => setUserOpen(o => !o)}>
+            <button type="button" className="user-btn" onClick={() => setUserOpen(o => !o)}>
               <span className="user-avatar">{initial}</span>
-              <span className="user-name hide-sm">{user?.username}</span>
+              <span className="user-name">{user?.username}</span>
               <span className="user-caret">▾</span>
             </button>
             {userOpen && (
-              <div className="user-dropdown">
+              <div className="user-dropdown user-dropdown-sidebar">
                 <button
                   type="button"
                   className="user-dd-head user-dd-head-btn"
@@ -148,35 +157,55 @@ export default function Layout() {
                   </div>
                 </button>
                 {isAdmin && (
-                  <button className="user-dd-item" onClick={() => go('/admin')}>⚙️ Admin Settings</button>
+                  <button type="button" className="user-dd-item" onClick={() => go('/admin')}>Admin Settings</button>
                 )}
                 {canPage('domain-user') && (
-                  <button className="user-dd-item" onClick={() => go('/domain-user')}>👤 My Profile</button>
+                  <button type="button" className="user-dd-item" onClick={() => go('/domain-user')}>My Profile</button>
                 )}
-                <button className="user-dd-item" onClick={handleLogout}>🔒 Logout</button>
+                <button type="button" className="user-dd-item" onClick={handleLogout}>Logout</button>
               </div>
             )}
           </div>
         </div>
-      </header>
+      </aside>
 
-      <main className="app-main">
-        {noAccess ? (
-          <div className="no-access-wrap">
-            <div className="no-access-card">
-              <div className="no-access-icon">🔒</div>
-              <h2 className="no-access-title">{noInventoryAssigned ? NO_DOMAINS_TITLE : 'Access Restricted'}</h2>
-              <p className="no-access-msg">
-                {noInventoryAssigned
-                  ? NO_DOMAINS_MSG
-                  : "You don't have permission to access this resource. Please contact your administrator."}
-              </p>
-            </div>
+      <div className="app-content">
+        <header className="app-mobile-bar">
+          <button
+            type="button"
+            className="nav-toggle"
+            aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+            aria-expanded={menuOpen}
+            onClick={() => setMenuOpen(o => !o)}
+          >
+            {menuOpen ? '✕' : '☰'}
+          </button>
+          <BrandLogo />
+          <div className="live-dot header-live">
+            <span className="dot-pulse" />
+            {isMock ? 'Mock' : 'Live'}
           </div>
-        ) : (
-          <Outlet context={{ networkInfo, isMock }} />
-        )}
-      </main>
+        </header>
+
+        <main className="app-main">
+          {noAccess ? (
+            <div className="no-access-wrap">
+              <div className="no-access-card">
+                <div className="no-access-icon">!</div>
+                <h2 className="no-access-title">{noInventoryAssigned ? NO_DOMAINS_TITLE : 'Access Restricted'}</h2>
+                <p className="no-access-msg">
+                  {noInventoryAssigned
+                    ? NO_DOMAINS_MSG
+                    : "You don't have permission to access this resource. Please contact your administrator."}
+                </p>
+              </div>
+            </div>
+          ) : (
+            <Outlet context={{ networkInfo, isMock }} />
+          )}
+        </main>
+      </div>
+      </div>
     </div>
   );
 }

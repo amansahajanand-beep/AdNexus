@@ -76,8 +76,15 @@ import {
 } from '../utils/recentFilters';
 import SavedFiltersBar from './ui/SavedFiltersBar';
 import { SAVED_FILTERS_PAGES } from '../utils/savedFilters';
+import {
+  CHART_COLORS,
+  CHART_SERIES,
+  CHART_GRID,
+  CHART_AXIS_TICK,
+  CHART_TOOLTIP_STYLE,
+} from '../utils/chartTheme';
 
-const SHARE_COLORS = ['#1a73e8', '#34a853', '#f29900', '#ea4335', '#8e24aa', '#00acc1'];
+const SHARE_COLORS = CHART_COLORS;
 
 const PAGE_SIZE = 50;
 const POLL_MS = 30 * 60 * 1000; // matches backend 30-min cache TTL
@@ -98,6 +105,49 @@ function toNumber(v) {
 }
 
 /** True when a chart series has at least one positive value to plot. */
+function buildEngagementSeries(rows = []) {
+  const map = new Map();
+  rows.forEach((row) => {
+    const date = readValue(row, ['date', 'report_date', 'DATE', 'reportDate', 'period'], ['day']) || 'Unknown';
+    if (!date) return;
+    const entry = map.get(date) || { date, impressions: 0, clicks: 0, unfilled: 0 };
+    entry.impressions += toNumber(readValue(row, ['impression', 'impressions', 'total_line_item_level_impressions'], ['impressionsTotal']));
+    entry.clicks += toNumber(readValue(row, ['clicks', 'click', 'total_line_item_level_clicks'], ['clicksTotal']));
+    entry.unfilled += toNumber(readValue(row, ['unfilled', 'unfilled_impressions', 'total_inventory_level_unfilled_impressions'], ['unfilledImpressions']));
+    const ctrRaw = toNumber(readValue(row, ['ctr', 'total_line_item_level_ctr'], ['clickThroughRate']));
+    const fillRaw = toNumber(readValue(row, ['fillRate', 'fill_rate', 'adxMatchRate'], ['fillRatePercent']));
+    if (ctrRaw > 0) entry._ctrSum = (entry._ctrSum || 0) + (ctrRaw > 1 ? ctrRaw : ctrRaw * 100);
+    if (fillRaw > 0) entry._fillSum = (entry._fillSum || 0) + (fillRaw > 1 ? fillRaw : fillRaw * 100);
+    entry._count = (entry._count || 0) + 1;
+    map.set(date, entry);
+  });
+
+  const series = Array.from(map.values())
+    .map((entry) => {
+      const impressions = entry.impressions;
+      const clicks = entry.clicks;
+      const unfilled = entry.unfilled;
+      const ctr = impressions > 0
+        ? +((clicks / impressions) * 100).toFixed(2)
+        : (entry._count ? +((entry._ctrSum || 0) / entry._count).toFixed(2) : 0);
+      const fillRate = (impressions + unfilled) > 0
+        ? +((impressions / (impressions + unfilled)) * 100).toFixed(2)
+        : (entry._count ? +((entry._fillSum || 0) / entry._count).toFixed(2) : 0);
+      return {
+        date: entry.date,
+        impressions,
+        clicks,
+        unfilled,
+        ctr,
+        fillRate,
+      };
+    })
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+  const hasSignal = series.some((item) => item.clicks > 0 || item.ctr > 0 || item.fillRate > 0 || item.unfilled > 0);
+  return hasSignal ? series : [];
+}
+
 function hasChartData(series = [], valueKeys = ['value', 'revenue', 'impressions', 'ecpm', 'score']) {
   if (!Array.isArray(series) || !series.length) return false;
   return series.some((row) => {
@@ -1024,6 +1074,8 @@ export default function Dashboard() {
       'total_line_item_level_cpm_and_cpc_revenue',
       'total_line_item_level_impressions',
       'total_line_item_level_ctr',
+      'total_line_item_level_clicks',
+      'total_inventory_level_unfilled_impressions',
       'total_line_item_level_without_cpd_average_ecpm',
       'total_active_view_viewable_impressions_rate',
     ]);
@@ -1043,6 +1095,11 @@ export default function Dashboard() {
     }
     return buildDailySeries(enrichedRows, trend);
   }, [filterApplied, enrichedRows, detailData?.trend]);
+
+  const engagementSeries = useMemo(() => {
+    if (!filterApplied) return [];
+    return buildEngagementSeries(enrichedRows);
+  }, [filterApplied, enrichedRows]);
 
   const shareSeries = useMemo(() => {
     const charts = detailData?.charts;
@@ -1104,6 +1161,39 @@ export default function Dashboard() {
       { isNarrow }
     ),
     [dailyWithEcpm, isNarrow]
+  );
+  const engagementDates = useMemo(
+    () => engagementSeries.map((d) => d.date).filter(Boolean),
+    [engagementSeries]
+  );
+  const engagementScrollable = Boolean(scrollableChartMinWidth(engagementSeries.length, { isNarrow }));
+  const engagementDateAxis = useMemo(
+    () => dateAxisProps(engagementSeries.length, {
+      isNarrow,
+      dates: engagementDates,
+      scrollable: engagementScrollable,
+    }),
+    [engagementSeries.length, isNarrow, engagementDates, engagementScrollable]
+  );
+  const engagementClicksWidth = useMemo(
+    () => yAxisWidthForValues(engagementSeries.map((d) => d.clicks), 'raw', { isNarrow }),
+    [engagementSeries, isNarrow]
+  );
+  const engagementPctWidth = useMemo(
+    () => yAxisWidthForValues(
+      engagementSeries.flatMap((d) => [d.ctr, d.fillRate]),
+      'percent',
+      { isNarrow }
+    ),
+    [engagementSeries, isNarrow]
+  );
+  const engagementMargins = useMemo(
+    () => chartMargins({
+      isNarrow,
+      hasAngledX: Boolean(engagementDateAxis.angle),
+      yWidth: Math.max(engagementClicksWidth, engagementPctWidth),
+    }),
+    [isNarrow, engagementDateAxis.angle, engagementClicksWidth, engagementPctWidth]
   );
   const dailyChartMargins = useMemo(
     () => chartMargins({
@@ -1550,19 +1640,19 @@ export default function Dashboard() {
                 <AreaChart data={dailySeries} margin={dailyChartMargins}>
                   <defs>
                     <linearGradient id="dashEarnGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.28} />
-                      <stop offset="95%" stopColor="#1a73e8" stopOpacity={0.04} />
+                      <stop offset="5%" stopColor={CHART_SERIES.primary} stopOpacity={0.22} />
+                      <stop offset="95%" stopColor={CHART_SERIES.primary} stopOpacity={0.02} />
                     </linearGradient>
                     <linearGradient id="dashImpsGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#34a853" stopOpacity={0.22} />
-                      <stop offset="95%" stopColor="#34a853" stopOpacity={0.04} />
+                      <stop offset="5%" stopColor={CHART_SERIES.secondary} stopOpacity={0.18} />
+                      <stop offset="95%" stopColor={CHART_SERIES.secondary} stopOpacity={0.02} />
                     </linearGradient>
                   </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                   <XAxis dataKey="date" {...dailyDateAxis} />
                   <YAxis
                     yAxisId="left"
-                    tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisMoney(v, currency)}
@@ -1571,21 +1661,123 @@ export default function Dashboard() {
                   <YAxis
                     yAxisId="right"
                     orientation="right"
-                    tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisNumber(v)}
                     width={dailyImpWidth}
                   />
-                  <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                  <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
                     labelFormatter={(label) => String(label || '')}
                     formatter={(v, name) => (name === 'Revenue' ? [money(v, currency), 'Revenue'] : [num(v), 'Impressions'])} />
-                  <Area yAxisId="left" type="monotone" dataKey="revenue" stroke="#1a73e8" strokeWidth={2}
+                  <Area yAxisId="left" type="monotone" dataKey="revenue" stroke={CHART_SERIES.primary} strokeWidth={2}
                     fill="url(#dashEarnGrad)" fillOpacity={1} dot={false} activeDot={{ r: 4 }} name="Revenue" isAnimationActive={false} />
-                  <Area yAxisId="right" type="monotone" dataKey="impressions" stroke="#34a853" strokeWidth={2}
+                  <Area yAxisId="right" type="monotone" dataKey="impressions" stroke={CHART_SERIES.secondary} strokeWidth={2}
                     fill="url(#dashImpsGrad)" fillOpacity={1} dot={false} activeDot={{ r: 4 }} name="Impressions" isAnimationActive={false} />
                 </AreaChart>
               </ScrollableChart>
+          </div>
+          )}
+
+          {(hasChartData(engagementSeries, ['clicks', 'ctr', 'fillRate'])) && (
+          <div className="charts-grid">
+            {hasChartData(engagementSeries, ['ctr']) && (
+            <div className="chart-card">
+              <div className="chart-header">
+                <h3 className="chart-title">CTR over time</h3>
+                <span className="filter-section-hint">Clicks / impressions</span>
+              </div>
+              <ScrollableChart pointCount={engagementSeries.length} isNarrow={isNarrow} height={isNarrow ? 260 : 250}>
+                <AreaChart data={engagementSeries} margin={engagementMargins}>
+                  <defs>
+                    <linearGradient id="dashCtrGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={CHART_SERIES.primary} stopOpacity={0.2} />
+                      <stop offset="95%" stopColor={CHART_SERIES.primary} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
+                  <XAxis dataKey="date" {...engagementDateAxis} />
+                  <YAxis
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => `${Number(v || 0).toFixed(1)}%`}
+                    width={engagementPctWidth}
+                  />
+                  <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
+                    labelFormatter={(label) => String(label || '')}
+                    formatter={(v) => [`${Number(v || 0).toFixed(2)}%`, 'CTR']} />
+                  <Area type="monotone" dataKey="ctr" name="CTR" stroke={CHART_SERIES.primary} strokeWidth={2}
+                    fill="url(#dashCtrGrad)" fillOpacity={1} dot={false} isAnimationActive={false} />
+                </AreaChart>
+              </ScrollableChart>
+            </div>
+            )}
+            {hasChartData(engagementSeries, ['clicks']) && (
+            <div className="chart-card">
+              <div className="chart-header">
+                <h3 className="chart-title">Clicks trend</h3>
+                <span className="filter-section-hint">Daily clicks</span>
+              </div>
+              <ScrollableChart pointCount={engagementSeries.length} isNarrow={isNarrow} height={isNarrow ? 260 : 250}>
+                <AreaChart data={engagementSeries} margin={engagementMargins}>
+                  <defs>
+                    <linearGradient id="dashClicksGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={CHART_SERIES.accent} stopOpacity={0.22} />
+                      <stop offset="95%" stopColor={CHART_SERIES.accent} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
+                  <XAxis dataKey="date" {...engagementDateAxis} />
+                  <YAxis
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => formatAxisNumber(v)}
+                    width={engagementClicksWidth}
+                  />
+                  <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
+                    labelFormatter={(label) => String(label || '')}
+                    formatter={(v) => [num(v), 'Clicks']} />
+                  <Area type="monotone" dataKey="clicks" name="Clicks" stroke={CHART_SERIES.accent} strokeWidth={2}
+                    fill="url(#dashClicksGrad)" fillOpacity={1} dot={false} isAnimationActive={false} />
+                </AreaChart>
+              </ScrollableChart>
+            </div>
+            )}
+            {hasChartData(engagementSeries, ['fillRate']) && (
+            <div className="chart-card">
+              <div className="chart-header">
+                <h3 className="chart-title">Fill rate over time</h3>
+                <span className="filter-section-hint">Impressions / (impressions + unfilled)</span>
+              </div>
+              <ScrollableChart pointCount={engagementSeries.length} isNarrow={isNarrow} height={isNarrow ? 260 : 250}>
+                <AreaChart data={engagementSeries} margin={engagementMargins}>
+                  <defs>
+                    <linearGradient id="dashFillGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={CHART_SERIES.secondary} stopOpacity={0.2} />
+                      <stop offset="95%" stopColor={CHART_SERIES.secondary} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
+                  <XAxis dataKey="date" {...engagementDateAxis} />
+                  <YAxis
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => `${Number(v || 0).toFixed(0)}%`}
+                    width={engagementPctWidth}
+                    domain={[0, 100]}
+                  />
+                  <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
+                    labelFormatter={(label) => String(label || '')}
+                    formatter={(v) => [`${Number(v || 0).toFixed(1)}%`, 'Fill rate']} />
+                  <Area type="monotone" dataKey="fillRate" name="Fill rate" stroke={CHART_SERIES.secondary} strokeWidth={2}
+                    fill="url(#dashFillGrad)" fillOpacity={1} dot={false} isAnimationActive={false} />
+                </AreaChart>
+              </ScrollableChart>
+            </div>
+            )}
           </div>
           )}
 
@@ -1643,7 +1835,7 @@ export default function Dashboard() {
               </div>
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={shareSeries.device} layout="vertical" margin={hBarMargins}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                   <XAxis type="number" tick={false} axisLine={false} />
                   <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
                     tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
@@ -1722,19 +1914,19 @@ export default function Dashboard() {
                 </div>
                 <ScrollableChart pointCount={dailyWithEcpm.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
                   <LineChart data={dailyWithEcpm} margin={dailyEcpmMargins}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                     <XAxis dataKey="date" {...dailyDateAxis} />
                     <YAxis
-                      tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
+                      tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
                       tickLine={false}
                       axisLine={false}
                       tickFormatter={(v) => formatAxisMoney(v, currency)}
                       width={dailyMoneyWidth}
                     />
-                    <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                    <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
                       labelFormatter={(label) => String(label || '')}
                       formatter={(v) => [money(v, currency), 'eCPM']} />
-                    <Line type="monotone" dataKey="ecpm" name="eCPM" stroke="#8e24aa" strokeWidth={2} dot={dailyWithEcpm.length <= 31} />
+                    <Line type="monotone" dataKey="ecpm" name="eCPM" stroke={CHART_COLORS[4]} strokeWidth={2} dot={dailyWithEcpm.length <= 31} />
                   </LineChart>
                 </ScrollableChart>
               </div>
@@ -1746,7 +1938,7 @@ export default function Dashboard() {
                 </div>
                 <ResponsiveContainer width="100%" height={260}>
                   <BarChart data={siteShareSeries} layout="vertical" margin={hBarMargins}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                     <XAxis type="number" tick={false} axisLine={false} />
                     <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
                     tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
@@ -1771,12 +1963,12 @@ export default function Dashboard() {
             </div>
             <ResponsiveContainer width="100%" height={240}>
               <BarChart data={performanceSeries} layout="vertical" margin={hBarMargins}>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                 <XAxis type="number" tick={false} axisLine={false} />
                 <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
                     tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
                 <Tooltip formatter={(value) => [Number(value).toFixed(0), 'Performance score']} />
-                <Bar dataKey="score" radius={[0, 6, 6, 0]} fill="#b91c1c" />
+                <Bar dataKey="score" radius={[0, 6, 6, 0]} fill={CHART_SERIES.danger} />
               </BarChart>
             </ResponsiveContainer>
           </div>
@@ -1790,11 +1982,11 @@ export default function Dashboard() {
               </div>
               <ScrollableChart pointCount={dailyWithEcpm.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
                 <ComposedChart data={dailyWithEcpm} margin={dailyEcpmMargins}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                   <XAxis dataKey="date" {...dailyDateAxis} />
                   <YAxis
                     yAxisId="left"
-                    tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisMoney(v, currency)}
@@ -1803,18 +1995,18 @@ export default function Dashboard() {
                   <YAxis
                     yAxisId="right"
                     orientation="right"
-                    tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisMoney(v, currency)}
                     width={dailyEcpmWidth}
                   />
-                  <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                  <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
                     labelFormatter={(label) => String(label || '')}
                     formatter={(v, name) => [money(v, currency), name]} />
                   <Legend />
-                  <Bar yAxisId="left" dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[4, 4, 0, 0]} maxBarSize={isNarrow ? 14 : 28} />
-                  <Line yAxisId="right" type="monotone" dataKey="ecpm" name="eCPM" stroke="#f29900" strokeWidth={2} dot={false} />
+                  <Bar yAxisId="left" dataKey="revenue" name="Revenue" fill={CHART_SERIES.primary} radius={[4, 4, 0, 0]} maxBarSize={isNarrow ? 14 : 28} />
+                  <Line yAxisId="right" type="monotone" dataKey="ecpm" name="eCPM" stroke={CHART_SERIES.accent} strokeWidth={2} dot={false} />
                 </ComposedChart>
               </ScrollableChart>
             </div>
@@ -1831,7 +2023,7 @@ export default function Dashboard() {
                 </div>
                 <ResponsiveContainer width="100%" height={240}>
                   <BarChart data={siteShareSeries} layout="vertical" margin={hBarMargins}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                     <XAxis type="number" tick={false} axisLine={false} />
                     <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
                     tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
@@ -1854,7 +2046,7 @@ export default function Dashboard() {
                 </div>
                 <ResponsiveContainer width="100%" height={240}>
                   <BarChart data={adUnitMixSeries} layout="vertical" margin={hBarMargins}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                     <XAxis type="number" tick={false} axisLine={false} />
                     <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
                     tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
@@ -1863,10 +2055,10 @@ export default function Dashboard() {
                     )} />
                     <Legend />
                     {showRevenueCharts && (
-                      <Bar dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[0, 6, 6, 0]} />
+                      <Bar dataKey="revenue" name="Revenue" fill={CHART_SERIES.primary} radius={[0, 6, 6, 0]} />
                     )}
                     {showImpressionCharts && (
-                      <Bar dataKey="impressions" name="Impressions" fill="#34a853" radius={[0, 6, 6, 0]} />
+                      <Bar dataKey="impressions" name="Impressions" fill={CHART_SERIES.secondary} radius={[0, 6, 6, 0]} />
                     )}
                   </BarChart>
                 </ResponsiveContainer>

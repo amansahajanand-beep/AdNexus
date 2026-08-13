@@ -24,7 +24,7 @@ function Delta({ change, loading }) {
 }
 
 /**
- * GAM Home → Overview card (4 KPIs in one panel).
+ * Network overview KPIs — Stripe/Mixpanel-style metric strip.
  */
 export default function GamOverviewCard({
   summary = {},
@@ -60,7 +60,6 @@ export default function GamOverviewCard({
       <div className="gam-overview-head">
         <div className="gam-overview-title-row">
           <h3 className="gam-overview-title">Overview</h3>
-          <span className="gam-overview-help" title="Network overview for selected date">?</span>
           {loading && <span className="overview-loading-badge" aria-live="polite">Fetching…</span>}
         </div>
         <span className="gam-overview-select" aria-label="Overview breakdown">Programmatic channels</span>

@@ -49,7 +49,7 @@ export default function Onboard() {
         <form className="login-card onboard-card" onSubmit={submit} noValidate autoComplete="off">
           <BrandMark size={56} className="login-logo" />
           <h2 className="login-title">Register your GAM network</h2>
-          <p className="login-sub">Paste your Google Ad Manager credentials to create your publisher account.</p>
+          <p className="login-sub">Connect Google Ad Manager credentials to start publisher analytics.</p>
           {error && <div className="login-error">{error}</div>}
 
           <TextField label="Publisher name" value={form.name} onChange={set('name')} placeholder="Acme Media" autoFocus />

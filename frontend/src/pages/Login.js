@@ -67,7 +67,7 @@ export default function Login() {
         >
           <BrandMark size={56} className="login-logo" />
           <h2 className="login-title">Sign in to AdNexus</h2>
-          <p className="login-sub">Secure access to your ad revenue analytics dashboard</p>
+          <p className="login-sub">Publisher analytics for revenue, inventory, and performance</p>
 
           {displayError && <div className="login-error">{displayError}</div>}
 

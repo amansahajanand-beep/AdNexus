@@ -30,8 +30,15 @@ import {
   categoryLabelMaxChars,
 } from '../../utils/chartAxis';
 import ScrollableChart from './ScrollableChart';
+import {
+  CHART_COLORS,
+  CHART_SERIES,
+  CHART_GRID,
+  CHART_AXIS_TICK,
+  CHART_TOOLTIP_STYLE,
+} from '../../utils/chartTheme';
 
-const SHARE_COLORS = ['#1a73e8', '#34a853', '#f29900', '#ea4335', '#8e24aa', '#00acc1'];
+const SHARE_COLORS = CHART_COLORS;
 
 function money(v, currency = 'USD') {
   const n = Number(v) || 0;
@@ -109,31 +116,31 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
         <AreaChart data={chart.data} margin={margins}>
           <defs>
             <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.28} />
-              <stop offset="95%" stopColor="#1a73e8" stopOpacity={0.04} />
+              <stop offset="5%" stopColor={CHART_SERIES.primary} stopOpacity={0.22} />
+              <stop offset="95%" stopColor={CHART_SERIES.primary} stopOpacity={0.02} />
             </linearGradient>
           </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+          <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
           <XAxis
             dataKey="date"
             {...(xDate || { tick: { fontSize: 11 }, tickLine: false, axisLine: false })}
           />
           <YAxis
-            tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
+            tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
             tickLine={false}
             axisLine={false}
             tickFormatter={(v) => formatAxisMetric(v, format, currency)}
             width={yWidth}
           />
           <Tooltip
-            contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+            contentStyle={CHART_TOOLTIP_STYLE}
             labelFormatter={(label) => String(label || '')}
             formatter={(v) => [formatMetricValue(v, format, currency), metName]}
           />
           <Area
             type="monotone"
             dataKey="value"
-            stroke="#1a73e8"
+            stroke={CHART_SERIES.primary}
             strokeWidth={2}
             fill={`url(#${gradId})`}
             fillOpacity={1}
@@ -149,14 +156,14 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
     body = (
       <ResponsiveContainer width="100%" height={height}>
         <RadarChart data={radarData} cx="50%" cy="50%" outerRadius="70%">
-          <PolarGrid stroke="#e8eaed" />
-          <PolarAngleAxis dataKey="name" tick={{ fontSize: 10, fill: '#5f6368' }} />
+          <PolarGrid stroke={CHART_GRID.stroke} />
+          <PolarAngleAxis dataKey="name" tick={{ fontSize: 10, fill: CHART_AXIS_TICK.fill }} />
           <PolarRadiusAxis angle={30} tick={false} axisLine={false} domain={[0, 100]} />
           <Radar
             name="Relative"
             dataKey="score"
-            stroke="#1a73e8"
-            fill="#1a73e8"
+            stroke={CHART_SERIES.primary}
+            fill={CHART_SERIES.primary}
             fillOpacity={0.35}
           />
           <Tooltip
@@ -184,7 +191,7 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
           barCategoryGap={isNarrow ? '18%' : '12%'}
           barGap={isNarrow ? 3 : 2}
         >
-          <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+          <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
           <XAxis
             dataKey={isDateSeries ? 'date' : 'name'}
             {...(xDate || {
@@ -199,7 +206,7 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
             })}
           />
           <YAxis
-            tick={{ fontSize: 11, fill: '#5f6368' }}
+            tick={{ fontSize: 11, fill: CHART_AXIS_TICK.fill }}
             axisLine={false}
             tickLine={false}
             tickFormatter={(v) => formatAxisMetric(v, format, currency)}
@@ -231,7 +238,7 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
           layout="vertical"
           margin={{ top: 8, right: 12, left: isNarrow ? 4 : 8, bottom: 8 }}
         >
-          <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+          <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
           <XAxis
             type="number"
             tick={{ fontSize: 11 }}

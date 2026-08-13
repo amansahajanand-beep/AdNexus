@@ -38,18 +38,17 @@ export default function MultiSelect({
     if (!el) return;
     const rect = el.getBoundingClientRect();
     const gap = 4;
-    const viewportPad = 12;
+    const viewportPad = 10;
     const isNarrow = window.innerWidth < 768;
-    // Leave room for Apply/Reset on mobile — tall menus push actions off-screen.
-    const hardCap = isNarrow ? Math.min(200, Math.round(window.innerHeight * 0.32)) : 360;
-    const softMin = isNarrow ? 110 : 160;
-    const spaceBelow = window.innerHeight - rect.bottom - viewportPad;
+    // Keep Apply Filter / sticky foot visible on mobile — short scrollable menu.
+    const footReserve = isNarrow ? 72 : 0;
+    const hardCap = isNarrow ? Math.min(150, Math.round(window.innerHeight * 0.26)) : 360;
+    const softMin = isNarrow ? 96 : 160;
+    const spaceBelow = window.innerHeight - rect.bottom - viewportPad - footReserve;
     const spaceAbove = rect.top - viewportPad;
-    const openUp = spaceBelow < (isNarrow ? 140 : 180) && spaceAbove > spaceBelow;
-    const maxMenuHeight = Math.min(
-      hardCap,
-      Math.max(softMin, openUp ? spaceAbove - gap : spaceBelow - gap)
-    );
+    const openUp = spaceBelow < (isNarrow ? 120 : 180) && spaceAbove > spaceBelow;
+    const available = openUp ? spaceAbove - gap : spaceBelow - gap;
+    const maxMenuHeight = Math.min(hardCap, Math.max(softMin, available));
 
     setMenuStyle({
       position: 'fixed',
@@ -58,6 +57,8 @@ export default function MultiSelect({
       top: openUp ? undefined : rect.bottom + gap,
       bottom: openUp ? window.innerHeight - rect.top + gap : undefined,
       maxHeight: maxMenuHeight,
+      height: 'auto',
+      overflow: 'hidden',
       zIndex: 1200,
     });
   }, []);

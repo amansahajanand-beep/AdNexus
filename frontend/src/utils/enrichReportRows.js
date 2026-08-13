@@ -85,6 +85,19 @@ function fillMetrics(row, metricIds = [], useProxy = false) {
       metrics[id] = Number(row.ctr);
       return;
     }
+    if (id === 'total_line_item_level_clicks' && (row.clicks != null || row.click != null)) {
+      const clicks = row.clicks ?? row.click;
+      if (clicks !== '' && Number.isFinite(Number(clicks))) {
+        metrics[id] = Number(clicks);
+        return;
+      }
+    }
+    if (id === 'total_inventory_level_unfilled_impressions' && row.unfilled != null && row.unfilled !== '') {
+      if (Number.isFinite(Number(row.unfilled))) {
+        metrics[id] = Number(row.unfilled);
+        return;
+      }
+    }
     if (id === 'ad_exchange_match_rate' && row.adxMatchRate != null && row.adxMatchRate !== '') {
       metrics[id] = Number(row.adxMatchRate);
       return;
