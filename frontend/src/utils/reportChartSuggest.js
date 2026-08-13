@@ -129,6 +129,44 @@ export function buildTimeSeries(rows = [], timeDim, metricId) {
     .sort((a, b) => String(a.date).localeCompare(String(b.date)));
 }
 
+/**
+ * Full-range daily series from server SQL `trend` (not truncated table rows).
+ * Table rows are often capped + sorted newest-first → charts collapse to one day.
+ */
+export function buildTimeSeriesFromTrend(trend = [], metricId) {
+  if (!Array.isArray(trend) || !trend.length || !metricId) return [];
+  const id = String(metricId || '').toLowerCase();
+  const preferImpressions = id.includes('impression') && !id.includes('revenue');
+  const series = trend
+    .map((t) => {
+      const date = String(t?.date || t?.report_date || '').slice(0, 10);
+      if (!date || date === '—') return null;
+      let value = 0;
+      if (preferImpressions) {
+        value = Number(t.impressions ?? t.value ?? 0) || 0;
+      } else {
+        value = Number(t.earning ?? t.revenue ?? t.value ?? 0) || 0;
+      }
+      return { date, value };
+    })
+    .filter(Boolean)
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+  // Drop all-zero series (wrong metric mapped onto trend).
+  if (!series.some((e) => e.value > 0)) return [];
+  return series;
+}
+
+/** Prefer SQL trend when it covers more dates than capped grain rows. */
+export function preferTimeSeries(fromTrend = [], fromRows = []) {
+  if (!fromTrend.length) return fromRows;
+  if (!fromRows.length) return fromTrend;
+  if (fromTrend.length > fromRows.length) return fromTrend;
+  // Cap often leaves a single latest day in rows while trend has the full range.
+  if (fromRows.length <= 2 && fromTrend.length > fromRows.length) return fromTrend;
+  return fromRows;
+}
+
 export function buildCategorySeries(rows = [], catDim, metricId, { topN = 10 } = {}) {
   if (!catDim || !metricId) return [];
   const map = new Map();
@@ -188,10 +226,11 @@ export function suggestReportCharts({
   dimensions = [],
   metrics = [],
   rows = [],
+  trend = [],
   visibility = {},
   mode = 'inventory',
 } = {}) {
-  if (!rows?.length) return [];
+  if (!rows?.length && !trend?.length) return [];
 
   const dims = (dimensions || []).map(String).filter(Boolean);
   const mets = (metrics || []).map(String).filter(Boolean);
@@ -227,10 +266,13 @@ export function suggestReportCharts({
   const catDims = dims.filter((d) => isCategoryDim(d) && !isTimeDim(d)).slice(0, 3);
   const primary = chartMetrics[0] || null;
 
-  // 1) Time series — prefer columns over line/area; at most one area chart
+  // 1) Time series — prefer SQL trend (full range) over capped table rows
   if (timeDim && chartMetrics.length) {
     chartMetrics.slice(0, 2).forEach((m, idx) => {
-      const series = buildTimeSeries(rows, timeDim, m);
+      const series = preferTimeSeries(
+        buildTimeSeriesFromTrend(trend, m),
+        buildTimeSeries(rows, timeDim, m)
+      );
       const data = series.map((d) => ({ name: d.date, value: d.value, date: d.date }));
       if (idx === 0) {
         pushUnique(charts, {
@@ -255,6 +297,27 @@ export function suggestReportCharts({
         });
       }
     });
+  }
+
+  // When Date is selected but only one chart metric, still add an area trend twin
+  // from the same series so "by Date" + "trend" both appear for revenue reports.
+  if (timeDim && chartMetrics.length === 1) {
+    const m = chartMetrics[0];
+    const series = preferTimeSeries(
+      buildTimeSeriesFromTrend(trend, m),
+      buildTimeSeries(rows, timeDim, m)
+    );
+    if (series.length > 1) {
+      pushUnique(charts, {
+        type: 'area',
+        title: `${metricLabel(m)} trend`,
+        hint: `Area · by ${dimensionLabel(timeDim)} · ${metricLabel(m)}`,
+        data: series,
+        metricId: m,
+        format: inferMetricFormat(m),
+        layout: 'horizontal',
+      });
+    }
   }
 
   // 2) Category charts — mix column + horizontal bar (no pie by default)

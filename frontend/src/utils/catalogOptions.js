@@ -304,7 +304,9 @@ export function buildFilterDropdownOptions({
       ? validSiteHostsOnly([...inventoryScope.allowedSites])
       : [];
     appOptions = inventoryScope.allowedAppIds?.length
-      ? [...inventoryScope.allowedAppIds].filter(isLikelyAppPackage)
+      ? [...inventoryScope.allowedAppIds]
+        .map((v) => String(v || '').trim())
+        .filter(Boolean)
         .sort((a, b) => String(a).localeCompare(String(b)))
       : [];
     return {

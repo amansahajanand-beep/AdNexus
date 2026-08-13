@@ -14,6 +14,8 @@ import { userIdFromToken } from './crossTabAuth';
 const STORAGE_PREFIX = 'savedReportFilters_v1';
 /** Soft cap so localStorage stays reasonable — not a product limit of 2. */
 const MAX = 50;
+/** Max length for a saved filter display name. */
+export const SAVED_FILTER_NAME_MAX = 20;
 export const SAVED_FILTERS_PAGES = Object.freeze({
   dashboard: 'dashboard',
   reporting: 'reporting',
@@ -149,7 +151,7 @@ export function saveNamedFilter(page, name, filter, userId) {
     const next = [
       {
         id: makeId(),
-        name: trimmed.slice(0, 80),
+        name: trimmed.slice(0, SAVED_FILTER_NAME_MAX),
         snapshot: snap,
         summary: summaryFor(snap),
         when: Date.now(),
@@ -174,7 +176,7 @@ export function updateNamedFilter(page, id, { name, filter } = {}, userId) {
     if (idx < 0) return existing;
 
     const prev = existing[idx];
-    const trimmed = name != null ? String(name).trim().slice(0, 80) : prev.name;
+    const trimmed = name != null ? String(name).trim().slice(0, SAVED_FILTER_NAME_MAX) : prev.name;
     if (!trimmed) return existing;
 
     const snap = filter != null

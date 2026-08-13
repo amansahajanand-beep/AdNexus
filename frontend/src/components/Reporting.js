@@ -1380,6 +1380,7 @@ export default function Reporting() {
       {reportReady && hasReportData && (
         <ReportAutoCharts
           rows={tableRows}
+          trend={data?.trend || progData?.trend || []}
           dimensions={tableConfig.dimensions}
           metrics={tableConfig.metrics}
           visibility={vis}

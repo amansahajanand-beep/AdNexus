@@ -39,10 +39,17 @@ export default function MultiSelect({
     const rect = el.getBoundingClientRect();
     const gap = 4;
     const viewportPad = 12;
+    const isNarrow = window.innerWidth < 768;
+    // Leave room for Apply/Reset on mobile — tall menus push actions off-screen.
+    const hardCap = isNarrow ? Math.min(200, Math.round(window.innerHeight * 0.32)) : 360;
+    const softMin = isNarrow ? 110 : 160;
     const spaceBelow = window.innerHeight - rect.bottom - viewportPad;
     const spaceAbove = rect.top - viewportPad;
-    const openUp = spaceBelow < 180 && spaceAbove > spaceBelow;
-    const maxMenuHeight = Math.min(360, Math.max(160, openUp ? spaceAbove - gap : spaceBelow - gap));
+    const openUp = spaceBelow < (isNarrow ? 140 : 180) && spaceAbove > spaceBelow;
+    const maxMenuHeight = Math.min(
+      hardCap,
+      Math.max(softMin, openUp ? spaceAbove - gap : spaceBelow - gap)
+    );
 
     setMenuStyle({
       position: 'fixed',

@@ -182,38 +182,112 @@ function enrichRowsWithAppPackages(rows = [], maps) {
   return rows.map((r) => enrichRowWithAppPackage(r, maps));
 }
 
-/** Keys used to match App ID filters / permissions — package & resolved IDs only (not display names). */
+/**
+ * Expand assigned/filter App IDs to every alias GAM may store:
+ * package, display name, numeric resolved id.
+ * Lean sync often writes MOBILE_APP_NAME into inv_app, while the UI assigns packages.
+ */
+function expandAppFilterAliases(apps = [], mapsInput = null) {
+  const maps = mapsInput
+    ? (mapsInput.byPackage instanceof Map ? mapsInput : rehydrateAppPackageMaps(mapsInput))
+    : { byPackage: new Map(), byName: new Map(), byResolvedId: new Map() };
+  const out = new Set();
+  const add = (v) => {
+    const n = norm(v);
+    if (n && n !== '—') out.add(n);
+  };
+
+  (apps || []).forEach((raw) => {
+    const a = norm(raw);
+    if (!a) return;
+    add(a);
+
+    maps.byPackage.forEach((name, pkg) => {
+      if (norm(pkg) === a) add(name);
+    });
+    const pkgFromName = maps.byName.get(a);
+    if (pkgFromName) {
+      add(pkgFromName);
+      maps.byPackage.forEach((name, pkg) => {
+        if (norm(pkg) === norm(pkgFromName)) add(name);
+      });
+    }
+    const pkgFromId = maps.byResolvedId.get(a) || maps.byResolvedId.get(String(raw || '').trim());
+    if (pkgFromId) {
+      add(pkgFromId);
+      maps.byPackage.forEach((name, pkg) => {
+        if (norm(pkg) === norm(pkgFromId)) add(name);
+      });
+    }
+    maps.byResolvedId.forEach((pkg, id) => {
+      if (norm(pkg) === a) add(id);
+    });
+  });
+
+  return [...out];
+}
+
+function loadCachedAppPackageMaps() {
+  try {
+    const { cache } = require('../gamClient');
+    const catalog = cache.get('filter_catalog_inventory_v25');
+    return rehydrateAppPackageMaps(catalog?.appPackageMaps);
+  } catch (_) {
+    return { byPackage: new Map(), byName: new Map(), byResolvedId: new Map() };
+  }
+}
+
+/** Keys used to match App ID filters / permissions — package, resolved IDs, and display names. */
 function collectRowAppKeys(row = {}) {
   const keys = new Set();
-  const addPackageLike = (v) => {
+  const add = (v) => {
     const n = norm(v);
-    if (!n || n === '—') return;
-    // Match real GAM App ID / package — never display names like "Videos" / "XVX HD…".
-    if (isLikelyAppPackage(n) || isGamInternalAppId(n)) keys.add(n);
+    if (!n || n === '—' || /^\(not\s+applicable\)$/i.test(n) || n === '(unknown)') return;
+    keys.add(n);
   };
-  addPackageLike(row.appPackage);
-  addPackageLike(row.appId);
-  addPackageLike(row.gamResolvedId);
+  add(row.appPackage);
+  add(row.appId);
+  add(row.gamResolvedId);
+  add(row.appName);
+  add(row.inv_app);
   if (row.dimensions) {
-    addPackageLike(row.dimensions.mobile_app_resolved_id);
-    addPackageLike(row.dimensions.mobile_app_name);
+    add(row.dimensions.mobile_app_resolved_id);
+    add(row.dimensions.MOBILE_APP_RESOLVED_ID);
+    add(row.dimensions.mobile_app_name);
+    add(row.dimensions.MOBILE_APP_NAME);
+    add(row.dimensions.appPackage);
+    add(row.dimensions.appId);
   }
-  addPackageLike(row.appName);
   return keys;
+}
+
+function rowAdUnitLooksLikeApp(row = {}) {
+  const adUnit = norm(row.site || row.ad_unit_name || row.AD_UNIT_NAME || row.inv_ad_unit || '');
+  if (!adUnit) return '';
+  // Android/iOS packages in ad-unit names: com.foo.bar_slot
+  if (/^(com|org|net|io)\.[a-z0-9_.]+/i.test(adUnit)) return adUnit;
+  return '';
 }
 
 function rowMatchesAppKeys(row, assignedSet) {
   if (!assignedSet?.size) return true;
+  const expanded = new Set(expandAppFilterAliases([...assignedSet], loadCachedAppPackageMaps()));
   const keys = collectRowAppKeys(row);
-  if (!keys.size) return false;
   for (const k of keys) {
-    if (assignedSet.has(k)) return true;
+    if (expanded.has(k)) return true;
+  }
+  const adUnit = rowAdUnitLooksLikeApp(row);
+  if (adUnit) {
+    for (const a of expanded) {
+      if (isLikelyAppPackage(a) && a.includes('.') && adUnit.startsWith(a)) return true;
+    }
   }
   return false;
 }
 
 function isMobileAppRow(row = {}) {
-  return collectRowAppKeys(row).size > 0;
+  if (collectRowAppKeys(row).size > 0) return true;
+  return Boolean(rowAdUnitLooksLikeApp(row));
 }
 
 function appPackageForPicker(row = {}) {
@@ -233,6 +307,8 @@ module.exports = {
   rehydrateAppPackageMaps,
   collectRowAppKeys,
   rowMatchesAppKeys,
+  expandAppFilterAliases,
+  loadCachedAppPackageMaps,
   isMobileAppRow,
   appPackageForPicker,
   isLikelyAppPackage,

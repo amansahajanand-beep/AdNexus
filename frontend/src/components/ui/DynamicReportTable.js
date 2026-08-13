@@ -36,6 +36,7 @@ export default function DynamicReportTable({
   sortDir: controlledSortDir = 'asc',
   onSortChange,
   showTotals = true,
+  summaryTotals = null,
   showPagination = true,
   emptyMessage = 'No records found for the selected filters',
   noReportMessage = 'Select dimensions and metrics in the report builder, then click Apply Filter.',
@@ -116,6 +117,12 @@ export default function DynamicReportTable({
   };
 
   const renderTotalCell = (col) => {
+    if (summaryTotals && col.type === 'metric' && summaryTotals[col.id] != null) {
+      const v = Number(summaryTotals[col.id]);
+      if (Number.isFinite(v)) {
+        return formatCellValue(v, col.format, currency, money, num);
+      }
+    }
     const raw = aggregateColumn(filteredRows, col);
     if (raw === '—' || raw === 'Total') return raw;
     return formatCellValue(raw, col.format, currency, money, num);

@@ -71,6 +71,7 @@ const {
   parseDimensionsFromGamRow,
   parseAllDimensionsFromGamRow,
   syncLegacyFields,
+  pickRowRevenueDollars,
 } = require('../utils/gamReportMetrics');
 
 const { isMockClient, getClient, getClientId } = require('../utils/clientContext');
@@ -2266,7 +2267,7 @@ function applyOverviewVisibility(payload, user) {
 // Derive the dashboard summary cards from detailed rows + daily trend
 function deriveDashboardSummary(rows, trend, currency, isMock) {
   const impressions = rows.reduce((a, r) => a + (r.impression || 0), 0);
-  const selectRange = +rows.reduce((a, r) => a + (r.revenue || 0), 0).toFixed(2);
+  const selectRange = +rows.reduce((a, r) => a + pickRowRevenueDollars(r), 0).toFixed(2);
   const clicks = rows.reduce((a, r) => a + (
     typeof r.clicks === 'number' ? r.clicks : Math.round((r.impression || 0) * ((r.ctr || 0) / 100))
   ), 0);
@@ -2674,7 +2675,7 @@ async function handleDashboardOverview(req, res) {
     }
 
     const { rows: rawRows } = await loadReportRowsCacheAside(filters, token, {
-      cachePrefix: 'report_overview_v1',
+      cachePrefix: 'report_overview_v3',
       fastMode: true,
       persistOnGam: true,
       enqueueSyncOnMiss: true,
@@ -2806,7 +2807,7 @@ async function handleDashboard(req, res) {
   const currency = process.env.GAM_CURRENCY || null;
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
-  const dashRespKey = `report_dashboard_resp_v1_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = `report_dashboard_resp_v4_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3214,7 +3215,7 @@ async function handleDetailedReport(req, res) {
   const pageKey = wantAllRows
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
-  const detailedRespKey = `report_detailed_resp_v2_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v3_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,

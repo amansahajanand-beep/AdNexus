@@ -35,6 +35,14 @@ import { isReportCacheFresh } from '../hooks/useReportPageCache';
 import { useMedia } from '../hooks/useMedia';
 import DynamicReportTable from './ui/DynamicReportTable';
 import {
+  formatAxisMoney,
+  formatAxisNumber,
+  yAxisWidthForValues,
+  dateAxisProps,
+  chartMargins,
+  truncateAxisLabel,
+} from '../utils/chartAxis';
+import {
   resolveDashboardTableConfig,
   buildReportColumns,
   aggregateRowsByColumns,
@@ -910,14 +918,25 @@ export default function Dashboard() {
   }, [currency]);
 
   const tableConfig = useMemo(
-    () => resolveDashboardTableConfig(applied, filterApplied, { isAdmin: isAdmin(user) }),
-    [applied, filterApplied, user]
+    () => resolveDashboardTableConfig(applied, filterApplied),
+    [applied, filterApplied]
   );
 
   const tableColumns = useMemo(
     () => buildReportColumns(tableConfig.dimensions, tableConfig.metrics, vis),
     [tableConfig, vis]
   );
+
+  const tableSummaryTotals = useMemo(() => {
+    const s = detailData?.summary;
+    if (!s) return null;
+    return {
+      total_line_item_level_all_revenue: s.revenue ?? s.selectRange ?? 0,
+      total_line_item_level_impressions: s.impressions ?? 0,
+      total_line_item_level_without_cpd_average_ecpm: s.ecpm ?? 0,
+      total_active_view_viewable_impressions_rate: s.viewability ?? 0,
+    };
+  }, [detailData?.summary]);
 
   const tableRows = useMemo(() => {
     if (!filterApplied) return [];
@@ -1041,6 +1060,30 @@ export default function Dashboard() {
   }, [enrichedRows, detailData?.charts?.performance]);
 
   const dailyWithEcpm = useMemo(() => withDailyEcpm(dailySeries), [dailySeries]);
+
+  const dailyDateAxis = useMemo(
+    () => dateAxisProps(dailySeries.length, { isNarrow }),
+    [dailySeries.length, isNarrow]
+  );
+  const dailyMoneyWidth = useMemo(
+    () => yAxisWidthForValues(dailySeries.map((d) => d.revenue), 'money', { isNarrow }),
+    [dailySeries, isNarrow]
+  );
+  const dailyImpWidth = useMemo(
+    () => yAxisWidthForValues(dailySeries.map((d) => d.impressions), 'raw', { isNarrow }),
+    [dailySeries, isNarrow]
+  );
+  const dailyChartMargins = useMemo(
+    () => ({
+      ...chartMargins({
+        isNarrow,
+        hasAngledX: Boolean(dailyDateAxis.angle),
+        yWidth: dailyMoneyWidth,
+      }),
+      right: Math.max(isNarrow ? 10 : 16, dailyImpWidth - 20),
+    }),
+    [isNarrow, dailyDateAxis.angle, dailyMoneyWidth, dailyImpWidth]
+  );
   const siteShareSeries = useMemo(
     () => buildSiteRevenueShare(enrichedRows, 10),
     [enrichedRows]
@@ -1458,32 +1501,46 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
-            <ResponsiveContainer width="100%" height={isNarrow ? 220 : 260}>
-              <AreaChart data={dailySeries} margin={{ top: 10, right: isNarrow ? 8 : 20, left: 0, bottom: 5 }}>
-                <defs>
-                  <linearGradient id="dashEarnGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.25} />
-                    <stop offset="95%" stopColor="#1a73e8" stopOpacity={0} />
-                  </linearGradient>
-                  <linearGradient id="dashImpsGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#34a853" stopOpacity={0.2} />
-                    <stop offset="95%" stopColor="#34a853" stopOpacity={0} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-                <YAxis yAxisId="left" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                  tickFormatter={v => money(v, currency)} width={isNarrow ? 48 : 72} />
-                <YAxis yAxisId="right" orientation="right" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                  tickFormatter={v => num(v)} width={isNarrow ? 46 : 64} />
-                <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
-                  formatter={(v, name) => (name === 'Revenue' ? [money(v, currency), 'Revenue'] : [num(v), 'Impressions'])} />
-                <Area yAxisId="left" type="monotone" dataKey="revenue" stroke="#1a73e8" strokeWidth={2}
-                  fill="url(#dashEarnGrad)" dot={false} activeDot={{ r: 4 }} name="Revenue" />
-                <Area yAxisId="right" type="monotone" dataKey="impressions" stroke="#34a853" strokeWidth={2}
-                  fill="url(#dashImpsGrad)" dot={false} activeDot={{ r: 4 }} name="Impressions" />
-              </AreaChart>
-            </ResponsiveContainer>
+              <ResponsiveContainer width="100%" height={isNarrow ? 270 : 280}>
+                <AreaChart data={dailySeries} margin={dailyChartMargins}>
+                  <defs>
+                    <linearGradient id="dashEarnGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.25} />
+                      <stop offset="95%" stopColor="#1a73e8" stopOpacity={0} />
+                    </linearGradient>
+                    <linearGradient id="dashImpsGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#34a853" stopOpacity={0.2} />
+                      <stop offset="95%" stopColor="#34a853" stopOpacity={0} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis dataKey="date" {...dailyDateAxis} />
+                  <YAxis
+                    yAxisId="left"
+                    tick={{ fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => formatAxisMoney(v, currency)}
+                    width={dailyMoneyWidth}
+                  />
+                  <YAxis
+                    yAxisId="right"
+                    orientation="right"
+                    tick={{ fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => formatAxisNumber(v)}
+                    width={dailyImpWidth}
+                  />
+                  <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                    labelFormatter={(label) => String(label || '')}
+                    formatter={(v, name) => (name === 'Revenue' ? [money(v, currency), 'Revenue'] : [num(v), 'Impressions'])} />
+                  <Area yAxisId="left" type="monotone" dataKey="revenue" stroke="#1a73e8" strokeWidth={2}
+                    fill="url(#dashEarnGrad)" dot={false} activeDot={{ r: 4 }} name="Revenue" />
+                  <Area yAxisId="right" type="monotone" dataKey="impressions" stroke="#34a853" strokeWidth={2}
+                    fill="url(#dashImpsGrad)" dot={false} activeDot={{ r: 4 }} name="Impressions" />
+                </AreaChart>
+              </ResponsiveContainer>
           </div>
           )}
 
@@ -1506,9 +1563,25 @@ export default function Dashboard() {
                 </span>
               </div>
               <ResponsiveContainer width="100%" height={220}>
-                <PieChart>
-                  <Pie data={shareSeries.revenue} dataKey="value" nameKey="name" innerRadius={48} outerRadius={78} paddingAngle={2}>
-                    {shareSeries.revenue.map((entry, idx) => <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />)}
+                <PieChart className="chart-pie-no-focus">
+                  <Pie
+                    data={shareSeries.revenue}
+                    dataKey="value"
+                    nameKey="name"
+                    innerRadius={48}
+                    outerRadius={78}
+                    paddingAngle={2}
+                    isAnimationActive={false}
+                    stroke="none"
+                  >
+                    {shareSeries.revenue.map((entry, idx) => (
+                      <Cell
+                        key={`${entry.name}-${idx}`}
+                        fill={SHARE_COLORS[idx % SHARE_COLORS.length]}
+                        stroke="none"
+                        style={{ outline: 'none' }}
+                      />
+                    ))}
                   </Pie>
                   <Tooltip formatter={(value) => [money(value, currency), 'Revenue']} />
                   <Legend />
@@ -1527,7 +1600,8 @@ export default function Dashboard() {
                 <BarChart data={shareSeries.device} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                   <XAxis type="number" tick={false} axisLine={false} />
-                  <YAxis dataKey="name" type="category" width={72} tick={{ fontSize: 11 }} axisLine={false} />
+                  <YAxis dataKey="name" type="category" width={isNarrow ? 78 : 100} tick={{ fontSize: 11 }} axisLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
                   <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Device']} />
                   <Bar dataKey="value" radius={[0, 6, 6, 0]}>
                     {shareSeries.device.map((entry, idx) => (
@@ -1557,7 +1631,7 @@ export default function Dashboard() {
                 <span className="filter-section-hint">Top 10 countries</span>
               </div>
               <ResponsiveContainer width="100%" height={260}>
-                <PieChart>
+                <PieChart className="chart-pie-no-focus">
                   <Pie
                     data={shareSeries.country}
                     dataKey="value"
@@ -1565,13 +1639,20 @@ export default function Dashboard() {
                     innerRadius={48}
                     outerRadius={78}
                     paddingAngle={2}
+                    isAnimationActive={false}
+                    stroke="none"
                     label={isNarrow
                       ? false
                       : ({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)`}
                     labelLine={isNarrow ? false : { stroke: '#9aa0a6', strokeWidth: 1 }}
                   >
                     {shareSeries.country.map((entry, idx) => (
-                      <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
+                      <Cell
+                        key={`${entry.name}-${idx}`}
+                        fill={SHARE_COLORS[idx % SHARE_COLORS.length]}
+                        stroke="none"
+                        style={{ outline: 'none' }}
+                      />
                     ))}
                   </Pie>
                   <Tooltip
@@ -1594,15 +1675,21 @@ export default function Dashboard() {
                   <h3 className="chart-title">Daily eCPM</h3>
                   <span className="filter-section-hint">Revenue / impressions × 1000</span>
                 </div>
-                <ResponsiveContainer width="100%" height={260}>
-                  <LineChart data={dailyWithEcpm} margin={{ top: 10, right: 8, left: 0, bottom: 5 }}>
+                <ResponsiveContainer width="100%" height={isNarrow ? 270 : 280}>
+                  <LineChart data={dailyWithEcpm} margin={dailyChartMargins}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                    <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-                    <YAxis tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                      tickFormatter={(v) => money(v, currency)} width={isNarrow ? 48 : 64} />
+                    <XAxis dataKey="date" {...dailyDateAxis} />
+                    <YAxis
+                      tick={{ fontSize: isNarrow ? 10 : 11 }}
+                      tickLine={false}
+                      axisLine={false}
+                      tickFormatter={(v) => formatAxisMoney(v, currency)}
+                      width={dailyMoneyWidth}
+                    />
                     <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                      labelFormatter={(label) => String(label || '')}
                       formatter={(v) => [money(v, currency), 'eCPM']} />
-                    <Line type="monotone" dataKey="ecpm" name="eCPM" stroke="#8e24aa" strokeWidth={2} dot={{ r: 3 }} />
+                    <Line type="monotone" dataKey="ecpm" name="eCPM" stroke="#8e24aa" strokeWidth={2} dot={dailyWithEcpm.length <= 31} />
                   </LineChart>
                 </ResponsiveContainer>
               </div>
@@ -1616,7 +1703,8 @@ export default function Dashboard() {
                   <BarChart data={siteShareSeries} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                     <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
+                    <YAxis dataKey="name" type="category" width={isNarrow ? 86 : 110} tick={{ fontSize: 11 }} axisLine={false}
+                      tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
                     <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
                     <Bar dataKey="value" radius={[0, 6, 6, 0]}>
                       {siteShareSeries.map((entry, idx) => (
@@ -1640,7 +1728,8 @@ export default function Dashboard() {
               <BarChart data={performanceSeries} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                 <XAxis type="number" tick={false} axisLine={false} />
-                <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
+                <YAxis dataKey="name" type="category" width={isNarrow ? 86 : 110} tick={{ fontSize: 11 }} axisLine={false}
+                  tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
                 <Tooltip formatter={(value) => [Number(value).toFixed(0), 'Performance score']} />
                 <Bar dataKey="score" radius={[0, 6, 6, 0]} fill="#b91c1c" />
               </BarChart>
@@ -1654,18 +1743,32 @@ export default function Dashboard() {
                 <h3 className="chart-title">Revenue vs eCPM</h3>
                 <span className="filter-section-hint">Daily revenue bars with eCPM overlay</span>
               </div>
-              <ResponsiveContainer width="100%" height={isNarrow ? 220 : 260}>
-                <ComposedChart data={dailyWithEcpm} margin={{ top: 10, right: isNarrow ? 8 : 20, left: 0, bottom: 5 }}>
+              <ResponsiveContainer width="100%" height={isNarrow ? 270 : 280}>
+                <ComposedChart data={dailyWithEcpm} margin={dailyChartMargins}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                  <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
-                  <YAxis yAxisId="left" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                    tickFormatter={(v) => money(v, currency)} width={isNarrow ? 48 : 72} />
-                  <YAxis yAxisId="right" orientation="right" tick={{ fontSize: isNarrow ? 10 : 11 }} tickLine={false} axisLine={false}
-                    tickFormatter={(v) => money(v, currency)} width={isNarrow ? 46 : 64} />
+                  <XAxis dataKey="date" {...dailyDateAxis} />
+                  <YAxis
+                    yAxisId="left"
+                    tick={{ fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => formatAxisMoney(v, currency)}
+                    width={dailyMoneyWidth}
+                  />
+                  <YAxis
+                    yAxisId="right"
+                    orientation="right"
+                    tick={{ fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => formatAxisMoney(v, currency)}
+                    width={dailyMoneyWidth}
+                  />
                   <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+                    labelFormatter={(label) => String(label || '')}
                     formatter={(v, name) => [money(v, currency), name]} />
                   <Legend />
-                  <Bar yAxisId="left" dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[4, 4, 0, 0]} />
+                  <Bar yAxisId="left" dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[4, 4, 0, 0]} maxBarSize={isNarrow ? 18 : 36} />
                   <Line yAxisId="right" type="monotone" dataKey="ecpm" name="eCPM" stroke="#f29900" strokeWidth={2} dot={false} />
                 </ComposedChart>
               </ResponsiveContainer>
@@ -1685,7 +1788,8 @@ export default function Dashboard() {
                   <BarChart data={siteShareSeries} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                     <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
+                    <YAxis dataKey="name" type="category" width={isNarrow ? 86 : 110} tick={{ fontSize: 11 }} axisLine={false}
+                      tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
                     <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
                     <Bar dataKey="value" radius={[0, 6, 6, 0]}>
                       {siteShareSeries.map((entry, idx) => (
@@ -1707,7 +1811,8 @@ export default function Dashboard() {
                   <BarChart data={adUnitMixSeries} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                     <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={100} tick={{ fontSize: 11 }} axisLine={false} />
+                    <YAxis dataKey="name" type="category" width={isNarrow ? 86 : 110} tick={{ fontSize: 11 }} axisLine={false}
+                      tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
                     <Tooltip formatter={(value, name) => (
                       name === 'Revenue' ? [money(value, currency), name] : [num(value), name]
                     )} />
@@ -1755,6 +1860,7 @@ export default function Dashboard() {
         pageSize={PAGE_SIZE}
         onPageChange={setPage}
         showTotals={filterApplied && tableRows.length > 0}
+        summaryTotals={tableSummaryTotals}
         noReportMessage="No data available for this period"
         emptyMessage="No data available"
       />}

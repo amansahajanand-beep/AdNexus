@@ -1,5 +1,6 @@
 import { readDomainName, readSiteName } from './filters';
 import { packageFromRow } from './appPackage';
+import { pickRowRevenueDollars } from './reportMetrics';
 
 const LEGACY_DIMENSION = {
   date: (r) => r.date,
@@ -64,11 +65,12 @@ function fillDimensions(row, dimensionIds = []) {
 
 function fillMetrics(row, metricIds = [], useProxy = false) {
   const metrics = { ...(row.metrics || {}) };
+  const rowRev = pickRowRevenueDollars(row);
   metricIds.forEach((id) => {
-    if (metrics[id] != null && metrics[id] !== '') return;
-    if (id === 'total_line_item_level_cpm_and_cpc_revenue') {
-      if (row.revenue != null && row.revenue !== '' && Number.isFinite(Number(row.revenue))) {
-        metrics[id] = Number(row.revenue);
+    if (metrics[id] != null && metrics[id] !== '' && Number(metrics[id]) !== 0) return;
+    if (id === 'total_line_item_level_all_revenue' || id === 'total_line_item_level_cpm_and_cpc_revenue') {
+      if (rowRev > 0) {
+        metrics[id] = rowRev;
         return;
       }
     }

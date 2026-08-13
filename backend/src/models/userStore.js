@@ -17,6 +17,7 @@ if (usePg) {
     updateUser: async (id, updates) => await pg.updateUser(id, updates),
     deleteUser: async (id) => await pg.deleteUser(id),
     verifyPassword: async (username, password) => await pg.verifyPassword(username, password),
+    checkPasswordForUser: (user, password) => pg.checkPasswordForUser(user, password),
     hashPassword: (pw) => pg.hashPassword(pw),
   };
 } else {
@@ -169,12 +170,16 @@ if (usePg) {
   function verifyPassword(username, password) {
     const user = getUserByUsername(username);
     if (!user || !user.isActive) return null;
-    const hash = hashPassword(password);
-    if (hash !== user.passwordHash) return null;
+    if (!checkPasswordForUser(user, password)) return null;
 
     // Update last login
     updateUser(user.id, { lastLogin: new Date().toISOString() });
     return { ...user, passwordHash: undefined };
+  }
+
+  function checkPasswordForUser(user, password) {
+    if (!user?.passwordHash || !password) return false;
+    return hashPassword(password) === user.passwordHash;
   }
 
   module.exports = {
@@ -187,6 +192,7 @@ if (usePg) {
     updateUser,
     deleteUser,
     verifyPassword,
+    checkPasswordForUser,
     hashPassword
   };
 }

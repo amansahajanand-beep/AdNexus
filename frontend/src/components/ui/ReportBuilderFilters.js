@@ -30,7 +30,8 @@ function FilterCategory({
   const ids = category.items.map(i => i.id);
   const count = ids.filter(id => selected.includes(id)).length;
   const allSelected = ids.length > 0 && count === ids.length;
-  const [open, setOpen] = useState(defaultOpen || count > 0);
+  // Always start collapsed; Expand all / search can open categories later.
+  const [open, setOpen] = useState(Boolean(defaultOpen));
   const prevExpandAll = useRef(expandAll);
 
   useEffect(() => {
@@ -170,9 +171,7 @@ function FilterColumn({
         />
       </div>
       <div className="gam-filter-categories">
-        {filtered.map((cat) => {
-          const selCount = cat.items.filter(i => selected.includes(i.id)).length;
-          return (
+        {filtered.map((cat) => (
             <FilterCategory
               key={cat.id}
               category={cat}
@@ -180,7 +179,7 @@ function FilterColumn({
               disabled={disabled}
               expandAll={expandAll}
               forceSearchOpen={!!q}
-              defaultOpen={cat.id === 'total' || cat.id === 'activeView' || cat.id === 'core' || selCount > 0}
+              defaultOpen={false}
               onToggle={(id) => toggle(selected, id, onChange)}
               onToggleAll={(ids, allSel) => {
                 if (allSel) {
@@ -191,8 +190,7 @@ function FilterColumn({
                 }
               }}
             />
-          );
-        })}
+          ))}
         {filtered.length === 0 && (
           <p className="gam-filter-empty">No matches for &ldquo;{search}&rdquo;</p>
         )}

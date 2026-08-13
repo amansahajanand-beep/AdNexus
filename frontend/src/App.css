@@ -186,8 +186,26 @@ img, svg, video { max-width: 100%; height: auto; }
 .report-auto-charts { margin-top: 16px; }
 @media (max-width: 900px) { .charts-grid { grid-template-columns: 1fr; } }
 
-.chart-card { background: #fff; border: 1px solid #e0e0e0; border-radius: 12px; padding: 20px; }
+.chart-card { background: #fff; border: 1px solid #e0e0e0; border-radius: 12px; padding: 20px; overflow: visible; }
 .chart-card.wide { grid-column: 1 / -1; }
+.charts-grid { overflow: visible; }
+
+/* Recharts pie: browsers draw a rectangular focus ring on SVG path click — kill it everywhere. */
+.recharts-wrapper:focus,
+.recharts-wrapper *:focus,
+.recharts-surface:focus,
+.recharts-layer:focus,
+.recharts-pie:focus,
+.recharts-pie-sector:focus,
+.recharts-sector:focus,
+.chart-pie-no-focus:focus,
+.chart-pie-no-focus *:focus {
+  outline: none !important;
+}
+.recharts-pie-sector,
+.recharts-sector {
+  outline: none !important;
+}
 .heatmap-wrap { display: flex; flex-direction: column; gap: 10px; }
 .heatmap-row { display: flex; flex-direction: column; gap: 8px; padding: 10px 0; border-bottom: 1px solid #f1f3f4; }
 .heatmap-row:last-child { border-bottom: none; }
@@ -784,6 +802,9 @@ img, svg, video { max-width: 100%; height: auto; }
 .gam-filter-list {
   display: flex; flex-direction: column; gap: 2px;
   padding: 4px 8px 10px 8px; border-top: 1px solid #f0f0f0;
+  max-height: 200px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .gam-filter-check {
   display: grid; grid-template-columns: 18px 1fr; align-items: start; gap: 10px;
@@ -1652,7 +1673,8 @@ select.ui-field-input { border-radius: 10px; cursor: pointer; }
   .page-title { font-size: 18px; }
   .reporting-sub { font-size: 12px; }
   .gam-report-builder { grid-template-columns: 1fr; }
-  .gam-filter-categories { max-height: 320px; }
+  .gam-filter-categories { max-height: 260px; }
+  .gam-filter-list { max-height: 132px; }
   .gam-filter-column-top { flex-direction: column; align-items: stretch; }
 
   .filter-chips-bar { padding: 10px 12px; }
@@ -1790,7 +1812,7 @@ select.ui-field-input { border-radius: 10px; cursor: pointer; }
   .ui-modal-body { padding-bottom: 16px; }
   .user-form-modal-content .form-note { padding: 10px 12px; }
   .domain-selector-list { max-height: min(36vh, 180px); }
-  .ms-menu-portal { left: 10px !important; right: 10px !important; width: auto !important; max-height: 50vh; }
+  .ms-menu-portal { left: 10px !important; right: 10px !important; width: auto !important; max-height: 32vh !important; }
 }
 
 /* ─── Very small phone ───────────────────────────────────────────────────── */
@@ -2019,6 +2041,12 @@ select.ui-field-input { border-radius: 10px; cursor: pointer; }
 .saved-filters-name-input:focus {
   border-color: #1a73e8;
   box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.2);
+}
+.saved-filters-name-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #80868b;
+  text-align: right;
 }
 .saved-filters-error {
   margin-top: 6px;

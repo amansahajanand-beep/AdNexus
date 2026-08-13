@@ -1,12 +1,13 @@
 const { enrichReportRow } = require('./adUnit');
 const { resolveAppFields } = require('./appIdentity');
+const { gamMoneyToDollars, pickRowRevenueDollars } = require('./gamReportMetrics');
 
 const REVENUE_KEYS = [
   'revenue',
-  'total_line_item_level_cpm_and_cpc_revenue',
-  'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE',
   'TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE',
   'total_line_item_level_all_revenue',
+  'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE',
+  'total_line_item_level_cpm_and_cpc_revenue',
 ];
 
 const IMPRESSION_KEYS = [
@@ -19,18 +20,14 @@ const IMPRESSION_KEYS = [
 const CLICK_KEYS = ['clicks', 'total_line_item_level_clicks', 'TOTAL_LINE_ITEM_LEVEL_CLICKS'];
 
 function toDollars(v) {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n === 0) return 0;
-  // GAM stores revenue in micros (large integers); already-normalized rows are small decimals.
-  if (Math.abs(n) >= 1000) return +(n / 1e6).toFixed(2);
-  return +n.toFixed(2);
+  return gamMoneyToDollars(v);
 }
 
 function firstNumeric(row, keys) {
   for (const k of keys) {
     if (row[k] != null && row[k] !== '') {
       const n = Number(row[k]);
-      if (Number.isFinite(n)) return n;
+      if (Number.isFinite(n) && n !== 0) return n;
     }
   }
   return null;
@@ -69,8 +66,11 @@ function normalizeReportRow(row = {}) {
   if (!r.gamDomain && r.DOMAIN) r.gamDomain = r.DOMAIN;
 
   if (!r.revenue || r.revenue === 0) {
-    const raw = firstNumeric(r, REVENUE_KEYS.filter((k) => k !== 'revenue'));
-    if (raw != null) r.revenue = toDollars(raw);
+    r.revenue = pickRowRevenueDollars(r);
+    if (!r.revenue) {
+      const raw = firstNumeric(r, REVENUE_KEYS.filter((k) => k !== 'revenue'));
+      if (raw != null) r.revenue = toDollars(raw);
+    }
   } else {
     r.revenue = toDollars(r.revenue);
   }

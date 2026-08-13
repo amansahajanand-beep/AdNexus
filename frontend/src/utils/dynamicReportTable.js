@@ -14,6 +14,7 @@ import {
   readMetricValue,
   inferMetricFormat,
   inferMetricAggregate,
+  pickRowRevenueDollars,
 } from './reportMetrics';
 
 export const PROGRAMMATIC_DIMENSION_IDS = new Set([
@@ -22,25 +23,22 @@ export const PROGRAMMATIC_DIMENSION_IDS = new Set([
 ]);
 
 export const DASHBOARD_DEFAULT_METRICS = [
-  'total_line_item_level_cpm_and_cpc_revenue',
+  'total_line_item_level_all_revenue',
   'total_line_item_level_impressions',
   'total_line_item_level_without_cpd_average_ecpm',
   'total_active_view_viewable_impressions_rate',
 ];
 
 /** Dashboard table — only columns matching applied inventory filters (+ date & KPI metrics). */
-export function resolveDashboardTableConfig(applied = {}, filterApplied = false, opts = {}) {
+export function resolveDashboardTableConfig(applied = {}, filterApplied = false) {
   if (!filterApplied) {
     return { dimensions: [], metrics: [] };
   }
-  const showAdUnitColumn = opts.isAdmin === true;
   const dimensions = ['date'];
   if (applied.domain?.length) dimensions.push('domain');
-  if (applied.site?.length) {
-    dimensions.push('site_name');
-    if (showAdUnitColumn) dimensions.push('ad_unit_name');
-  }
-  if (applied.domainName?.length && showAdUnitColumn) dimensions.push('ad_unit_name');
+  if (applied.site?.length) dimensions.push('site_name');
+  // Ad unit column only when user explicitly filters ad units (matches GAM Site vs Ad unit reports).
+  if (applied.domainName?.length) dimensions.push('ad_unit_name');
   if (applied.domainId?.length) dimensions.push('mobile_app_resolved_id');
   return {
     dimensions,
@@ -117,8 +115,8 @@ const METRIC_DEFS = {
     aggregate: 'sum',
   },
   total_line_item_level_all_revenue: {
-    label: 'Total revenue',
-    getValue: (r) => Number(r.revenue) || 0,
+    label: 'Revenue',
+    getValue: (r) => readMetricValue(r, 'total_line_item_level_all_revenue', (row) => row.revenue),
     format: 'money',
     visKey: 'revenue',
     aggregate: 'sum',
@@ -148,7 +146,7 @@ const METRIC_DEFS = {
     label: 'eCPM',
     getValue: (r) => {
       const imp = Number(readMetricValue(r, 'total_line_item_level_impressions', (row) => row.impression ?? row.impressions)) || 0;
-      const rev = Number(readMetricValue(r, 'total_line_item_level_cpm_and_cpc_revenue', (row) => row.revenue)) || 0;
+      const rev = Number(readMetricValue(r, 'total_line_item_level_all_revenue', (row) => row.revenue)) || 0;
       if (imp > 0 && rev > 0) return +((rev / imp) * 1000).toFixed(2);
       const direct = Number(r.ecpm);
       return direct > 0 ? direct : 0;
@@ -375,7 +373,7 @@ export function aggregateRowsByColumns(rows = [], columns = []) {
       map.set(key, bucket);
     }
     const imp = Number(row.impression ?? row.impressions) || 0;
-    const rev = Number(row.revenue) || 0;
+    const rev = pickRowRevenueDollars(row);
     const ctr = Number(row.ctr) || 0;
     const view = Number(row.viewableRate) || 0;
     const fill = Number(row.fillRate) || 0;
@@ -399,6 +397,7 @@ export function aggregateRowsByColumns(rows = [], columns = []) {
     out.ecpm = imp > 0 ? +((out.revenue / imp) * 1000).toFixed(2) : 0;
     out.metrics = {
       ...(out.metrics || {}),
+      total_line_item_level_all_revenue: out.revenue,
       total_line_item_level_cpm_and_cpc_revenue: out.revenue,
       total_line_item_level_impressions: imp,
       total_line_item_level_without_cpd_average_ecpm: out.ecpm,
@@ -435,7 +434,7 @@ export function summarizeRowsForOverview(rows = [], currency = 'USD') {
     (a, r) => a + (Number(r.impression ?? r.impressions) || 0),
     0
   );
-  const revenue = +rows.reduce((a, r) => a + (Number(r.revenue) || 0), 0).toFixed(2);
+  const revenue = +rows.reduce((a, r) => a + pickRowRevenueDollars(r), 0).toFixed(2);
   const ecpm = impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0;
   const viewability = impressions > 0
     ? +(rows.reduce(
@@ -488,8 +487,8 @@ export function aggregateColumn(rows, col) {
     let rev = 0;
     let imp = 0;
     rows.forEach((r) => {
+      const rowRev = Number(readMetricValue(r, 'total_line_item_level_all_revenue', (row) => row.revenue)) || 0;
       const rowImp = Number(readMetricValue(r, 'total_line_item_level_impressions', (row) => row.impression ?? row.impressions)) || 0;
-      const rowRev = Number(readMetricValue(r, 'total_line_item_level_cpm_and_cpc_revenue', (row) => row.revenue)) || 0;
       rev += rowRev;
       imp += rowImp;
     });

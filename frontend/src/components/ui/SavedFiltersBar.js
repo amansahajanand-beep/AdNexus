@@ -103,11 +103,17 @@ export default function SavedFiltersBar({
     setPanelOpen(true);
   };
 
+  const FILTER_NAME_MAX = 20;
+
   const confirmForm = (e) => {
     e?.preventDefault?.();
     const trimmed = name.trim();
     if (!trimmed) {
       setError('Enter a name for this filter.');
+      return;
+    }
+    if (trimmed.length > FILTER_NAME_MAX) {
+      setError(`Name must be ${FILTER_NAME_MAX} characters or fewer.`);
       return;
     }
 
@@ -194,12 +200,15 @@ export default function SavedFiltersBar({
               className="saved-filters-name-input"
               placeholder="e.g. MediaMonetix apps"
               value={name}
-              maxLength={80}
+              maxLength={FILTER_NAME_MAX}
               onChange={(e) => {
-                setName(e.target.value);
+                setName(e.target.value.slice(0, FILTER_NAME_MAX));
                 if (error) setError('');
               }}
             />
+            <div className="saved-filters-name-meta">
+              {name.trim().length}/{FILTER_NAME_MAX} characters
+            </div>
             {isEdit && (
               <label className="saved-filters-update-toggle">
                 <input

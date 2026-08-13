@@ -8,12 +8,25 @@ const MONEY_APIS = /REVENUE|ECPM|CPC|EARNINGS|COST_PER/;
 const PERCENT_APIS = /CTR|RATE|PERCENT|VIEWABLE_TIME/;
 const COUNT_APIS = /IMPRESSIONS|CLICKS|REQUESTS|RESPONSES|VIEWS/;
 
+/** Convert GAM money columns (micros) or already-normalized dollar floats. */
+function gamMoneyToDollars(raw) {
+  const num = Number(raw);
+  if (!Number.isFinite(num) || num === 0) return 0;
+  if (Math.abs(num) >= 1000) return +(num / 1e6).toFixed(4);
+  if (Math.abs(num) > 0 && Math.abs(num) < 1) return +num.toFixed(4);
+  // GAM micros are whole numbers, often 1–999 ($0.000001–$0.001).
+  if (Math.abs(num) >= 1 && Math.abs(num) < 1000 && num === Math.floor(num)) {
+    return +(num / 1e6).toFixed(4);
+  }
+  return +num.toFixed(4);
+}
+
 function parseGamMetricValue(api, raw) {
   if (raw == null || raw === '') return 0;
   const num = parseFloat(raw);
   if (!Number.isFinite(num)) return 0;
   const apiU = String(api).toUpperCase();
-  if (MONEY_APIS.test(apiU)) return +(num / 1e6).toFixed(4);
+  if (MONEY_APIS.test(apiU)) return gamMoneyToDollars(num);
   if (PERCENT_APIS.test(apiU)) {
     if (num > 0 && num <= 1) return +(num * 100).toFixed(4);
     return +num.toFixed(4);
@@ -143,7 +156,10 @@ function attachMetricsToRows(rows, metricIds = []) {
     // Keep GAM-parsed line-item revenue/impressions — never replace with metric proxies.
     if (gamRevenue > 0) {
       next.revenue = gamRevenue;
-      if (next.metrics) next.metrics.total_line_item_level_cpm_and_cpc_revenue = gamRevenue;
+      if (next.metrics) {
+        next.metrics.total_line_item_level_all_revenue = gamRevenue;
+        next.metrics.total_line_item_level_cpm_and_cpc_revenue = gamRevenue;
+      }
     }
     if (gamImp > 0) {
       next.impression = gamImp;
@@ -164,9 +180,35 @@ function parseMetricsFromGamRow(rawRow, metricIds = []) {
   return metrics;
 }
 
+function pickRowRevenueDollars(row = {}) {
+  const keys = [
+    'revenue',
+    'TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE',
+    'total_line_item_level_all_revenue',
+    'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE',
+    'total_line_item_level_cpm_and_cpc_revenue',
+  ];
+  for (const k of keys) {
+    if (row[k] == null || row[k] === '') continue;
+    const n = Number(row[k]);
+    if (Number.isFinite(n) && n !== 0) return gamMoneyToDollars(n);
+  }
+  const m = row.metrics || {};
+  for (const k of keys.slice(1)) {
+    if (m[k] == null || m[k] === '') continue;
+    const n = Number(m[k]);
+    if (Number.isFinite(n) && n !== 0) return gamMoneyToDollars(n);
+  }
+  return 0;
+}
+
 function syncLegacyFields(row) {
   const m = row.metrics || {};
-  if (m.total_line_item_level_cpm_and_cpc_revenue != null) row.revenue = m.total_line_item_level_cpm_and_cpc_revenue;
+  const rev = pickRowRevenueDollars({ ...row, metrics: m });
+  if (rev > 0) row.revenue = rev;
+  else if (m.total_line_item_level_cpm_and_cpc_revenue != null) {
+    row.revenue = gamMoneyToDollars(m.total_line_item_level_cpm_and_cpc_revenue);
+  }
   if (m.total_line_item_level_impressions != null) row.impression = m.total_line_item_level_impressions;
   if (m.total_line_item_level_ctr != null) row.ctr = m.total_line_item_level_ctr;
   if (m.ad_exchange_match_rate != null) row.adxMatchRate = m.ad_exchange_match_rate;
@@ -182,6 +224,8 @@ function syncLegacyFields(row) {
 module.exports = {
   catalogIdToGamEnum,
   gamEnumToCatalogId,
+  gamMoneyToDollars,
+  pickRowRevenueDollars,
   parseGamMetricValue,
   mockMetricValue,
   attachMetricsToRows,

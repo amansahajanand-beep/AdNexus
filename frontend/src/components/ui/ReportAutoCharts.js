@@ -20,6 +20,13 @@ import {
 import { suggestReportCharts } from '../../utils/reportChartSuggest';
 import { inferMetricFormat } from '../../utils/reportMetrics';
 import { metricLabel } from '../../utils/gamReportCatalog';
+import {
+  formatAxisMetric,
+  yAxisWidthForValues,
+  dateAxisProps,
+  chartMargins,
+  truncateAxisLabel,
+} from '../../utils/chartAxis';
 
 const SHARE_COLORS = ['#1a73e8', '#34a853', '#f29900', '#ea4335', '#8e24aa', '#00acc1'];
 
@@ -63,16 +70,29 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
   const format = chart.format || inferMetricFormat(chart.metricId);
   const metName = metricLabel(chart.metricId);
   const height = isNarrow ? 220 : 250;
-  const wide = Boolean(chart.wide) || chart.type === 'column' && chart.title?.includes('by Date');
+  const wide = Boolean(chart.wide) || (chart.type === 'column' && chart.title?.includes('by Date'));
+  const isDateSeries = chart.data?.some((d) => d.date != null)
+    || /by date|trend/i.test(chart.title || '');
 
   // No empty placeholder cards — only render charts that have data.
   if (!chart.data?.length) return null;
 
+  const values = chart.data.map((d) => Number(d.value) || 0);
+  const yWidth = yAxisWidthForValues(values, format, { isNarrow });
+  const n = chart.data.length;
+  const xDate = isDateSeries ? dateAxisProps(n, { isNarrow }) : null;
+  const margins = chartMargins({
+    isNarrow,
+    hasAngledX: Boolean(xDate?.angle) || (!isDateSeries && n > 6),
+    yWidth,
+  });
+
   let body = null;
   if (chart.type === 'area') {
+    const chartH = height + (xDate?.angle ? 28 : 0);
     body = (
-      <ResponsiveContainer width="100%" height={height}>
-        <AreaChart data={chart.data} margin={{ top: 10, right: isNarrow ? 8 : 20, left: 0, bottom: 5 }}>
+      <ResponsiveContainer width="100%" height={chartH}>
+        <AreaChart data={chart.data} margin={margins}>
           <defs>
             <linearGradient id={`reportAreaGrad-${chart.metricId}-${chart.title}`} x1="0" y1="0" x2="0" y2="1">
               <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.25} />
@@ -80,16 +100,20 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
             </linearGradient>
           </defs>
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-          <XAxis dataKey="date" tick={{ fontSize: 11 }} tickLine={false} axisLine={false} />
+          <XAxis
+            dataKey="date"
+            {...(xDate || { tick: { fontSize: 11 }, tickLine: false, axisLine: false })}
+          />
           <YAxis
             tick={{ fontSize: isNarrow ? 10 : 11 }}
             tickLine={false}
             axisLine={false}
-            tickFormatter={(v) => formatMetricValue(v, format, currency)}
-            width={isNarrow ? 52 : 72}
+            tickFormatter={(v) => formatAxisMetric(v, format, currency)}
+            width={yWidth}
           />
           <Tooltip
             contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
+            labelFormatter={(label) => String(label || '')}
             formatter={(v) => [formatMetricValue(v, format, currency), metName]}
           />
           <Area
@@ -98,7 +122,7 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
             stroke="#1a73e8"
             strokeWidth={2}
             fill={`url(#reportAreaGrad-${chart.metricId}-${chart.title})`}
-            dot={false}
+            dot={n <= 31}
             activeDot={{ r: 4 }}
           />
           <Line type="monotone" dataKey="value" stroke="#1a73e8" strokeWidth={2} dot={false} />
@@ -130,34 +154,50 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
       </ResponsiveContainer>
     );
   } else if (chart.type === 'column') {
+    const angledCats = !isDateSeries && n > 6;
+    const colMargins = chartMargins({
+      isNarrow,
+      hasAngledX: Boolean(xDate?.angle) || angledCats,
+      yWidth,
+    });
+    const chartH = height + ((xDate?.angle || angledCats) ? 32 : 0);
     body = (
-      <ResponsiveContainer width="100%" height={height}>
-        <BarChart data={chart.data} margin={{ top: 8, right: 12, left: 4, bottom: 8 }}>
+      <ResponsiveContainer width="100%" height={chartH}>
+        <BarChart
+          data={chart.data}
+          margin={colMargins}
+          barCategoryGap={isNarrow ? '18%' : '12%'}
+          barGap={isNarrow ? 3 : 2}
+        >
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
           <XAxis
             dataKey="name"
-            tick={{ fontSize: 11 }}
-            axisLine={false}
-            tickLine={false}
-            interval={0}
-            angle={chart.data.length > 6 ? -25 : 0}
-            textAnchor={chart.data.length > 6 ? 'end' : 'middle'}
-            height={chart.data.length > 6 ? 56 : 30}
+            {...(xDate || {
+              tick: { fontSize: isNarrow ? 9 : 11 },
+              axisLine: false,
+              tickLine: false,
+              interval: n > 10 ? Math.ceil(n / (isNarrow ? 5 : 8)) - 1 : 0,
+              angle: angledCats ? -35 : 0,
+              textAnchor: angledCats ? 'end' : 'middle',
+              height: angledCats ? 56 : 30,
+              tickFormatter: (v) => truncateAxisLabel(v, isNarrow ? 10 : 14),
+            })}
           />
           <YAxis
             tick={{ fontSize: 11 }}
             axisLine={false}
             tickLine={false}
-            tickFormatter={(v) => formatMetricValue(v, format, currency)}
-            width={isNarrow ? 48 : 64}
+            tickFormatter={(v) => formatAxisMetric(v, format, currency)}
+            width={yWidth}
           />
           <Tooltip
             formatter={(v, _n, item) => [
               formatMetricValue(v, format, currency),
               item?.payload?.name || metName,
             ]}
+            labelFormatter={(label) => String(label || '')}
           />
-          <Bar dataKey="value" radius={[6, 6, 0, 0]}>
+          <Bar dataKey="value" radius={[6, 6, 0, 0]} maxBarSize={isNarrow ? 28 : 48}>
             {chart.data.map((entry, idx) => (
               <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
             ))}
@@ -167,22 +207,29 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
     );
   } else {
     // Default: horizontal bar
+    const labelW = isNarrow ? 78 : 110;
     body = (
       <ResponsiveContainer width="100%" height={height}>
         <BarChart
           data={chart.data}
           layout="vertical"
-          margin={{ top: 8, right: 12, left: 8, bottom: 8 }}
+          margin={{ top: 8, right: 12, left: 4, bottom: 8 }}
         >
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-          <XAxis type="number" tick={{ fontSize: 11 }} axisLine={false} tickFormatter={(v) => formatMetricValue(v, format, currency)} />
+          <XAxis
+            type="number"
+            tick={{ fontSize: 11 }}
+            axisLine={false}
+            tickFormatter={(v) => formatAxisMetric(v, format, currency)}
+          />
           <YAxis
             type="category"
             dataKey="name"
-            width={isNarrow ? 72 : 100}
+            width={labelW}
             tick={{ fontSize: 11 }}
             axisLine={false}
             tickLine={false}
+            tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)}
           />
           <Tooltip
             formatter={(v, _n, item) => [
@@ -214,9 +261,12 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
 
 /**
  * Auto-pick several varied charts (column / bar / area / radar) from applied fields.
+ * Pass `trend` (server SQL daily series) so date charts cover the full selected range
+ * even when table `rows` are capped to the newest grain slice.
  */
 export default function ReportAutoCharts({
   rows = [],
+  trend = [],
   dimensions = [],
   metrics = [],
   visibility = {},
@@ -231,10 +281,11 @@ export default function ReportAutoCharts({
       dimensions,
       metrics,
       rows,
+      trend,
       visibility,
       mode,
     }).filter((c) => Array.isArray(c?.data) && c.data.some((d) => Number(d?.value) > 0 || Number(d?.score) > 0)),
-    [dimensions, metrics, rows, visibility, mode]
+    [dimensions, metrics, rows, trend, visibility, mode]
   );
 
   // Hide the whole charts block when this query has nothing to plot.

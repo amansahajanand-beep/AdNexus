@@ -4,7 +4,7 @@ const {
   SAFE_METRICS,
   pickBestFullSlice,
 } = require('../utils/fullReportSyncCatalog');
-const { parseGamMetricValue } = require('../utils/gamReportMetrics');
+const { parseGamMetricValue, gamMoneyToDollars, pickRowRevenueDollars } = require('../utils/gamReportMetrics');
 
 /**
  * gamSyncService — fetches data from GAM and writes into PostgreSQL.
@@ -28,13 +28,36 @@ const {
   subdomainFromAdUnit,
   isGamReportSiteHost,
 } = require('../utils/adUnit');
-const { resolveAppFields } = require('../utils/appIdentity');
+const {
+  resolveAppFields,
+  expandAppFilterAliases,
+  loadCachedAppPackageMaps,
+  isLikelyAppPackage,
+} = require('../utils/appIdentity');
 const logger  = require('../utils/logger');
 
 function cleanInv(v) {
   const s = String(v ?? '').trim();
   if (!s || s === '—' || /^\(not\s+applicable\)$/i.test(s)) return '';
   return s;
+}
+
+/** Match assigned App IDs against inv_app (often a display name) and app-style ad units. */
+function sqlAppMatchClause(params, apps, appExpr, adUnitExpr) {
+  if (!apps?.length) return '';
+  const expanded = expandAppFilterAliases(apps, loadCachedAppPackageMaps());
+  if (!expanded.length) return '';
+  params.push(expanded);
+  const appIdx = params.length;
+  const packages = expanded.filter((a) => isLikelyAppPackage(a) && String(a).includes('.'));
+  if (!packages.length) {
+    return ` AND ${appExpr} = ANY($${appIdx}::text[])`;
+  }
+  params.push(packages);
+  return ` AND (
+    ${appExpr} = ANY($${appIdx}::text[])
+    OR ${adUnitExpr} LIKE ANY(ARRAY(SELECT p || '%' FROM unnest($${params.length}::text[]) AS p))
+  )`;
 }
 
 /**
@@ -285,10 +308,23 @@ async function replaceHistoricalRows(rows, syncType = 'sync-day') {
     return 0;
   }
 
+  const syncStartedAt = new Date();
   // Write new/updated rich rows first (no empty-window for dashboard readers).
   const upserted = await upsertRows(rows, syncType);
 
   if (dates.length) {
+    try {
+      // Drop stale grains from older dimension sets (prevents 2× totals on re-sync).
+      await query(
+        `DELETE FROM report_daily
+         WHERE client_id = $2::uuid
+           AND report_date = ANY($1::date[])
+           AND synced_at < $3`,
+        [dates, requireClientId(), syncStartedAt]
+      );
+    } catch (e) {
+      logger.warn(`[${syncType}] stale historical cleanup skipped:`, e.message);
+    }
     try {
       await query(
         `DELETE FROM report_daily
@@ -502,10 +538,23 @@ async function fetchFromDB(startDate, endDate) {
 }
 
 function toDollarsLean(n) {
-  const v = Number(n);
-  if (!Number.isFinite(v) || v === 0) return 0;
-  if (Math.abs(v) >= 1000) return +(v / 1e6).toFixed(2);
-  return +v.toFixed(2);
+  return gamMoneyToDollars(n);
+}
+
+/** GAM money in metrics JSONB — prefer Total revenue (ALL), skip zero CPM stub. */
+function leanRevenueSqlFragments() {
+  const allRevRaw = `NULLIF(NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE','')::double precision, 0)`;
+  const cpcRevRaw = `NULLIF(NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE','')::double precision, 0)`;
+  const legacyRevRaw = `NULLIF(metrics->>'revenue','')::double precision`;
+  const revenueRawExpr = `COALESCE(${allRevRaw}, ${cpcRevRaw}, ${legacyRevRaw}, 0)`;
+  const revenueExpr = `CASE
+    WHEN ABS(${revenueRawExpr}) >= 1000 THEN ${revenueRawExpr} / 1000000.0
+    WHEN ABS(${revenueRawExpr}) > 0 AND ABS(${revenueRawExpr}) < 1 THEN ${revenueRawExpr}
+    WHEN ABS(${revenueRawExpr}) >= 1 AND ABS(${revenueRawExpr}) < 1000
+      AND ${revenueRawExpr} = FLOOR(${revenueRawExpr}) THEN ${revenueRawExpr} / 1000000.0
+    ELSE ${revenueRawExpr}
+  END`;
+  return { revenueRawExpr, revenueExpr };
 }
 
 /** Map flat SQL dashboard rows into the canonical report shape (no heavy JSONB normalize). */
@@ -639,8 +688,7 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
     }
 
     if (apps.length) {
-      params.push(apps);
-      extra += ` AND ${appExpr} = ANY($${params.length}::text[])`;
+      extra += sqlAppMatchClause(params, apps, appExpr, adUnitExpr);
     }
 
     if (!domains.length && !sites.length && !adUnitNames.length && !apps.length && adUnitPatterns.length) {
@@ -658,6 +706,7 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
       )) = ANY($${params.length}::text[])`;
     }
 
+    const { revenueExpr } = leanRevenueSqlFragments();
     const { rows } = await query(
       `SELECT
          to_char(report_date, 'YYYY-MM-DD') AS report_date,
@@ -672,12 +721,7 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
            NULLIF(metrics->>'impression','')::double precision,
            0
          ) AS impression,
-         COALESCE(
-           NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE','')::double precision,
-           NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE','')::double precision,
-           NULLIF(metrics->>'revenue','')::double precision,
-           0
-         ) AS revenue_raw,
+         ${revenueExpr} AS revenue_raw,
          COALESCE(
            NULLIF(metrics->>'TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE','')::double precision,
            NULLIF(metrics->>'viewableRate','')::double precision,
@@ -784,17 +828,7 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
     NULLIF(metrics->>'impression','')::double precision,
     0
   )`;
-  const revenueRawExpr = `COALESCE(
-    NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE','')::double precision,
-    NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE','')::double precision,
-    NULLIF(metrics->>'revenue','')::double precision,
-    0
-  )`;
-  // Match toDollarsLean: micros (>=1000) → dollars
-  const revenueExpr = `CASE
-    WHEN ABS(${revenueRawExpr}) >= 1000 THEN ${revenueRawExpr} / 1000000.0
-    ELSE ${revenueRawExpr}
-  END`;
+  const { revenueExpr } = leanRevenueSqlFragments();
   const viewableRawExpr = `COALESCE(
     NULLIF(metrics->>'TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE','')::double precision,
     NULLIF(metrics->>'viewableRate','')::double precision,
@@ -863,16 +897,7 @@ function leanMetricSql() {
     NULLIF(metrics->>'impression','')::double precision,
     0
   )`;
-  const revenueRawExpr = `COALESCE(
-    NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE','')::double precision,
-    NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE','')::double precision,
-    NULLIF(metrics->>'revenue','')::double precision,
-    0
-  )`;
-  const revenueExpr = `CASE
-    WHEN ABS(${revenueRawExpr}) >= 1000 THEN ${revenueRawExpr} / 1000000.0
-    ELSE ${revenueRawExpr}
-  END`;
+  const { revenueExpr } = leanRevenueSqlFragments();
   const viewableRawExpr = `COALESCE(
     NULLIF(metrics->>'TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE','')::double precision,
     NULLIF(metrics->>'viewableRate','')::double precision,
@@ -1075,8 +1100,7 @@ function appendRollupInventoryFilters(params, extra, opts = {}) {
       : ` AND ${webParts[0]} AND ${webParts[1]}`;
   }
   if (apps.length) {
-    params.push(apps);
-    clause += ` AND LOWER(inv_app) = ANY($${params.length}::text[])`;
+    clause += sqlAppMatchClause(params, apps, 'LOWER(inv_app)', 'LOWER(inv_ad_unit)');
   }
   if (!domains.length && !sites.length && !adUnitNames.length && !apps.length && adUnitPatterns.length) {
     params.push(adUnitPatterns);
@@ -1163,8 +1187,7 @@ function appendLeanInventoryFilters(params, extra, opts = {}) {
       : ` AND ${webParts[0]} AND ${webParts[1]}`;
   }
   if (apps.length) {
-    params.push(apps);
-    clause += ` AND ${appExpr} = ANY($${params.length}::text[])`;
+    clause += sqlAppMatchClause(params, apps, appExpr, adUnitExpr);
   }
   if (!domains.length && !sites.length && !adUnitNames.length && !apps.length && adUnitPatterns.length) {
     params.push(adUnitPatterns);
@@ -1719,7 +1742,8 @@ function normalizeGAMRows(rawRows, currency = 'USD') {
       if (k.startsWith('Dimension.')) {
         dimensions[k.replace('Dimension.', '')] = v;
       } else if (k.startsWith('Column.')) {
-        metrics[k.replace('Column.', '')] = parseFloat(v) || 0;
+        const api = k.replace('Column.', '');
+        metrics[api] = parseGamMetricValue(api, v);
       }
     }
     const report_date = dimensions.DATE || dimensions.date || todayInTZ();
@@ -1956,10 +1980,14 @@ async function invalidateCacheForDate(date) {
     tenantKey(`report:rows:*:${date}`),
     tenantKey(`report_dashboard_raw_${date}_*`),
     tenantKey(`report_dashboard_raw_v2_${date}_*`),
+    tenantKey(`report_dashboard_resp_v2_*`),
+    tenantKey(`report_dashboard_resp_v3_*`),
     tenantKey(`report_dashboard_full_${date}_*`),
     tenantKey(`report_detailed_raw_${date}_*`),
+    tenantKey(`report_detailed_resp_v3_*`),
     tenantKey(`report_domain_user_${date}_*`),
     tenantKey(`report_programmatic_${date}_*`),
+    tenantKey(`report_overview_v2_*`),
   ];
   let scanned = 0;
   for (const pattern of patterns) {
@@ -2608,11 +2636,13 @@ function mapFullDbRowToReportRow(row) {
       ?? metrics.TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS
       ?? 0) || 0
   );
-  const revenue = +Number(
-    metrics.total_line_item_level_cpm_and_cpc_revenue
-      ?? metrics.TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE
-      ?? 0
-  ).toFixed(2);
+  const revenue = pickRowRevenueDollars({
+    metrics,
+    TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE: metrics.TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE,
+    TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE: metrics.TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE,
+    total_line_item_level_all_revenue: metrics.total_line_item_level_all_revenue,
+    total_line_item_level_cpm_and_cpc_revenue: metrics.total_line_item_level_cpm_and_cpc_revenue,
+  });
 
   let viewableRate = Number(
     metrics.total_active_view_viewable_impressions_rate
@@ -2674,7 +2704,8 @@ async function fetchFullReportBundleFromDB(startDate, endDate, opts = {}) {
   }
   if (!branches.length) return null;
 
-  const revExpr = `COALESCE((metrics->>'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE')::float8, 0)`;
+  const { revenueExpr } = leanRevenueSqlFragments();
+  const revExpr = revenueExpr;
   const impExpr = `COALESCE((metrics->>'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS')::float8, 0)`;
 
   const runAgg = async (selectSql, orderLimit = '') => {
