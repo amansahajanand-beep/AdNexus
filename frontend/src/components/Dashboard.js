@@ -434,7 +434,7 @@ export default function Dashboard() {
   const [lastUpdated, setLastUpdated] = useState(() => saved?.lastUpdated ?? null);
   const [fetchedAt, setFetchedAt] = useState(() => saved?.fetchedAt ?? null);
   const [breakdownOpen, setBreakdownOpen] = useState(() => saved?.breakdownOpen ?? true);
-  const [chipsExpanded, setChipsExpanded] = useState(() => saved?.chipsExpanded ?? false);
+  const [chipsExpanded, setChipsExpanded] = useState(() => saved?.chipsExpanded ?? true);
   const [slowDetail, setSlowDetail] = useState(false);
   const [recentFilters, setRecentFilters] = useState(() => getRecentFilters(user?.id));
   const pollRef = useRef(null);
@@ -742,7 +742,7 @@ export default function Dashboard() {
     setStartDate(r.startDate);
     setEndDate(r.endDate);
     setPage(1);
-    setChipsExpanded(false);
+    setChipsExpanded(true);
     setOverviewData(null);
     setDetailData(null);
     if (scopedAutoLoad) {
@@ -789,7 +789,7 @@ export default function Dashboard() {
     setDomainName(nextDomainName);
     setDomainId(nextDomainId);
     setPage(1);
-    setChipsExpanded(false);
+    setChipsExpanded(true);
     setBreakdownOpen(true);
     setOverviewData(null);
     setDetailData(null);
@@ -821,7 +821,7 @@ export default function Dashboard() {
     setFilterApplied(true);
     persistRecentFilter();
     setBreakdownOpen(true);
-    setChipsExpanded(false);
+    setChipsExpanded(true);
     loadCatalog(true);
     const apiFilters = normalizeInventorySelections(nextApplied, {
       domainOptions: domainRootOptions,
@@ -898,7 +898,7 @@ export default function Dashboard() {
     setSite([]);
     setSearch('');
     setBreakdownOpen(filterVisibility.isScopedUser);
-    setChipsExpanded(false);
+    setChipsExpanded(true);
     setFilterApplied(false);
     setDetailData(null);
     setOverviewData(null);

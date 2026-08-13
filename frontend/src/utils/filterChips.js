@@ -11,7 +11,7 @@
 
 import { ALL_SENTINEL, isAllSelection, optionValues } from './inventorySelection';
 
-const CHIP_EXPAND_LIMIT = 25;
+const CHIP_EXPAND_LIMIT = 200;
 
 function countryLabel(id, countryOptions) {
   const hit = (countryOptions || []).find((c) => String(c.id) === String(id));

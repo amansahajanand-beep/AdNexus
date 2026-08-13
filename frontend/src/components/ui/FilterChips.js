@@ -1,16 +1,17 @@
 import React, { useEffect, useRef, useState } from 'react';
 
-const COLLAPSED_MAX_HEIGHT = 62; // ~2 chip rows
+/** Collapsed preview height (~3 chip rows) before “Show more”. */
+const COLLAPSED_MAX_HEIGHT = 96;
 
 /**
- * GAM-style applied filters — single list, max 2 rows collapsed, show more/less, add filter.
- * hasData: true = green chips, false = red chips, null/undefined = default grey
+ * GAM-style applied filters — one chip per value, wrap to new lines.
+ * Collapsed shows a few rows; expanded shows the full wrapped list (like GAM).
  */
 export default function FilterChips({
   chips = [],
   onRemove,
   onAddFilter,
-  expanded = false,
+  expanded = true,
   onToggleExpand,
   title = 'Applied filters',
   hasData = null,
@@ -37,7 +38,7 @@ export default function FilterChips({
 
   if (!chips.length) return null;
 
-  const showToggle = hasOverflow || expanded;
+  const showToggle = hasOverflow || (expanded && chips.length > 8);
 
   const chipVariant = hasData === true ? 'green' : hasData === false ? 'red' : '';
 

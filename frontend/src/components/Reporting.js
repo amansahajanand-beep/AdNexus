@@ -149,7 +149,7 @@ export default function Reporting() {
 
   const [filtersOpen, setFiltersOpen] = useState(() => saved?.filtersOpen ?? !filterVisibility.isScopedUser);
   const [breakdownOpen, setBreakdownOpen] = useState(() => saved?.breakdownOpen ?? true);
-  const [chipsExpanded, setChipsExpanded] = useState(() => saved?.chipsExpanded ?? false);
+  const [chipsExpanded, setChipsExpanded] = useState(() => saved?.chipsExpanded ?? true);
   // Restore saved builder state; default metrics = Total revenue (+ impressions).
   const [reportDimensions, setReportDimensions] = useState(() => saved?.reportDimensions ?? []);
   const [reportMetrics, setReportMetrics] = useState(
@@ -286,7 +286,7 @@ export default function Reporting() {
     setReportMetrics(nextMets);
     setReportSettings(nextSettings);
     setPage(1);
-    setChipsExpanded(false);
+    setChipsExpanded(true);
     setFiltersOpen(true);
     setData(null);
     setProgData(null);
@@ -670,7 +670,7 @@ export default function Reporting() {
     setStartDate(r.startDate);
     setEndDate(r.endDate);
     setPage(1);
-    setChipsExpanded(false);
+    setChipsExpanded(true);
     if (resolveReportingQuery({ ...applied, startDate: r.startDate, endDate: r.endDate })) {
       setData(null);
       setProgData(null);
@@ -706,7 +706,7 @@ export default function Reporting() {
     });
     persistRecentFilter();
     setFiltersOpen(false);
-    setChipsExpanded(false);
+    setChipsExpanded(true);
     loadCatalog(true);
   };
 
@@ -738,7 +738,7 @@ export default function Reporting() {
     setFiltersOpen((open) => {
       const next = !open;
       if (!next) {
-        setChipsExpanded(false);
+        setChipsExpanded(true);
         setBreakdownOpen(false);
       }
       return next;
@@ -968,7 +968,7 @@ export default function Reporting() {
     setReportSettings(DEFAULT_REPORT_SETTINGS);
     setFiltersOpen(!filterVisibility.isScopedUser);
     setBreakdownOpen(true);
-    setChipsExpanded(false);
+    setChipsExpanded(true);
     setSearch('');
     setPage(1);
     setData(null);
