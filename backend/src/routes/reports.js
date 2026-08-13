@@ -357,23 +357,28 @@ function extractTag(xml, tag) {
 
 async function pollReport(jobId, token, opts = {}) {
   const fastMode = Boolean(opts.fastMode);
-  // Short first delay: most jobs are COMPLETED well before the old 8s sleep.
-  // Env override for tuning without redeploying poll logic.
   const firstDelay = Math.max(
     200,
     parseInt(process.env.GAM_REPORT_FIRST_POLL_MS || '400', 10) || 400
   );
-  // More attempts than the old schedule because each wait is shorter.
-  const maxAttempts = fastMode ? 40 : 80;
-  let status = 'IN_PROGRESS', tries = 0;
+  // Hard caps — unbounded polls held connections + delayed GC pressure.
+  const maxAttempts = fastMode
+    ? Math.min(30, parseInt(process.env.GAM_REPORT_MAX_POLLS_FAST || '30', 10) || 30)
+    : Math.min(50, parseInt(process.env.GAM_REPORT_MAX_POLLS || '50', 10) || 50);
+  const hardDeadline = Date.now() + (fastMode ? 90_000 : 180_000);
+  let status = 'IN_PROGRESS';
+  let tries = 0;
   while (status === 'IN_PROGRESS' && tries < maxAttempts) {
+    if (Date.now() > hardDeadline) {
+      throw new Error(`Report poll timed out after ${tries} attempts (job ${jobId})`);
+    }
     const delay = tries === 0
       ? firstDelay
       : tries < 3
         ? (fastMode ? 800 : 1000)
         : tries < 10
           ? (fastMode ? 1200 : 2000)
-          : (fastMode ? 1500 : 3000);
+          : (fastMode ? 2000 : 3000);
     await new Promise(r => setTimeout(r, delay));
     const xml = await gamSOAP('ReportService', 'getReportJobStatus',
       `<reportJobId>${jobId}</reportJobId>`, token);
@@ -584,6 +589,22 @@ function buildCountryFilter(country) {
 }
 
 // Stable cache key for a filter set (arrays sorted so order doesn't matter).
+let _cacheGenMemo = { value: 0, at: 0 };
+async function currentCacheGen() {
+  if (Date.now() - _cacheGenMemo.at < 5000) return _cacheGenMemo.value;
+  try {
+    const { getCacheGeneration } = require('../redisClient');
+    const { tenantKey } = require('../utils/clientContext');
+    _cacheGenMemo = {
+      value: await getCacheGeneration(tenantKey('')) || 0,
+      at: Date.now(),
+    };
+  } catch (_) {
+    _cacheGenMemo = { value: 0, at: Date.now() };
+  }
+  return _cacheGenMemo.value;
+}
+
 function filterCacheKey({
   startDate, endDate, country, domainId, domainName, domain, site,
   reportDimensions, reportMetrics,
@@ -2086,8 +2107,11 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
         : Boolean(rows?.length);
       if (dbHit) {
         const payload = { rows: rows || [] };
+        // Memory-only for large grain; Redis only for compact payloads.
         cache.set(cacheKey, payload, REPORT_CACHE_TTL);
-        if (r?.redisSet) await r.redisSet(cacheKey, payload, r.TTL?.REPORT || REPORT_CACHE_TTL);
+        if (r?.redisSet && (rows || []).length <= 3000) {
+          await r.redisSet(cacheKey, payload, r.TTL?.REPORT || REPORT_CACHE_TTL);
+        }
         logger.info(
           `${logLabel} from PostgreSQL${useAdhocStore ? ' (report_adhoc)' : ''} (${(rows || []).length} rows) ${filters.startDate}..${filters.endDate}`
           + (hasInventoryFilters(filters) ? ' (SQL query filter)' : '')
@@ -2171,7 +2195,9 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
       reportWarningUsedMetricIds: result.reportWarningUsedMetricIds || [],
     };
     cache.set(cacheKey, payload, REPORT_CACHE_TTL);
-    if (r?.redisSet) await r.redisSet(cacheKey, payload, r.TTL?.REPORT || REPORT_CACHE_TTL);
+    if (r?.redisSet && (result.rows || []).length <= 3000) {
+      await r.redisSet(cacheKey, payload, r.TTL?.REPORT || REPORT_CACHE_TTL);
+    }
     // 5. Store for next request
     if (persistOnGam) {
       if (useAdhocStore) {
@@ -2807,7 +2833,8 @@ async function handleDashboard(req, res) {
   const currency = process.env.GAM_CURRENCY || null;
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
-  const dashRespKey = `report_dashboard_resp_v4_${req.user?.id || 'anon'}_${filterCacheKey({
+  const cacheGen = await currentCacheGen();
+  const dashRespKey = `report_dashboard_resp_v4_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3074,6 +3101,49 @@ router.get('/filter-catalog', async (req, res) => {
     return res.status(403).json({ error: 'You do not have permission to load filter options.' });
   }
 
+  // Domain/child users: return granted domain/site/app IDs from user.permissions instantly.
+  // Do not wait on the full network GAM/Redis catalog (admin path).
+  if (req.user?.role !== 'admin' && userHasAssignedInventory(req.user)) {
+    const scope = getUserInventoryScope(req.user);
+    const domainRoots = [...(scope?.domains || [])].sort((a, b) => a.localeCompare(b));
+    const siteHosts = [...(scope?.sites || [])].sort((a, b) => a.localeCompare(b));
+    const appPackages = [...(scope?.appIds || [])]
+      .map((v) => String(v || '').trim())
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b));
+    const sitesByDomain = {};
+    siteHosts.forEach((host) => {
+      const root = rootDomainFromHost(host) || host;
+      if (!sitesByDomain[root]) sitesByDomain[root] = [];
+      if (!sitesByDomain[root].includes(host)) sitesByDomain[root].push(host);
+    });
+    return res.json({
+      rows: [],
+      domainRoots,
+      siteHosts,
+      sitesByDomain,
+      adUnitsByHost: {},
+      appPackages,
+      noDomainsAssigned: domainRoots.length === 0 && siteHosts.length === 0 && appPackages.length === 0,
+      noInventoryAssigned: false,
+      fromAssignment: true,
+    });
+  }
+
+  if (req.user?.role !== 'admin' && !userHasAssignedInventory(req.user)) {
+    return res.json({
+      rows: [],
+      domainRoots: [],
+      siteHosts: [],
+      sitesByDomain: {},
+      adUnitsByHost: {},
+      appPackages: [],
+      noDomainsAssigned: true,
+      noInventoryAssigned: true,
+      fromAssignment: true,
+    });
+  }
+
   if (isMockClient()) {
     const { startDate, endDate } = dateRangeYMDInTZ(7);
     const base = mockDetailed({ startDate, endDate });
@@ -3085,23 +3155,22 @@ router.get('/filter-catalog', async (req, res) => {
     return res.json({ ...scoped, isMock: true });
   }
 
-  // Always use the dedicated catalog (enriched with InventoryService site map).
-  // Do NOT fall back to general report rows — those lack proper site/domain enrichment.
+  // Admin: full network catalog (enriched with InventoryService site map).
   try {
     const token = await getToken();
     const result = await getFilterCatalog(token, { allowStale: true });
-    const rows = scopeRowsToUser(result.rows || [], req.user);
     const scoped = scopeCatalogOptionsForUser(
       {
-        rows,
+        rows: result.rows || [],
         adUnitsByHost: result.adUnitsByHost || {},
-        ...buildCatalogFilterOptions(rows, result.rawHosts || {}),
+        appPackages: result.appPackages || [],
+        ...buildCatalogFilterOptions(result.rows || [], result.rawHosts || {}),
       },
       req.user
     );
     res.json({
       ...scoped,
-      appPackages: result.appPackages || [],
+      appPackages: result.appPackages || scoped.appPackages || [],
       startDate: result.startDate,
       endDate: result.endDate,
     });
@@ -3215,7 +3284,8 @@ async function handleDetailedReport(req, res) {
   const pageKey = wantAllRows
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
-  const detailedRespKey = `report_detailed_resp_v3_${req.user?.id || 'anon'}_${filterCacheKey({
+  const cacheGen = await currentCacheGen();
+  const detailedRespKey = `report_detailed_resp_v4_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,

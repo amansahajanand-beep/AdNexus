@@ -2,7 +2,7 @@
  * Shared chart axis helpers — keep full datasets; only thin visible ticks / compact labels.
  */
 
-/** Compact axis tick for money (avoids US$1,000,000.00 clipping). Tooltips can stay full. */
+/** Compact axis tick for money (avoids $16,000.00 clipping). Tooltips can stay full. */
 export function formatAxisMoney(value, currency = 'USD') {
   const n = Number(value) || 0;
   const abs = Math.abs(n);
@@ -10,8 +10,7 @@ export function formatAxisMoney(value, currency = 'USD') {
   const sym = currency === 'USD' || !currency ? '$' : '';
   if (abs >= 1e9) return `${sign}${sym}${(abs / 1e9).toFixed(abs >= 1e10 ? 0 : 1)}B`;
   if (abs >= 1e6) return `${sign}${sym}${(abs / 1e6).toFixed(abs >= 1e7 ? 0 : 1)}M`;
-  if (abs >= 1e4) return `${sign}${sym}${(abs / 1e3).toFixed(abs >= 1e5 ? 0 : 1)}K`;
-  if (abs >= 1e3) return `${sign}${sym}${(abs / 1e3).toFixed(1)}K`;
+  if (abs >= 1e3) return `${sign}${sym}${(abs / 1e3).toFixed(abs >= 10_000 ? 0 : 1)}K`;
   if (abs >= 100) return `${sign}${sym}${Math.round(abs)}`;
   if (abs >= 10) return `${sign}${sym}${abs.toFixed(1)}`;
   return `${sign}${sym}${abs.toFixed(2)}`;
@@ -37,13 +36,13 @@ export function formatAxisMetric(value, format, currency = 'USD') {
   return formatAxisNumber(value);
 }
 
-/** Left margin / YAxis width so compact ticks never clip. */
+/** Left YAxis width so compact ticks never clip (includes padding inside the axis band). */
 export function yAxisWidthForValues(values = [], format = 'raw', { isNarrow = false } = {}) {
   const sample = (values.length ? values : [0])
     .map((v) => formatAxisMetric(v, format, 'USD'))
     .sort((a, b) => b.length - a.length)[0] || '$0';
-  const approx = Math.ceil(sample.length * (isNarrow ? 7.2 : 7.8)) + 10;
-  const min = isNarrow ? 44 : 52;
+  const approx = Math.ceil(sample.length * (isNarrow ? 8.5 : 9)) + 20;
+  const min = isNarrow ? 52 : 60;
   const max = isNarrow ? 72 : 88;
   return Math.min(max, Math.max(min, approx));
 }
@@ -64,55 +63,116 @@ export function formatDateTick(raw, pointCount = 0) {
   const p = parseDateParts(raw);
   if (!p) return String(raw || '');
   const mon = MONTHS[p.mo - 1] || String(p.mo);
-  if (pointCount > 120) return mon; // year-ish → month only
-  if (pointCount > 45) return `${mon}`; // multi-month → month
-  if (pointCount > 14) return `${mon} ${p.d}`;
+  if (pointCount > 90) return mon;
+  if (pointCount > 31) return `${mon} ${p.d}`;
   return `${mon} ${p.d}`;
 }
 
 /**
- * Recharts XAxis interval: 0 = every tick; N = show every (N+1)th.
- * Keeps ~5–8 labels on narrow, ~6–12 on desktop.
+ * Explicit tick list — more reliable than Recharts `interval` for long ranges.
+ * Always includes first + last date.
  */
-export function dateTickInterval(pointCount, { isNarrow = false } = {}) {
-  const n = Math.max(0, Number(pointCount) || 0);
-  if (n <= 7) return 0;
-  const target = isNarrow ? 5 : (n > 180 ? 8 : n > 60 ? 8 : 10);
-  return Math.max(0, Math.ceil(n / target) - 1);
+export function pickDateTicks(dates = [], { isNarrow = false } = {}) {
+  const list = (dates || []).map((d) => (typeof d === 'object' ? (d.date || d.name) : d)).filter(Boolean);
+  const n = list.length;
+  if (n <= 1) return list;
+  // Keep sparse enough that angled labels never collide on phone or desktop.
+  const maxTicks = isNarrow
+    ? (n > 45 ? 4 : n > 14 ? 5 : 6)
+    : (n > 90 ? 5 : n > 45 ? 6 : n > 14 ? 7 : 8);
+  if (n <= maxTicks) return list;
+  const ticks = [];
+  const lastIdx = n - 1;
+  for (let i = 0; i < maxTicks; i += 1) {
+    const idx = i === maxTicks - 1 ? lastIdx : Math.round((i * lastIdx) / (maxTicks - 1));
+    const v = list[idx];
+    if (ticks[ticks.length - 1] !== v) ticks.push(v);
+  }
+  return ticks;
 }
 
-export function dateAxisProps(pointCount, { isNarrow = false } = {}) {
-  const n = Math.max(0, Number(pointCount) || 0);
-  const angled = isNarrow ? n > 5 : n > 14;
-  const interval = dateTickInterval(n, { isNarrow });
+/**
+ * Chart margins — left/right must leave room OUTSIDE the plot for axis labels.
+ * Bug fix: never cap left with Math.min(8/12) — that was clipping Y labels.
+ */
+export function chartMargins({
+  isNarrow = false,
+  hasAngledX = false,
+  yWidth = 56,
+  rightWidth = 0,
+} = {}) {
   return {
-    interval,
-    minTickGap: isNarrow ? 22 : 14,
-    angle: angled ? -35 : 0,
-    textAnchor: angled ? 'end' : 'middle',
-    height: angled ? (isNarrow ? 48 : 52) : 30,
-    tickMargin: angled ? 6 : 4,
-    tickFormatter: (v) => formatDateTick(v, n),
-    tick: { fontSize: isNarrow ? 9 : 11 },
-    tickLine: false,
-    axisLine: false,
+    top: 12,
+    // Extra pad outside the YAxis band so currency ticks never hug/clip the card edge.
+    left: Math.max(isNarrow ? 8 : 12, Math.ceil((yWidth || 0) * 0.08)),
+    right: Math.max(isNarrow ? 14 : 18, rightWidth ? Math.min(rightWidth, isNarrow ? 60 : 76) : 0),
+    bottom: hasAngledX ? (isNarrow ? 52 : 42) : 14,
   };
 }
 
-/** Chart margins that leave room for Y ticks + angled X labels. */
-export function chartMargins({ isNarrow = false, hasAngledX = false, yWidth = 56 } = {}) {
-  const leftPad = Math.max(4, yWidth - (isNarrow ? 40 : 48));
-  return {
-    top: 10,
-    right: isNarrow ? 10 : 18,
-    left: Math.min(isNarrow ? 8 : 12, leftPad),
-    bottom: hasAngledX ? (isNarrow ? 36 : 28) : 8,
-  };
+/** Category (horizontal bar) Y-axis width + truncation that fits that width. */
+export function categoryAxisWidth({ isNarrow = false } = {}) {
+  return isNarrow ? 108 : 148;
 }
 
-/** Truncate long category labels for axis (full name stays in tooltip). */
 export function truncateAxisLabel(label, max = 14) {
   const s = String(label || '');
   if (s.length <= max) return s;
   return `${s.slice(0, Math.max(1, max - 1))}…`;
+}
+
+/** Max chars that fit roughly in categoryAxisWidth. */
+export function categoryLabelMaxChars({ isNarrow = false } = {}) {
+  return isNarrow ? 13 : 20;
+}
+
+/**
+ * When a date series is long, expand chart width so points stay readable and
+ * the user can scroll horizontally (6mo / 1yr ranges).
+ * Returns null when the series fits the card without scrolling.
+ */
+export function scrollableChartMinWidth(pointCount, { isNarrow = false } = {}) {
+  const n = Math.max(0, Number(pointCount) || 0);
+  const startScrollAt = isNarrow ? 21 : 31;
+  if (n <= startScrollAt) return null;
+  const pxPerPoint = isNarrow ? 30 : 26;
+  const floor = isNarrow ? 560 : 720;
+  return Math.max(floor, Math.round(n * pxPerPoint));
+}
+
+/**
+ * Recharts XAxis props for date series.
+ * Prefer explicit `ticks` + short labels. When `scrollable`, allow denser ticks.
+ */
+export function dateAxisProps(pointCount, { isNarrow = false, dates = null, scrollable = false } = {}) {
+  const n = Math.max(0, Number(pointCount) || (dates?.length || 0));
+  const angled = n > 7;
+  let ticks;
+  if (Array.isArray(dates) && dates.length) {
+    if (scrollable) {
+      const every = n > 180 ? 14 : n > 90 ? 10 : 7;
+      const list = dates.map((d) => (typeof d === 'object' ? (d.date || d.name) : d)).filter(Boolean);
+      const picked = [];
+      for (let i = 0; i < list.length; i += every) picked.push(list[i]);
+      if (picked[picked.length - 1] !== list[list.length - 1]) picked.push(list[list.length - 1]);
+      ticks = picked;
+    } else {
+      ticks = pickDateTicks(dates, { isNarrow });
+    }
+  }
+  return {
+    type: 'category',
+    ...(ticks ? { ticks } : {
+      interval: n <= 7 ? 0 : Math.max(0, Math.ceil(n / (isNarrow ? 4 : 7)) - 1),
+    }),
+    minTickGap: scrollable ? (isNarrow ? 22 : 18) : (isNarrow ? 36 : 28),
+    angle: angled ? (isNarrow ? -45 : -35) : 0,
+    textAnchor: angled ? 'end' : 'middle',
+    height: angled ? (isNarrow ? 64 : 52) : 28,
+    tickMargin: angled ? 10 : 6,
+    tickFormatter: (v) => formatDateTick(v, n),
+    tick: { fontSize: isNarrow ? 9 : 10, fill: '#5f6368' },
+    tickLine: false,
+    axisLine: false,
+  };
 }

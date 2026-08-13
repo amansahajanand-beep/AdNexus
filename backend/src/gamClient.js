@@ -4,8 +4,13 @@ const logger = require('./utils/logger');
 const { getClient, tenantKey } = require('./utils/clientContext');
 
 // Default 30 minutes — GAM report data does not change minute-to-minute.
-// Override via CACHE_TTL env var (seconds).
-const cache = new NodeCache({ stdTTL: parseInt(process.env.CACHE_TTL) || 3600 });
+// Override via CACHE_TTL env var (seconds). Cap entries to avoid heap blowups.
+const cache = new NodeCache({
+  stdTTL: parseInt(process.env.CACHE_TTL) || 1800,
+  maxKeys: parseInt(process.env.NODE_CACHE_MAX_KEYS || '250', 10) || 250,
+  useClones: false,
+  checkperiod: 120,
+});
 
 // ─── OAuth2 Client ────────────────────────────────────────────────────────────
 function resolveGamCreds(client = getClient()) {

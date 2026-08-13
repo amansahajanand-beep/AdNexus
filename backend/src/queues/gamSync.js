@@ -19,10 +19,10 @@ const gamSyncQueue = useQueue
   : new Queue('gam-sync', {
       connection: createBullmqConnection('BullMQ gam-sync queue'),
       defaultJobOptions: {
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 10000 },
-        removeOnComplete: { count: 100 },
-        removeOnFail:     { count: 200 },
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 20000 },
+        removeOnComplete: { count: 20 },
+        removeOnFail:     { count: 40 },
       },
     });
 
@@ -33,10 +33,10 @@ const gamReportQueue = useQueue
   : new Queue('gam-report', {
       connection: createBullmqConnection('BullMQ gam-report queue'),
       defaultJobOptions: {
-        attempts: 2,
-        backoff: { type: 'fixed', delay: 15000 },
-        removeOnComplete: { count: 50 },
-        removeOnFail:     { count: 100 },
+        attempts: 1,
+        backoff: { type: 'fixed', delay: 30000 },
+        removeOnComplete: { count: 20 },
+        removeOnFail:     { count: 40 },
       },
     });
 

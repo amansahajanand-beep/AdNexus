@@ -189,6 +189,34 @@ img, svg, video { max-width: 100%; height: auto; }
 .chart-card { background: #fff; border: 1px solid #e0e0e0; border-radius: 12px; padding: 20px; overflow: visible; }
 .chart-card.wide { grid-column: 1 / -1; }
 .charts-grid { overflow: visible; }
+.chart-card .recharts-wrapper,
+.chart-card .recharts-surface,
+.chart-card .recharts-responsive-container { overflow: visible !important; }
+.chart-card .recharts-cartesian-axis-tick text { paint-order: stroke; }
+
+/* Long date ranges: horizontal scroll instead of crushed labels */
+.chart-h-scroll {
+  width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding-bottom: 4px;
+  margin: 0 -2px;
+}
+.chart-h-scroll-inner {
+  min-width: 100%;
+}
+.chart-h-scroll::-webkit-scrollbar {
+  height: 8px;
+}
+.chart-h-scroll::-webkit-scrollbar-thumb {
+  background: #c4c7c5;
+  border-radius: 8px;
+}
+.chart-h-scroll::-webkit-scrollbar-track {
+  background: #f1f3f4;
+  border-radius: 8px;
+}
 
 /* Recharts pie: browsers draw a rectangular focus ring on SVG path click — kill it everywhere. */
 .recharts-wrapper:focus,

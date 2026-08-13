@@ -41,7 +41,11 @@ import {
   dateAxisProps,
   chartMargins,
   truncateAxisLabel,
+  categoryAxisWidth,
+  categoryLabelMaxChars,
+  scrollableChartMinWidth,
 } from '../utils/chartAxis';
+import ScrollableChart from './ui/ScrollableChart';
 import {
   resolveDashboardTableConfig,
   buildReportColumns,
@@ -643,6 +647,11 @@ export default function Dashboard() {
   }, []);
 
   const loadCatalog = useCallback(async (force = false) => {
+    // Domain users: options come from assigned permissions already on the user — no network catalog wait.
+    if (filterVisibility.isScopedUser) {
+      setCatalogLoading(false);
+      return;
+    }
     if (!force && catalog.length) return;
     setCatalogLoading(true);
     try {
@@ -650,12 +659,16 @@ export default function Dashboard() {
       applyCatalogResponse(res);
     } catch (_) { /* filter options optional until opened */ }
     finally { setCatalogLoading(false); }
-  }, [catalog.length, applyCatalogResponse]);
+  }, [catalog.length, applyCatalogResponse, filterVisibility.isScopedUser]);
 
   useEffect(() => {
     if (!canGenerate) return;
+    if (filterVisibility.isScopedUser) {
+      setCatalogLoading(false);
+      return;
+    }
     loadCatalog(true);
-  }, [canGenerate, loadCatalog]);
+  }, [canGenerate, loadCatalog, filterVisibility.isScopedUser]);
 
   const selections = useMemo(
     () => ({
@@ -682,6 +695,8 @@ export default function Dashboard() {
     }),
     [catalog, selections, catalogLists, domain, inventoryScope, filterVisibility.isScopedUser]
   );
+  // Domain users already have lists on the session — never show catalog "Loading…"
+  const catalogBusy = !filterVisibility.isScopedUser && catalogLoading;
 
   const showNoDomainsNote = !isAdmin(user) && !inventoryAssigned;
 
@@ -1061,9 +1076,18 @@ export default function Dashboard() {
 
   const dailyWithEcpm = useMemo(() => withDailyEcpm(dailySeries), [dailySeries]);
 
+  const dailyDates = useMemo(
+    () => dailySeries.map((d) => d.date).filter(Boolean),
+    [dailySeries]
+  );
+  const dailyScrollable = Boolean(scrollableChartMinWidth(dailySeries.length, { isNarrow }));
   const dailyDateAxis = useMemo(
-    () => dateAxisProps(dailySeries.length, { isNarrow }),
-    [dailySeries.length, isNarrow]
+    () => dateAxisProps(dailySeries.length, {
+      isNarrow,
+      dates: dailyDates,
+      scrollable: dailyScrollable,
+    }),
+    [dailySeries.length, isNarrow, dailyDates, dailyScrollable]
   );
   const dailyMoneyWidth = useMemo(
     () => yAxisWidthForValues(dailySeries.map((d) => d.revenue), 'money', { isNarrow }),
@@ -1073,16 +1097,37 @@ export default function Dashboard() {
     () => yAxisWidthForValues(dailySeries.map((d) => d.impressions), 'raw', { isNarrow }),
     [dailySeries, isNarrow]
   );
+  const dailyEcpmWidth = useMemo(
+    () => yAxisWidthForValues(
+      (dailyWithEcpm || []).map((d) => d.ecpm),
+      'money',
+      { isNarrow }
+    ),
+    [dailyWithEcpm, isNarrow]
+  );
   const dailyChartMargins = useMemo(
-    () => ({
-      ...chartMargins({
-        isNarrow,
-        hasAngledX: Boolean(dailyDateAxis.angle),
-        yWidth: dailyMoneyWidth,
-      }),
-      right: Math.max(isNarrow ? 10 : 16, dailyImpWidth - 20),
+    () => chartMargins({
+      isNarrow,
+      hasAngledX: Boolean(dailyDateAxis.angle),
+      yWidth: dailyMoneyWidth,
+      rightWidth: dailyImpWidth,
     }),
     [isNarrow, dailyDateAxis.angle, dailyMoneyWidth, dailyImpWidth]
+  );
+  const dailyEcpmMargins = useMemo(
+    () => chartMargins({
+      isNarrow,
+      hasAngledX: Boolean(dailyDateAxis.angle),
+      yWidth: dailyMoneyWidth,
+      rightWidth: dailyEcpmWidth,
+    }),
+    [isNarrow, dailyDateAxis.angle, dailyMoneyWidth, dailyEcpmWidth]
+  );
+  const catAxisW = categoryAxisWidth({ isNarrow });
+  const catLabelMax = categoryLabelMaxChars({ isNarrow });
+  const hBarMargins = useMemo(
+    () => ({ top: 8, right: 16, left: isNarrow ? 4 : 8, bottom: 8 }),
+    [isNarrow]
   );
   const siteShareSeries = useMemo(
     () => buildSiteRevenueShare(enrichedRows, 10),
@@ -1339,7 +1384,7 @@ export default function Dashboard() {
                 {filterVisibility.isScopedUser
                   ? 'Pick from your assigned list — overview KPIs update when you apply filters'
                   : 'Domain, site, ad unit, app & custom dates'}
-                {catalogLoading ? ' · Loading options…' : ''}
+                {catalogBusy ? ' · Loading options…' : ''}
               </span>
             </div>
             <div className="filter-grid">
@@ -1347,28 +1392,28 @@ export default function Dashboard() {
               <div className="filter-field">
                 <label>Domain name</label>
                 <MultiSelect options={domainRootOptions} value={domain} onChange={handleDomainChange}
-                  placeholder="Select domain names" disabled={!canFilter} loading={catalogLoading} />
+                  placeholder="Select domain names" disabled={!canFilter} loading={catalogBusy} />
               </div>
               )}
               {filterVisibility.showSite && (
               <div className="filter-field">
                 <label>Site (URL)</label>
                 <MultiSelect options={siteOptions} value={site} onChange={handleSiteChange}
-                  placeholder="Select sites" disabled={!canFilter} loading={catalogLoading} />
+                  placeholder="Select sites" disabled={!canFilter} loading={catalogBusy} />
               </div>
               )}
               {filterVisibility.showAdUnit && (
               <div className="filter-field">
                 <label>Ad Unit</label>
                 <MultiSelect options={adUnitOptions} value={domainName} onChange={handleAdUnitChange}
-                  placeholder="Select Ad Units" disabled={!canFilter} loading={catalogLoading} />
+                  placeholder="Select Ad Units" disabled={!canFilter} loading={catalogBusy} />
               </div>
               )}
               {filterVisibility.showApp && (
               <div className="filter-field">
                 <label>App ID</label>
                 <MultiSelect options={appOptions} value={domainId} onChange={handleAppChange}
-                  placeholder="Select app IDs" disabled={!canFilter} loading={catalogLoading} />
+                  placeholder="Select app IDs" disabled={!canFilter} loading={catalogBusy} />
               </div>
               )}
             </div>
@@ -1501,23 +1546,23 @@ export default function Dashboard() {
                 </div>
               )}
             </div>
-              <ResponsiveContainer width="100%" height={isNarrow ? 270 : 280}>
+              <ScrollableChart pointCount={dailySeries.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
                 <AreaChart data={dailySeries} margin={dailyChartMargins}>
                   <defs>
                     <linearGradient id="dashEarnGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.25} />
-                      <stop offset="95%" stopColor="#1a73e8" stopOpacity={0} />
+                      <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.28} />
+                      <stop offset="95%" stopColor="#1a73e8" stopOpacity={0.04} />
                     </linearGradient>
                     <linearGradient id="dashImpsGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#34a853" stopOpacity={0.2} />
-                      <stop offset="95%" stopColor="#34a853" stopOpacity={0} />
+                      <stop offset="5%" stopColor="#34a853" stopOpacity={0.22} />
+                      <stop offset="95%" stopColor="#34a853" stopOpacity={0.04} />
                     </linearGradient>
                   </defs>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                   <XAxis dataKey="date" {...dailyDateAxis} />
                   <YAxis
                     yAxisId="left"
-                    tick={{ fontSize: isNarrow ? 10 : 11 }}
+                    tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisMoney(v, currency)}
@@ -1526,7 +1571,7 @@ export default function Dashboard() {
                   <YAxis
                     yAxisId="right"
                     orientation="right"
-                    tick={{ fontSize: isNarrow ? 10 : 11 }}
+                    tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisNumber(v)}
@@ -1536,11 +1581,11 @@ export default function Dashboard() {
                     labelFormatter={(label) => String(label || '')}
                     formatter={(v, name) => (name === 'Revenue' ? [money(v, currency), 'Revenue'] : [num(v), 'Impressions'])} />
                   <Area yAxisId="left" type="monotone" dataKey="revenue" stroke="#1a73e8" strokeWidth={2}
-                    fill="url(#dashEarnGrad)" dot={false} activeDot={{ r: 4 }} name="Revenue" />
+                    fill="url(#dashEarnGrad)" fillOpacity={1} dot={false} activeDot={{ r: 4 }} name="Revenue" isAnimationActive={false} />
                   <Area yAxisId="right" type="monotone" dataKey="impressions" stroke="#34a853" strokeWidth={2}
-                    fill="url(#dashImpsGrad)" dot={false} activeDot={{ r: 4 }} name="Impressions" />
+                    fill="url(#dashImpsGrad)" fillOpacity={1} dot={false} activeDot={{ r: 4 }} name="Impressions" isAnimationActive={false} />
                 </AreaChart>
-              </ResponsiveContainer>
+              </ScrollableChart>
           </div>
           )}
 
@@ -1597,11 +1642,11 @@ export default function Dashboard() {
                 <span className="filter-section-hint">Laptop · Mobile · Tablet</span>
               </div>
               <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={shareSeries.device} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                <BarChart data={shareSeries.device} layout="vertical" margin={hBarMargins}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                   <XAxis type="number" tick={false} axisLine={false} />
-                  <YAxis dataKey="name" type="category" width={isNarrow ? 78 : 100} tick={{ fontSize: 11 }} axisLine={false}
-                    tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
+                  <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
                   <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Device']} />
                   <Bar dataKey="value" radius={[0, 6, 6, 0]}>
                     {shareSeries.device.map((entry, idx) => (
@@ -1675,12 +1720,12 @@ export default function Dashboard() {
                   <h3 className="chart-title">Daily eCPM</h3>
                   <span className="filter-section-hint">Revenue / impressions × 1000</span>
                 </div>
-                <ResponsiveContainer width="100%" height={isNarrow ? 270 : 280}>
-                  <LineChart data={dailyWithEcpm} margin={dailyChartMargins}>
+                <ScrollableChart pointCount={dailyWithEcpm.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
+                  <LineChart data={dailyWithEcpm} margin={dailyEcpmMargins}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                     <XAxis dataKey="date" {...dailyDateAxis} />
                     <YAxis
-                      tick={{ fontSize: isNarrow ? 10 : 11 }}
+                      tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
                       tickLine={false}
                       axisLine={false}
                       tickFormatter={(v) => formatAxisMoney(v, currency)}
@@ -1691,7 +1736,7 @@ export default function Dashboard() {
                       formatter={(v) => [money(v, currency), 'eCPM']} />
                     <Line type="monotone" dataKey="ecpm" name="eCPM" stroke="#8e24aa" strokeWidth={2} dot={dailyWithEcpm.length <= 31} />
                   </LineChart>
-                </ResponsiveContainer>
+                </ScrollableChart>
               </div>
             ) : (showRevenueCharts && hasChartData(siteShareSeries)) ? (
               <div className="chart-card">
@@ -1700,11 +1745,11 @@ export default function Dashboard() {
                   <span className="filter-section-hint">Top 10 by revenue</span>
                 </div>
                 <ResponsiveContainer width="100%" height={260}>
-                  <BarChart data={siteShareSeries} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                  <BarChart data={siteShareSeries} layout="vertical" margin={hBarMargins}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                     <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={isNarrow ? 86 : 110} tick={{ fontSize: 11 }} axisLine={false}
-                      tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
+                    <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
                     <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
                     <Bar dataKey="value" radius={[0, 6, 6, 0]}>
                       {siteShareSeries.map((entry, idx) => (
@@ -1725,11 +1770,11 @@ export default function Dashboard() {
               <span className="filter-section-hint">Compact score by ad unit</span>
             </div>
             <ResponsiveContainer width="100%" height={240}>
-              <BarChart data={performanceSeries} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
+              <BarChart data={performanceSeries} layout="vertical" margin={hBarMargins}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                 <XAxis type="number" tick={false} axisLine={false} />
-                <YAxis dataKey="name" type="category" width={isNarrow ? 86 : 110} tick={{ fontSize: 11 }} axisLine={false}
-                  tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
+                <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
                 <Tooltip formatter={(value) => [Number(value).toFixed(0), 'Performance score']} />
                 <Bar dataKey="score" radius={[0, 6, 6, 0]} fill="#b91c1c" />
               </BarChart>
@@ -1743,13 +1788,13 @@ export default function Dashboard() {
                 <h3 className="chart-title">Revenue vs eCPM</h3>
                 <span className="filter-section-hint">Daily revenue bars with eCPM overlay</span>
               </div>
-              <ResponsiveContainer width="100%" height={isNarrow ? 270 : 280}>
-                <ComposedChart data={dailyWithEcpm} margin={dailyChartMargins}>
+              <ScrollableChart pointCount={dailyWithEcpm.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
+                <ComposedChart data={dailyWithEcpm} margin={dailyEcpmMargins}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                   <XAxis dataKey="date" {...dailyDateAxis} />
                   <YAxis
                     yAxisId="left"
-                    tick={{ fontSize: isNarrow ? 10 : 11 }}
+                    tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisMoney(v, currency)}
@@ -1758,20 +1803,20 @@ export default function Dashboard() {
                   <YAxis
                     yAxisId="right"
                     orientation="right"
-                    tick={{ fontSize: isNarrow ? 10 : 11 }}
+                    tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisMoney(v, currency)}
-                    width={dailyMoneyWidth}
+                    width={dailyEcpmWidth}
                   />
                   <Tooltip contentStyle={{ fontSize: 12, borderRadius: 8, border: '0.5px solid #e0e0e0' }}
                     labelFormatter={(label) => String(label || '')}
                     formatter={(v, name) => [money(v, currency), name]} />
                   <Legend />
-                  <Bar yAxisId="left" dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[4, 4, 0, 0]} maxBarSize={isNarrow ? 18 : 36} />
+                  <Bar yAxisId="left" dataKey="revenue" name="Revenue" fill="#1a73e8" radius={[4, 4, 0, 0]} maxBarSize={isNarrow ? 14 : 28} />
                   <Line yAxisId="right" type="monotone" dataKey="ecpm" name="eCPM" stroke="#f29900" strokeWidth={2} dot={false} />
                 </ComposedChart>
-              </ResponsiveContainer>
+              </ScrollableChart>
             </div>
           )}
 
@@ -1785,11 +1830,11 @@ export default function Dashboard() {
                   <span className="filter-section-hint">Top 10 by revenue</span>
                 </div>
                 <ResponsiveContainer width="100%" height={240}>
-                  <BarChart data={siteShareSeries} layout="vertical" margin={{ top: 8, right: 12, left: 8, bottom: 8 }}>
+                  <BarChart data={siteShareSeries} layout="vertical" margin={hBarMargins}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                     <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={isNarrow ? 86 : 110} tick={{ fontSize: 11 }} axisLine={false}
-                      tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
+                    <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
                     <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
                     <Bar dataKey="value" radius={[0, 6, 6, 0]}>
                       {siteShareSeries.map((entry, idx) => (
@@ -1808,11 +1853,11 @@ export default function Dashboard() {
                   <span className="filter-section-hint">Revenue and impressions by ad unit</span>
                 </div>
                 <ResponsiveContainer width="100%" height={240}>
-                  <BarChart data={adUnitMixSeries} layout="vertical" margin={{ top: 8, right: 16, left: 8, bottom: 8 }}>
+                  <BarChart data={adUnitMixSeries} layout="vertical" margin={hBarMargins}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                     <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={isNarrow ? 86 : 110} tick={{ fontSize: 11 }} axisLine={false}
-                      tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)} />
+                    <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
                     <Tooltip formatter={(value, name) => (
                       name === 'Revenue' ? [money(value, currency), name] : [num(value), name]
                     )} />

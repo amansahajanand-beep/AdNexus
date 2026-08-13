@@ -18,7 +18,9 @@ const { parseGamMetricValue, gamMoneyToDollars, pickRowRevenueDollars } = requir
 const crypto  = require('crypto');
 const { query } = require('../db');
 const { requireClientId, tenantKey } = require('../utils/clientContext');
-const { redisDel, redisDelByPattern, TTL, redisGet, redisSet } = require('../redisClient');
+const {
+  redisDel, redisDelByPattern, bumpCacheGeneration, TTL, redisGet, redisSet, MAX_REDIS_ARRAY_ITEMS,
+} = require('../redisClient');
 const { todayInTZ } = require('../utils/datetime');
 const { normalizeReportRows, rowsHaveMetrics } = require('../utils/rowNormalize');
 const {
@@ -707,6 +709,10 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
     }
 
     const { revenueExpr } = leanRevenueSqlFragments();
+    const maxRows = Math.max(
+      1000,
+      parseInt(process.env.MAX_LEAN_GRAIN_ROWS || '25000', 10) || 25000
+    );
     const { rows } = await query(
       `SELECT
          to_char(report_date, 'YYYY-MM-DD') AS report_date,
@@ -731,7 +737,9 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
          currency
        FROM ${table}
        WHERE report_date BETWEEN $1 AND $2
-       ${extra}`,
+       ${extra}
+       ORDER BY report_date DESC
+       LIMIT ${maxRows}`,
       params
     );
     return rows;
@@ -1952,12 +1960,16 @@ async function syncDateRangeFromGAM(startDate, endDate, syncType = 'sync-backfil
       } else {
         total += await replaceHistoricalRows(normalized, `${syncType}:${day}`);
       }
-      await invalidateCacheForDate(day);
+      // Multi-day: defer invalidation to once at end (avoids N× SCAN/INCR storms).
+      if (days.length === 1) await invalidateCacheForDate(day);
       logger.info(`[${syncType}] day ${day} → ${day === today ? 'report_present' : 'report_daily'} (${normalized.length} rows)`);
     } catch (e) {
       logger.error(`[${syncType}] day ${day} failed:`, e.message);
       throw e;
     }
+  }
+  if (days.length > 1) {
+    await invalidateCacheForDate(endDate);
   }
   return total;
 }
@@ -1975,25 +1987,24 @@ async function invalidateCacheForDate(date) {
   if (date === todayInTZ()) exact.push(tenantKey('overview:today'));
   await redisDel(...exact);
 
+  // Date-scoped patterns only — never SCAN global report_*_resp_v*_ (burned Upstash 500k cmds).
   const patterns = [
     tenantKey(`report:rows:${date}:*`),
     tenantKey(`report:rows:*:${date}`),
     tenantKey(`report_dashboard_raw_${date}_*`),
     tenantKey(`report_dashboard_raw_v2_${date}_*`),
-    tenantKey(`report_dashboard_resp_v2_*`),
-    tenantKey(`report_dashboard_resp_v3_*`),
     tenantKey(`report_dashboard_full_${date}_*`),
     tenantKey(`report_detailed_raw_${date}_*`),
-    tenantKey(`report_detailed_resp_v3_*`),
     tenantKey(`report_domain_user_${date}_*`),
     tenantKey(`report_programmatic_${date}_*`),
-    tenantKey(`report_overview_v2_*`),
   ];
   let scanned = 0;
   for (const pattern of patterns) {
-    scanned += await redisDelByPattern(pattern);
+    scanned += await redisDelByPattern(pattern, { maxRounds: 4 });
   }
-  logger.info(`Cache invalidated for ${date}: exact=${exact.length} scanned=${scanned}`);
+  // Response caches embed cache:gen — bumping invalidates without SCAN.
+  const gen = await bumpCacheGeneration(tenantKey(''));
+  logger.info(`Cache invalidated for ${date}: exact=${exact.length} scanned=${scanned} gen=${gen}`);
 }
 
 async function logSync(syncType, status, rowsUpserted = 0, errorMsg = null) {
@@ -2032,7 +2043,10 @@ async function getReportRange(startDate, endDate, userId = null) {
         normalizedRows = normalizeReportRows(rows);
       }
       if (normalizedRows && normalizedRows.length && rowsHaveLeanMetrics(normalizedRows)) {
-        try { await redisSet(cacheKey, normalizedRows, TTL.REPORT); } catch (e) { logger.warn('redisSet failed in getReportRange:', e.message); }
+        // Never cache huge grain arrays in Redis (heap + command burn).
+        if (normalizedRows.length <= MAX_REDIS_ARRAY_ITEMS) {
+          try { await redisSet(cacheKey, normalizedRows, TTL.REPORT); } catch (e) { logger.warn('redisSet failed in getReportRange:', e.message); }
+        }
         return { rows: normalizedRows, source: 'db' };
       }
     }
@@ -2066,7 +2080,9 @@ async function getReportRange(startDate, endDate, userId = null) {
       logger.warn('Failed to persist GAM rows to Postgres:', e.message);
     }
 
-    try { await redisSet(cacheKey, normalizedRows, TTL.REPORT); } catch (e) { logger.warn('redisSet failed in getReportRange after GAM fetch:', e.message); }
+    if (normalizedRows.length <= MAX_REDIS_ARRAY_ITEMS) {
+      try { await redisSet(cacheKey, normalizedRows, TTL.REPORT); } catch (e) { logger.warn('redisSet failed in getReportRange after GAM fetch:', e.message); }
+    }
     return { rows: normalizedRows, source: 'gam' };
   } catch (e) {
     logger.error('GAM fallback failed in getReportRange:', e.message);
@@ -2281,9 +2297,9 @@ function buildFullSyncReportXML(dimensions, metrics, buildDateXML, startDate, en
 
 /**
  * Fetch Reporting-builder fields from GAM using compatible dim slices × metric batches.
- * Returns normalized rows tagged with slice_key / dim_keys / metric_keys.
+ * Streams each slice via onSlice when provided so Node never holds all slices in heap.
  */
-async function fetchFullFromGAM(startDate, endDate) {
+async function fetchFullFromGAM(startDate, endDate, { onSlice } = {}) {
   const helpers = require('../routes/reports').__gamHelpers;
   if (!helpers) throw new Error('GAM helpers unavailable');
   const { getToken, runReportAndDownload, buildDateXML } = helpers;
@@ -2292,6 +2308,7 @@ async function fetchFullFromGAM(startDate, endDate) {
   const out = [];
   let okSlices = 0;
   let failSlices = 0;
+  let totalRows = 0;
 
   async function tryPull(dims, metrics, label) {
     const attempts = [
@@ -2350,19 +2367,27 @@ async function fetchFullFromGAM(startDate, endDate) {
         dim_keys: usedDims,
         metric_keys: got.metrics,
       }));
-      for (let i = 0; i < normalized.length; i += 1) out.push(normalized[i]);
+      // Drop raw ASAP — keep only normalized for upsert.
+      got.raw.length = 0;
+      totalRows += normalized.length;
       okSlices += 1;
       logger.info(
         `[full-sync] ${sliceKey} OK rows=${normalized.length} dims=${usedDims.length} metrics=${got.metrics.length}`
       );
+      if (typeof onSlice === 'function') {
+        await onSlice(normalized);
+      } else {
+        for (let i = 0; i < normalized.length; i += 1) out.push(normalized[i]);
+      }
     }
   }
 
   logger.info(
-    `[full-sync] range ${startDate}..${endDate} → ${out.length} rows`
+    `[full-sync] range ${startDate}..${endDate} → ${totalRows} rows`
     + ` (${okSlices} slices ok, ${failSlices} failed/empty)`
+    + (typeof onSlice === 'function' ? ' [streamed]' : '')
   );
-  return out;
+  return typeof onSlice === 'function' ? [] : out;
 }
 
 async function insertFullRowsInto(table, rows, syncType) {
@@ -2579,15 +2604,35 @@ async function syncFullDateRangeFromGAM(startDate, endDate, syncType = 'sync-ful
   let total = 0;
   for (const day of days) {
     try {
-      const rows = await fetchFullFromGAM(day, day);
+      // Stream slice → upsert → discard (never hold 7×3 CSVs in heap at once).
       if (day === today) {
-        total += await replaceFullPresentRows(rows, `${syncType}:${day}`);
+        try {
+          await migrateStaleFullPresentToDaily(`${syncType}:${day}`);
+        } catch (e) {
+          logger.warn(`[${syncType}] stale full-present migrate skipped:`, e.message);
+        }
+        await query('DELETE FROM report_full_present WHERE client_id = $1::uuid', [requireClientId()]);
+        await fetchFullFromGAM(day, day, {
+          onSlice: async (sliceRows) => {
+            const todayRows = (sliceRows || []).filter((r) => toYmd(r.report_date) === today);
+            if (!todayRows.length) return;
+            total += await insertFullRowsInto('report_full_present', todayRows, `${syncType}:${day}`);
+          },
+        });
+        logger.info(`[${syncType}] full day ${day} → report_full_present (streamed, total≈${total})`);
       } else {
-        total += await replaceFullHistoricalRows(rows, `${syncType}:${day}`);
+        await query(
+          `DELETE FROM report_full_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
+          [day, requireClientId()]
+        );
+        await fetchFullFromGAM(day, day, {
+          onSlice: async (sliceRows) => {
+            if (!sliceRows?.length) return;
+            total += await insertFullRowsInto('report_full_daily', sliceRows, `${syncType}:${day}`);
+          },
+        });
+        logger.info(`[${syncType}] full day ${day} → report_full_daily (streamed, total≈${total})`);
       }
-      logger.info(
-        `[${syncType}] full day ${day} → ${day === today ? 'report_full_present' : 'report_full_daily'} (${rows.length} rows)`
-      );
     } catch (e) {
       logger.error(`[${syncType}] full day ${day} failed:`, e.message);
       // Don't fail the whole lean sync — full is best-effort enrichment.

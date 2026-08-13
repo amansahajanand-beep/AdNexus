@@ -504,6 +504,11 @@ export default function Reporting() {
   }, []);
 
   const loadCatalog = useCallback(async (force = false) => {
+    // Domain users: granted domain/site/app lists are already on the session user.
+    if (filterVisibility.isScopedUser) {
+      setCatalogLoading(false);
+      return;
+    }
     if (!force && catalog.length) return;
     setCatalogLoading(true);
     try {
@@ -513,10 +518,14 @@ export default function Reporting() {
       logErrorForDebug(err, 'Reporting filter catalog');
       setError(getUserFacingMessage(err, 'Could not load filter options. Please refresh the page.'));
     } finally { setCatalogLoading(false); }
-  }, [catalog.length, applyCatalogResponse]);
+  }, [catalog.length, applyCatalogResponse, filterVisibility.isScopedUser]);
 
   useEffect(() => {
     if (!canGenerate) return;
+    if (filterVisibility.isScopedUser) {
+      setCatalogLoading(false);
+      return undefined;
+    }
     let cancelled = false;
     setCatalogLoading(true);
     reportsAPI.getFilterCatalog()
@@ -529,7 +538,7 @@ export default function Reporting() {
       })
       .finally(() => { if (!cancelled) setCatalogLoading(false); });
     return () => { cancelled = true; };
-  }, [applyCatalogResponse, canGenerate]);
+  }, [applyCatalogResponse, canGenerate, filterVisibility.isScopedUser]);
 
   // Selections keyed by filter field; drives bidirectional cascading so picking
   // any filter instantly narrows the other three (no Generate needed).
@@ -558,6 +567,7 @@ export default function Reporting() {
     }),
     [catalog, selections, catalogLists, domain, inventoryScope, filterVisibility.isScopedUser]
   );
+  const catalogBusy = !filterVisibility.isScopedUser && catalogLoading;
 
   const showNoDomainsNote = !isAdmin(user) && (!inventoryAssigned || noDomainsAssigned);
 
@@ -1157,7 +1167,7 @@ export default function Reporting() {
                 {filterVisibility.isScopedUser
                   ? 'Pick from your assigned list'
                   : 'Country, domain, site, ad unit & app filters'}
-                {catalogLoading ? ' · Loading options…' : ''}
+                {catalogBusy ? ' · Loading options…' : ''}
               </span>
             </div>
             <div className="filter-grid">
@@ -1179,28 +1189,28 @@ export default function Reporting() {
               <div className="filter-field">
                 <label>Domain name</label>
                 <MultiSelect options={domainRootOptions} value={domain} onChange={handleDomainChange}
-                  placeholder="Select domain names" disabled={!canFilter} loading={catalogLoading} />
+                  placeholder="Select domain names" disabled={!canFilter} loading={catalogBusy} />
               </div>
               )}
               {filterVisibility.showSite && (
               <div className="filter-field">
                 <label>Site (URL)</label>
                 <MultiSelect options={siteOptions} value={site} onChange={handleSiteChange}
-                  placeholder="Select sites" disabled={!canFilter} loading={catalogLoading} />
+                  placeholder="Select sites" disabled={!canFilter} loading={catalogBusy} />
               </div>
               )}
               {filterVisibility.showAdUnit && (
               <div className="filter-field">
                 <label>Ad Unit</label>
                 <MultiSelect options={adUnitOptions} value={domainName} onChange={handleAdUnitChange}
-                  placeholder="Select Ad Units" disabled={!canFilter} loading={catalogLoading} />
+                  placeholder="Select Ad Units" disabled={!canFilter} loading={catalogBusy} />
               </div>
               )}
               {filterVisibility.showApp && (
               <div className="filter-field">
                 <label>App ID</label>
                 <MultiSelect options={appOptions} value={domainId} onChange={handleAppChange}
-                  placeholder="Select app IDs" disabled={!canFilter} loading={catalogLoading} />
+                  placeholder="Select app IDs" disabled={!canFilter} loading={catalogBusy} />
               </div>
               )}
             </div>

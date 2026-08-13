@@ -1,9 +1,7 @@
 import React, { useMemo } from 'react';
 import {
-  ResponsiveContainer,
   AreaChart,
   Area,
-  Line,
   BarChart,
   Bar,
   RadarChart,
@@ -16,6 +14,7 @@ import {
   CartesianGrid,
   Tooltip,
   Cell,
+  ResponsiveContainer,
 } from 'recharts';
 import { suggestReportCharts } from '../../utils/reportChartSuggest';
 import { inferMetricFormat } from '../../utils/reportMetrics';
@@ -26,7 +25,11 @@ import {
   dateAxisProps,
   chartMargins,
   truncateAxisLabel,
+  scrollableChartMinWidth,
+  categoryAxisWidth,
+  categoryLabelMaxChars,
 } from '../../utils/chartAxis';
+import ScrollableChart from './ScrollableChart';
 
 const SHARE_COLORS = ['#1a73e8', '#34a853', '#f29900', '#ea4335', '#8e24aa', '#00acc1'];
 
@@ -66,6 +69,10 @@ function normalizeRadarData(data = []) {
   }));
 }
 
+function safeGradId(metricId) {
+  return `reportAreaGrad-${String(metricId || 'm').replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+}
+
 function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
   const format = chart.format || inferMetricFormat(chart.metricId);
   const metName = metricLabel(chart.metricId);
@@ -80,23 +87,30 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
   const values = chart.data.map((d) => Number(d.value) || 0);
   const yWidth = yAxisWidthForValues(values, format, { isNarrow });
   const n = chart.data.length;
-  const xDate = isDateSeries ? dateAxisProps(n, { isNarrow }) : null;
+  const dateKeys = isDateSeries
+    ? chart.data.map((d) => d.date || d.name).filter(Boolean)
+    : [];
+  const scrollable = isDateSeries && Boolean(scrollableChartMinWidth(n, { isNarrow }));
+  const xDate = isDateSeries
+    ? dateAxisProps(n, { isNarrow, dates: dateKeys, scrollable })
+    : null;
   const margins = chartMargins({
     isNarrow,
     hasAngledX: Boolean(xDate?.angle) || (!isDateSeries && n > 6),
     yWidth,
   });
+  const chartHeight = height + (xDate?.angle ? (isNarrow ? 40 : 28) : 0);
+  const gradId = safeGradId(chart.metricId);
 
   let body = null;
   if (chart.type === 'area') {
-    const chartH = height + (xDate?.angle ? 28 : 0);
     body = (
-      <ResponsiveContainer width="100%" height={chartH}>
+      <ScrollableChart pointCount={isDateSeries ? n : 0} isNarrow={isNarrow} height={chartHeight}>
         <AreaChart data={chart.data} margin={margins}>
           <defs>
-            <linearGradient id={`reportAreaGrad-${chart.metricId}-${chart.title}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.25} />
-              <stop offset="95%" stopColor="#1a73e8" stopOpacity={0} />
+            <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor="#1a73e8" stopOpacity={0.28} />
+              <stop offset="95%" stopColor="#1a73e8" stopOpacity={0.04} />
             </linearGradient>
           </defs>
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
@@ -105,7 +119,7 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
             {...(xDate || { tick: { fontSize: 11 }, tickLine: false, axisLine: false })}
           />
           <YAxis
-            tick={{ fontSize: isNarrow ? 10 : 11 }}
+            tick={{ fontSize: isNarrow ? 10 : 11, fill: '#5f6368' }}
             tickLine={false}
             axisLine={false}
             tickFormatter={(v) => formatAxisMetric(v, format, currency)}
@@ -121,13 +135,14 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
             dataKey="value"
             stroke="#1a73e8"
             strokeWidth={2}
-            fill={`url(#reportAreaGrad-${chart.metricId}-${chart.title})`}
+            fill={`url(#${gradId})`}
+            fillOpacity={1}
             dot={n <= 31}
             activeDot={{ r: 4 }}
+            isAnimationActive={false}
           />
-          <Line type="monotone" dataKey="value" stroke="#1a73e8" strokeWidth={2} dot={false} />
         </AreaChart>
-      </ResponsiveContainer>
+      </ScrollableChart>
     );
   } else if (chart.type === 'radar') {
     const radarData = normalizeRadarData(chart.data);
@@ -160,9 +175,9 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
       hasAngledX: Boolean(xDate?.angle) || angledCats,
       yWidth,
     });
-    const chartH = height + ((xDate?.angle || angledCats) ? 32 : 0);
+    const chartH = height + ((xDate?.angle || angledCats) ? (isNarrow ? 40 : 32) : 0);
     body = (
-      <ResponsiveContainer width="100%" height={chartH}>
+      <ScrollableChart pointCount={isDateSeries ? n : 0} isNarrow={isNarrow} height={chartH}>
         <BarChart
           data={chart.data}
           margin={colMargins}
@@ -171,12 +186,12 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
         >
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
           <XAxis
-            dataKey="name"
+            dataKey={isDateSeries ? 'date' : 'name'}
             {...(xDate || {
               tick: { fontSize: isNarrow ? 9 : 11 },
               axisLine: false,
               tickLine: false,
-              interval: n > 10 ? Math.ceil(n / (isNarrow ? 5 : 8)) - 1 : 0,
+              interval: n > 10 ? Math.ceil(n / (isNarrow ? 4 : 7)) - 1 : 0,
               angle: angledCats ? -35 : 0,
               textAnchor: angledCats ? 'end' : 'middle',
               height: angledCats ? 56 : 30,
@@ -184,7 +199,7 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
             })}
           />
           <YAxis
-            tick={{ fontSize: 11 }}
+            tick={{ fontSize: 11, fill: '#5f6368' }}
             axisLine={false}
             tickLine={false}
             tickFormatter={(v) => formatAxisMetric(v, format, currency)}
@@ -199,21 +214,22 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
           />
           <Bar dataKey="value" radius={[6, 6, 0, 0]} maxBarSize={isNarrow ? 28 : 48}>
             {chart.data.map((entry, idx) => (
-              <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
+              <Cell key={`${entry.name || entry.date}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
             ))}
           </Bar>
         </BarChart>
-      </ResponsiveContainer>
+      </ScrollableChart>
     );
   } else {
     // Default: horizontal bar
-    const labelW = isNarrow ? 78 : 110;
+    const labelW = categoryAxisWidth({ isNarrow });
+    const labelMax = categoryLabelMaxChars({ isNarrow });
     body = (
       <ResponsiveContainer width="100%" height={height}>
         <BarChart
           data={chart.data}
           layout="vertical"
-          margin={{ top: 8, right: 12, left: 4, bottom: 8 }}
+          margin={{ top: 8, right: 12, left: isNarrow ? 4 : 8, bottom: 8 }}
         >
           <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
           <XAxis
@@ -226,10 +242,10 @@ function ChartCard({ chart, currency, rangeLabel, isNarrow }) {
             type="category"
             dataKey="name"
             width={labelW}
-            tick={{ fontSize: 11 }}
+            tick={{ fontSize: isNarrow ? 10 : 11 }}
             axisLine={false}
             tickLine={false}
-            tickFormatter={(v) => truncateAxisLabel(v, isNarrow ? 10 : 16)}
+            tickFormatter={(v) => truncateAxisLabel(v, labelMax)}
           />
           <Tooltip
             formatter={(v, _n, item) => [

@@ -215,10 +215,12 @@ function startWorker() {
 
   const worker = new Worker('gam-sync', processJob, {
     connection: createBullmqConnection('BullMQ gam-sync worker'),
-    concurrency: 2,
-    // Past-window backfill can take many minutes — keep the lock alive.
-    lockDuration: 30 * 60 * 1000,
-    stalledInterval: 60 * 1000,
+    // Never overlap lean + full multi-slice sync in the same process (OOM risk).
+    concurrency: 1,
+    lockDuration: 45 * 60 * 1000,
+    // Less frequent stall checks → fewer Upstash commands.
+    stalledInterval: 5 * 60 * 1000,
+    maxStalledCount: 1,
   });
 
   worker.on('completed', (job) => {
@@ -235,14 +237,14 @@ function startWorker() {
   });
 
   worker.on('error', (err) => {
-    if (isTransientRedisError(err)) {
-      logger.warn(`[gam-sync] Worker Redis reconnect: ${err.message}`);
+    if (isTransientRedisError(err) || /max requests limit exceeded/i.test(err.message || '')) {
+      logger.warn(`[gam-sync] Worker Redis issue: ${err.message}`);
       return;
     }
     logger.error('[gam-sync] Worker error:', err.message);
   });
 
-  logger.info('BullMQ gam-sync worker started (concurrency=2, lean today can run beside full-sync)');
+  logger.info('BullMQ gam-sync worker started (concurrency=1, stalledInterval=5m)');
   return worker;
 }
 
@@ -269,13 +271,15 @@ function startReportWorker() {
     connection: createBullmqConnection('BullMQ gam-report worker'),
     concurrency: 1,
     lockDuration: 15 * 60 * 1000,
+    stalledInterval: 5 * 60 * 1000,
+    maxStalledCount: 1,
   });
 
   reportWorker.on('completed', (job) => logger.info(`[gam-report] Job ${job.id} completed`));
   reportWorker.on('failed', (job, err) => logger.error(`[gam-report] Job ${job.id} failed: ${err.message}`));
   reportWorker.on('error', (err) => {
-    if (isTransientRedisError(err)) {
-      logger.warn(`[gam-report] Worker Redis reconnect: ${err.message}`);
+    if (isTransientRedisError(err) || /max requests limit exceeded/i.test(err.message || '')) {
+      logger.warn(`[gam-report] Worker Redis issue: ${err.message}`);
       return;
     }
     logger.error('[gam-report] Worker error:', err.message);
@@ -376,14 +380,7 @@ async function processReportJob(job) {
     logger.info(`[gam-report] Processing user-report ${startDate} → ${endDate} id=${job.id}`);
     try {
       const count = await syncDateRangeFromGAM(startDate, endDate, job.name || 'user-report');
-      const cacheKey = `report:rows:${startDate}:${endDate}`;
-      try {
-        const { fetchFromDB } = require('../services/gamSyncService');
-        const rows = await fetchFromDB(startDate, endDate);
-        await redisSet(cacheKey, rows, TTL.REPORT);
-      } catch (e) {
-        logger.warn('redisSet failed for user-report cache:', e.message);
-      }
+      // Do not reload+cache full grain into Redis after sync (OOM + quota).
       logger.info(`[gam-report] user-report job completed (${count} rows written)`);
     } catch (e) {
       logger.error('[gam-report] user-report failed:', e.message);
