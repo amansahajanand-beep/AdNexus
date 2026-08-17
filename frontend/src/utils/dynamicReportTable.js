@@ -29,17 +29,24 @@ export const DASHBOARD_DEFAULT_METRICS = [
   'total_active_view_viewable_impressions_rate',
 ];
 
-/** Dashboard table — only columns matching applied inventory filters (+ date & KPI metrics). */
+/** Dashboard table — date + inventory columns from applied filters (defaults when none). */
 export function resolveDashboardTableConfig(applied = {}, filterApplied = false) {
-  if (!filterApplied) {
-    return { dimensions: [], metrics: [] };
-  }
   const dimensions = ['date'];
+  if (!filterApplied) {
+    return {
+      dimensions: ['date', 'domain', 'site_name'],
+      metrics: [...DASHBOARD_DEFAULT_METRICS],
+    };
+  }
   if (applied.domain?.length) dimensions.push('domain');
   if (applied.site?.length) dimensions.push('site_name');
   // Ad unit column only when user explicitly filters ad units (matches GAM Site vs Ad unit reports).
   if (applied.domainName?.length) dimensions.push('ad_unit_name');
   if (applied.domainId?.length) dimensions.push('mobile_app_resolved_id');
+  // When filter applied but only dates (no inventory dims), keep a readable default grain.
+  if (dimensions.length === 1) {
+    dimensions.push('domain', 'site_name');
+  }
   return {
     dimensions,
     metrics: [...DASHBOARD_DEFAULT_METRICS],

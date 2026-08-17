@@ -9,7 +9,7 @@ export default function GamReportControlBar({
 
   return (
     <div className="gcb-no-report-banner" role="status">
-      <span className="gcb-icon" aria-hidden>📊</span>
+      <span className="gcb-icon" aria-hidden>○</span>
       <div className="gcb-body">
         <span className="gcb-title">Select a report to run</span>
         <span className="gcb-hint">
@@ -18,7 +18,7 @@ export default function GamReportControlBar({
       </div>
       {onOpenBuilder && (
         <button type="button" className="gcb-btn" onClick={onOpenBuilder}>
-          Open Report Builder ↓
+          Open Report Builder
         </button>
       )}
     </div>

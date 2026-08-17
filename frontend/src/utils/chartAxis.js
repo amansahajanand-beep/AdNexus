@@ -127,17 +127,15 @@ export function categoryLabelMaxChars({ isNarrow = false } = {}) {
 }
 
 /**
- * When a date series is long, expand chart width so points stay readable and
- * the user can scroll horizontally (6mo / 1yr ranges).
- * Returns null when the series fits the card without scrolling.
+ * Ideal inner width for a date series. Returns null when the chart should
+ * simply fill the card (desktop, or a short phone series).
+ * On phones, 7d / 30d / 90d expand past the viewport so the user can swipe.
  */
 export function scrollableChartMinWidth(pointCount, { isNarrow = false } = {}) {
   const n = Math.max(0, Number(pointCount) || 0);
-  const startScrollAt = isNarrow ? 21 : 31;
-  if (n <= startScrollAt) return null;
-  const pxPerPoint = isNarrow ? 30 : 26;
-  const floor = isNarrow ? 560 : 720;
-  return Math.max(floor, Math.round(n * pxPerPoint));
+  if (!isNarrow) return null;
+  if (n <= 6) return null;
+  return Math.max(640, Math.round(n * 44));
 }
 
 /**

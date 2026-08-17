@@ -4,6 +4,7 @@ const { cache } = require('../gamClient');
 const logger = require('../utils/logger');
 const { requireAuth } = require('../middleware/auth');
 const { getVersionStatus } = require('../utils/gamVersion');
+const { classifyGoogleAuthError } = require('../utils/googleAuthErrors');
 
 const { isMockClient, getClient, tenantKey } = require('../utils/clientContext');
 
@@ -25,7 +26,7 @@ router.get('/info', async (req, res) => {
   }
 
   const cached = cache.get(tenantKey('network_info'));
-  if (cached) return res.json({ ...cached, gamVersion });
+  if (cached) return res.json({ ...cached, isMock: false, gamVersion });
 
   try {
     const { getGAMClient } = require('../gamClient');
@@ -59,13 +60,18 @@ router.get('/info', async (req, res) => {
       networkCode: extract('networkCode'),
       displayName: extract('displayName'),
       currencyCode: extract('currencyCode'),
-      timeZone: extract('timeZone')
+      timeZone: extract('timeZone'),
+      isMock: false,
     };
     cache.set(tenantKey('network_info'), info, 3600);
     res.json({ ...info, gamVersion });
   } catch (err) {
     logger.error('Network info error:', err.message);
-    res.status(500).json({ error: err.message });
+    const classified = classifyGoogleAuthError(err);
+    if (classified) {
+      return res.status(classified.status).json({ ...classified, gamVersion });
+    }
+    res.status(500).json({ error: err.message, isMock: false, gamVersion });
   }
 });
 

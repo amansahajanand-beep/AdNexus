@@ -11,7 +11,7 @@ export default function AccessRestricted({
   return (
     <div className="no-access-wrap">
       <div className="no-access-card">
-        <div className="no-access-icon">🔒</div>
+        <div className="no-access-icon" aria-hidden>!</div>
         <h2 className="no-access-title">{title}</h2>
         <p className="no-access-msg">{message}</p>
       </div>

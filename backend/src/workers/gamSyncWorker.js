@@ -34,7 +34,8 @@ const { runWithClient } = require('../utils/clientContext');
 const { getClientById, ensureBootstrapFromEnv } = require('../models/clientStore');
 
 function getGAMHelpers() {
-  return require('../routes/reports').__gamHelpers;
+  const { getHelpers, helpersReady } = require('../services/gamHelpers');
+  return helpersReady() ? getHelpers() : null;
 }
 
 function buildTargetDates(jobData = {}) {

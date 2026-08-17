@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
-import { useOutletContext } from 'react-router-dom';
+import { useOutletContext, useSearchParams } from 'react-router-dom';
 import { reportsAPI } from '../utils/api';
 import { nowTimeInTZ } from '../utils/datetime';
 import {
@@ -23,6 +23,7 @@ import ReportBuilderFilters, {
   DEFAULT_REPORT_METRICS,
 } from './ui/ReportBuilderFilters';
 import ReportSettingsFilters, { DEFAULT_REPORT_SETTINGS } from './ui/ReportSettingsFilters';
+import PageHeader from './ui/PageHeader';
 import {
   dimensionsToChips,
   metricsToChips,
@@ -42,11 +43,14 @@ import GamReportControlBar from './ui/GamReportControlBar';
 import {
   resolveReportTableConfig,
   buildReportColumns,
-  formatCellValue,
   hasActiveReport,
 } from '../utils/dynamicReportTable';
 import { enrichReportRows, sortRowsByCompleteness } from '../utils/enrichReportRows';
 import { resolveReportingQuery } from '../utils/reportSelection';
+import { rowMatchesChartDimension } from '../utils/reportChartSuggest';
+import { useReportHotkeys } from '../hooks/useReportHotkeys';
+import { showToast } from '../hooks/useToast';
+import { encodeReportShare, parseReportShare, copyReportLink } from '../utils/reportShare';
 import { usePermissions } from '../hooks/usePermissions';
 import { NO_VIEW_REPORTS_MSG, NO_VIEW_REPORTS_TITLE, getAssignedInventoryScope, hasAssignedInventory, isAdmin } from '../utils/permissions';
 import {
@@ -61,10 +65,43 @@ import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError
 import NoDomainsAssignedNote from './ui/NoDomainsAssignedNote';
 import { getRecentFilters, saveRecentFilter, applyRecentFilter, clearRecentFilters, RECENT_FILTERS_CLEARED_EVENT } from '../utils/recentFilters';
 import SavedFiltersBar from './ui/SavedFiltersBar';
-import { SAVED_FILTERS_PAGES } from '../utils/savedFilters';
+import { SAVED_FILTERS_PAGES, getSavedFilters } from '../utils/savedFilters';
+import { downloadCsv, downloadExcel, exportCellValue } from '../utils/tableExport';
 
 const PAGE_SIZE = 50;
 const POLL_MS = 30 * 60 * 1000; // matches backend 30-min cache TTL
+
+const MET_REVENUE = 'total_line_item_level_cpm_and_cpc_revenue';
+const MET_IMPRESSIONS = 'total_line_item_level_impressions';
+const MET_CTR = 'total_line_item_level_ctr';
+const MET_CLICKS = 'total_line_item_level_clicks';
+const MET_FILL = 'total_fill_rate';
+
+/** One-click report presets (dims/metrics + optional date preset). */
+const QUICK_VIEWS = [
+  { id: 'today', label: 'Today', preset: 'today' },
+  {
+    id: 'rev-domain',
+    label: 'Revenue by domain',
+    preset: 'last7',
+    dims: ['date', 'domain'],
+    mets: [MET_REVENUE, MET_IMPRESSIONS],
+  },
+  {
+    id: 'fill',
+    label: 'Fill rate',
+    preset: 'last7',
+    dims: ['date'],
+    mets: [MET_FILL, MET_IMPRESSIONS],
+  },
+  {
+    id: 'ctr',
+    label: 'CTR trend',
+    preset: 'last7',
+    dims: ['date'],
+    mets: [MET_CTR, MET_CLICKS, MET_IMPRESSIONS],
+  },
+];
 
 function normalizeCountry(v) {
   if (v == null || v === '') return [];
@@ -93,6 +130,9 @@ export default function Reporting() {
   const filterVisibility = getAssignedFilterVisibility(user);
   const saved = useSelector((s) => s.reports?.reporting);
   const { networkInfo } = useOutletContext();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const shareHydratedRef = useRef(false);
+  const undoSnapRef = useRef(null);
   const dateRestriction = useMemo(() => getDateRestriction(user), [user]);
   const dateFilterLocked = Boolean(isFixedDateRestriction(dateRestriction));
   const todayInit = useMemo(() => defaultReportRangeForUser(user), [user]);
@@ -193,6 +233,15 @@ export default function Reporting() {
   const [error, setError] = useState(null);
   const [page, setPage] = useState(() => saved?.page ?? 1);
   const [search, setSearch] = useState(() => saved?.search ?? '');
+  const [segmentFilter, setSegmentFilter] = useState(null);
+  const [activeQuickView, setActiveQuickView] = useState(null);
+  const [tableDensity, setTableDensity] = useState(() => {
+    try {
+      return localStorage.getItem('adnexus.tableDensity:reporting') === 'compact' ? 'compact' : 'comfortable';
+    } catch {
+      return 'comfortable';
+    }
+  });
   const [lastUpdated, setLastUpdated] = useState(() => saved?.lastUpdated ?? null);
   const [fetchedAt, setFetchedAt] = useState(() => saved?.fetchedAt ?? null);
   const [progData, setProgData] = useState(() => (cacheFresh ? saved?.progData : null) ?? null);
@@ -206,10 +255,91 @@ export default function Reporting() {
   }, [user?.id]);
 
   useEffect(() => {
+    try {
+      localStorage.setItem('adnexus.tableDensity:reporting', tableDensity);
+    } catch {
+      /* ignore */
+    }
+  }, [tableDensity]);
+
+  useEffect(() => {
     const onCleared = () => setRecentFilters([]);
     window.addEventListener(RECENT_FILTERS_CLEARED_EVENT, onCleared);
     return () => window.removeEventListener(RECENT_FILTERS_CLEARED_EVENT, onCleared);
   }, []);
+
+  useEffect(() => {
+    if (shareHydratedRef.current) return;
+    shareHydratedRef.current = true;
+    const viewId = searchParams.get('view');
+    if (viewId) {
+      const found = getSavedFilters(SAVED_FILTERS_PAGES.reporting, user?.id).find((f) => f.id === viewId);
+      if (found?.snapshot) {
+        const snap = found.snapshot;
+        if (snap.domain) setDomain(snap.domain);
+        if (snap.site) setSite(snap.site);
+        if (snap.domainName) setDomainName(snap.domainName);
+        if (snap.domainId) setDomainId(snap.domainId);
+        if (snap.country) setCountry(snap.country);
+        if (snap.reportDimensions) setReportDimensions(snap.reportDimensions);
+        if (snap.reportMetrics) setReportMetrics(snap.reportMetrics);
+        if (snap.reportSettings) setReportSettings(snap.reportSettings);
+      }
+    }
+    const shared = parseReportShare(searchParams);
+    if (!shared) return;
+    if (shared.preset && shared.preset !== 'custom') {
+      const r = clampPresetRange(shared.preset, dateRestriction);
+      setPreset(shared.preset);
+      setStartDate(r.startDate);
+      setEndDate(r.endDate);
+      if (shared.reportDimensions?.length) setReportDimensions(shared.reportDimensions);
+      if (shared.reportMetrics?.length) setReportMetrics(shared.reportMetrics);
+      if (shared.domain?.length) setDomain(shared.domain);
+      if (shared.site?.length) setSite(shared.site);
+      if (shared.domainName?.length) setDomainName(shared.domainName);
+      if (shared.domainId?.length) setDomainId(shared.domainId);
+      if (shared.country?.length) setCountry(shared.country);
+      setHasApplied(true);
+      setApplied((prev) => ({
+        ...prev,
+        ...r,
+        domain: shared.domain?.length ? shared.domain : prev.domain,
+        site: shared.site?.length ? shared.site : prev.site,
+        domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
+        domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
+        country: shared.country?.length ? shared.country : prev.country,
+        reportDimensions: shared.reportDimensions?.length ? shared.reportDimensions : prev.reportDimensions,
+        reportMetrics: shared.reportMetrics?.length ? shared.reportMetrics : prev.reportMetrics,
+      }));
+      return;
+    }
+    if (shared.startDate && shared.endDate) {
+      const r = clampDateRange(shared.startDate, shared.endDate, dateRestriction);
+      setPreset(shared.preset || 'custom');
+      setStartDate(r.startDate);
+      setEndDate(r.endDate);
+      if (shared.reportDimensions?.length) setReportDimensions(shared.reportDimensions);
+      if (shared.reportMetrics?.length) setReportMetrics(shared.reportMetrics);
+      if (shared.domain?.length) setDomain(shared.domain);
+      if (shared.site?.length) setSite(shared.site);
+      if (shared.domainName?.length) setDomainName(shared.domainName);
+      if (shared.domainId?.length) setDomainId(shared.domainId);
+      if (shared.country?.length) setCountry(shared.country);
+      setHasApplied(true);
+      setApplied((prev) => ({
+        ...prev,
+        ...r,
+        domain: shared.domain?.length ? shared.domain : prev.domain,
+        site: shared.site?.length ? shared.site : prev.site,
+        domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
+        domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
+        country: shared.country?.length ? shared.country : prev.country,
+        reportDimensions: shared.reportDimensions?.length ? shared.reportDimensions : prev.reportDimensions,
+        reportMetrics: shared.reportMetrics?.length ? shared.reportMetrics : prev.reportMetrics,
+      }));
+    }
+  }, [searchParams, user?.id, dateRestriction]);
 
   useEffect(() => {
     if (!dateRestriction) return;
@@ -692,6 +822,8 @@ export default function Reporting() {
     setData(null);
     setProgData(null);
     setHasApplied(true);
+    setActiveQuickView(null);
+    setSegmentFilter(null);
     // Keep Select-All sentinel in UI; API path normalizes to [].
     setApplied({
       ...dates,
@@ -708,7 +840,75 @@ export default function Reporting() {
     setFiltersOpen(false);
     setChipsExpanded(true);
     loadCatalog(true);
+    const qs = encodeReportShare({
+      preset,
+      startDate: dates.startDate,
+      endDate: dates.endDate,
+      domain,
+      site,
+      domainName,
+      domainId,
+      country,
+      reportDimensions,
+      reportMetrics,
+    });
+    setSearchParams(qs ? new URLSearchParams(qs) : {}, { replace: true });
+    const rangeLabel = dates.startDate === dates.endDate
+      ? dates.startDate
+      : `${dates.startDate} → ${dates.endDate}`;
+    showToast({ message: `Loaded ${rangeLabel}` });
   };
+
+  const applyQuickView = (view) => {
+    if (!canFilter || !view) return;
+    if (view.preset === 'today' && !view.dims && !view.mets) {
+      setActiveQuickView(view.id);
+      applyPreset('today');
+      return;
+    }
+    if (dateRestriction && view.preset && !isPresetAllowedForRestriction(view.preset, dateRestriction)) {
+      return;
+    }
+    const dates = view.preset && view.preset !== 'custom'
+      ? clampPresetRange(view.preset, dateRestriction)
+      : clampDateRange(startDate, endDate, dateRestriction);
+    const nextDims = view.dims?.length ? view.dims : reportDimensions;
+    const nextMets = view.mets?.length ? view.mets : reportMetrics;
+    setActiveQuickView(view.id);
+    setSegmentFilter(null);
+    if (view.preset) setPreset(view.preset);
+    setStartDate(dates.startDate);
+    setEndDate(dates.endDate);
+    setReportDimensions(nextDims);
+    setReportMetrics(nextMets);
+    setPage(1);
+    setData(null);
+    setProgData(null);
+    setHasApplied(true);
+    setChipsExpanded(true);
+    setApplied({
+      startDate: dates.startDate,
+      endDate: dates.endDate,
+      country,
+      domain,
+      site,
+      domainName,
+      domainId,
+      reportDimensions: nextDims,
+      reportMetrics: nextMets,
+      reportSettings,
+    });
+  };
+
+  const handleChartSegmentClick = useCallback((segment) => {
+    if (!segment?.dimensionId || !segment?.value || segment.value === 'Others') return;
+    setSegmentFilter((prev) => (
+      prev?.dimensionId === segment.dimensionId && prev?.value === segment.value
+        ? null
+        : { dimensionId: segment.dimensionId, value: segment.value }
+    ));
+    setPage(1);
+  }, []);
 
   const appliedChips = useMemo(
     () => buildAppliedFilterChips(applied, {
@@ -853,6 +1053,17 @@ export default function Reporting() {
     return sortRowsByCompleteness(enriched, reportColumns);
   }, [tableConfig, progData, data, reportColumns]);
 
+  const displayRows = useMemo(() => {
+    if (!segmentFilter?.dimensionId || !segmentFilter?.value) return tableRows;
+    return tableRows.filter((row) => (
+      rowMatchesChartDimension(row, segmentFilter.dimensionId, segmentFilter.value)
+    ));
+  }, [tableRows, segmentFilter]);
+
+  useEffect(() => {
+    setSegmentFilter(null);
+  }, [applied]);
+
   const totalRecordCount = tableRows.length;
 
   // Only treat as "no data" when the report is empty. If GAM returned a partial
@@ -885,9 +1096,41 @@ export default function Reporting() {
     reportReady
     && !loading
     && totalRecordCount === 0
+    && (data || progData)
     && data?.status !== 'building'
     && progData?.status !== 'building'
   );
+
+  const clearIncompatibleReporting = () => {
+    const skip = new Set(unavailableChips.map((s) => String(s).toLowerCase()));
+    const nextDims = reportDimensions.filter((id) => (
+      !skip.has(String(dimensionLabel(id)).toLowerCase()) && !skip.has(String(id).toLowerCase())
+    ));
+    const nextMets = reportMetrics.filter((id) => (
+      !skip.has(String(metricLabel(id)).toLowerCase()) && !skip.has(String(id).toLowerCase())
+    ));
+    const dropDomain = skip.has('domain name');
+    const dropSite = skip.has('site');
+    const dropAd = skip.has('ad unit');
+    const dropApp = skip.has('app id');
+    if (dropDomain) setDomain([]);
+    if (dropSite) setSite([]);
+    if (dropAd) setDomainName([]);
+    if (dropApp) setDomainId([]);
+    setReportDimensions(nextDims);
+    if (nextMets.length) setReportMetrics(nextMets);
+    setHasApplied(true);
+    setApplied((prev) => ({
+      ...prev,
+      reportDimensions: nextDims,
+      reportMetrics: nextMets.length ? nextMets : prev.reportMetrics,
+      domain: dropDomain ? [] : prev.domain,
+      site: dropSite ? [] : prev.site,
+      domainName: dropAd ? [] : prev.domainName,
+      domainId: dropApp ? [] : prev.domainId,
+    }));
+    showToast({ message: 'Removed incompatible fields' });
+  };
 
   const showPartialCompatWarning = Boolean(
     reportReady
@@ -954,6 +1197,10 @@ export default function Reporting() {
   };
 
   const reset = () => {
+    undoSnapRef.current = {
+      preset, startDate, endDate, country, domain, site, domainName, domainId,
+      reportDimensions, reportMetrics, reportSettings, applied, hasApplied,
+    };
     const r = defaultReportRangeForUser(user);
     setPreset('today');
     setStartDate(r.startDate);
@@ -979,67 +1226,147 @@ export default function Reporting() {
     setError(null);
     clearRecentFilters(user?.id);
     setRecentFilters([]);
+    setActiveQuickView(null);
+    setSegmentFilter(null);
     dispatch(saveReportPage({ pageKey: 'reporting', payload: null }));
     setApplied({
       ...r,
-      country: [],
       ...EMPTY_INVENTORY_FILTERS,
+      country: [],
       reportDimensions: [],
       reportMetrics: [...DEFAULT_REPORT_METRICS],
       reportSettings: DEFAULT_REPORT_SETTINGS,
     });
+    setSearchParams({}, { replace: true });
+    showToast({
+      message: 'Filters cleared',
+      actionLabel: 'Undo',
+      onAction: () => {
+        const snap = undoSnapRef.current;
+        if (!snap) return;
+        setPreset(snap.preset);
+        setStartDate(snap.startDate);
+        setEndDate(snap.endDate);
+        setCountry(snap.country || []);
+        setDomain(snap.domain || []);
+        setSite(snap.site || []);
+        setDomainName(snap.domainName || []);
+        setDomainId(snap.domainId || []);
+        setReportDimensions(snap.reportDimensions || []);
+        setReportMetrics(snap.reportMetrics || [...DEFAULT_REPORT_METRICS]);
+        setReportSettings(snap.reportSettings || DEFAULT_REPORT_SETTINGS);
+        setApplied(snap.applied);
+        setHasApplied(snap.hasApplied);
+      },
+    });
   };
 
+  const handleCopyLink = async () => {
+    await copyReportLink({
+      preset,
+      startDate: applied?.startDate || startDate,
+      endDate: applied?.endDate || endDate,
+      domain: applied?.domain || domain,
+      site: applied?.site || site,
+      domainName: applied?.domainName || domainName,
+      domainId: applied?.domainId || domainId,
+      country: applied?.country || country,
+      reportDimensions: applied?.reportDimensions || reportDimensions,
+      reportMetrics: applied?.reportMetrics || reportMetrics,
+    });
+    showToast({ message: 'Link copied — opens this exact report' });
+  };
+
+  useReportHotkeys({
+    enabled: canGenerate && canFilter,
+    onApply: () => {
+      if (!canRunReport || customDatesIncomplete) return;
+      applyFilter();
+    },
+    onReset: reset,
+  });
+
   const downloadCSV = () => {
-    const csvCell = (v) => {
-      const s = String(v ?? '');
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const money = (v) => {
-      const sym = currency === 'INR' ? '\u20B9' : '$';
-      return `${sym}${parseFloat(v || 0).toFixed(2)}`;
-    };
-    const numFmt = (v) => String(parseInt(v || 0, 10));
     const headers = reportColumns.map((c) => c.label);
-    const lines = tableRows.map((r) => reportColumns.map((col) => {
-      const raw = col.getValue(r);
-      const formatted = formatCellValue(raw, col.format, currency, money, numFmt);
-      return csvCell(formatted);
-    }).join(','));
-    const csv = [headers.join(','), ...lines].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `report_${applied.startDate}_${applied.endDate}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const body = displayRows.map((r) => reportColumns.map((col) => exportCellValue(col, r)));
+    downloadCsv(`report_${applied.startDate}_${applied.endDate}`, headers, body);
+  };
+
+  const downloadXls = () => {
+    const headers = reportColumns.map((c) => c.label);
+    const body = displayRows.map((r) => reportColumns.map((col) => exportCellValue(col, r)));
+    downloadExcel(`report_${applied.startDate}_${applied.endDate}`, headers, body, 'Report');
   };
 
   if (!canGenerate) {
     return (
       <div className="reporting-page">
-        <div className="reporting-head">
-          <h2 className="page-title">Reporting</h2>
-          <p className="reporting-sub">Historical report builder — select dimensions &amp; metrics, then apply filter</p>
-        </div>
+        <PageHeader
+          title="Reporting"
+          subtitle="Historical report builder — select dimensions and metrics, then apply filter"
+        />
         <AccessRestricted title={NO_VIEW_REPORTS_TITLE} message={NO_VIEW_REPORTS_MSG} />
       </div>
     );
   }
 
+  const reportFilterSummary = (() => {
+    if (!hasApplied) return 'Pick dates and fields, then Apply Filter';
+    const parts = [];
+    if (applied.startDate && applied.endDate) {
+      parts.push(applied.startDate === applied.endDate
+        ? applied.startDate
+        : `${applied.startDate} → ${applied.endDate}`);
+    }
+    const dimCount = (applied.reportDimensions || []).length;
+    const metCount = (applied.reportMetrics || []).length;
+    if (dimCount) parts.push(`${dimCount} dimension${dimCount === 1 ? '' : 's'}`);
+    if (metCount) parts.push(`${metCount} metric${metCount === 1 ? '' : 's'}`);
+    const inv = [];
+    if (applied.domain?.length && !isAllSelection(applied.domain)) inv.push(`${applied.domain.length} domains`);
+    if (applied.site?.length && !isAllSelection(applied.site)) inv.push(`${applied.site.length} sites`);
+    if (applied.country?.length) inv.push(`${applied.country.length} countries`);
+    if (inv.length) parts.push(inv.join(', '));
+    if (segmentFilter?.value) parts.push(`chart: ${segmentFilter.value}`);
+    return parts.join(' · ') || 'Report applied';
+  })();
+
   return (
     <div className="reporting-page">
-      <div className="reporting-head">
-        <h2 className="page-title">Reporting</h2>
-        <p className="reporting-sub">Historical report builder — select dimensions &amp; metrics, then apply filter</p>
-        {dateRestriction && (
-          <p className="form-note" style={{ marginTop: 4 }}>
-            {dateFilterLocked
-              ? `Data locked to: ${formatDateRestrictionLabel(dateRestriction)}`
-              : `Allowed filter window: ${formatDateRestrictionLabel(dateRestriction)}`}
-          </p>
+      <PageHeader
+        title="Reporting"
+        subtitle="Build historical GAM reports — dimensions, metrics, and inventory filters"
+        summary={reportFilterSummary}
+      >
+        {canFilter && (
+          <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>
+            Copy link
+          </button>
         )}
+      </PageHeader>
+      {dateRestriction && (
+        <p className="form-note page-restriction-note">
+          {dateFilterLocked
+            ? `Data locked to: ${formatDateRestrictionLabel(dateRestriction)}`
+            : `Allowed filter window: ${formatDateRestrictionLabel(dateRestriction)}`}
+        </p>
+      )}
+
+      <div className="quick-views-row" role="group" aria-label="Quick views">
+        <span className="quick-views-label">Quick views</span>
+        <div className="preset-pills quick-views-pills">
+          {QUICK_VIEWS.map((view) => (
+            <button
+              key={view.id}
+              type="button"
+              className={`preset-pill${activeQuickView === view.id ? ' active' : ''}`}
+              disabled={!canFilter || (view.preset && dateRestriction && !isPresetAllowedForRestriction(view.preset, dateRestriction))}
+              onClick={() => applyQuickView(view)}
+            >
+              {view.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className={`filter-card gam-report-shell ${filtersOpen ? 'filter-card-open' : ''}`} ref={filterPanelRef}>
@@ -1052,7 +1379,7 @@ export default function Reporting() {
           >
             Historical report {filtersOpen ? '▾' : '▸'}
           </button>
-          <div className="filter-actions">
+          <div className="filter-actions filter-actions--desktop">
             <button className="btn-generate" onClick={applyFilter} disabled={!canFilter || !canRunReport || customDatesIncomplete}
               title={customDatesIncomplete
                 ? 'Select both start and end dates, then click Apply Filter'
@@ -1066,7 +1393,10 @@ export default function Reporting() {
               disabled={!canFilter}
             />
             {canDownload && reportReady && (
-              <button className="btn-csv" onClick={downloadCSV} disabled={!tableRows.length}>⬇ Download CSV</button>
+              <>
+                <button className="btn-csv" onClick={downloadCSV} disabled={!displayRows.length}>⬇ CSV</button>
+                <button className="btn-csv" onClick={downloadXls} disabled={!displayRows.length}>Excel</button>
+              </>
             )}
             <button className="btn-reset" onClick={reset} disabled={!canFilter}>↺ Reset</button>
           </div>
@@ -1086,7 +1416,7 @@ export default function Reporting() {
         />
         {!dateFilterLocked && preset === 'custom' && (
           <div className="custom-range-hint">
-            📅 Pick <strong>start</strong> and <strong>end</strong> dates, then click <strong>Apply Filter</strong> to load data.
+            Pick <strong>start</strong> and <strong>end</strong> dates, then click <strong>Apply Filter</strong> to load data.
           </div>
         )}
 
@@ -1230,7 +1560,7 @@ export default function Reporting() {
           </div>
         )}
         {!canFilter && (
-          <p className="filter-locked-note">🔒 Filters are disabled for your account.</p>
+          <p className="filter-locked-note">Filters are disabled for your account.</p>
         )}
       </div>
 
@@ -1244,7 +1574,13 @@ export default function Reporting() {
       )}
 
       {error && (
-        <div className="error-box">⚠️ {error} <button onClick={() => load()} className="btn-retry">Retry</button></div>
+        <div className="error-box dash-error-box" role="alert">
+          <div className="dash-error-copy">
+            <strong>Couldn’t load report</strong>
+            <span>{error}</span>
+          </div>
+          <button type="button" onClick={() => load()} className="btn-retry">Retry</button>
+        </div>
       )}
 
       {showSummaryCards && (
@@ -1292,6 +1628,13 @@ export default function Reporting() {
                   Some selected dimensions or metrics can&apos;t be combined in one GAM report.
                   Results below use the compatible subset. Remove the unavailable items for a complete selection.
                 </div>
+                {canFilter && skippedChips.length > 0 && (
+                  <div className="warn-card-btns">
+                    <button type="button" className="warn-btn-primary" onClick={clearIncompatibleReporting}>
+                      Remove these and apply
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
             <div className="warn-card-right">
@@ -1322,16 +1665,10 @@ export default function Reporting() {
                 <div className="warn-card-btns">
                   {canFilter && (
                     <>
-                      <button type="button" className="warn-btn-primary" onClick={reset}>↺ Reset Filters</button>
-                      {canReportBuilder && (
-                        <button
-                          type="button"
-                          className="warn-btn-secondary"
-                          onClick={handleAddFilter}
-                        >
-                          ＋ Add New Filter
-                        </button>
-                      )}
+                      <button type="button" className="warn-btn-primary" onClick={clearIncompatibleReporting}>
+                        Remove these and apply
+                      </button>
+                      <button type="button" className="warn-btn-secondary" onClick={reset}>↺ Reset Filters</button>
                     </>
                   )}
                 </div>
@@ -1349,16 +1686,28 @@ export default function Reporting() {
           </div>
 
           <div className="warn-card-hint-bar">
-            <span className="warn-card-hint-icon" aria-hidden>💡</span>
+            <span className="warn-card-hint-icon" aria-hidden>i</span>
             <span>Some selected filters and metrics can&apos;t be combined in the same report. Remove incompatible filters to view complete data.</span>
           </div>
         </div>
       )}
 
       {reportReady && (loading || hasReportData) && (
+      <>
+      {segmentFilter && (
+        <div className="segment-filter-bar" role="status">
+          <span className="segment-filter-chip">
+            Filtered from chart: {dimensionLabel(segmentFilter.dimensionId)} = {segmentFilter.value}
+            {displayRows.length !== tableRows.length
+              ? ` · ${displayRows.length.toLocaleString()} of ${tableRows.length.toLocaleString()} rows`
+              : ''}
+          </span>
+          <button type="button" className="segment-filter-clear" onClick={() => setSegmentFilter(null)}>Clear</button>
+        </div>
+      )}
       <DynamicReportTable
-        title={tableConfig.mode === 'programmatic' ? '📊 Programmatic Channel Report' : '📊 Report Data'}
-        rows={tableRows}
+        title={tableConfig.mode === 'programmatic' ? 'Programmatic Channel Report' : 'Report Data'}
+        rows={displayRows}
         dimensions={tableConfig.dimensions}
         metrics={tableConfig.metrics}
         visibility={vis}
@@ -1373,17 +1722,53 @@ export default function Reporting() {
             : 'Search date / domain / site / ad unit…'
         }
         page={page}
-        pageSize={PAGE_SIZE}
+        pageSize={isNarrow ? 12 : PAGE_SIZE}
         onPageChange={setPage}
         pagination={data?.pagination || progData?.pagination || null}
-        showTotals={reportReady && tableRows.length > 0}
+        showTotals={reportReady && displayRows.length > 0}
         className="reporting-table"
-        headerExtra={applied.startDate && applied.endDate
-          ? <span className="report-range">{applied.startDate} → {applied.endDate}</span>
-          : null}
+        density={tableDensity}
+        freezeFirst
+        headerExtra={(
+          <>
+            <div className="table-density-toggle" role="group" aria-label="Table density">
+              <button
+                type="button"
+                className={`table-density-btn${tableDensity === 'compact' ? ' active' : ''}`}
+                onClick={() => setTableDensity('compact')}
+              >
+                Compact
+              </button>
+              <button
+                type="button"
+                className={`table-density-btn${tableDensity === 'comfortable' ? ' active' : ''}`}
+                onClick={() => setTableDensity('comfortable')}
+              >
+                Comfortable
+              </button>
+            </div>
+            {applied.startDate && applied.endDate
+              ? <span className="report-range">{applied.startDate} → {applied.endDate}</span>
+              : null}
+          </>
+        )}
         noReportMessage="Select at least one metric to run a report"
-        emptyMessage="No data available"
+        emptyMessage={segmentFilter ? 'No rows match this chart segment' : 'No data available'}
+        onReset={canFilter ? reset : undefined}
+        emptyActions={canFilter ? (
+          <>
+            <button type="button" className="btn-generate" onClick={() => applyPreset('yesterday')}>Try yesterday</button>
+            <button type="button" className="btn-reset" onClick={() => applyPreset('last7')}>Try last 7 days</button>
+            {segmentFilter && (
+              <button type="button" className="btn-reset" onClick={() => setSegmentFilter(null)}>Clear chart filter</button>
+            )}
+          </>
+        ) : null}
+        columnStorageKey="reporting-table"
+        canDownload={canDownload}
+        exportName={`report_${applied.startDate || 'start'}_${applied.endDate || 'end'}`}
       />
+      </>
       )}
 
       {/* Auto charts — preferred visualization(s) from selected dims/metrics */}
@@ -1399,7 +1784,30 @@ export default function Reporting() {
           endDate={applied.endDate}
           mode={tableConfig.mode}
           isNarrow={isNarrow}
+          onSegmentClick={handleChartSegmentClick}
+          activeSegment={segmentFilter}
         />
+      )}
+      {canFilter && (
+        <>
+          <button type="button" className="filter-add-fab" onClick={handleAddFilter} aria-label="Add filter">
+            <span className="filter-add-icon" aria-hidden>+</span>
+            Add filter
+          </button>
+          <div className="filter-actions-foot filter-actions-foot--mobile">
+            <button
+              className="btn-generate"
+              onClick={applyFilter}
+              disabled={!canRunReport || customDatesIncomplete}
+              title={customDatesIncomplete
+                ? 'Select both start and end dates, then click Apply Filter'
+                : (!canRunReport ? 'Select at least one dimension, metric, or inventory filter' : '')}
+            >
+              ✓ Apply Filter
+            </button>
+            <button type="button" className="btn-reset-link" onClick={reset}>Reset</button>
+          </div>
+        </>
       )}
     </div>
   );

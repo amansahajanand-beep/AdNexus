@@ -161,7 +161,7 @@ export default function SavedFiltersBar({
   const isEdit = form?.mode === 'edit';
 
   return (
-    <div className="saved-filters-bar" ref={panelRef}>
+    <div className={`saved-filters-bar${panelOpen || formOpen ? ' is-open' : ''}`} ref={panelRef}>
       <button
         type="button"
         className="btn-saved-filter"

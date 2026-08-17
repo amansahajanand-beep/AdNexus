@@ -37,7 +37,7 @@ const METRIC_PRIORITY = [
 ];
 
 /** Max charts to show on Reporting (varied types). */
-const MAX_CHARTS = 6;
+const MAX_CHARTS = 8;
 
 function isTimeDim(id) {
   return TIME_DIMS.has(String(id || '').toLowerCase());
@@ -185,6 +185,7 @@ export function buildCategorySeries(rows = [], catDim, metricId, { topN = 10 } =
     .map((entry) => ({
       name: entry.name,
       value: agg === 'avg' && entry.count ? entry.value / entry.count : entry.value,
+      dimensionId: catDim,
     }))
     .filter((e) => e.value > 0)
     .sort((a, b) => b.value - a.value);
@@ -192,7 +193,15 @@ export function buildCategorySeries(rows = [], catDim, metricId, { topN = 10 } =
   if (ranked.length <= topN) return ranked;
   const top = ranked.slice(0, topN);
   const rest = ranked.slice(topN).reduce((sum, item) => sum + item.value, 0);
-  return rest > 0 ? [...top, { name: 'Others', value: rest }] : top;
+  return rest > 0
+    ? [...top, { name: 'Others', value: rest, dimensionId: catDim }]
+    : top;
+}
+
+/** Match a table row to a chart segment label (same label rules as buildCategorySeries). */
+export function rowMatchesChartDimension(row, dimId, value) {
+  if (!dimId || value == null || value === '' || value === 'Others') return false;
+  return String(readDimLabel(row, dimId)) === String(value);
 }
 
 export function buildMetricTotals(rows = [], metrics = [], visibility = {}) {
@@ -255,10 +264,23 @@ export function suggestReportCharts({
         hint: `${type === 'column' ? 'Column' : 'Bar'} · by ${dimensionLabel(channelDim)} · ${metricLabel(m)}`,
         data,
         metricId: m,
+        dimensionId: channelDim,
         format: inferMetricFormat(m),
         layout: type === 'bar' ? 'vertical' : 'horizontal',
       });
     });
+    if (progMets[0]) {
+      const pieData = buildCategorySeries(rows, channelDim, progMets[0], { topN: 7 });
+      pushUnique(charts, {
+        type: 'pie',
+        title: `${metricLabel(progMets[0])} share`,
+        hint: `Share · by ${dimensionLabel(channelDim)}`,
+        data: pieData,
+        metricId: progMets[0],
+        dimensionId: channelDim,
+        format: inferMetricFormat(progMets[0]),
+      });
+    }
     return charts.slice(0, MAX_CHARTS);
   }
 
@@ -299,6 +321,61 @@ export function suggestReportCharts({
     });
   }
 
+  // Dual-axis: first two metrics on the same date axis (e.g. revenue vs impressions).
+  if (timeDim && chartMetrics.length >= 2) {
+    const a = chartMetrics[0];
+    const b = chartMetrics[1];
+    const seriesA = preferTimeSeries(
+      buildTimeSeriesFromTrend(trend, a),
+      buildTimeSeries(rows, timeDim, a)
+    );
+    const seriesB = preferTimeSeries(
+      buildTimeSeriesFromTrend(trend, b),
+      buildTimeSeries(rows, timeDim, b)
+    );
+    if (seriesA.length && seriesB.length) {
+      const map = new Map();
+      seriesA.forEach((d) => map.set(d.date, { date: d.date, name: d.date, primary: d.value, secondary: 0 }));
+      seriesB.forEach((d) => {
+        const prev = map.get(d.date) || { date: d.date, name: d.date, primary: 0, secondary: 0 };
+        prev.secondary = d.value;
+        map.set(d.date, prev);
+      });
+      const data = Array.from(map.values()).sort((x, y) => String(x.date).localeCompare(String(y.date)));
+      if (data.some((d) => d.primary > 0 || d.secondary > 0)) {
+        pushUnique(charts, {
+          type: 'composed',
+          title: `${metricLabel(a)} vs ${metricLabel(b)}`,
+          hint: `Bars + line · by ${dimensionLabel(timeDim)}`,
+          data,
+          metricId: a,
+          metricIdB: b,
+          format: inferMetricFormat(a),
+          formatB: inferMetricFormat(b),
+          wide: true,
+        });
+      }
+    }
+  }
+
+  // Line for a third time metric when selected.
+  if (timeDim && chartMetrics[2]) {
+    const m = chartMetrics[2];
+    const series = preferTimeSeries(
+      buildTimeSeriesFromTrend(trend, m),
+      buildTimeSeries(rows, timeDim, m)
+    );
+    pushUnique(charts, {
+      type: 'line',
+      title: `${metricLabel(m)} over time`,
+      hint: `Line · by ${dimensionLabel(timeDim)} · ${metricLabel(m)}`,
+      data: series,
+      metricId: m,
+      format: inferMetricFormat(m),
+      layout: 'horizontal',
+    });
+  }
+
   // When Date is selected but only one chart metric, still add an area trend twin
   // from the same series so "by Date" + "trend" both appear for revenue reports.
   if (timeDim && chartMetrics.length === 1) {
@@ -320,7 +397,7 @@ export function suggestReportCharts({
     }
   }
 
-  // 2) Category charts — mix column + horizontal bar (no pie by default)
+  // 2) Category charts — mix column + horizontal bar, plus a share pie for the first dim
   catDims.forEach((catDim, catIdx) => {
     if (!primary) return;
     const data = buildCategorySeries(rows, catDim, primary, { topN: 10 });
@@ -331,10 +408,27 @@ export function suggestReportCharts({
       hint: `${type === 'column' ? 'Column' : 'Bar'} · by ${dimensionLabel(catDim)} · ${metricLabel(primary)}`,
       data,
       metricId: primary,
+      dimensionId: catDim,
       format: inferMetricFormat(primary),
       layout: type === 'bar' ? 'vertical' : 'horizontal',
+      compareEnabled: catIdx === 0,
     });
   });
+
+  if (catDims[0] && primary) {
+    const pieData = buildCategorySeries(rows, catDims[0], primary, { topN: 7 });
+    if (pieData.length >= 2) {
+      pushUnique(charts, {
+        type: 'pie',
+        title: `${metricLabel(primary)} share by ${dimensionLabel(catDims[0])}`,
+        hint: `Share · by ${dimensionLabel(catDims[0])}`,
+        data: pieData,
+        metricId: primary,
+        dimensionId: catDims[0],
+        format: inferMetricFormat(primary),
+      });
+    }
+  }
 
   // 3) Second metric — different chart type than primary on same category
   if (catDims[0] && chartMetrics[1]) {
@@ -346,6 +440,7 @@ export function suggestReportCharts({
       hint: `Bar · by ${dimensionLabel(catDims[0])} · ${metricLabel(m)}`,
       data,
       metricId: m,
+      dimensionId: catDims[0],
       format: inferMetricFormat(m),
       layout: 'vertical',
     });
@@ -361,6 +456,7 @@ export function suggestReportCharts({
       hint: `Column · by ${dimensionLabel(catDims[0])} · ${metricLabel(m)}`,
       data,
       metricId: m,
+      dimensionId: catDims[0],
       format: inferMetricFormat(m),
       layout: 'horizontal',
     });

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo, startTransition } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
-import { useOutletContext } from 'react-router-dom';
+import { useOutletContext, useSearchParams } from 'react-router-dom';
 import {
   AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend, BarChart, Bar,
@@ -26,6 +26,32 @@ import AccessRestricted from './ui/AccessRestricted';
 import MultiSelect from './ui/MultiSelect';
 import FilterChips from './ui/FilterChips';
 import GamOverviewCard from './ui/GamOverviewCard';
+import InsightsStrip from './ui/InsightsStrip';
+import PageHeader from './ui/PageHeader';
+import ChartHeader from './ui/ChartHeader';
+import ChartExportButton from './ui/ChartExportButton';
+import OnboardingGuide from './ui/OnboardingGuide';
+import { useReportHotkeys } from '../hooks/useReportHotkeys';
+import { showToast } from '../hooks/useToast';
+import {
+  previousPeriodRange,
+  isPeriodAllowed,
+  withPeriodDeltas,
+  overlayPriorDaily,
+  buildInsights,
+  resolveCompareRange,
+  compareLabelFor,
+} from '../utils/periodCompare';
+import {
+  DASH_CHARTS,
+  loadHiddenDashCharts,
+  saveHiddenDashCharts,
+  loadComparePrefs,
+  saveComparePrefs,
+} from '../utils/dashCharts';
+import CompareRangeBar from './ui/CompareRangeBar';
+import ChartVisibilityMenu from './ui/ChartVisibilityMenu';
+import { encodeReportShare, parseReportShare, copyReportLink } from '../utils/reportShare';
 import { DATE_PRESETS } from '../utils/gamReportCatalog';
 import { buildFilterDropdownOptions } from '../utils/catalogOptions';
 import { buildAppliedFilterChips, removeFilterChip } from '../utils/filterChips';
@@ -75,7 +101,7 @@ import {
   RECENT_FILTERS_CLEARED_EVENT,
 } from '../utils/recentFilters';
 import SavedFiltersBar from './ui/SavedFiltersBar';
-import { SAVED_FILTERS_PAGES } from '../utils/savedFilters';
+import { SAVED_FILTERS_PAGES, getSavedFilters } from '../utils/savedFilters';
 import {
   CHART_COLORS,
   CHART_SERIES,
@@ -85,6 +111,25 @@ import {
 } from '../utils/chartTheme';
 
 const SHARE_COLORS = CHART_COLORS;
+
+/** Legend below the SVG so long labels never overlap the donut. */
+function SharePieLegend({ items = [], colors = SHARE_COLORS }) {
+  if (!items.length) return null;
+  return (
+    <ul className="pie-legend pie-legend-grid" aria-label="Chart legend">
+      {items.map((entry, idx) => (
+        <li key={`${entry.name}-${idx}`} className="pie-legend-item" title={entry.name}>
+          <span
+            className="pie-legend-swatch"
+            style={{ background: colors[idx % colors.length] }}
+            aria-hidden
+          />
+          <span className="pie-legend-label">{entry.name}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 const PAGE_SIZE = 50;
 const POLL_MS = 30 * 60 * 1000; // matches backend 30-min cache TTL
@@ -102,6 +147,30 @@ function num(v) {
 function toNumber(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+function inventoryQueryFromApplied(applied) {
+  const n = normalizeInventorySelections(applied || {}, {});
+  return {
+    domain: n.domain || [],
+    site: n.site || [],
+    domainName: n.domainName || [],
+    domainId: n.domainId || [],
+  };
+}
+
+function priorQueryKey(startDate, endDate, applied, compareStart, compareEnd) {
+  const inv = inventoryQueryFromApplied(applied);
+  return [
+    startDate || '',
+    endDate || '',
+    compareStart || '',
+    compareEnd || '',
+    (inv.domain || []).join(','),
+    (inv.site || []).join(','),
+    (inv.domainName || []).join(','),
+    (inv.domainId || []).join(','),
+  ].join('|');
 }
 
 /** True when a chart series has at least one positive value to plot. */
@@ -408,6 +477,7 @@ export default function Dashboard() {
   const savedRaw = useSelector((s) => s.reports?.dashboard);
   const saved = savedRaw?.userId === user?.id ? savedRaw : null;
   const { networkInfo } = useOutletContext();
+  const [searchParams, setSearchParams] = useSearchParams();
   const dateRestriction = useMemo(() => getDateRestriction(user), [user]);
   const todayInit = useMemo(() => defaultReportRangeForUser(user), [user]);
   const initDates = useMemo(() => initialReportDatesForUser(user, saved), [user, saved]);
@@ -470,6 +540,8 @@ export default function Dashboard() {
   const [detailData, setDetailData] = useState(() => (
     filterVisibility.isScopedUser ? null : ((cacheFresh ? saved?.detailData : null) ?? null)
   ));
+  const [priorOverview, setPriorOverview] = useState(null);
+  const [priorDetail, setPriorDetail] = useState(null);
   const [overviewLoading, setOverviewLoading] = useState(() => (
     filterVisibility.isScopedUser ? true : !saved?.overviewData
   ));
@@ -486,15 +558,117 @@ export default function Dashboard() {
   const [breakdownOpen, setBreakdownOpen] = useState(() => saved?.breakdownOpen ?? true);
   const [chipsExpanded, setChipsExpanded] = useState(() => saved?.chipsExpanded ?? true);
   const [slowDetail, setSlowDetail] = useState(false);
+  const [tableDensity, setTableDensity] = useState(() => {
+    try {
+      return localStorage.getItem('adnexus.tableDensity:dashboard') === 'compact' ? 'compact' : 'comfortable';
+    } catch {
+      return 'comfortable';
+    }
+  });
+  const [trendMetric, setTrendMetric] = useState('all');
+  const [compareMode, setCompareMode] = useState(() => loadComparePrefs(user?.id).mode);
+  const [compareStart, setCompareStart] = useState(() => loadComparePrefs(user?.id).startDate);
+  const [compareEnd, setCompareEnd] = useState(() => loadComparePrefs(user?.id).endDate);
+  const [hiddenChartIds, setHiddenChartIds] = useState(() => loadHiddenDashCharts(user?.id));
   const [recentFilters, setRecentFilters] = useState(() => getRecentFilters(user?.id));
+  const isNarrow = useMedia('(max-width: 768px)');
+  const [mobileFiltersOpen, setMobileFiltersOpen] = useState(true);
   const pollRef = useRef(null);
   const filterPanelRef = useRef(null);
   const skipDetailRef = useRef(cacheFresh && saved?.filterApplied);
   const slowTimerRef = useRef(null);
+  const shareHydratedRef = useRef(false);
+  const undoSnapRef = useRef(null);
+  const skipPrefsSaveRef = useRef(true);
 
   useEffect(() => {
+    skipPrefsSaveRef.current = true;
     setRecentFilters(getRecentFilters(user?.id));
+    const prefs = loadComparePrefs(user?.id);
+    setCompareMode(prefs.mode);
+    setCompareStart(prefs.startDate);
+    setCompareEnd(prefs.endDate);
+    setHiddenChartIds(loadHiddenDashCharts(user?.id));
   }, [user?.id]);
+
+  useEffect(() => {
+    if (skipPrefsSaveRef.current) {
+      skipPrefsSaveRef.current = false;
+      return;
+    }
+    saveComparePrefs(user?.id, { mode: compareMode, startDate: compareStart, endDate: compareEnd });
+    saveHiddenDashCharts(user?.id, hiddenChartIds);
+  }, [user?.id, compareMode, compareStart, compareEnd, hiddenChartIds]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('adnexus.tableDensity:dashboard', tableDensity);
+    } catch {
+      /* ignore */
+    }
+  }, [tableDensity]);
+
+  useEffect(() => {
+    setMobileFiltersOpen(!isNarrow);
+  }, [isNarrow]);
+
+  useEffect(() => {
+    if (shareHydratedRef.current) return;
+    shareHydratedRef.current = true;
+    const viewId = searchParams.get('view');
+    if (viewId) {
+      const found = getSavedFilters(SAVED_FILTERS_PAGES.dashboard, user?.id).find((f) => f.id === viewId);
+      if (found?.snapshot) {
+        const snap = found.snapshot;
+        if (snap.domain) setDomain(snap.domain);
+        if (snap.site) setSite(snap.site);
+        if (snap.domainName) setDomainName(snap.domainName);
+        if (snap.domainId) setDomainId(snap.domainId);
+      }
+    }
+    const shared = parseReportShare(searchParams);
+    if (!shared) return;
+    if (shared.preset && shared.preset !== 'custom') {
+      const r = clampPresetRange(shared.preset, dateRestriction);
+      setPreset(shared.preset);
+      setStartDate(r.startDate);
+      setEndDate(r.endDate);
+      setApplied((prev) => ({
+        ...prev,
+        startDate: r.startDate,
+        endDate: r.endDate,
+        domain: shared.domain?.length ? shared.domain : prev.domain,
+        site: shared.site?.length ? shared.site : prev.site,
+        domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
+        domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
+      }));
+      if (shared.domain?.length) setDomain(shared.domain);
+      if (shared.site?.length) setSite(shared.site);
+      if (shared.domainName?.length) setDomainName(shared.domainName);
+      if (shared.domainId?.length) setDomainId(shared.domainId);
+      setFilterApplied(true);
+      return;
+    }
+    if (shared.startDate && shared.endDate) {
+      const r = clampDateRange(shared.startDate, shared.endDate, dateRestriction);
+      setPreset(shared.preset || 'custom');
+      setStartDate(r.startDate);
+      setEndDate(r.endDate);
+      setApplied((prev) => ({
+        ...prev,
+        ...r,
+        domain: shared.domain?.length ? shared.domain : prev.domain,
+        site: shared.site?.length ? shared.site : prev.site,
+        domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
+        domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
+      }));
+      if (shared.domain?.length) setDomain(shared.domain);
+      if (shared.site?.length) setSite(shared.site);
+      if (shared.domainName?.length) setDomainName(shared.domainName);
+      if (shared.domainId?.length) setDomainId(shared.domainId);
+      setFilterApplied(true);
+    }
+  }, [searchParams, user?.id, dateRestriction]);
 
   useEffect(() => {
     const onCleared = () => setRecentFilters([]);
@@ -573,9 +747,8 @@ export default function Dashboard() {
 
   const currency = overviewData?.summary?.currency || overviewData?.currency
     || detailData?.summary?.currency || networkInfo?.currencyCode || 'USD';
-  const isNarrow = useMedia('(max-width: 768px)');
 
-  /** Full breakdown — after Apply Filter. */
+  /** Network + filtered charts — load for current dates; inventory filters refine. */
   const loadDetail = useCallback(async (silent = false) => {
     if (!silent) {
       setDetailLoading(true);
@@ -585,9 +758,14 @@ export default function Dashboard() {
     }
     setError(null);
     try {
+      const dates = {
+        startDate: applied?.startDate || startDate,
+        endDate: applied?.endDate || endDate,
+      };
       // Compact dashboard payload (SQL charts + capped table). Do NOT request allRows —
       // wide ranges were shipping 100k–700k grain rows and freezing the UI.
       const res = await reportsAPI.getDashboard({
+        ...dates,
         ...normalizeInventorySelections(applied || {}, {}),
       });
       startTransition(() => {
@@ -601,6 +779,9 @@ export default function Dashboard() {
       // Auth/permission still surface as errors; filter incompat / empty → warn card like Reporting.
       if (status === 401 || status === 403) {
         setError(getUserFacingMessage(err, 'Could not load the chart and breakdown table. Try Apply Filter again or use a shorter date range.'));
+        setDetailData(null);
+      } else if (status === 503) {
+        setError(getUserFacingMessage(err, 'Live metrics unavailable. Check Google OAuth credentials in Admin.'));
         setDetailData(null);
       } else {
         setError(null);
@@ -629,7 +810,7 @@ export default function Dashboard() {
         clearTimeout(slowTimerRef.current);
       }
     }
-  }, [applied]);
+  }, [applied, startDate, endDate]);
 
   useEffect(() => {
     if (filterApplied && hasInventoryFilterSelection(applied)) return;
@@ -638,14 +819,74 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (!canGenerate) return;
-    if (!filterApplied) return;
+    if (isCustomRangeIncomplete(preset, startDate, endDate)) return;
     if (skipDetailRef.current) {
       skipDetailRef.current = false;
       return;
     }
     loadDetail();
     setPage(1);
-  }, [filterApplied, applied, loadDetail, canGenerate]);
+  }, [filterApplied, applied, loadDetail, canGenerate, preset, startDate, endDate]);
+
+  const compareRange = useMemo(
+    () => resolveCompareRange(
+      compareMode,
+      applied?.startDate || startDate,
+      applied?.endDate || endDate,
+      { startDate: compareStart, endDate: compareEnd }
+    ),
+    [compareMode, applied?.startDate, applied?.endDate, startDate, endDate, compareStart, compareEnd]
+  );
+  const compareLabel = compareLabelFor(compareMode, compareRange);
+
+  const compareKey = priorQueryKey(
+    applied?.startDate || startDate,
+    applied?.endDate || endDate,
+    applied,
+    compareRange?.startDate,
+    compareRange?.endDate
+  );
+
+  useEffect(() => {
+    if (!canGenerate) {
+      setPriorOverview(null);
+      setPriorDetail(null);
+      return undefined;
+    }
+    const prior = compareRange;
+    if (!prior || !isPeriodAllowed(prior, dateRestriction)) {
+      setPriorOverview(null);
+      setPriorDetail(null);
+      return undefined;
+    }
+    setPriorOverview(null);
+    setPriorDetail(null);
+    let cancelled = false;
+    (async () => {
+      const inv = inventoryQueryFromApplied(applied);
+      const priorFilters = {
+        ...inv,
+        startDate: prior.startDate,
+        endDate: prior.endDate,
+      };
+      try {
+        const ov = await reportsAPI.getDashboardOverview(priorFilters);
+        if (!cancelled) setPriorOverview(ov);
+      } catch {
+        /* keep last successful compare if this retry fails */
+      }
+      try {
+        const dash = await reportsAPI.getDashboard(priorFilters);
+        if (!cancelled) {
+          setPriorDetail(dash);
+          if (dash?.summary) setPriorOverview((prev) => prev || { summary: dash.summary });
+        }
+      } catch {
+        /* keep last successful compare */
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [canGenerate, compareKey, dateRestriction, compareRange, applied]);
 
   useEffect(() => {
     if (!overviewData && !detailData) return;
@@ -882,6 +1123,20 @@ export default function Dashboard() {
     if (!hasInventoryFilterSelection(apiFilters) && isAdmin(user)) {
       loadOverview(buildOverviewFiltersForState(apiFilters, true));
     }
+    const qs = encodeReportShare({
+      preset,
+      startDate: dates.startDate,
+      endDate: dates.endDate,
+      domain,
+      site,
+      domainName,
+      domainId,
+    });
+    setSearchParams(qs ? new URLSearchParams(qs) : {}, { replace: true });
+    const rangeLabel = dates.startDate === dates.endDate
+      ? dates.startDate
+      : `${dates.startDate} → ${dates.endDate}`;
+    showToast({ message: `Loaded ${rangeLabel}` });
   };
 
   const appliedChips = useMemo(
@@ -894,14 +1149,25 @@ export default function Dashboard() {
     [filterApplied, applied, domainRootOptions, siteOptions, adUnitOptions, appOptions]
   );
 
-  const handleAddFilter = () => {
+  const handleAddFilter = useCallback(() => {
+    const needsReveal = !breakdownOpen || (isNarrow && !mobileFiltersOpen);
+    setMobileFiltersOpen(true);
     setBreakdownOpen(true);
     loadCatalog(true);
-    requestAnimationFrame(() => {
-      filterPanelRef.current?.querySelector('.dash-breakdown-section')
-        ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
-  };
+    window.setTimeout(() => {
+      const section = document.getElementById('dash-inventory-filters');
+      if (!section) {
+        filterPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        return;
+      }
+      section.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const control = section.querySelector('.ms-control:not([disabled])');
+      if (control && !section.querySelector('.ms-is-open')) {
+        control.focus();
+        control.click();
+      }
+    }, needsReveal ? 120 : 0);
+  }, [breakdownOpen, isNarrow, mobileFiltersOpen, loadCatalog]);
 
   const handleRemoveChip = useCallback((chip) => {
     if (chip.field === 'date') {
@@ -938,6 +1204,17 @@ export default function Dashboard() {
   ]);
 
   const reset = () => {
+    undoSnapRef.current = {
+      preset,
+      startDate,
+      endDate,
+      domain,
+      site,
+      domainName,
+      domainId,
+      applied,
+      filterApplied,
+    };
     const r = defaultReportRangeForUser(user);
     setPreset('today');
     setStartDate(r.startDate);
@@ -952,11 +1229,44 @@ export default function Dashboard() {
     setFilterApplied(false);
     setDetailData(null);
     setOverviewData(null);
+    setPriorOverview(null);
+    setPriorDetail(null);
     setFetchedAt(null);
     clearRecentFilters(user?.id);
     setRecentFilters([]);
     dispatch(saveReportPage({ pageKey: 'dashboard', payload: null }));
     setApplied({ ...r, ...EMPTY_INVENTORY_FILTERS });
+    setSearchParams({}, { replace: true });
+    showToast({
+      message: 'Filters cleared',
+      actionLabel: 'Undo',
+      onAction: () => {
+        const snap = undoSnapRef.current;
+        if (!snap) return;
+        setPreset(snap.preset);
+        setStartDate(snap.startDate);
+        setEndDate(snap.endDate);
+        setDomain(snap.domain || []);
+        setSite(snap.site || []);
+        setDomainName(snap.domainName || []);
+        setDomainId(snap.domainId || []);
+        setApplied(snap.applied);
+        setFilterApplied(snap.filterApplied);
+      },
+    });
+  };
+
+  const handleCopyLink = async () => {
+    await copyReportLink({
+      preset,
+      startDate: applied?.startDate || startDate,
+      endDate: applied?.endDate || endDate,
+      domain: applied?.domain || domain,
+      site: applied?.site || site,
+      domainName: applied?.domainName || domainName,
+      domainId: applied?.domainId || domainId,
+    });
+    showToast({ message: 'Link copied — opens this exact report' });
   };
 
   const vis = {
@@ -964,6 +1274,17 @@ export default function Dashboard() {
     ...(overviewData?.visibility || detailData?.visibility || {}),
   };
   const canFilter = vis.filters !== false;
+
+  useReportHotkeys({
+    enabled: canGenerate && canFilter,
+    onApply: () => {
+      if (customDatesIncomplete) return;
+      if (!canApplyInventory) return;
+      applyFilter();
+    },
+    onReset: reset,
+  });
+
   const hasInventoryFilter = filterApplied && hasInventoryFilterSelection(applied);
   const isScopedDashboardUser = !isAdmin(user);
 
@@ -1004,30 +1325,35 @@ export default function Dashboard() {
   }, [detailData?.summary]);
 
   const tableRows = useMemo(() => {
-    if (!filterApplied) return [];
+    if (!detailData) return [];
     const raw = detailData?.rows || [];
     const enriched = enrichReportRows(raw, tableConfig.dimensions, tableConfig.metrics, { useProxy: false });
     return aggregateRowsByColumns(enriched, tableColumns);
-  }, [filterApplied, detailData, tableConfig, tableColumns]);
+  }, [detailData, tableConfig, tableColumns]);
 
   const overviewSummary = useMemo(() => {
     const fromDetail = mapDetailSummary(detailData?.summary);
+    let base = {};
 
     if (isScopedDashboardUser) {
       if (hasInventoryFilter) {
-        if (fromDetail && !detailLoading) return fromDetail;
-        if (fromDetail) return fromDetail;
-        if (detailData && tableRows.length) return summarizeRowsForOverview(tableRows, currency);
-        return {};
+        if (fromDetail && !detailLoading) base = fromDetail;
+        else if (fromDetail) base = fromDetail;
+        else if (detailData && tableRows.length) base = summarizeRowsForOverview(tableRows, currency);
+        else base = {};
+      } else {
+        base = overviewData?.summary || {};
       }
-      return overviewData?.summary || {};
+    } else if (hasInventoryFilter && fromDetail && !detailLoading) {
+      base = fromDetail;
+    } else if (hasInventoryFilter && detailData) {
+      base = fromDetail || summarizeRowsForOverview(tableRows, currency);
+    } else {
+      base = overviewData?.summary || {};
     }
 
-    if (hasInventoryFilter && fromDetail && !detailLoading) return fromDetail;
-    if (hasInventoryFilter && detailData) {
-      return fromDetail || summarizeRowsForOverview(tableRows, currency);
-    }
-    return overviewData?.summary || {};
+    const priorSum = priorDetail?.summary || priorOverview?.summary || null;
+    return withPeriodDeltas(base, priorSum);
   }, [
     isScopedDashboardUser,
     filterApplied,
@@ -1038,6 +1364,8 @@ export default function Dashboard() {
     currency,
     overviewData,
     mapDetailSummary,
+    priorOverview,
+    priorDetail,
   ]);
 
   const overviewCardLoading = useMemo(() => {
@@ -1082,7 +1410,6 @@ export default function Dashboard() {
   }, [detailData?.rows]);
 
   const dailySeries = useMemo(() => {
-    if (!filterApplied) return [];
     const trend = detailData?.trend || [];
     // Prefer server trend (full-range SQL) — compact table rows are truncated.
     if (Array.isArray(trend) && trend.length) {
@@ -1094,12 +1421,9 @@ export default function Dashboard() {
       if (fromTrend.some((d) => d.revenue > 0 || d.impressions > 0)) return fromTrend;
     }
     return buildDailySeries(enrichedRows, trend);
-  }, [filterApplied, enrichedRows, detailData?.trend]);
+  }, [enrichedRows, detailData?.trend]);
 
-  const engagementSeries = useMemo(() => {
-    if (!filterApplied) return [];
-    return buildEngagementSeries(enrichedRows);
-  }, [filterApplied, enrichedRows]);
+  const engagementSeries = useMemo(() => buildEngagementSeries(enrichedRows), [enrichedRows]);
 
   const shareSeries = useMemo(() => {
     const charts = detailData?.charts;
@@ -1132,6 +1456,50 @@ export default function Dashboard() {
   }, [enrichedRows, detailData?.charts?.performance]);
 
   const dailyWithEcpm = useMemo(() => withDailyEcpm(dailySeries), [dailySeries]);
+
+  const priorDailySeries = useMemo(() => {
+    const trend = priorDetail?.trend || [];
+    if (!Array.isArray(trend) || !trend.length) return [];
+    return trend.map((item) => ({
+      date: item.date,
+      revenue: toNumber(item.earning ?? item.revenue),
+      impressions: toNumber(item.impressions),
+    }));
+  }, [priorDetail?.trend]);
+
+  const dailyCompareSeries = useMemo(
+    () => withDailyEcpm(overlayPriorDaily(dailySeries, priorDailySeries)),
+    [dailySeries, priorDailySeries]
+  );
+
+  const insightItems = useMemo(() => {
+    const currentShare = Array.isArray(detailData?.charts?.revenue)
+      ? detailData.charts.revenue
+      : [];
+    const currentCountry = Array.isArray(detailData?.charts?.country)
+      ? detailData.charts.country
+      : [];
+    const priorShare = Array.isArray(priorDetail?.charts?.revenue) ? priorDetail.charts.revenue : [];
+    const priorCountry = Array.isArray(priorDetail?.charts?.country) ? priorDetail.charts.country : [];
+    if (!priorShare.length && !priorCountry.length && !priorDetail?.summary && !priorOverview?.summary) {
+      return [];
+    }
+    return buildInsights({
+      currentSummary: overviewSummary,
+      priorSummary: priorDetail?.summary || priorOverview?.summary || null,
+      currentShare,
+      priorShare,
+      currentCountry,
+      priorCountry,
+      comparePhrase: compareLabel,
+    });
+  }, [overviewSummary, priorOverview, priorDetail, detailData?.charts, compareLabel]);
+
+  const stickyKpis = useMemo(() => ([
+    { key: 'imps', label: 'Imps', value: overviewSummary?.impressions, change: overviewSummary?.impressionsChange },
+    { key: 'rev', label: 'Rev', value: overviewSummary?.revenue ?? overviewSummary?.selectRange, change: overviewSummary?.revenueChange, money: true },
+    { key: 'ecpm', label: 'eCPM', value: overviewSummary?.ecpm, change: overviewSummary?.ecpmChange, money: true },
+  ]), [overviewSummary]);
 
   const dailyDates = useMemo(
     () => dailySeries.map((d) => d.date).filter(Boolean),
@@ -1231,16 +1599,54 @@ export default function Dashboard() {
     })).filter((row) => row.revenue > 0 || row.impressions > 0),
     [performanceSeries]
   );
+  const yieldSeries = useMemo(() => {
+    if (!dailyWithEcpm.length || !engagementSeries.length) return [];
+    const ctrByDate = new Map(engagementSeries.map((d) => [d.date, toNumber(d.ctr)]));
+    const merged = dailyWithEcpm.map((d) => ({
+      date: d.date,
+      ecpm: toNumber(d.ecpm),
+      ctr: ctrByDate.get(d.date) || 0,
+    }));
+    return merged.some((d) => d.ecpm > 0 && d.ctr > 0) ? merged : [];
+  }, [dailyWithEcpm, engagementSeries]);
+  const impressionDomainShare = useMemo(
+    () => buildShareSeries(enrichedRows, ['domain', 'inv_domain', 'gamDomain', 'DOMAIN'], 'impressions', { topN: 10 }),
+    [enrichedRows]
+  );
+  const impressionCountryShare = useMemo(
+    () => buildShareSeries(enrichedRows, [
+      'country_name', 'country', 'COUNTRY_NAME', 'countryName', 'countryCode',
+    ], 'impressions', { topN: 10 }),
+    [enrichedRows]
+  );
+  const yieldMargins = useMemo(
+    () => chartMargins({
+      isNarrow,
+      hasAngledX: Boolean(dailyDateAxis.angle),
+      yWidth: dailyEcpmWidth,
+      rightWidth: engagementPctWidth,
+    }),
+    [isNarrow, dailyDateAxis.angle, dailyEcpmWidth, engagementPctWidth]
+  );
   const showRevenueCharts = vis.revenue !== false;
   const showImpressionCharts = vis.impressions !== false;
   const showEcpmCharts = showRevenueCharts && showImpressionCharts;
+  const activeTrend = (
+    (trendMetric === 'ecpm' && !showEcpmCharts)
+    || (trendMetric === 'revenue' && !showRevenueCharts)
+    || (trendMetric === 'impressions' && !showImpressionCharts)
+  ) ? 'all' : trendMetric;
+  const dataStillBuilding = detailData?.status === 'building';
 
-  const hasFilteredReportData = useMemo(() => {
-    if (!hasInventoryFilter) return false;
+  const hasChartReportData = useMemo(() => {
     if (detailData?.summary && (
       (Number(detailData.summary.impressions) || 0) > 0
       || (Number(detailData.summary.revenue) || 0) > 0
     )) {
+      return true;
+    }
+    if (hasChartData(dailySeries, ['revenue', 'impressions'])) return true;
+    if (hasChartData(shareSeries.revenue) || hasChartData(shareSeries.device) || hasChartData(shareSeries.country)) {
       return true;
     }
     return enrichedRows.some((row) => {
@@ -1248,7 +1654,12 @@ export default function Dashboard() {
       const revenue = toNumber(readValue(row, ['revenue', 'total_line_item_level_cpm_and_cpc_revenue'], ['earnings']));
       return impressions > 0 || revenue > 0;
     });
-  }, [hasInventoryFilter, enrichedRows, detailData?.summary]);
+  }, [enrichedRows, detailData?.summary, dailySeries, shareSeries]);
+
+  const hasFilteredReportData = useMemo(() => {
+    if (!hasInventoryFilter) return hasChartReportData;
+    return hasChartReportData;
+  }, [hasInventoryFilter, hasChartReportData]);
 
   const skippedFilterChips = useMemo(() => {
     if (detailData?.reportWarningSkipped?.length) return detailData.reportWarningSkipped;
@@ -1290,29 +1701,122 @@ export default function Dashboard() {
     && detailData?.status !== 'building'
   );
 
+  const clearIncompatibleFilters = () => {
+    const names = new Set(unavailableFilterChips);
+    const next = { ...applied };
+    if (names.has('Domain name')) { setDomain([]); next.domain = []; }
+    if (names.has('Site')) { setSite([]); next.site = []; }
+    if (names.has('Ad Unit')) { setDomainName([]); next.domainName = []; }
+    if (names.has('App ID')) { setDomainId([]); next.domainId = []; }
+    setApplied(next);
+    setFilterApplied(true);
+    showToast({ message: 'Removed incompatible filters' });
+  };
+
   const presetLabel = DATE_PRESETS.find(p => p.id === preset)?.label || 'Custom';
   const isMock = overviewData?.isMock || detailData?.isMock;
 
+  const filterSummary = useMemo(() => {
+    const parts = [];
+    if (customDatesIncomplete) {
+      parts.push('Custom range incomplete');
+    } else if (startDate && endDate) {
+      parts.push(startDate === endDate ? startDate : `${startDate} → ${endDate}`);
+    } else {
+      parts.push(presetLabel);
+    }
+    if (hasInventoryFilter) {
+      const bits = [];
+      if (applied?.domain?.length && !isAllSelection(applied.domain)) bits.push(`${applied.domain.length} domains`);
+      if (applied?.site?.length && !isAllSelection(applied.site)) bits.push(`${applied.site.length} sites`);
+      if (applied?.domainName?.length && !isAllSelection(applied.domainName)) bits.push(`${applied.domainName.length} ad units`);
+      if (applied?.domainId?.length && !isAllSelection(applied.domainId)) bits.push(`${applied.domainId.length} apps`);
+      parts.push(bits.length ? bits.join(', ') : 'Filtered inventory');
+    } else {
+      parts.push('All inventory');
+    }
+    return parts.join(' · ');
+  }, [
+    customDatesIncomplete, startDate, endDate, presetLabel, hasInventoryFilter, applied,
+  ]);
+
+  const chartOn = (id) => !hiddenChartIds.includes(id);
+  const hideChart = (id) => {
+    setHiddenChartIds((prev) => {
+      const next = prev.includes(id) ? prev : [...prev, id];
+      return next.length >= DASH_CHARTS.length ? prev : next;
+    });
+  };
+  const toggleChart = (id) => {
+    setHiddenChartIds((prev) => {
+      if (prev.includes(id)) return prev.filter((x) => x !== id);
+      const next = [...prev, id];
+      return next.length >= DASH_CHARTS.length ? prev : next;
+    });
+  };
+  const handleCompareMode = (mode) => {
+    setCompareMode(mode);
+    if (mode === 'custom' && (!compareStart || !compareEnd)) {
+      const prior = previousPeriodRange(applied?.startDate || startDate, applied?.endDate || endDate);
+      if (prior) {
+        setCompareStart(prior.startDate);
+        setCompareEnd(prior.endDate);
+      }
+    }
+  };
 
   return (
     <div className="dashboard-page">
-      <div className="reporting-head">
-        <h2 className="page-title">Dashboard</h2>
-        <p className="reporting-sub">Overview shows your full assigned revenue; apply filters to narrow KPIs, chart &amp; table</p>
-        {dateRestriction && (
-          <p className="form-note" style={{ marginTop: 4 }}>
-            {dateFilterLocked
-              ? `Data locked to: ${formatDateRestrictionLabel(dateRestriction)}`
-              : `Allowed filter window: ${formatDateRestrictionLabel(dateRestriction)}`}
-          </p>
+      <PageHeader
+        title="Dashboard"
+        subtitle="Network performance overview — charts load for the selected dates; inventory filters refine them"
+        summary={filterSummary}
+      >
+        {canFilter && (
+          <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>
+            Copy link
+          </button>
         )}
-      </div>
+      </PageHeader>
+      {canGenerate && (
+        <CompareRangeBar
+          mode={compareMode}
+          onModeChange={handleCompareMode}
+          customStart={compareStart}
+          customEnd={compareEnd}
+          onCustomStart={(v) => setCompareStart(clampDateValue(v, dateRestriction))}
+          onCustomEnd={(v) => setCompareEnd(clampDateValue(v, dateRestriction))}
+          minDate={dateRestriction?.startDate}
+          maxDate={dateRestriction?.endDate}
+          disabled={!canFilter}
+        />
+      )}
+      {canGenerate && (
+        <OnboardingGuide
+          visible
+          onPickDates={() => {
+            setBreakdownOpen(true);
+            setMobileFiltersOpen(true);
+            filterPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }}
+          onApply={() => {
+            if (!customDatesIncomplete && canApplyInventory) applyFilter();
+          }}
+        />
+      )}
+      {dateRestriction && (
+        <p className="form-note page-restriction-note">
+          {dateFilterLocked
+            ? `Data locked to: ${formatDateRestrictionLabel(dateRestriction)}`
+            : `Allowed filter window: ${formatDateRestrictionLabel(dateRestriction)}`}
+        </p>
+      )}
 
       {canGenerate && (
       <div className="filter-card dash-overview-shell" ref={filterPanelRef}>
         <div className="dash-date-toolbar filter-card-head-sticky">
           <div className="dash-date-display">
-            <span className="dash-date-label">📅 {presetLabel}</span>
+            <span className="dash-date-label">{presetLabel}</span>
             <span className="dash-date-range">
               {customDatesIncomplete
                 ? 'Select start & end dates'
@@ -1321,7 +1825,7 @@ export default function Dashboard() {
                   : '…')}
             </span>
           </div>
-          <div className="filter-actions">
+          <div className="filter-actions filter-actions--desktop">
             <button className="btn-generate" onClick={applyFilter}
               disabled={!canFilter || !canApplyInventory || customDatesIncomplete}
               title={customDatesIncomplete
@@ -1339,6 +1843,21 @@ export default function Dashboard() {
           </div>
         </div>
 
+        {isNarrow && (
+          <div className="filter-mobile-toggle-row">
+            <button
+              type="button"
+              className="filter-mobile-toggle"
+              aria-expanded={mobileFiltersOpen}
+              onClick={() => setMobileFiltersOpen((v) => !v)}
+            >
+              Filters{appliedChips.length ? ` (${appliedChips.length})` : ''} {mobileFiltersOpen ? '▴' : '▾'}
+            </button>
+            <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>Copy link</button>
+          </div>
+        )}
+
+        <div className={`filter-panel-body${!mobileFiltersOpen && isNarrow ? ' is-collapsed' : ''}`}>
         {!dateFilterLocked && visiblePresets.length > 0 && (
         <div className="preset-pills dash-preset-row">
           {visiblePresets.map(p => {
@@ -1393,7 +1912,7 @@ export default function Dashboard() {
               </div>
             </div>
             <div className="custom-range-hint">
-              📅 Pick <strong>start</strong> and <strong>end</strong> dates, then click <strong>Apply Filter</strong> to load data.
+              Pick <strong>start</strong> and <strong>end</strong> dates, then click <strong>Apply Filter</strong> to load data.
             </div>
           </>
         )}
@@ -1461,8 +1980,21 @@ export default function Dashboard() {
           </div>
         )}
 
+        {isNarrow && (
+          <div className="filter-actions filter-actions--mobile-inline" style={{ marginTop: 10 }}>
+            <SavedFiltersBar
+              page={SAVED_FILTERS_PAGES.dashboard}
+              userId={user?.id}
+              getSnapshot={getSavedFilterSnapshot}
+              onApply={handleApplySavedFilter}
+              canSave={canFilter}
+              disabled={!canFilter}
+            />
+          </div>
+        )}
+
         {breakdownOpen && (
-          <div className="dash-breakdown-section gam-report-breakdown-section">
+          <div id="dash-inventory-filters" className="dash-breakdown-section gam-report-breakdown-section">
             <div className="filter-section-divider" />
             {showNoDomainsNote ? (
               <NoDomainsAssignedNote />
@@ -1511,7 +2043,8 @@ export default function Dashboard() {
             )}
           </div>
         )}
-        {(breakdownOpen || filterApplied) && canFilter && (
+        </div>
+        {breakdownOpen && canFilter && (
           <div className="filter-actions-foot">
             <button className="btn-generate" onClick={applyFilter}
               disabled={!canApplyInventory || customDatesIncomplete}>✓ Apply Filter</button>
@@ -1519,40 +2052,94 @@ export default function Dashboard() {
           </div>
         )}
         {!canFilter && (
-          <p className="filter-locked-note">🔒 Filters are disabled for your account.</p>
+          <p className="filter-locked-note">Filters are disabled for your account.</p>
         )}
       </div>
       )}
 
       {error && (
-        <div className="error-box">⚠️ {error}
-          <button onClick={() => { loadOverview(); if (canGenerate && filterApplied) loadDetail(); }} className="btn-retry">Retry</button>
+        <div className="error-box dash-error-box" role="alert">
+          <div className="dash-error-copy">
+            <strong>Couldn’t load live metrics</strong>
+            <span>{error}</span>
+          </div>
+          <button type="button" onClick={() => { loadOverview(); if (canGenerate) loadDetail(); }} className="btn-retry">Retry</button>
         </div>
       )}
 
       {!(hasInventoryFilter && !detailLoading && !hasFilteredReportData) && (
-        <div className="dash-overview-row">
-          <GamOverviewCard
-            summary={overviewSummary}
-            currency={currency}
-            loading={overviewCardLoading}
-          />
-        </div>
+        <>
+          {isNarrow && !overviewCardLoading && (overviewSummary?.impressions != null || overviewSummary?.revenue != null) && (
+            <div className="kpi-sticky-strip" aria-label="Key metrics">
+              {stickyKpis.map((k) => {
+                const change = k.change;
+                const down = change != null && change < 0;
+                const val = k.money
+                  ? money(k.value, currency)
+                  : Number(k.value || 0).toLocaleString();
+                return (
+                  <div key={k.key} className="kpi-sticky-item">
+                    <span className="kpi-sticky-label">{k.label}</span>
+                    <span className="kpi-sticky-value">{val}</span>
+                    {change != null && (
+                      <span className={`kpi-sticky-delta ${down ? 'down' : 'up'}`}>
+                        {down ? '▼' : '▲'}{Math.abs(change).toFixed(0)}%
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          <div className="dash-overview-row">
+            <GamOverviewCard
+              summary={overviewSummary}
+              currency={currency}
+              loading={overviewCardLoading}
+              sparkSeries={dailyWithEcpm}
+              compareLabel={compareLabel}
+            />
+          </div>
+          {!overviewCardLoading && insightItems.length > 0 && (
+            <InsightsStrip items={insightItems} compareLabel={compareLabel} />
+          )}
+        </>
       )}
 
       {!canGenerate ? (
         <AccessRestricted title={NO_VIEW_REPORTS_TITLE} message={NO_VIEW_REPORTS_MSG} />
       ) : (
         <>
+      {detailLoading && (
+        <div className="dash-skeleton-grid" aria-busy="true" aria-label="Loading charts">
+          <div className="chart-card wide dash-skeleton-card">
+            <div className="skeleton dash-skeleton-title" />
+            <div className="skeleton dash-skeleton-chart" />
+          </div>
+          <div className="charts-grid">
+            <div className="chart-card dash-skeleton-card">
+              <div className="skeleton dash-skeleton-title" />
+              <div className="skeleton dash-skeleton-chart sm" />
+            </div>
+            <div className="chart-card dash-skeleton-card">
+              <div className="skeleton dash-skeleton-title" />
+              <div className="skeleton dash-skeleton-chart sm" />
+            </div>
+          </div>
+        </div>
+      )}
+
       {detailLoading && slowDetail && (
         <div className="gam-report-warning" role="status">
-          <span className="gam-report-warning-icon" aria-hidden>⏳</span>
+          <span className="gam-report-warning-icon" aria-hidden>…</span>
           Reports are taking longer than usual to respond. Please wait…
         </div>
       )}
 
-      {hasInventoryFilter && detailLoading && (
-        <div className="spinner-wrap"><div className="spinner" /></div>
+      {!detailLoading && dataStillBuilding && hasChartReportData && (
+        <div className="chart-annotation" role="status">
+          Data is still filling in for this range. Totals may change when the sync finishes.
+        </div>
       )}
 
       {showPartialCompatWarning && (
@@ -1568,6 +2155,13 @@ export default function Dashboard() {
                   Some selected filters can&apos;t be combined in one result set.
                   Results below use the compatible subset. Remove the unavailable items for a complete selection.
                 </div>
+                {canFilter && skippedFilterChips.length > 0 && (
+                  <div className="warn-card-btns">
+                    <button type="button" className="warn-btn-primary" onClick={clearIncompatibleFilters}>
+                      Remove these and apply
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
             <div className="warn-card-right">
@@ -1598,10 +2192,10 @@ export default function Dashboard() {
                 <div className="warn-card-btns">
                   {canFilter && (
                     <>
-                      <button type="button" className="warn-btn-primary" onClick={reset}>↺ Reset Filters</button>
-                      <button type="button" className="warn-btn-secondary" onClick={handleAddFilter}>
-                        ＋ Add New Filter
+                      <button type="button" className="warn-btn-primary" onClick={clearIncompatibleFilters}>
+                        Remove these and apply
                       </button>
+                      <button type="button" className="warn-btn-secondary" onClick={reset}>↺ Reset Filters</button>
                     </>
                   )}
                 </div>
@@ -1617,27 +2211,60 @@ export default function Dashboard() {
             </div>
           </div>
           <div className="warn-card-hint-bar">
-            <span className="warn-card-hint-icon" aria-hidden>💡</span>
+            <span className="warn-card-hint-icon" aria-hidden>i</span>
             <span>Some selected filters can&apos;t be combined in the same report. Remove incompatible filters to view complete data.</span>
           </div>
         </div>
       )}
 
-      {hasInventoryFilter && !detailLoading && hasFilteredReportData && (
+      {!detailLoading && hasChartReportData && (
         <>
-          {hasChartData(dailySeries, ['revenue', 'impressions']) && (
+          <div className="dash-chart-toolbar">
+            <ChartVisibilityMenu
+              hiddenIds={hiddenChartIds}
+              onToggle={toggleChart}
+              onShowAll={() => setHiddenChartIds([])}
+            />
+          </div>
+          {chartOn('trend') && hasChartData(dailySeries, ['revenue', 'impressions']) && (
           <div className="chart-card wide">
             <div className="chart-header">
-              <h3 className="chart-title">Revenue growth &amp; impressions</h3>
-              {filterApplied && (
-                <div className="report-live">
-                  <span className="dot-pulse" /> {isMock ? 'Mock' : 'Live'}
-                  {lastUpdated && <span className="report-updated">Updated {lastUpdated} SGT</span>}
+              <div className="chart-header-text">
+                <h3 className="chart-title">
+                  {activeTrend === 'revenue' ? 'Revenue'
+                    : activeTrend === 'impressions' ? 'Impressions'
+                      : activeTrend === 'ecpm' ? 'eCPM'
+                        : 'Revenue growth & impressions'}
+                </h3>
+                {priorDailySeries.length > 0 && activeTrend !== 'impressions' && activeTrend !== 'ecpm' && (
+                  <p className="chart-hint">Solid = this period · Dashed = {compareLabel} revenue</p>
+                )}
+              </div>
+              <div className="chart-header-actions">
+                <div className="chart-metric-toggle" role="group" aria-label="Trend metric">
+                  <button type="button" className={`chart-metric-toggle-btn${activeTrend === 'all' ? ' active' : ''}`} onClick={() => setTrendMetric('all')}>All</button>
+                  {showRevenueCharts && (
+                    <button type="button" className={`chart-metric-toggle-btn${activeTrend === 'revenue' ? ' active' : ''}`} onClick={() => setTrendMetric('revenue')}>Revenue</button>
+                  )}
+                  {showImpressionCharts && (
+                    <button type="button" className={`chart-metric-toggle-btn${activeTrend === 'impressions' ? ' active' : ''}`} onClick={() => setTrendMetric('impressions')}>Impressions</button>
+                  )}
+                  {showEcpmCharts && (
+                    <button type="button" className={`chart-metric-toggle-btn${activeTrend === 'ecpm' ? ' active' : ''}`} onClick={() => setTrendMetric('ecpm')}>eCPM</button>
+                  )}
                 </div>
-              )}
+                {filterApplied && (
+                  <div className="report-live">
+                    <span className="dot-pulse" /> {isMock ? 'Mock' : 'Live'}
+                    {lastUpdated && <span className="report-updated">Updated {lastUpdated} SGT</span>}
+                  </div>
+                )}
+                <ChartExportButton filename="revenue-impressions" />
+                <button type="button" className="chart-hide-btn" onClick={() => hideChart('trend')} title="Hide this chart">Hide</button>
+              </div>
             </div>
-              <ScrollableChart pointCount={dailySeries.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
-                <AreaChart data={dailySeries} margin={dailyChartMargins}>
+              <ScrollableChart pointCount={dailyCompareSeries.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
+                <ComposedChart data={dailyCompareSeries} margin={dailyChartMargins}>
                   <defs>
                     <linearGradient id="dashEarnGrad" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor={CHART_SERIES.primary} stopOpacity={0.22} />
@@ -1650,43 +2277,80 @@ export default function Dashboard() {
                   </defs>
                   <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
                   <XAxis dataKey="date" {...dailyDateAxis} />
+                  {(activeTrend === 'all' || activeTrend === 'revenue' || activeTrend === 'ecpm') && (
                   <YAxis
                     yAxisId="left"
                     tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisMoney(v, currency)}
-                    width={dailyMoneyWidth}
+                    width={activeTrend === 'ecpm' ? dailyEcpmWidth : dailyMoneyWidth}
                   />
+                  )}
+                  {(activeTrend === 'all' || activeTrend === 'impressions') && (
                   <YAxis
-                    yAxisId="right"
-                    orientation="right"
+                    yAxisId={activeTrend === 'impressions' ? 'left' : 'right'}
+                    orientation={activeTrend === 'impressions' ? 'left' : 'right'}
                     tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
                     tickLine={false}
                     axisLine={false}
                     tickFormatter={(v) => formatAxisNumber(v)}
                     width={dailyImpWidth}
                   />
+                  )}
                   <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
                     labelFormatter={(label) => String(label || '')}
-                    formatter={(v, name) => (name === 'Revenue' ? [money(v, currency), 'Revenue'] : [num(v), 'Impressions'])} />
+                    formatter={(v, name) => {
+                      if (name === 'Prior revenue') return [money(v, currency), compareLabel.replace(/^vs /, '')];
+                      if (name === 'eCPM') return [money(v, currency), 'eCPM'];
+                      return name === 'Revenue' ? [money(v, currency), 'Revenue'] : [num(v), 'Impressions'];
+                    }} />
+                  {(activeTrend === 'all' || activeTrend === 'revenue') && (
                   <Area yAxisId="left" type="monotone" dataKey="revenue" stroke={CHART_SERIES.primary} strokeWidth={2}
                     fill="url(#dashEarnGrad)" fillOpacity={1} dot={false} activeDot={{ r: 4 }} name="Revenue" isAnimationActive={false} />
-                  <Area yAxisId="right" type="monotone" dataKey="impressions" stroke={CHART_SERIES.secondary} strokeWidth={2}
+                  )}
+                  {priorDailySeries.length > 0 && (activeTrend === 'all' || activeTrend === 'revenue') && (
+                    <Line
+                      yAxisId="left"
+                      type="monotone"
+                      dataKey="priorRevenue"
+                      stroke={CHART_SERIES.muted}
+                      strokeWidth={2}
+                      strokeDasharray="5 5"
+                      dot={false}
+                      name="Prior revenue"
+                      isAnimationActive={false}
+                    />
+                  )}
+                  {(activeTrend === 'all' || activeTrend === 'impressions') && (
+                  <Area yAxisId={activeTrend === 'impressions' ? 'left' : 'right'} type="monotone" dataKey="impressions" stroke={CHART_SERIES.secondary} strokeWidth={2}
                     fill="url(#dashImpsGrad)" fillOpacity={1} dot={false} activeDot={{ r: 4 }} name="Impressions" isAnimationActive={false} />
-                </AreaChart>
+                  )}
+                  {activeTrend === 'ecpm' && (
+                    <Line
+                      yAxisId="left"
+                      type="monotone"
+                      dataKey="ecpm"
+                      stroke={CHART_SERIES.accent}
+                      strokeWidth={2}
+                      dot={false}
+                      activeDot={{ r: 4 }}
+                      name="eCPM"
+                      isAnimationActive={false}
+                    />
+                  )}
+                </ComposedChart>
               </ScrollableChart>
           </div>
           )}
 
-          {(hasChartData(engagementSeries, ['clicks', 'ctr', 'fillRate'])) && (
+          {(chartOn('ctr') && hasChartData(engagementSeries, ['ctr'])
+            || chartOn('clicks') && hasChartData(engagementSeries, ['clicks'])
+            || chartOn('fill') && hasChartData(engagementSeries, ['fillRate'])) && (
           <div className="charts-grid">
-            {hasChartData(engagementSeries, ['ctr']) && (
+            {chartOn('ctr') && hasChartData(engagementSeries, ['ctr']) && (
             <div className="chart-card">
-              <div className="chart-header">
-                <h3 className="chart-title">CTR over time</h3>
-                <span className="filter-section-hint">Clicks / impressions</span>
-              </div>
+              <ChartHeader title="CTR over time" hint="Clicks / impressions" onHide={() => hideChart('ctr')} />
               <ScrollableChart pointCount={engagementSeries.length} isNarrow={isNarrow} height={isNarrow ? 260 : 250}>
                 <AreaChart data={engagementSeries} margin={engagementMargins}>
                   <defs>
@@ -1713,12 +2377,9 @@ export default function Dashboard() {
               </ScrollableChart>
             </div>
             )}
-            {hasChartData(engagementSeries, ['clicks']) && (
+            {chartOn('clicks') && hasChartData(engagementSeries, ['clicks']) && (
             <div className="chart-card">
-              <div className="chart-header">
-                <h3 className="chart-title">Clicks trend</h3>
-                <span className="filter-section-hint">Daily clicks</span>
-              </div>
+              <ChartHeader title="Clicks trend" hint="Daily clicks" onHide={() => hideChart('clicks')} />
               <ScrollableChart pointCount={engagementSeries.length} isNarrow={isNarrow} height={isNarrow ? 260 : 250}>
                 <AreaChart data={engagementSeries} margin={engagementMargins}>
                   <defs>
@@ -1745,12 +2406,9 @@ export default function Dashboard() {
               </ScrollableChart>
             </div>
             )}
-            {hasChartData(engagementSeries, ['fillRate']) && (
+            {chartOn('fill') && hasChartData(engagementSeries, ['fillRate']) && (
             <div className="chart-card">
-              <div className="chart-header">
-                <h3 className="chart-title">Fill rate over time</h3>
-                <span className="filter-section-hint">Impressions / (impressions + unfilled)</span>
-              </div>
+              <ChartHeader title="Fill rate over time" hint="Impressions / (impressions + unfilled)" onHide={() => hideChart('fill')} />
               <ScrollableChart pointCount={engagementSeries.length} isNarrow={isNarrow} height={isNarrow ? 260 : 250}>
                 <AreaChart data={engagementSeries} margin={engagementMargins}>
                   <defs>
@@ -1781,58 +2439,140 @@ export default function Dashboard() {
           </div>
           )}
 
-          {(hasChartData(shareSeries.revenue) || hasChartData(shareSeries.device) || hasChartData(shareSeries.country)
-            || (showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']))
-            || (showRevenueCharts && !showEcpmCharts && hasChartData(siteShareSeries))) && (
+          {(chartOn('unfilled') && hasChartData(engagementSeries, ['unfilled'])
+            || (chartOn('yield') && showEcpmCharts && hasChartData(yieldSeries, ['ecpm', 'ctr']))) && (
           <div className="charts-grid">
-            {hasChartData(shareSeries.revenue) && (
+            {chartOn('unfilled') && hasChartData(engagementSeries, ['unfilled']) && (
+            <div className="chart-card">
+              <ChartHeader title="Unfilled impressions" hint="Demand that did not fill" onHide={() => hideChart('unfilled')} />
+              <ScrollableChart pointCount={engagementSeries.length} isNarrow={isNarrow} height={isNarrow ? 260 : 250}>
+                <AreaChart data={engagementSeries} margin={engagementMargins}>
+                  <defs>
+                    <linearGradient id="dashUnfilledGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor={CHART_SERIES.danger} stopOpacity={0.2} />
+                      <stop offset="95%" stopColor={CHART_SERIES.danger} stopOpacity={0.02} />
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
+                  <XAxis dataKey="date" {...engagementDateAxis} />
+                  <YAxis
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => formatAxisNumber(v)}
+                    width={engagementClicksWidth}
+                  />
+                  <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
+                    labelFormatter={(label) => String(label || '')}
+                    formatter={(v) => [num(v), 'Unfilled']} />
+                  <Area type="monotone" dataKey="unfilled" name="Unfilled" stroke={CHART_SERIES.danger} strokeWidth={2}
+                    fill="url(#dashUnfilledGrad)" fillOpacity={1} dot={false} isAnimationActive={false} />
+                </AreaChart>
+              </ScrollableChart>
+            </div>
+            )}
+            {chartOn('yield') && showEcpmCharts && hasChartData(yieldSeries, ['ecpm', 'ctr']) && (
+            <div className="chart-card">
+              <ChartHeader title="Yield quality" hint="eCPM vs CTR" onHide={() => hideChart('yield')} />
+              <ScrollableChart pointCount={yieldSeries.length} isNarrow={isNarrow} height={isNarrow ? 260 : 250}>
+                <ComposedChart data={yieldSeries} margin={yieldMargins}>
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
+                  <XAxis dataKey="date" {...dailyDateAxis} />
+                  <YAxis
+                    yAxisId="left"
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => formatAxisMoney(v, currency)}
+                    width={dailyEcpmWidth}
+                  />
+                  <YAxis
+                    yAxisId="right"
+                    orientation="right"
+                    tick={{ ...CHART_AXIS_TICK, fontSize: isNarrow ? 10 : 11 }}
+                    tickLine={false}
+                    axisLine={false}
+                    tickFormatter={(v) => `${Number(v || 0).toFixed(1)}%`}
+                    width={engagementPctWidth}
+                  />
+                  <Tooltip contentStyle={CHART_TOOLTIP_STYLE}
+                    labelFormatter={(label) => String(label || '')}
+                    formatter={(v, name) => (
+                      name === 'CTR'
+                        ? [`${Number(v || 0).toFixed(2)}%`, 'CTR']
+                        : [money(v, currency), 'eCPM']
+                    )} />
+                  <Legend />
+                  <Bar yAxisId="left" dataKey="ecpm" name="eCPM" fill={CHART_SERIES.primary} radius={[4, 4, 0, 0]} maxBarSize={isNarrow ? 14 : 28} />
+                  <Line yAxisId="right" type="monotone" dataKey="ctr" name="CTR" stroke={CHART_SERIES.accent} strokeWidth={2} dot={false} />
+                </ComposedChart>
+              </ScrollableChart>
+            </div>
+            )}
+          </div>
+          )}
+
+          {((chartOn('revenueShare') && hasChartData(shareSeries.revenue))
+            || (chartOn('deviceShare') && hasChartData(shareSeries.device))
+            || (chartOn('countryShare') && hasChartData(shareSeries.country))
+            || (chartOn('dailyEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']))
+            || (chartOn('topSites') && showRevenueCharts && !showEcpmCharts && hasChartData(siteShareSeries))) && (
+          <div className="charts-grid">
+            {chartOn('revenueShare') && hasChartData(shareSeries.revenue) && (
             <div className="chart-card">
               <div className="chart-header">
-                <h3 className="chart-title">Revenue share</h3>
-                <span className="filter-section-hint">
-                  {isAllSelection(applied?.domain)
-                    ? 'Top 10 domains'
-                    : (applied?.domain?.length || 0) >= 10
+                <div className="chart-header-text">
+                  <h3 className="chart-title">Revenue share</h3>
+                  <span className="filter-section-hint">
+                    {isAllSelection(applied?.domain)
                       ? 'Top 10 domains'
-                      : (applied?.domain?.length || 0) > 0
-                        ? `All ${applied.domain.length} selected`
-                        : 'Top 10 domains'}
-                </span>
+                      : (applied?.domain?.length || 0) >= 10
+                        ? 'Top 10 domains'
+                        : (applied?.domain?.length || 0) > 0
+                          ? `All ${applied.domain.length} selected`
+                          : 'Top 10 domains'}
+                  </span>
+                </div>
+                <div className="chart-header-actions">
+                  <ChartExportButton filename="revenue-share" />
+                  <button type="button" className="chart-hide-btn" onClick={() => hideChart('revenueShare')} title="Hide this chart">Hide</button>
+                </div>
               </div>
-              <ResponsiveContainer width="100%" height={220}>
-                <PieChart className="chart-pie-no-focus">
-                  <Pie
-                    data={shareSeries.revenue}
-                    dataKey="value"
-                    nameKey="name"
-                    innerRadius={48}
-                    outerRadius={78}
-                    paddingAngle={2}
-                    isAnimationActive={false}
-                    stroke="none"
-                  >
-                    {shareSeries.revenue.map((entry, idx) => (
-                      <Cell
-                        key={`${entry.name}-${idx}`}
-                        fill={SHARE_COLORS[idx % SHARE_COLORS.length]}
-                        stroke="none"
-                        style={{ outline: 'none' }}
-                      />
-                    ))}
-                  </Pie>
-                  <Tooltip formatter={(value) => [money(value, currency), 'Revenue']} />
-                  <Legend />
-                </PieChart>
-              </ResponsiveContainer>
+              <div className="pie-chart-block">
+                <ResponsiveContainer width="100%" height={isNarrow ? 168 : 180}>
+                  <PieChart className="chart-pie-no-focus" margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
+                    <Pie
+                      data={shareSeries.revenue}
+                      dataKey="value"
+                      nameKey="name"
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={isNarrow ? 42 : 50}
+                      outerRadius={isNarrow ? 68 : 76}
+                      paddingAngle={2}
+                      isAnimationActive={false}
+                      stroke="none"
+                    >
+                      {shareSeries.revenue.map((entry, idx) => (
+                        <Cell
+                          key={`${entry.name}-${idx}`}
+                          fill={SHARE_COLORS[idx % SHARE_COLORS.length]}
+                          stroke="none"
+                          style={{ outline: 'none' }}
+                        />
+                      ))}
+                    </Pie>
+                    <Tooltip formatter={(value) => [money(value, currency), 'Revenue']} />
+                  </PieChart>
+                </ResponsiveContainer>
+                <SharePieLegend items={shareSeries.revenue} />
+              </div>
             </div>
             )}
 
-            {hasChartData(shareSeries.device) && (
+            {chartOn('deviceShare') && hasChartData(shareSeries.device) && (
             <div className="chart-card">
-              <div className="chart-header">
-                <h3 className="chart-title">Device share</h3>
-                <span className="filter-section-hint">Laptop · Mobile · Tablet</span>
-              </div>
+              <ChartHeader title="Device share" hint="Laptop · Mobile · Tablet" onHide={() => hideChart('deviceShare')} />
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={shareSeries.device} layout="vertical" margin={hBarMargins}>
                   <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
@@ -1861,57 +2601,46 @@ export default function Dashboard() {
             </div>
             )}
 
-            {hasChartData(shareSeries.country) && (
+            {chartOn('countryShare') && hasChartData(shareSeries.country) && (
             <div className="chart-card">
-              <div className="chart-header">
-                <h3 className="chart-title">Country share</h3>
-                <span className="filter-section-hint">Top 10 countries</span>
+              <ChartHeader title="Country share" hint="Top 10 countries" onHide={() => hideChart('countryShare')} />
+              <div className="pie-chart-block">
+                <ResponsiveContainer width="100%" height={isNarrow ? 168 : 180}>
+                  <PieChart className="chart-pie-no-focus" margin={{ top: 4, right: 4, bottom: 4, left: 4 }}>
+                    <Pie
+                      data={shareSeries.country}
+                      dataKey="value"
+                      nameKey="name"
+                      cx="50%"
+                      cy="50%"
+                      innerRadius={isNarrow ? 42 : 50}
+                      outerRadius={isNarrow ? 68 : 76}
+                      paddingAngle={2}
+                      isAnimationActive={false}
+                      stroke="none"
+                    >
+                      {shareSeries.country.map((entry, idx) => (
+                        <Cell
+                          key={`${entry.name}-${idx}`}
+                          fill={SHARE_COLORS[idx % SHARE_COLORS.length]}
+                          stroke="none"
+                          style={{ outline: 'none' }}
+                        />
+                      ))}
+                    </Pie>
+                    <Tooltip
+                      formatter={(value, name) => [money(value, currency), name || 'Country']}
+                    />
+                  </PieChart>
+                </ResponsiveContainer>
+                <SharePieLegend items={shareSeries.country} />
               </div>
-              <ResponsiveContainer width="100%" height={260}>
-                <PieChart className="chart-pie-no-focus">
-                  <Pie
-                    data={shareSeries.country}
-                    dataKey="value"
-                    nameKey="name"
-                    innerRadius={48}
-                    outerRadius={78}
-                    paddingAngle={2}
-                    isAnimationActive={false}
-                    stroke="none"
-                    label={isNarrow
-                      ? false
-                      : ({ name, percent }) => `${name} (${(percent * 100).toFixed(0)}%)`}
-                    labelLine={isNarrow ? false : { stroke: '#9aa0a6', strokeWidth: 1 }}
-                  >
-                    {shareSeries.country.map((entry, idx) => (
-                      <Cell
-                        key={`${entry.name}-${idx}`}
-                        fill={SHARE_COLORS[idx % SHARE_COLORS.length]}
-                        stroke="none"
-                        style={{ outline: 'none' }}
-                      />
-                    ))}
-                  </Pie>
-                  <Tooltip
-                    formatter={(value, name) => [money(value, currency), name || 'Country']}
-                  />
-                  <Legend
-                    layout="horizontal"
-                    verticalAlign="bottom"
-                    align="center"
-                    formatter={(value) => <span style={{ color: '#333', fontSize: 11 }}>{value}</span>}
-                  />
-                </PieChart>
-              </ResponsiveContainer>
             </div>
             )}
 
-            {showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']) ? (
+            {chartOn('dailyEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']) ? (
               <div className="chart-card">
-                <div className="chart-header">
-                  <h3 className="chart-title">Daily eCPM</h3>
-                  <span className="filter-section-hint">Revenue / impressions × 1000</span>
-                </div>
+                <ChartHeader title="Daily eCPM" hint="Revenue / impressions × 1000" onHide={() => hideChart('dailyEcpm')} />
                 <ScrollableChart pointCount={dailyWithEcpm.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
                   <LineChart data={dailyWithEcpm} margin={dailyEcpmMargins}>
                     <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
@@ -1930,12 +2659,9 @@ export default function Dashboard() {
                   </LineChart>
                 </ScrollableChart>
               </div>
-            ) : (showRevenueCharts && hasChartData(siteShareSeries)) ? (
+            ) : (chartOn('topSites') && showRevenueCharts && hasChartData(siteShareSeries)) ? (
               <div className="chart-card">
-                <div className="chart-header">
-                  <h3 className="chart-title">Top sites</h3>
-                  <span className="filter-section-hint">Top 10 by revenue</span>
-                </div>
+                <ChartHeader title="Top sites" hint="Top 10 by revenue" onHide={() => hideChart('topSites')} />
                 <ResponsiveContainer width="100%" height={260}>
                   <BarChart data={siteShareSeries} layout="vertical" margin={hBarMargins}>
                     <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
@@ -1955,12 +2681,52 @@ export default function Dashboard() {
           </div>
           )}
 
-          {hasChartData(performanceSeries, ['score', 'value']) && (
-          <div className="chart-card wide">
-            <div className="chart-header">
-              <h3 className="chart-title">Ad performance</h3>
-              <span className="filter-section-hint">Compact score by ad unit</span>
+          {showImpressionCharts && ((chartOn('impsDomain') && hasChartData(impressionDomainShare)) || (chartOn('impsCountry') && hasChartData(impressionCountryShare))) && (
+          <div className="charts-grid">
+            {chartOn('impsDomain') && hasChartData(impressionDomainShare) && (
+            <div className="chart-card">
+              <ChartHeader title="Impressions by domain" hint="Top 10 domains" onHide={() => hideChart('impsDomain')} />
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={impressionDomainShare} layout="vertical" margin={hBarMargins}>
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
+                  <XAxis type="number" tick={false} axisLine={false} />
+                  <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
+                  <Tooltip formatter={(value, _n, item) => [num(value), item?.payload?.name || 'Domain']} />
+                  <Bar dataKey="value" radius={[0, 6, 6, 0]}>
+                    {impressionDomainShare.map((entry, idx) => (
+                      <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
+            )}
+            {chartOn('impsCountry') && hasChartData(impressionCountryShare) && (
+            <div className="chart-card">
+              <ChartHeader title="Impressions by country" hint="Top 10 countries" onHide={() => hideChart('impsCountry')} />
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={impressionCountryShare} layout="vertical" margin={hBarMargins}>
+                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
+                  <XAxis type="number" tick={false} axisLine={false} />
+                  <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
+                  <Tooltip formatter={(value, _n, item) => [num(value), item?.payload?.name || 'Country']} />
+                  <Bar dataKey="value" radius={[0, 6, 6, 0]}>
+                    {impressionCountryShare.map((entry, idx) => (
+                      <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            )}
+          </div>
+          )}
+
+          {chartOn('adPerformance') && hasChartData(performanceSeries, ['score', 'value']) && (
+          <div className="chart-card wide">
+            <ChartHeader title="Ad performance" hint="Compact score by ad unit" onHide={() => hideChart('adPerformance')} />
             <ResponsiveContainer width="100%" height={240}>
               <BarChart data={performanceSeries} layout="vertical" margin={hBarMargins}>
                 <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
@@ -1974,12 +2740,9 @@ export default function Dashboard() {
           </div>
           )}
 
-          {showEcpmCharts && hasChartData(dailyWithEcpm, ['revenue', 'ecpm']) && (
+          {chartOn('revenueEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['revenue', 'ecpm']) && (
             <div className="chart-card wide">
-              <div className="chart-header">
-                <h3 className="chart-title">Revenue vs eCPM</h3>
-                <span className="filter-section-hint">Daily revenue bars with eCPM overlay</span>
-              </div>
+              <ChartHeader title="Revenue vs eCPM" hint="Daily revenue bars with eCPM overlay" onHide={() => hideChart('revenueEcpm')} />
               <ScrollableChart pointCount={dailyWithEcpm.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
                 <ComposedChart data={dailyWithEcpm} margin={dailyEcpmMargins}>
                   <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
@@ -2012,15 +2775,12 @@ export default function Dashboard() {
             </div>
           )}
 
-          {((showRevenueCharts && showEcpmCharts && hasChartData(siteShareSeries))
-            || ((showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']))) && (
+          {((chartOn('topSites') && showRevenueCharts && showEcpmCharts && hasChartData(siteShareSeries))
+            || (chartOn('adUnitMix') && (showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']))) && (
           <div className="charts-grid">
-            {showRevenueCharts && showEcpmCharts && hasChartData(siteShareSeries) && (
+            {chartOn('topSites') && showRevenueCharts && showEcpmCharts && hasChartData(siteShareSeries) && (
               <div className="chart-card">
-                <div className="chart-header">
-                  <h3 className="chart-title">Top sites</h3>
-                  <span className="filter-section-hint">Top 10 by revenue</span>
-                </div>
+                <ChartHeader title="Top sites" hint="Top 10 by revenue" onHide={() => hideChart('topSites')} />
                 <ResponsiveContainer width="100%" height={240}>
                   <BarChart data={siteShareSeries} layout="vertical" margin={hBarMargins}>
                     <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
@@ -2038,12 +2798,9 @@ export default function Dashboard() {
               </div>
             )}
 
-            {(showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']) && (
+            {chartOn('adUnitMix') && (showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']) && (
               <div className="chart-card">
-                <div className="chart-header">
-                  <h3 className="chart-title">Ad unit mix</h3>
-                  <span className="filter-section-hint">Revenue and impressions by ad unit</span>
-                </div>
+                <ChartHeader title="Ad unit mix" hint="Revenue and impressions by ad unit" onHide={() => hideChart('adUnitMix')} />
                 <ResponsiveContainer width="100%" height={240}>
                   <BarChart data={adUnitMixSeries} layout="vertical" margin={hBarMargins}>
                     <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
@@ -2069,38 +2826,92 @@ export default function Dashboard() {
         </>
       )}
 
-      {!hasInventoryFilter && (
-        <div className="no-filter-hint">
-          <span className="no-filter-hint-icon">📂</span>
-          <p className="no-filter-hint-title">Select an inventory filter to view chart &amp; table</p>
-          <p className="no-filter-hint-sub">
-            {filterVisibility.isScopedUser
-              ? 'Pick from your assigned list above and click Apply Filter.'
-              : <>Choose a domain, site, ad unit, or app above and click <strong>Apply Filter</strong>.</>}
+      {!detailLoading && !hasChartReportData && detailData && (
+        <div className="dash-empty-state" role="status">
+          <h3 className="dash-empty-title">No data for this range</h3>
+          <p className="dash-empty-desc">
+            Nothing matched this range. Try yesterday, last 7 days, or reset filters.
           </p>
+          <div className="dash-empty-actions">
+            {canFilter && (
+              <button type="button" className="btn-generate" onClick={() => applyPreset('yesterday')}>Try yesterday</button>
+            )}
+            {canFilter && (
+              <button type="button" className="btn-reset" onClick={() => applyPreset('last7')}>Try last 7 days</button>
+            )}
+            {canFilter && (
+              <button type="button" className="btn-reset" onClick={reset}>Reset filters</button>
+            )}
+          </div>
         </div>
       )}
 
-      {hasInventoryFilter && !detailLoading && hasFilteredReportData && <DynamicReportTable
-        title="📄 Inventory Breakdown"
+      {!detailLoading && hasChartReportData && <DynamicReportTable
+        title="Inventory Breakdown"
         rows={tableRows}
         dimensions={tableConfig.dimensions}
         metrics={tableConfig.metrics}
         visibility={vis}
         currency={currency}
-        loading={filterApplied && detailLoading}
+        loading={detailLoading}
         search={search}
         onSearchChange={setSearch}
         onPageReset={() => setPage(1)}
         searchPlaceholder="Search domain / site / date…"
         page={page}
-        pageSize={PAGE_SIZE}
+        pageSize={isNarrow ? 12 : PAGE_SIZE}
         onPageChange={setPage}
-        showTotals={filterApplied && tableRows.length > 0}
+        showTotals={tableRows.length > 0}
         summaryTotals={tableSummaryTotals}
+        density={tableDensity}
+        freezeFirst
+        headerExtra={(
+          <div className="table-density-toggle" role="group" aria-label="Table density">
+            <button
+              type="button"
+              className={`table-density-btn${tableDensity === 'compact' ? ' active' : ''}`}
+              onClick={() => setTableDensity('compact')}
+            >
+              Compact
+            </button>
+            <button
+              type="button"
+              className={`table-density-btn${tableDensity === 'comfortable' ? ' active' : ''}`}
+              onClick={() => setTableDensity('comfortable')}
+            >
+              Comfortable
+            </button>
+          </div>
+        )}
         noReportMessage="No data available for this period"
         emptyMessage="No data available"
+        onReset={canFilter ? reset : undefined}
+        emptyActions={canFilter ? (
+          <>
+            <button type="button" className="btn-generate" onClick={() => applyPreset('yesterday')}>Try yesterday</button>
+            <button type="button" className="btn-reset" onClick={() => applyPreset('last7')}>Try last 7 days</button>
+          </>
+        ) : null}
+        columnStorageKey="dashboard-inventory"
+        canDownload={vis.download !== false}
+        exportName={`dashboard_${applied?.startDate || startDate}_${applied?.endDate || endDate}`}
       />}
+        </>
+      )}
+      {canFilter && (
+        <>
+          <button type="button" className="filter-add-fab" onClick={handleAddFilter} aria-label="Add filter">
+            <span className="filter-add-icon" aria-hidden>+</span>
+            Add filter
+          </button>
+          <div className="filter-actions-foot filter-actions-foot--mobile">
+            <button
+              className="btn-generate"
+              onClick={applyFilter}
+              disabled={!canApplyInventory || customDatesIncomplete}
+            >✓ Apply Filter</button>
+            <button type="button" className="btn-reset-link" onClick={reset}>Reset</button>
+          </div>
         </>
       )}
     </div>

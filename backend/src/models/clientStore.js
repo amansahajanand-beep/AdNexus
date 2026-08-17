@@ -146,7 +146,25 @@ async function ensureBootstrapFromEnv() {
   }
 
   const existing = await getClientByNetworkCode(String(networkCode).trim());
-  if (existing) return existing;
+  if (existing) {
+    // Production: live requests use gam_clients (encrypted), not .env.
+    // Set SYNC_GAM_CREDS_FROM_ENV=true once after rotating Google OAuth secrets, then restart.
+    if (String(process.env.SYNC_GAM_CREDS_FROM_ENV || '').toLowerCase() === 'true') {
+      const updated = await updateClientCredentials(existing.id, {
+        networkCode,
+        googleClientId: clientId,
+        googleClientSecret: clientSecret,
+        refreshToken,
+        redirectUri: process.env.GOOGLE_REDIRECT_URI || null,
+      });
+      logger.warn(
+        `[tenancy] Synced GAM OAuth credentials from .env → gam_clients (${updated.name}). `
+        + 'Unset SYNC_GAM_CREDS_FROM_ENV after a successful login.'
+      );
+      return updated;
+    }
+    return existing;
+  }
 
   const created = await createClient({
     name: process.env.BOOTSTRAP_CLIENT_NAME || 'Default publisher',

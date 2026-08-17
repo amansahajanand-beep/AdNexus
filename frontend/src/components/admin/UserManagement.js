@@ -180,7 +180,7 @@ export default function UserManagement({
         </div>
       </div>
 
-      {error && <div className="error-box">⚠️ {error}</div>}
+      {error && <div className="error-box">{error}</div>}
 
       <div className="table-wrap">
         <table className="data-table responsive-table admin-table">

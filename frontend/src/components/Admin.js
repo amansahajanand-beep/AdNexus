@@ -7,6 +7,7 @@ import { isLikelyAppPackage } from '../utils/appPackage';
 import UserManagement from './admin/UserManagement';
 import ClientSettings from './admin/ClientSettings';
 import DomainPermissions from './admin/DomainPermissions';
+import PageHeader from './ui/PageHeader';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
 const TABS = [
   { id: 'user', label: 'Users' },
@@ -21,6 +22,9 @@ export default function Admin() {
     new URLSearchParams(location.search).get('oauth') ? 'client' : 'user'
   ));
 
+  useEffect(() => {
+    if (new URLSearchParams(location.search).get('oauth')) setTab('client');
+  }, [location.search]);
   const [users, setUsers] = useState([]);
   const [usersLoading, setUsersLoading] = useState(true);
   const [usersError, setUsersError] = useState(null);
@@ -135,15 +139,19 @@ export default function Admin() {
 
   return (
     <div className="dashboard-page admin-page">
-      <div className="reporting-head">
-        <h2 className="page-title">Admin User Management</h2>
-        <p className="reporting-sub">Manage users, roles &amp; domain permissions efficiently.</p>
-      </div>
+      <PageHeader
+        title="Admin"
+        subtitle="Users, inventory permissions, and GAM OAuth credentials"
+        summary={tab === 'user' ? 'User management' : tab === 'domains' ? 'Assign inventory access' : 'Client OAuth settings'}
+      />
 
-      <div className="admin-tabs">
+      <div className="admin-tabs" role="tablist" aria-label="Admin sections">
         {TABS.map((t) => (
           <button
             key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.id}
             className={`admin-tab ${tab === t.id ? 'active' : ''}`}
             onClick={() => setTab(t.id)}
           >

@@ -195,21 +195,21 @@ export default function UserProfilePanel({ user, layout = 'card' }) {
           <h3 className="profile-panel-title">Account info</h3>
           <div className="profile-meta-list">
             <div className="profile-meta-item">
-              <span className="profile-meta-icon" aria-hidden>📅</span>
+              <span className="profile-meta-icon" aria-hidden>·</span>
               <div>
                 <span className="profile-readonly-label">Member since</span>
                 <span className="profile-readonly-value">{formatWhen(user.createdAt)}</span>
               </div>
             </div>
             <div className="profile-meta-item">
-              <span className="profile-meta-icon" aria-hidden>🕐</span>
+              <span className="profile-meta-icon" aria-hidden>·</span>
               <div>
                 <span className="profile-readonly-label">Last login</span>
                 <span className="profile-readonly-value">{formatWhen(user.lastLogin)}</span>
               </div>
             </div>
             <div className="profile-meta-item">
-              <span className="profile-meta-icon" aria-hidden>✓</span>
+              <span className="profile-meta-icon" aria-hidden>·</span>
               <div>
                 <span className="profile-readonly-label">Status</span>
                 <span className="profile-readonly-value profile-status-active">Active</span>

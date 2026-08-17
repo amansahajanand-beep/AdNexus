@@ -1,17 +1,37 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { networkAPI } from '../../utils/api';
 import { useAuth } from '../../store/useAuth';
 import { usePermissions } from '../../hooks/usePermissions';
 import { NO_DOMAINS_MSG, NO_DOMAINS_TITLE, hasAssignedInventory } from '../../utils/permissions';
 import BrandLogo from '../ui/BrandLogo';
+import ToastStack from '../ui/ToastStack';
+import CommandPalette from '../ui/CommandPalette';
+import { rememberLastRoute } from '../../utils/lastRoute';
+import { APP_TIMEZONE } from '../../utils/datetime';
+
+const FOCUS_KEY = 'adnexus.focusMode';
 
 const NAV_ITEMS = [
-  { to: '/dashboard', label: 'Dashboard', page: 'dashboard' },
-  { to: '/reporting', label: 'Reporting', page: 'reporting' },
-  { to: '/admin', label: 'Admin', adminOnly: true },
-  { to: '/domain-user', label: 'Domain User', page: 'domain-user' },
+  { to: '/dashboard', label: 'Dashboard', short: 'D', page: 'dashboard' },
+  { to: '/reporting', label: 'Reporting', short: 'R', page: 'reporting' },
+  { to: '/admin', label: 'Admin', short: 'A', adminOnly: true },
+  { to: '/domain-user', label: 'Domain User', short: 'U', page: 'domain-user' },
 ];
+
+function statusLabel(isMock, authError) {
+  if (isMock) return 'Mock';
+  if (authError) return 'Offline';
+  return 'Live';
+}
+
+function readFocusMode() {
+  try {
+    return localStorage.getItem(FOCUS_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
 
 export default function Layout() {
   const { user, isAdmin, logout } = useAuth();
@@ -23,12 +43,36 @@ export default function Layout() {
   const [verDismissed, setVerDismissed] = useState(false);
   const [userOpen, setUserOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [focusMode, setFocusMode] = useState(readFocusMode);
   const userRef = useRef(null);
+
+  const toggleFocusMode = useCallback(() => {
+    setFocusMode((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem(FOCUS_KEY, next ? '1' : '0');
+      } catch {
+        /* ignore */
+      }
+      return next;
+    });
+  }, []);
 
   useEffect(() => {
     networkAPI.getInfo()
       .then(info => { setNetworkInfo(info); setIsMock(!!info.isMock); })
-      .catch(() => setIsMock(true));
+      .catch((err) => {
+        const data = err?.response?.data;
+        setIsMock(!!data?.isMock);
+        if (data?.error) {
+          setNetworkInfo({
+            displayName: 'Connection issue',
+            isMock: false,
+            authError: data.error,
+            authCode: data.code,
+          });
+        }
+      });
   }, []);
 
   useEffect(() => {
@@ -42,6 +86,10 @@ export default function Layout() {
   useEffect(() => { setMenuOpen(false); }, [location.pathname]);
 
   useEffect(() => {
+    rememberLastRoute(location.pathname);
+  }, [location.pathname]);
+
+  useEffect(() => {
     if (!menuOpen) return undefined;
     const onKey = (e) => { if (e.key === 'Escape') setMenuOpen(false); };
     document.addEventListener('keydown', onKey);
@@ -51,6 +99,20 @@ export default function Layout() {
       document.body.classList.remove('sidebar-open');
     };
   }, [menuOpen]);
+
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const tag = e.target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable) return;
+      if (e.key === '[') {
+        e.preventDefault();
+        toggleFocusMode();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  }, [toggleFocusMode]);
 
   const handleLogout = () => {
     logout();
@@ -72,6 +134,11 @@ export default function Layout() {
 
   const noInventoryAssigned = !!user && user.role !== 'admin' && !hasAssignedInventory(user);
   const noAccess = !!user && !isAdmin && (!hasAnyPage || noInventoryAssigned);
+  const authError = !isMock && networkInfo?.authError;
+  const liveText = statusLabel(isMock, authError);
+  const liveClass = `live-dot header-live${isMock ? ' is-mock' : ''}${authError ? ' is-auth-error' : ''}`;
+  const currencyCode = networkInfo?.currencyCode || 'USD';
+  const tzShort = APP_TIMEZONE === 'Asia/Singapore' ? 'SGT' : APP_TIMEZONE;
 
   const gv = networkInfo?.gamVersion;
   const verStatus = gv?.status;
@@ -87,17 +154,34 @@ export default function Layout() {
   })();
 
   return (
-    <div className="app app-shell">
+    <div className={`app app-shell${focusMode ? ' is-focus-mode' : ''}`}>
       {isMock && (
-        <div className="mock-banner">
-          Mock Mode — Showing sample data. To load real data, add your ad network credentials to <code>.env</code> and restart the backend.
+        <div className="status-banner status-banner--mock" role="status">
+          <strong>Mock mode</strong>
+          <span>Showing sample data. Add live ad network credentials and restart the backend to load real metrics.</span>
+        </div>
+      )}
+
+      {authError && (
+        <div className="status-banner status-banner--auth" role="alert">
+          <strong>Connection issue</strong>
+          <span className="status-banner-text">{networkInfo.authError}</span>
+          {isAdmin && (
+            <button
+              type="button"
+              className="status-banner-action"
+              onClick={() => go('/admin?oauth=1')}
+            >
+              Open Client settings
+            </button>
+          )}
         </div>
       )}
 
       {showVerWarn && (
-        <div className={`version-banner ${verStatus === 'sunset' ? 'critical' : ''}`}>
-          <span className="version-banner-text">{verMessage}</span>
-          <button className="version-banner-close" onClick={() => setVerDismissed(true)} aria-label="Dismiss">✕</button>
+        <div className={`status-banner status-banner--version${verStatus === 'sunset' ? ' is-critical' : ''}`} role="status">
+          <span className="status-banner-text">{verMessage}</span>
+          <button type="button" className="status-banner-close" onClick={() => setVerDismissed(true)} aria-label="Dismiss">✕</button>
         </div>
       )}
 
@@ -111,100 +195,124 @@ export default function Layout() {
       )}
 
       <div className="app-shell-body">
-      <aside className={`app-sidebar ${menuOpen ? 'open' : ''}`}>
-        <div className="sidebar-top">
-          <BrandLogo />
-          {networkInfo && <span className="network-label">{networkInfo.displayName}</span>}
-        </div>
-
-        <nav className="sidebar-nav">
-          {navItems.map(item => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              className={({ isActive }) => `nav-btn ${isActive ? 'active' : ''}`}
-              onClick={() => setMenuOpen(false)}
-            >
-              {item.label}
-            </NavLink>
-          ))}
-        </nav>
-
-        <div className="sidebar-foot">
-          <div className="live-dot header-live">
-            <span className="dot-pulse" />
-            {isMock ? 'Mock' : 'Live'}
-          </div>
-          <div className="user-menu" ref={userRef}>
-            <button type="button" className="user-btn" onClick={() => setUserOpen(o => !o)}>
-              <span className="user-avatar">{initial}</span>
-              <span className="user-name">{user?.username}</span>
-              <span className="user-caret">▾</span>
-            </button>
-            {userOpen && (
-              <div className="user-dropdown user-dropdown-sidebar">
-                <button
-                  type="button"
-                  className="user-dd-head user-dd-head-btn"
-                  onClick={goProfile}
-                  disabled={!profileRoute}
-                  title={profileRoute ? 'Open profile' : undefined}
-                >
-                  <span className="user-avatar lg">{initial}</span>
-                  <div>
-                    <div className="user-dd-name">{user?.username}</div>
-                    <div className="user-dd-role">{isAdmin ? 'Administrator' : 'Domain User'}</div>
-                  </div>
-                </button>
-                {isAdmin && (
-                  <button type="button" className="user-dd-item" onClick={() => go('/admin')}>Admin Settings</button>
-                )}
-                {canPage('domain-user') && (
-                  <button type="button" className="user-dd-item" onClick={() => go('/domain-user')}>My Profile</button>
-                )}
-                <button type="button" className="user-dd-item" onClick={handleLogout}>Logout</button>
-              </div>
+        <aside className={`app-sidebar ${menuOpen ? 'open' : ''}${focusMode ? ' is-collapsed' : ''}`}>
+          <div className="sidebar-top">
+            <BrandLogo showTitle={!focusMode} markSize={focusMode ? 26 : 28} />
+            {!focusMode && networkInfo && (
+              <span className="network-label">{networkInfo.displayName}</span>
+            )}
+            {!focusMode && (
+              <span className="context-chip context-chip--sidebar" title={`Currency ${currencyCode} · ${APP_TIMEZONE}`}>
+                {currencyCode} · {tzShort}
+              </span>
             )}
           </div>
-        </div>
-      </aside>
 
-      <div className="app-content">
-        <header className="app-mobile-bar">
-          <button
-            type="button"
-            className="nav-toggle"
-            aria-label={menuOpen ? 'Close menu' : 'Open menu'}
-            aria-expanded={menuOpen}
-            onClick={() => setMenuOpen(o => !o)}
-          >
-            {menuOpen ? '✕' : '☰'}
-          </button>
-          <BrandLogo />
-          <div className="live-dot header-live">
-            <span className="dot-pulse" />
-            {isMock ? 'Mock' : 'Live'}
-          </div>
-        </header>
+          <nav className="sidebar-nav">
+            {navItems.map(item => (
+              <NavLink
+                key={item.to}
+                to={item.to}
+                title={item.label}
+                className={({ isActive }) => `nav-btn ${isActive ? 'active' : ''}`}
+                onClick={() => setMenuOpen(false)}
+              >
+                <span className="nav-btn-short" aria-hidden>{item.short}</span>
+                <span className="nav-btn-label">{item.label}</span>
+              </NavLink>
+            ))}
+          </nav>
 
-        <main className="app-main">
-          {noAccess ? (
-            <div className="no-access-wrap">
-              <div className="no-access-card">
-                <div className="no-access-icon">!</div>
-                <h2 className="no-access-title">{noInventoryAssigned ? NO_DOMAINS_TITLE : 'Access Restricted'}</h2>
-                <p className="no-access-msg">
-                  {noInventoryAssigned
-                    ? NO_DOMAINS_MSG
-                    : "You don't have permission to access this resource. Please contact your administrator."}
-                </p>
-              </div>
+          <div className="sidebar-foot">
+            <button
+              type="button"
+              className="sidebar-focus-toggle"
+              onClick={toggleFocusMode}
+              title={focusMode ? 'Expand sidebar ([)' : 'Focus mode — more chart width ([)'}
+              aria-pressed={focusMode}
+            >
+              {focusMode ? '»' : '«'}
+              <span className="sidebar-focus-label">{focusMode ? 'Expand' : 'Focus'}</span>
+            </button>
+            <div className={liveClass} title={liveText}>
+              <span className="dot-pulse" />
+              <span className="live-dot-label">{liveText}</span>
             </div>
-          ) : (
-            <Outlet context={{ networkInfo, isMock }} />
-          )}
-        </main>
-      </div>
+            <div className="user-menu" ref={userRef}>
+              <button type="button" className="user-btn" onClick={() => setUserOpen(o => !o)} title={user?.username}>
+                <span className="user-avatar">{initial}</span>
+                <span className="user-name">{user?.username}</span>
+                <span className="user-caret">▾</span>
+              </button>
+              {userOpen && (
+                <div className="user-dropdown user-dropdown-sidebar">
+                  <button
+                    type="button"
+                    className="user-dd-head user-dd-head-btn"
+                    onClick={goProfile}
+                    disabled={!profileRoute}
+                    title={profileRoute ? 'Open profile' : undefined}
+                  >
+                    <span className="user-avatar lg">{initial}</span>
+                    <div>
+                      <div className="user-dd-name">{user?.username}</div>
+                      <div className="user-dd-role">{isAdmin ? 'Administrator' : 'Domain User'}</div>
+                    </div>
+                  </button>
+                  {isAdmin && (
+                    <button type="button" className="user-dd-item" onClick={() => go('/admin')}>Admin Settings</button>
+                  )}
+                  {canPage('domain-user') && (
+                    <button type="button" className="user-dd-item" onClick={() => go('/domain-user')}>My Profile</button>
+                  )}
+                  <button type="button" className="user-dd-item" onClick={handleLogout}>Logout</button>
+                </div>
+              )}
+            </div>
+          </div>
+        </aside>
+
+        <div className="app-content">
+          <header className="app-mobile-bar">
+            <button
+              type="button"
+              className="nav-toggle"
+              aria-label={menuOpen ? 'Close menu' : 'Open menu'}
+              aria-expanded={menuOpen}
+              onClick={() => setMenuOpen(o => !o)}
+            >
+              {menuOpen ? '✕' : '☰'}
+            </button>
+            <BrandLogo />
+            <span className="context-chip" title={`Currency ${currencyCode} · ${APP_TIMEZONE}`}>
+              {currencyCode} · {tzShort}
+            </span>
+            <div className={liveClass}>
+              <span className="dot-pulse" />
+              {liveText}
+            </div>
+          </header>
+
+          <main className="app-main">
+            {noAccess ? (
+              <div className="no-access-wrap">
+                <div className="no-access-card">
+                  <div className="no-access-icon" aria-hidden>!</div>
+                  <h2 className="no-access-title">{noInventoryAssigned ? NO_DOMAINS_TITLE : 'Access Restricted'}</h2>
+                  <p className="no-access-msg">
+                    {noInventoryAssigned
+                      ? NO_DOMAINS_MSG
+                      : "You don't have permission to access this resource. Please contact your administrator."}
+                  </p>
+                </div>
+              </div>
+            ) : (
+              <Outlet context={{ networkInfo, isMock }} />
+            )}
+          </main>
+          <ToastStack />
+          <CommandPalette />
+        </div>
       </div>
     </div>
   );

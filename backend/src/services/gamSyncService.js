@@ -1798,11 +1798,7 @@ function buildSyncReportXML(dimensions, buildDateXML, startDate, endDate) {
 }
 
 async function fetchFromGAM(startDate, endDate) {
-  const helpers = require('../routes/reports').__gamHelpers;
-  if (!helpers) {
-    throw new Error('GAM helpers unavailable');
-  }
-  const { getToken, runReportAndDownload, buildDateXML } = helpers;
+  const { getToken, runReportAndDownload, buildDateXML } = require('../gam/reportTransport');
   const token = await getToken();
   let lastErr;
   for (const dims of SYNC_DIMENSION_SETS) {
@@ -2300,9 +2296,7 @@ function buildFullSyncReportXML(dimensions, metrics, buildDateXML, startDate, en
  * Streams each slice via onSlice when provided so Node never holds all slices in heap.
  */
 async function fetchFullFromGAM(startDate, endDate, { onSlice } = {}) {
-  const helpers = require('../routes/reports').__gamHelpers;
-  if (!helpers) throw new Error('GAM helpers unavailable');
-  const { getToken, runReportAndDownload, buildDateXML } = helpers;
+  const { getToken, runReportAndDownload, buildDateXML } = require('../gam/reportTransport');
   const token = await getToken();
   const currency = process.env.GAM_CURRENCY || 'USD';
   const out = [];

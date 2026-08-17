@@ -71,6 +71,9 @@ router.put('/me', async (req, res) => {
     res.json({ ...pub, isMock: isMockClient(next) });
   } catch (err) {
     logger.error('Update client failed:', err.message);
+    const { classifyGoogleAuthError } = require('../utils/googleAuthErrors');
+    const classified = classifyGoogleAuthError(err);
+    if (classified) return res.status(classified.status).json(classified);
     res.status(400).json({ error: err.message || 'Could not update credentials' });
   }
 });
