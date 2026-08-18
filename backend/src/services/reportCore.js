@@ -12,7 +12,7 @@ const {
   userHasAssignedInventory,
   resolveScopedSqlInventoryOpts,
 } = require('../utils/permissions');
-const { todayInTZ, dateRangeInTZ, dateRangeYMDInTZ } = require('../utils/datetime');
+const { todayInTZ, dateRangeInTZ, dateRangeYMDInTZ, listCalendarMonthsNewestFirst } = require('../utils/datetime');
 const { resolveAppFields, buildAppPackageMapsFromGamRows, buildAppPackageMapsFromMobileApps, mergeAppPackageMapData, mapsToPlain, packageListFromMapData, enrichRowsWithAppPackages, rehydrateAppPackageMaps, isLikelyAppPackage, isMobileAppRow } = require('../utils/appIdentity');
 const { domainFromAdUnit, enrichReportRow, resolveInventoryFields, rootDomainFromHost, pickSiteHost, adUnitAlignsWithSiteHost } = require('../utils/adUnit');
 const {
@@ -71,6 +71,7 @@ const {
   pickRowRevenueDollars,
 } = require('../utils/gamReportMetrics');
 
+const { classifyReportingQuery } = require('../utils/warehouseGrain');
 const { isMockClient, getClientId } = require('../utils/clientContext');
 const {
   getToken,
@@ -1718,34 +1719,45 @@ async function enqueueRangeSync(startDate, endDate) {
   if (!queue || isMockClient()) return false;
   const today = todayInTZ();
   const { getClientId } = require('../utils/clientContext');
+  const { shiftYMD } = require('../utils/datetime');
   const clientId = getClientId();
+  const cid = String(clientId || 'na').slice(0, 8);
   try {
-    const isTodayOnly = startDate === endDate && startDate === today;
-    if (isTodayOnly) {
-      // BullMQ custom jobId cannot contain ':'
-      const jobId = `sync-today-${startDate}`;
+    if (startDate === today || (startDate <= today && endDate >= today)) {
+      const jobId = `sync-today-${cid}-${today}`.slice(0, 120);
       const existing = await queue.getJob(jobId);
       if (!existing) {
-        await queue.add('sync-today', { date: startDate, includeFull: false, clientId }, {
+        await queue.add('sync-today', { date: today, includeFull: false, clientId }, {
           jobId,
           priority: 1,
           attempts: 3,
           backoff: { type: 'exponential', delay: 10000 },
         });
-        logger.info(`Enqueued ${jobId} → report_present (lean)`);
+        logger.info(`Enqueued ${jobId} → report_present`);
       }
-    } else {
-      const jobId = `sync-backfill-${startDate}-${endDate}`;
+    }
+
+    const pastEnd = endDate < today ? endDate : shiftYMD(today, -1);
+    if (!startDate || startDate > pastEnd) return true;
+
+    const months = listCalendarMonthsNewestFirst(startDate, pastEnd);
+    for (let i = 0; i < months.length; i += 1) {
+      const { startDate: ms, endDate: me } = months[i];
+      const jobId = `sync-month-${cid}-${ms}-${me}`.slice(0, 120);
       const existing = await queue.getJob(jobId);
-      if (!existing) {
-        await queue.add('sync-backfill', { startDate, endDate, includeFull: false, clientId }, {
-          jobId,
-          priority: 10,
-          attempts: 2,
-          backoff: { type: 'fixed', delay: 60000 },
-        });
-        logger.info(`Enqueued ${jobId} → report_daily (lean)`);
-      }
+      if (existing) continue;
+      await queue.add('sync-backfill', {
+        startDate: ms,
+        endDate: me,
+        includeFull: false,
+        clientId,
+      }, {
+        jobId,
+        priority: 3 + i,
+        attempts: 2,
+        backoff: { type: 'fixed', delay: 60000 },
+      });
+      logger.info(`Enqueued ${jobId} → report_daily (priority=${3 + i})`);
     }
     return true;
   } catch (qErr) {
@@ -1754,40 +1766,10 @@ async function enqueueRangeSync(startDate, endDate) {
   }
 }
 
-/** Enqueue full-only sync for Reporting warehouse miss (jobId without ':'). */
+/** Grain warehouse fill only — report_full_* is no longer written. */
 async function enqueueFullReportSync(startDate, endDate) {
-  const queue = getQueue();
-  if (!queue || isMockClient()) return null;
-  const today = todayInTZ();
-  const { getClientId } = require('../utils/clientContext');
-  const clientId = getClientId();
-  try {
-    if (startDate === endDate && startDate === today) {
-      const jobId = `sync-full-today-${today}-req`;
-      const existing = await queue.getJob(jobId);
-      if (!existing) {
-        await queue.add('sync-full-today', { startDate: today, endDate: today, clientId }, {
-          jobId,
-          attempts: 2,
-          backoff: { type: 'fixed', delay: 20000 },
-        });
-      }
-      return jobId;
-    }
-    const jobId = `sync-full-backfill-${startDate}-${endDate}`.slice(0, 120);
-    const existing = await queue.getJob(jobId);
-    if (!existing) {
-      await queue.add('sync-full-backfill', { startDate, endDate, clientId }, {
-        jobId,
-        attempts: 2,
-        backoff: { type: 'fixed', delay: 60000 },
-      });
-    }
-    return jobId;
-  } catch (e) {
-    logger.warn('enqueueFullReportSync failed:', e.message);
-    return null;
-  }
+  const ok = await enqueueRangeSync(startDate, endDate);
+  return ok ? `sync-month-${startDate}-${endDate}` : null;
 }
 
 /**
@@ -1878,8 +1860,28 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
         ? Boolean(rows?.length && rowsHaveMetrics(rows))
         : Boolean(rows?.length);
       if (dbHit) {
+        const svc = getSyncSvc();
+        let coverage = null;
+        let complete = true;
+        if (!useAdhocStore && typeof svc?.getRangeCoverage === 'function') {
+          coverage = await svc.getRangeCoverage(filters.startDate, filters.endDate);
+          complete = Boolean(coverage?.complete);
+        }
+        if (!complete && (enqueueSyncOnMiss || asyncOnMiss)) {
+          await enqueueRangeSync(filters.startDate, filters.endDate);
+          logger.info(
+            `${logLabel} partial Postgres ${filters.startDate}..${filters.endDate}`
+            + ` covered=${coverage?.coveredDays || 0}/${coverage?.totalDays || 0} → building`
+          );
+          return {
+            rows: rows || [],
+            cacheKey,
+            source: 'db',
+            status: 'building',
+            coverage,
+          };
+        }
         const payload = { rows: rows || [] };
-        // Memory-only for large grain; Redis only for compact payloads.
         cache.set(cacheKey, payload, REPORT_CACHE_TTL);
         if (r?.redisSet && (rows || []).length <= 3000) {
           await r.redisSet(cacheKey, payload, r.TTL?.REPORT || REPORT_CACHE_TTL);
@@ -1888,7 +1890,7 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
           `${logLabel} from PostgreSQL${useAdhocStore ? ' (report_adhoc)' : ''} (${(rows || []).length} rows) ${filters.startDate}..${filters.endDate}`
           + (hasInventoryFilters(filters) ? ' (SQL query filter)' : '')
         );
-        return { rows: rows || [], cacheKey, source: 'db' };
+        return { rows: rows || [], cacheKey, source: 'db', coverage };
       }
       logger.info(`${logLabel}: no Postgres data for query ${filters.startDate}..${filters.endDate} → ${asyncOnMiss ? 'async job' : 'GAM'}`);
     } catch (pgErr) {
@@ -1910,12 +1912,20 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
         logger.warn(`${logLabel}: async adhoc enqueue failed — returning building (no live GAM)`);
       }
     }
+    let coverage = null;
+    try {
+      const svc = getSyncSvc();
+      if (typeof svc?.getRangeCoverage === 'function') {
+        coverage = await svc.getRangeCoverage(filters.startDate, filters.endDate);
+      }
+    } catch (_) { /* ignore */ }
     return {
       rows: [],
       cacheKey,
       source: 'building',
       status: 'building',
       jobId,
+      coverage,
       reportWarning: null,
       reportWarningSkipped: [],
       reportWarningUsed: [],
@@ -2784,7 +2794,7 @@ async function handleDashboard(req, res) {
   // memory → Redis → Postgres (present/past for this query) → GAM → persist
   try {
     const token = await getToken();
-    const { rows } = await loadReportRowsCacheAside(filters, token, {
+    const loaded = await loadReportRowsCacheAside(filters, token, {
       cachePrefix: 'report_dashboard_raw_v3',
       fastMode: true,
       persistOnGam: true,
@@ -2792,7 +2802,12 @@ async function handleDashboard(req, res) {
       asyncOnMiss: true,
       logLabel: 'Dashboard',
     });
-    return res.json(buildScoped(rows, currency, false));
+    const body = buildScoped(loaded.rows || [], currency, false);
+    if (loaded.status === 'building' || loaded.source === 'building') {
+      body.status = 'building';
+      body.coverage = loaded.coverage || null;
+    }
+    return res.json(body);
   } catch (err) {
     logger.error('Dashboard report error:', err.message);
     res.status(500).json({ error: err.message });
@@ -3049,7 +3064,15 @@ async function handleDetailedReport(req, res) {
   const currency = process.env.GAM_CURRENCY || null;
   const dimIds = asArray(filters.reportDimensions);
   const metIds = asArray(filters.reportMetrics);
+  const dimensionApis = dimIds.map(catalogIdToGamEnum).filter(Boolean);
+  const metricApis = metIds.map(catalogIdToGamEnum).filter(Boolean);
+  const classified = classifyReportingQuery(dimensionApis, metricApis);
   const wantsCustomShape = Boolean(dimIds.length || metIds.length);
+  const useGrainSql = !wantsCustomShape || classified.mode === 'grain';
+  if (classified.mode === 'adhoc') {
+    filters.reportDimensions = dimIds.filter((id) => classified.usedDims.includes(catalogIdToGamEnum(id)));
+    filters.reportMetrics = metIds.filter((id) => classified.usedMetrics.includes(catalogIdToGamEnum(id)));
+  }
 
   // Compact response cache (final JSON) — warm clicks like Dashboard.
   const pageKey = wantAllRows
@@ -3144,8 +3167,8 @@ async function handleDetailedReport(req, res) {
       skipAdUnitLike,
     };
 
-    // ── Inventory-only: reuse Dashboard lean/rollup path ─────────────────────
-    if (!wantsCustomShape && typeof svc?.fetchLeanDashboardBundleFromDB === 'function') {
+    // ── Grain SQL: Dashboard lean/rollup path (including select-all / grain subset) ─
+    if (useGrainSql && typeof svc?.fetchLeanDashboardBundleFromDB === 'function') {
       const t0 = Date.now();
       const compat = await fetchLeanDashboardBundleCompatible(
         svc,
@@ -3182,11 +3205,22 @@ async function handleDetailedReport(req, res) {
             }).rows,
           trend: bundle.trend || [],
           isMock: false,
-          reportWarning: compat.skipped?.length ? 'partial' : null,
-          reportWarningSkipped: compat.skipped || [],
-          reportWarningUsed: [],
-          reportWarningUsedIds: [],
-          reportWarningUsedMetricIds: [],
+          reportWarning: (compat.skipped?.length || classified.skippedDims?.length || classified.skippedMets?.length)
+            ? 'partial' : null,
+          reportWarningSkipped: [
+            ...(compat.skipped || []),
+            ...(classified.skippedDims || []),
+            ...(classified.skippedMets || []),
+          ],
+          reportWarningUsed: classified.usedDims || [],
+          reportWarningUsedIds: classified.mode === 'grain' ? dimIds.filter((id) => {
+            const api = catalogIdToGamEnum(id);
+            return !api || classified.usedDims.includes(api) || api === 'DATE';
+          }) : [],
+          reportWarningUsedMetricIds: classified.mode === 'grain' ? metIds.filter((id) => {
+            const api = catalogIdToGamEnum(id);
+            return !api || classified.usedMetrics.includes(api);
+          }) : [],
           pagination: bundle.pagination || {
             totalRows: bundle.grainCount || scopedRows.length,
             truncated: Boolean(bundle.pagination?.truncated),
@@ -3212,100 +3246,46 @@ async function handleDetailedReport(req, res) {
       }
     }
 
-    // ── Custom dims/metrics: report_full_* warehouse ─────────────────────────
-    if (wantsCustomShape && typeof svc?.fetchFullReportBundleFromDB === 'function') {
-      const t0 = Date.now();
-      const dimensionApis = dimIds.map(catalogIdToGamEnum).filter(Boolean);
-      const metricApis = metIds.map(catalogIdToGamEnum).filter(Boolean);
-      const fullBundle = await svc.fetchFullReportBundleFromDB(
-        filters.startDate,
-        filters.endDate,
-        {
-          ...invOpts,
-          dimensionApis,
-          metricApis,
-          dimensionIds: dimIds,
-          metricIds: metIds,
-        }
-      );
-      if (fullBundle?.rows?.length || (fullBundle?.grainCount > 0)) {
-        // Light JS scope on already-capped SQL rows (filters applied in SQL).
-        const scopedRows = isScopedChild
-          ? prepareScopedReportRows(fullBundle.rows || [], {
-            ...filters,
-            // Inventory already applied in SQL — avoid double-AND wiping union rows.
-            domain: [],
-            site: [],
-            domainName: [],
-            domainId: [],
-          }, req.user)
-          : (fullBundle.rows || []);
-        const body = applyVisibility({
-          summary: {
-            ...(fullBundle.summary || {}),
-            currency: currency || fullBundle.summary?.currency || 'USD',
-            offeredRecords: fullBundle.summary?.offeredRecords ?? fullBundle.grainCount ?? scopedRows.length,
-          },
-          rows: wantAllRows
-            ? scopedRows
-            : paginateRows(scopedRows, {
-              ...paginationOpts,
-              limit: Math.min(paginationOpts.limit || 50, MAX_REPORTING_CLIENT_ROWS),
-            }).rows,
-          trend: fullBundle.trend || [],
-          isMock: false,
-          reportWarning: fullBundle.reportWarning || null,
-          reportWarningSkipped: fullBundle.reportWarningSkipped || [],
-          reportWarningUsed: fullBundle.reportWarningUsed || [],
-          reportWarningUsedIds: fullBundle.reportWarningUsedIds || [],
-          reportWarningUsedMetricIds: fullBundle.reportWarningUsedMetricIds || [],
-          pagination: fullBundle.pagination || {
-            totalRows: fullBundle.grainCount || scopedRows.length,
-            truncated: Boolean(fullBundle.pagination?.truncated),
-          },
-        }, req.user);
-        if (!wantAllRows) {
-          const paged = paginateRows(scopedRows, {
-            ...paginationOpts,
-            limit: Math.min(paginationOpts.limit || 50, MAX_REPORTING_CLIENT_ROWS),
-          });
-          body.rows = paged.rows;
-          body.pagination = {
-            ...paged.pagination,
-            totalRows: fullBundle.grainCount || scopedRows.length,
-            truncated: Boolean(fullBundle.pagination?.truncated),
-          };
-        }
-        logger.info(
-          `Reporting from report_full (${fullBundle.sliceKey}) ${filters.startDate}..${filters.endDate}`
-          + ` grain≈${fullBundle.grainCount || 0} in ${Date.now() - t0}ms`
-        );
-        return res.json(await cacheDetailedResponse(body));
-      }
-    }
-
-    // ── Miss: enqueue background job, never block HTTP on live GAM ───────────
+    // ── Miss: enqueue month jobs (grain) or adhoc GAM; never block HTTP ────────
     const token = await getToken().catch(() => null);
     const loaded = await loadReportRowsCacheAside(filters, token, {
-      cachePrefix: wantsCustomShape ? 'report_detailed_custom_v1' : 'report_detailed_raw_v3',
+      cachePrefix: classified.mode === 'adhoc' ? 'report_detailed_custom_v1' : 'report_detailed_raw_v3',
       fastMode: true,
-      useAdhocStore: wantsCustomShape,
+      useAdhocStore: classified.mode === 'adhoc',
       skipDb: false,
       persistOnGam: true,
-      enqueueSyncOnMiss: true,
+      enqueueSyncOnMiss: classified.mode !== 'adhoc',
       asyncOnMiss: true,
-      logLabel: wantsCustomShape ? 'Reporting' : 'Detailed',
+      logLabel: classified.mode === 'adhoc' ? 'Reporting adhoc' : 'Reporting',
     });
 
     if (loaded.status === 'building' || loaded.source === 'building') {
-      if (wantsCustomShape) {
-        await enqueueFullReportSync(filters.startDate, filters.endDate);
-      }
       logger.info(
         `Reporting building ${filters.startDate}..${filters.endDate}`
         + (loaded.jobId ? ` job=${loaded.jobId}` : '')
+        + (loaded.coverage ? ` covered=${loaded.coverage.coveredDays}/${loaded.coverage.totalDays}` : '')
       );
-      return res.json(buildingPayload(loaded.jobId || null));
+      if (loaded.rows?.length) {
+        const body = buildScopedFromRows(
+          loaded.rows,
+          currency,
+          false,
+          loaded.reportWarning || (classified.skippedDims?.length ? 'partial' : null),
+          loaded.reportWarningSkipped?.length
+            ? loaded.reportWarningSkipped
+            : [...(classified.skippedDims || []), ...(classified.skippedMets || [])],
+          loaded.reportWarningUsed,
+          loaded.reportWarningUsedIds,
+          loaded.reportWarningUsedMetricIds,
+        );
+        body.status = 'building';
+        body.coverage = loaded.coverage || null;
+        body.jobId = loaded.jobId || null;
+        return res.json(body);
+      }
+      const payload = buildingPayload(loaded.jobId || null);
+      payload.coverage = loaded.coverage || null;
+      return res.json(payload);
     }
 
     if (loaded.rows?.length) {
@@ -3319,14 +3299,10 @@ async function handleDetailedReport(req, res) {
         loaded.reportWarningUsedIds,
         loaded.reportWarningUsedMetricIds,
       );
+      if (loaded.coverage) body.coverage = loaded.coverage;
       return res.json(await cacheDetailedResponse(body));
     }
 
-    // Empty after async path — still enqueue full fill for custom queries.
-    if (wantsCustomShape) {
-      const jobId = await enqueueFullReportSync(filters.startDate, filters.endDate);
-      return res.json(buildingPayload(jobId));
-    }
     await enqueueRangeSync(filters.startDate, filters.endDate);
     return res.json(buildingPayload(null));
   } catch (err) {
@@ -3369,45 +3345,7 @@ async function handleProgrammaticReport(req, res) {
     }
   }
 
-  // Prefer channel slice from report_full_* when available (no live GAM on request).
-  try {
-    const svc = getSyncSvc();
-    if (typeof svc?.fetchFullReportBundleFromDB === 'function') {
-      const bundle = await svc.fetchFullReportBundleFromDB(startDate, endDate, {
-        dimensionApis: ['DATE', 'PROGRAMMATIC_CHANNEL_NAME', 'DEMAND_CHANNEL_NAME', 'COUNTRY_NAME'],
-        metricApis: [
-          'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS',
-          'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE',
-        ],
-        dimensionIds: ['date', 'programmatic_channel_name', 'demand_channel_name', 'country_name'],
-        metricIds: [
-          'total_line_item_level_impressions',
-          'total_line_item_level_cpm_and_cpc_revenue',
-        ],
-        countryNames: toFilterArray(country).map((c) => String(c)),
-        currency,
-        tableLimit: 2500,
-      });
-      if (bundle?.rows?.length) {
-        const payload = {
-          rows: bundle.rows,
-          startDate,
-          endDate,
-          isMock: false,
-          summary: bundle.summary,
-          trend: bundle.trend,
-        };
-        cache.set(cacheKey, payload, REPORT_CACHE_TTL);
-        if (r?.redisSet) await r.redisSet(cacheKey, payload, r.TTL?.REPORT || REPORT_CACHE_TTL);
-        logger.info(`Programmatic from report_full ${startDate}..${endDate} rows=${bundle.rows.length}`);
-        return res.json(applyProgrammaticVisibility({ ...payload, currency }, req.user));
-      }
-    }
-  } catch (e) {
-    logger.warn(`Programmatic report_full read failed: ${e.message}`);
-  }
-
-  // Miss → enqueue background full sync + adhoc-style job; never block on GAM.
+  // Miss → enqueue grain months + programmatic job; never block on GAM.
   const jobId = await enqueueFullReportSync(startDate, endDate);
   try {
     const { gamReportQueue } = require('../queues/gamSync');

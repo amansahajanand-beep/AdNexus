@@ -508,16 +508,16 @@ export default function Reporting() {
       // Only poll when we truly have no usable data yet (don't flash building over good rows).
       const needsPoll = (!silent)
         && (
-          (detailed?.status === 'building' && !hasRows(detailed))
-          || (programmatic?.status === 'building' && !hasRows(programmatic))
+          detailed?.status === 'building'
+          || programmatic?.status === 'building'
         );
       if (needsPoll) {
         let tries = 0;
         const poll = async () => {
           if (buildingPollId !== buildingPollRef.current) return;
           tries += 1;
-          if (tries > 40) return;
-          await new Promise((r) => setTimeout(r, 3000));
+          if (tries > 120) return;
+          await new Promise((r) => setTimeout(r, 5000));
           if (buildingPollId !== buildingPollRef.current) return;
           try {
             const [againDetailed, againProg] = await Promise.all([
@@ -530,8 +530,8 @@ export default function Reporting() {
             if (againDetailed) applyDetailed(againDetailed);
             if (againProg) applyProg(againProg);
             const stillBuilding = (
-              (againDetailed?.status === 'building' && !hasRows(againDetailed))
-              || (againProg?.status === 'building' && !hasRows(againProg))
+              againDetailed?.status === 'building'
+              || againProg?.status === 'building'
             );
             if (stillBuilding) {
               poll();

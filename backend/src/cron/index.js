@@ -11,7 +11,7 @@
 const cron   = require('node-cron');
 const logger = require('../utils/logger');
 const { gamSyncQueue } = require('../queues/gamSync');
-const { todayInTZ, isLastHourOfDay, historicalRangeForPresets } = require('../utils/datetime');
+const { todayInTZ, isLastHourOfDay, historicalRangeForPresets, listCalendarMonthsNewestFirst } = require('../utils/datetime');
 
 async function eachActiveClient(fn) {
   const { listActiveClients } = require('../models/clientStore');
@@ -78,25 +78,6 @@ async function enqueueLeanYesterdayAndFullToday({ reason } = {}) {
     } catch (e) {
       logger.error('Cron: failed to enqueue sync-day:', e.message);
     }
-
-    if (process.env.FULL_SYNC_DISABLED === 'true') return;
-    try {
-      await gamSyncQueue.add('sync-full-today', {
-        startDate: today,
-        endDate: today,
-        clientId: cid,
-      }, {
-        jobId: `sync-full-today-${cid.slice(0, 8)}-${today}-${Math.floor(hourSlot / 6)}`,
-        priority: 8,
-        attempts: 1,
-        backoff: { type: 'fixed', delay: 60000 },
-      });
-      logger.info(
-        `Cron: enqueued sync-full-today for ${today} client=${cid.slice(0, 8)}${tag} → report_full_present`
-      );
-    } catch (e) {
-      logger.error('Cron: failed to enqueue sync-full-today:', e.message);
-    }
   });
 }
 
@@ -125,62 +106,38 @@ function startCron() {
     await enqueueLeanYesterdayAndFullToday({ reason: '6h' });
   }, { timezone: 'Asia/Singapore' });
 
-  // ── 2 AM daily: lean past window (full backfill only if opted in) ────────
+  // ── 2 AM daily: grain past window, one job per calendar month (newest first) ─
   cron.schedule('0 2 * * *', async () => {
     const range = historicalRangeForPresets();
-    const includeFull = process.env.FULL_BACKFILL_DAILY === 'true'
-      && process.env.FULL_SYNC_DISABLED !== 'true';
+    const months = listCalendarMonthsNewestFirst(range.startDate, range.endDate);
     await eachActiveClient(async (client) => {
       const cid = client.id;
-      try {
-        await gamSyncQueue.add('sync-backfill', {
-          startDate: range.startDate,
-          endDate: range.endDate,
-          includeFull,
-          clientId: cid,
-        }, {
-          jobId: `sync-backfill-${cid.slice(0, 8)}-${range.today}`,
-          priority: 10,
-          attempts: 1,
-          backoff: { type: 'fixed', delay: 120000 },
-        });
-        logger.info(
-          `Cron: enqueued sync-backfill ${range.startDate} → ${range.endDate}`
-          + ` client=${cid.slice(0, 8)} includeFull=${includeFull}`
-        );
-      } catch (e) {
-        logger.error('Cron: failed to enqueue sync-backfill:', e.message);
+      for (let i = 0; i < months.length; i += 1) {
+        const { startDate: ms, endDate: me } = months[i];
+        try {
+          await gamSyncQueue.add('sync-backfill', {
+            startDate: ms,
+            endDate: me,
+            includeFull: false,
+            clientId: cid,
+          }, {
+            jobId: `sync-month-${cid.slice(0, 8)}-${ms}-${me}`,
+            priority: 3 + i,
+            attempts: 1,
+            backoff: { type: 'fixed', delay: 120000 },
+          });
+          logger.info(
+            `Cron: enqueued sync-month ${ms} → ${me} client=${cid.slice(0, 8)} priority=${3 + i}`
+          );
+        } catch (e) {
+          logger.error('Cron: failed to enqueue sync-month:', e.message);
+        }
       }
     });
   }, { timezone: 'Asia/Singapore' });
 
-  // ── Weekly Sunday 3 AM: full warehouse backfill (optional heavy job) ─────
-  cron.schedule('0 3 * * 0', async () => {
-    if (process.env.FULL_SYNC_DISABLED === 'true') return;
-    if (process.env.FULL_BACKFILL_WEEKLY === 'false') return;
-    const range = historicalRangeForPresets();
-    await eachActiveClient(async (client) => {
-      const cid = client.id;
-      try {
-        await gamSyncQueue.add('sync-backfill', {
-          startDate: range.startDate,
-          endDate: range.endDate,
-          includeFull: true,
-          clientId: cid,
-        }, {
-          jobId: `sync-full-backfill-weekly-${cid.slice(0, 8)}-${range.today}`,
-          priority: 15,
-          attempts: 1,
-          backoff: { type: 'fixed', delay: 180000 },
-        });
-        logger.info(
-          `Cron: enqueued weekly FULL backfill ${range.startDate} → ${range.endDate} client=${cid.slice(0, 8)}`
-        );
-      } catch (e) {
-        logger.error('Cron: failed to enqueue weekly full backfill:', e.message);
-      }
-    });
-  }, { timezone: 'Asia/Singapore' });
+  // Weekly full warehouse retired — grain months are filled at 2 AM.
+
 
   // ── 23:05: copy today's present snapshot into report_daily (keep present) ─
   cron.schedule('5 23 * * *', async () => {
@@ -200,20 +157,6 @@ function startCron() {
         logger.info(`Cron: enqueued promote-present for ${today} client=${cid.slice(0, 8)}`);
       } catch (e) {
         logger.error('Cron: failed to enqueue promote-present:', e.message);
-      }
-      if (process.env.FULL_SYNC_DISABLED === 'true') return;
-      try {
-        await gamSyncQueue.add('promote-full-present', {
-          date: today,
-          clientId: cid,
-        }, {
-          jobId: `promote-full-present-${cid.slice(0, 8)}-${today}`,
-          attempts: 1,
-          backoff: { type: 'fixed', delay: 30000 },
-        });
-        logger.info(`Cron: enqueued promote-full-present for ${today} client=${cid.slice(0, 8)}`);
-      } catch (e) {
-        logger.error('Cron: failed to enqueue promote-full-present:', e.message);
       }
     });
   }, { timezone: 'Asia/Singapore' });
@@ -241,8 +184,7 @@ function startCron() {
   }, { timezone: 'Asia/Singapore' });
 
   logger.info(
-    'Cron jobs started: hourly lean-today, 6h yesterday+full-today, '
-    + '2AM lean backfill, weekly full backfill, 23:05 promote, 00:05 migrate, boot kickoff'
+    'Cron jobs started: hourly today, 6h yesterday, 2AM month-chunk backfill, 23:05 promote, 00:05 migrate, boot kickoff'
   );
 
   // Don't wait until the next clock hour — fill today's present now.

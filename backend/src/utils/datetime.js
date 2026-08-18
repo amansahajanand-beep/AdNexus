@@ -63,25 +63,55 @@ function endOfPreviousMonth(ymd) {
   return shiftYMD(thisMonthStart, -1);
 }
 
+/** Last day of the calendar month containing `ymd`. */
+function endOfMonth(ymd) {
+  const start = startOfMonth(ymd);
+  const [y, m] = start.split('-').map(Number);
+  const next = m === 12 ? { year: y + 1, month: 1 } : { year: y, month: m + 1 };
+  const nextStart = `${next.year}-${String(next.month).padStart(2, '0')}-01`;
+  return shiftYMD(nextStart, -1);
+}
+
+/**
+ * Calendar-month windows in [startDate, endDate], newest month first.
+ * Example: Aug 2026 → Jul 2026 → Jun 2026.
+ */
+function listCalendarMonthsNewestFirst(startDate, endDate) {
+  if (!startDate || !endDate || startDate > endDate) return [];
+  const months = [];
+  let cursor = startOfMonth(endDate);
+  const firstMonth = startOfMonth(startDate);
+  while (cursor >= firstMonth) {
+    const monthEnd = endOfMonth(cursor);
+    const from = cursor < startDate ? startDate : cursor;
+    const to = monthEnd > endDate ? endDate : monthEnd;
+    months.push({ startDate: from, endDate: to });
+    cursor = startOfMonth(shiftYMD(cursor, -1));
+  }
+  return months;
+}
+
 /**
  * Past-data window stored in report_daily.
- * Covers: yesterday, last 7 days, last 30 days, this month (to date), last month.
- * = start of previous calendar month → yesterday (today stays in report_present).
+ * HISTORICAL_DAYS (default 365) back from yesterday, at least previous calendar month.
+ * Today stays in report_present.
  */
 function historicalRangeForPresets(tz = APP_TIMEZONE) {
   const today = todayInTZ(tz);
   const endDate = shiftYMD(today, -1); // yesterday
-  const startDate = startOfPreviousMonth(today);
+  const days = Math.max(31, parseInt(process.env.HISTORICAL_DAYS || '365', 10) || 365);
+  let startDate = shiftYMD(today, -days);
+  const minStart = startOfPreviousMonth(today);
+  if (startDate > minStart) startDate = minStart;
   return {
     today,
     yesterday: endDate,
     startDate,
     endDate,
-    // Convenience bounds for logging / jobs
     last7Start: shiftYMD(today, -7),
     last30Start: shiftYMD(today, -30),
     thisMonthStart: startOfMonth(today),
-    lastMonthStart: startDate,
+    lastMonthStart: startOfPreviousMonth(today),
     lastMonthEnd: endOfPreviousMonth(today),
   };
 }
@@ -120,6 +150,8 @@ module.exports = {
   startOfMonth,
   startOfPreviousMonth,
   endOfPreviousMonth,
+  endOfMonth,
+  listCalendarMonthsNewestFirst,
   historicalRangeForPresets,
   ymdToObj,
   objToYmd,

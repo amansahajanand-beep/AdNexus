@@ -4,6 +4,10 @@ const {
   SAFE_METRICS,
   pickBestFullSlice,
 } = require('../utils/fullReportSyncCatalog');
+const {
+  UNIFIED_GRAIN_DIMS,
+  UNIFIED_GRAIN_METRICS,
+} = require('../utils/warehouseGrain');
 const { parseGamMetricValue, gamMoneyToDollars, pickRowRevenueDollars } = require('../utils/gamReportMetrics');
 
 /**
@@ -11,9 +15,9 @@ const { parseGamMetricValue, gamMoneyToDollars, pickRowRevenueDollars } = requir
  * Called by BullMQ workers. Does NOT touch HTTP request/response.
  *
  * Tables:
- *   report_present / report_daily — lean dashboard sync (country/device/ad unit + core metrics)
- *   report_full_present / report_full_daily — Reporting builder fields via multi-slice cron
- *   report_adhoc — on-demand Reporting page custom queries
+ *   report_present / report_daily — unified grain (dashboard + Reporting SQL)
+ *   report_adhoc — on-demand exotic Reporting queries (query cache)
+ *   rollup_* — Dashboard KPI speed layer
  */
 const crypto  = require('crypto');
 const { query } = require('../db');
@@ -21,7 +25,7 @@ const { requireClientId, tenantKey } = require('../utils/clientContext');
 const {
   redisDel, redisDelByPattern, bumpCacheGeneration, TTL, redisGet, redisSet, MAX_REDIS_ARRAY_ITEMS,
 } = require('../redisClient');
-const { todayInTZ } = require('../utils/datetime');
+const { todayInTZ, listCalendarMonthsNewestFirst } = require('../utils/datetime');
 const { normalizeReportRows, rowsHaveMetrics } = require('../utils/rowNormalize');
 const {
   resolveInventoryFields,
@@ -1770,10 +1774,13 @@ function normalizeGAMRows(rawRows, currency = 'USD') {
 }
 
 /**
- * Preferred → fallback dimension sets for cron / historical sync.
- * Include inventory dims used by dashboard filters when GAM allows the combo.
+ * Preferred → fallback dimension sets for warehouse sync.
+ * Unified grain first; shrink if GAM rejects the combo.
  */
 const SYNC_DIMENSION_SETS = [
+  UNIFIED_GRAIN_DIMS,
+  UNIFIED_GRAIN_DIMS.filter((d) => d !== 'PROGRAMMATIC_CHANNEL_NAME'),
+  UNIFIED_GRAIN_DIMS.filter((d) => d !== 'PROGRAMMATIC_CHANNEL_NAME' && d !== 'DOMAIN'),
   ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME', 'SITE_NAME', 'MOBILE_APP_NAME'],
   ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME', 'SITE_NAME'],
   ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME', 'DOMAIN'],
@@ -1787,12 +1794,10 @@ const SYNC_DIMENSION_SETS = [
 
 function buildSyncReportXML(dimensions, buildDateXML, startDate, endDate) {
   const dimXML = dimensions.map((d) => `<dimensions>${d}</dimensions>`).join('\n    ');
+  const colXML = UNIFIED_GRAIN_METRICS.map((c) => `<columns>${c}</columns>`).join('\n    ');
   return `
     ${dimXML}
-    <columns>TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS</columns>
-    <columns>TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE</columns>
-    <columns>TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE</columns>
-    <columns>TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE</columns>
+    ${colXML}
     ${buildDateXML(startDate, endDate)}
     <dateRangeType>CUSTOM_DATE</dateRangeType>`;
 }
@@ -1932,41 +1937,78 @@ async function hasCompleteDbCoverage(startDate, endDate) {
 }
 
 /**
- * Pull a date range from GAM and write into the correct table(s).
- * Processes one calendar day at a time so 7d/30d/last-month backfills stay reliable.
+ * Day coverage for a range — used so the UI can show August while July still builds.
  */
-async function syncDateRangeFromGAM(startDate, endDate, syncType = 'sync-backfill') {
-  const currency = process.env.GAM_CURRENCY || 'USD';
+async function getRangeCoverage(startDate, endDate) {
+  if (!startDate || !endDate || startDate > endDate) {
+    return { totalDays: 0, coveredDays: 0, missingDays: 0, complete: false };
+  }
   const today = todayInTZ();
-  const days = [];
   let cursor = startDate;
+  let totalDays = 0;
   while (cursor <= endDate) {
-    days.push(cursor);
+    totalDays += 1;
     cursor = shiftDate(cursor, 1);
   }
 
+  let missing = [];
+  const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
+  if (startDate <= pastEnd) {
+    missing = await listDatesMissingRichDims(startDate, pastEnd);
+  }
+  let presentMissing = 0;
+  if (startDate <= today && endDate >= today) {
+    const ok = await presentHasCountryAndDevice();
+    if (!ok) presentMissing = 1;
+  }
+  const missingDays = missing.length + presentMissing;
+  const coveredDays = Math.max(0, totalDays - missingDays);
+  return {
+    totalDays,
+    coveredDays,
+    missingDays,
+    complete: missingDays === 0,
+    newestFilled: missing.length ? null : (endDate < today ? endDate : shiftDate(today, -1)),
+  };
+}
+
+/**
+ * Pull a date range from GAM (one job per calendar month, newest first)
+ * and write daily rows into report_present / report_daily.
+ */
+async function syncDateRangeFromGAM(startDate, endDate, syncType = 'sync-backfill') {
+  const months = listCalendarMonthsNewestFirst(startDate, endDate);
+  if (!months.length) return 0;
   let total = 0;
-  for (const day of days) {
-    try {
-      const raw = await fetchFromGAM(day, day);
-      const normalized = normalizeGAMRows(raw, currency);
-      // Today always lands in report_present; past days in report_daily.
-      if (day === today) {
-        total += await replacePresentRows(normalized, `${syncType}:${day}`);
-      } else {
-        total += await replaceHistoricalRows(normalized, `${syncType}:${day}`);
-      }
-      // Multi-day: defer invalidation to once at end (avoids N× SCAN/INCR storms).
-      if (days.length === 1) await invalidateCacheForDate(day);
-      logger.info(`[${syncType}] day ${day} → ${day === today ? 'report_present' : 'report_daily'} (${normalized.length} rows)`);
-    } catch (e) {
-      logger.error(`[${syncType}] day ${day} failed:`, e.message);
-      throw e;
-    }
+  for (const month of months) {
+    total += await syncOneGamRange(month.startDate, month.endDate, syncType);
   }
-  if (days.length > 1) {
-    await invalidateCacheForDate(endDate);
+  return total;
+}
+
+async function syncOneGamRange(startDate, endDate, syncType) {
+  const currency = process.env.GAM_CURRENCY || 'USD';
+  const today = todayInTZ();
+  const raw = await fetchFromGAM(startDate, endDate);
+  const normalized = normalizeGAMRows(raw, currency);
+  const todayRows = [];
+  const pastRows = [];
+  for (const row of normalized) {
+    const day = toYmd(row.report_date);
+    if (day === today) todayRows.push(row);
+    else pastRows.push(row);
   }
+  let total = 0;
+  if (todayRows.length) {
+    total += await replacePresentRows(todayRows, `${syncType}:${startDate}`);
+  }
+  if (pastRows.length) {
+    total += await replaceHistoricalRows(pastRows, `${syncType}:${startDate}`);
+  }
+  await invalidateCacheForDate(endDate);
+  logger.info(
+    `[${syncType}] ${startDate}..${endDate} → present=${todayRows.length} daily=${pastRows.length} upserted=${total}`
+  );
   return total;
 }
 
@@ -2922,6 +2964,7 @@ module.exports = {
   presentHasCountryAndDevice,
   listDatesMissingRichDims,
   hasCompleteDbCoverage,
+  getRangeCoverage,
   normalizeGAMRows,
   invalidateCacheForDate,
   logSync,

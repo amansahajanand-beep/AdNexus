@@ -3,11 +3,9 @@
  * Runs in the same Node process (imported from server.js).
  *
  * Job types:
- *   sync-today    → clear report_present, store fresh today's snapshot
- *                   (+ at 23:00 promote present → report_daily)
- *                   + full Reporting slices → report_full_present
- *   sync-day      → replace one historical day in report_daily (+ report_full_daily)
- *   sync-backfill → replace many past days in report_daily / report_full_daily
+ *   sync-today    → report_present (unified grain)
+ *   sync-day      → one historical day in report_daily
+ *   sync-backfill → one calendar month (newest first) into report_daily
  */
 const { Worker } = require('bullmq');
 const { redisSet, TTL, createBullmqConnection, isTransientRedisError } = require('../redisClient');
@@ -20,14 +18,8 @@ const {
   fetchFromGAM,
   normalizeGAMRows,
   syncDateRangeFromGAM,
-  syncFullDateRangeFromGAM,
-  replaceFullPresentRows,
-  replaceFullHistoricalRows,
-  promoteFullPresentToDaily,
-  fetchFullFromGAM,
   invalidateCacheForDate,
   logSync,
-  migrateStaleFullPresentToDaily,
 } = require('../services/gamSyncService');
 const { todayInTZ, isLastHourOfDay, shiftYMD } = require('../utils/datetime');
 const { runWithClient } = require('../utils/clientContext');
@@ -122,34 +114,11 @@ async function processJobInner(job) {
       const normalized = normalizeGAMRows(rawRows, currency);
       totalUpserted = await replacePresentRows(normalized, job.name);
 
-      // Full multi-slice is expensive — hourly dashboard cron must stay lean.
-      const wantFull = job.data?.includeFull === true
-        && process.env.FULL_SYNC_DISABLED !== 'true';
-      if (wantFull) {
-        try {
-          const fullRows = await fetchFullFromGAM(day, day);
-          const fullCount = await replaceFullPresentRows(fullRows, `${job.name}-full`);
-          logger.info(`[gam-sync] Full present sync: ${fullCount} rows → report_full_present`);
-          totalUpserted += fullCount;
-        } catch (fullErr) {
-          logger.warn(`[gam-sync] Full present sync failed (lean OK): ${fullErr.message}`);
-        }
-      }
-
       const shouldPromote = job.data?.promoteToDaily === true || isLastHourOfDay();
       if (shouldPromote) {
         const promoted = await promotePresentToDaily('promote-present');
         logger.info(`[gam-sync] Last-of-day promote: ${promoted} rows copied into report_daily`);
         await logSync('promote-present', 'success', promoted);
-        if (wantFull) {
-          try {
-            const fullPromoted = await promoteFullPresentToDaily('promote-full-present');
-            logger.info(`[gam-sync] Last-of-day full promote: ${fullPromoted} rows → report_full_daily`);
-            await logSync('promote-full-present', 'success', fullPromoted);
-          } catch (e) {
-            logger.warn(`[gam-sync] Full promote failed: ${e.message}`);
-          }
-        }
       }
       await invalidateCacheForDate(day);
     } else if (job.name === 'sync-day') {
@@ -157,46 +126,12 @@ async function processJobInner(job) {
       const rawRows = await fetchFromGAM(day, day);
       const normalized = normalizeGAMRows(rawRows, currency);
       totalUpserted = await replaceHistoricalRows(normalized, job.name);
-      // Yesterday lean only on hourly — full past is opt-in (too heavy for dashboard).
-      if (job.data?.includeFull === true && process.env.FULL_SYNC_DISABLED !== 'true') {
-        try {
-          const fullRows = await fetchFullFromGAM(day, day);
-          const fullCount = await replaceFullHistoricalRows(fullRows, `${job.name}-full`);
-          logger.info(`[gam-sync] Full day sync: ${fullCount} rows → report_full_daily`);
-          totalUpserted += fullCount;
-        } catch (fullErr) {
-          logger.warn(`[gam-sync] Full day sync failed (lean OK): ${fullErr.message}`);
-        }
-      }
       await invalidateCacheForDate(day);
-    } else if (job.name === 'sync-full-range' || job.name === 'sync-full-today' || job.name === 'sync-full-backfill') {
-      // Full tables only — does not touch report_present / report_daily.
-      if (process.env.FULL_SYNC_DISABLED === 'true') {
-        logger.info(`[gam-sync] ${job.name} skipped (FULL_SYNC_DISABLED=true)`);
-        return;
-      }
-      // Keep present = today only: migrate any leftover past days first.
-      try {
-        await migrateStaleFullPresentToDaily(job.name);
-      } catch (e) {
-        logger.warn(`[gam-sync] stale full-present migrate skipped: ${e.message}`);
-      }
-      totalUpserted = await syncFullDateRangeFromGAM(startDate, endDate, job.name);
-      logger.info(`[gam-sync] ${job.name}: ${totalUpserted} rows → report_full_*`);
-    } else if (job.name === 'promote-full-present') {
-      totalUpserted = await promoteFullPresentToDaily(job.name);
+    } else if (job.name === 'sync-full-range' || job.name === 'sync-full-today' || job.name === 'sync-full-backfill' || job.name === 'promote-full-present') {
+      logger.info(`[gam-sync] ${job.name} skipped — report_full_* warehouse retired`);
+      return;
     } else {
-      // sync-backfill — lean only by default so dashboard can keep using Postgres.
       totalUpserted = await syncDateRangeFromGAM(startDate, endDate, job.name);
-      if (job.data?.includeFull === true && process.env.FULL_SYNC_DISABLED !== 'true') {
-        try {
-          const fullCount = await syncFullDateRangeFromGAM(startDate, endDate, `${job.name}-full`);
-          logger.info(`[gam-sync] Full backfill: ${fullCount} rows → report_full_*`);
-          totalUpserted += fullCount;
-        } catch (fullErr) {
-          logger.warn(`[gam-sync] Full backfill failed (lean OK): ${fullErr.message}`);
-        }
-      }
     }
 
     await logSync(job.name, 'success', totalUpserted);
@@ -214,12 +149,11 @@ function startWorker() {
     return null;
   }
 
+  const syncConcurrency = Math.min(5, Math.max(1, parseInt(process.env.GAM_SYNC_CONCURRENCY || '4', 10) || 4));
   const worker = new Worker('gam-sync', processJob, {
     connection: createBullmqConnection('BullMQ gam-sync worker'),
-    // Never overlap lean + full multi-slice sync in the same process (OOM risk).
-    concurrency: 1,
+    concurrency: syncConcurrency,
     lockDuration: 45 * 60 * 1000,
-    // Less frequent stall checks → fewer Upstash commands.
     stalledInterval: 5 * 60 * 1000,
     maxStalledCount: 1,
   });
@@ -245,7 +179,7 @@ function startWorker() {
     logger.error('[gam-sync] Worker error:', err.message);
   });
 
-  logger.info('BullMQ gam-sync worker started (concurrency=1, stalledInterval=5m)');
+  logger.info(`BullMQ gam-sync worker started (concurrency=${syncConcurrency}, stalledInterval=5m)`);
   return worker;
 }
 

@@ -134,7 +134,7 @@ async function startServer() {
     }
 
     // ── BullMQ workers (hourly DB sync + on-demand report jobs) ────────────────
-    if (process.env.SYNC_DISABLED !== 'true') {
+    if (process.env.SYNC_DISABLED !== 'true' && process.env.RUN_IN_PROCESS_WORKERS !== 'false') {
       try {
         const { startWorker, startReportWorker } = require('./workers/gamSyncWorker');
         startWorker();
@@ -142,6 +142,8 @@ async function startServer() {
       } catch (e) {
         logger.warn('BullMQ worker failed to start (non-fatal):', e.message);
       }
+    } else if (process.env.RUN_IN_PROCESS_WORKERS === 'false') {
+      logger.info('In-process BullMQ workers skipped (RUN_IN_PROCESS_WORKERS=false)');
     }
 
     // ── Cron jobs ─────────────────────────────────────────────────────────────

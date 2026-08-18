@@ -9,6 +9,7 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3001
+      - RUN_IN_PROCESS_WORKERS=false
     volumes:
       - ./backend/logs:/app/logs
     networks:
@@ -18,6 +19,22 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+
+  gam-worker:
+    build: ./backend
+    container_name: gam-worker
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      - NODE_ENV=production
+      - GAM_SYNC_CONCURRENCY=4
+    command: ["node", "src/worker.js"]
+    volumes:
+      - ./backend/logs:/app/logs
+    networks:
+      - gam-net
+    depends_on:
+      - backend
 
   frontend:
     build: ./frontend
@@ -31,7 +48,7 @@ services:
     networks:
       - gam-net
     volumes:
-      - ./ssl:/etc/nginx/ssl:ro   # SSL certs mount karein
+      - ./ssl:/etc/nginx/ssl:ro
 
 networks:
   gam-net:
