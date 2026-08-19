@@ -1,0 +1,47 @@
+name: Deploy AdNexus
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+
+          script: |
+            set -e
+
+            echo "===== AdNexus Deployment Started ====="
+
+            cd /var/www/AdNexus
+
+            echo "===== Pulling Latest Code ====="
+            git pull origin master
+
+            echo "===== Installing Frontend Dependencies ====="
+            cd frontend
+            npm install
+
+            echo "===== Building Frontend ====="
+            npm run build
+
+            echo "===== Installing Backend Dependencies ====="
+            cd ../backend
+            npm install
+
+            echo "===== Restarting Backend ====="
+            pm2 restart AdNexus
+
+            echo "===== Saving PM2 ====="
+            pm2 save
+
+            echo "===== Deployment Completed ====="
