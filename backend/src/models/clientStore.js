@@ -61,6 +61,23 @@ async function getClientByNetworkCode(networkCode) {
   return rows[0] ? mapRuntime(rows[0]) : null;
 }
 
+/** Row lookup without decrypt — needed so SYNC can overwrite even if old ciphertext is unreadable. */
+async function findClientRowByNetworkCode(networkCode) {
+  const { rows } = await query(
+    'SELECT id, name, network_code FROM gam_clients WHERE network_code = $1',
+    [String(networkCode).trim()]
+  );
+  return rows[0] || null;
+}
+
+function envFlagTrue(name) {
+  const raw = String(process.env[name] || '')
+    .trim()
+    .replace(/^['"]|['"]$/g, '')
+    .toLowerCase();
+  return raw === 'true' || raw === '1' || raw === 'yes';
+}
+
 async function listActiveClients() {
   const { rows } = await query(
     `SELECT * FROM gam_clients WHERE is_active = true AND google_refresh_token_enc IS NOT NULL
@@ -141,16 +158,45 @@ async function ensureBootstrapFromEnv() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
   const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  const syncFromEnv = envFlagTrue('SYNC_GAM_CREDS_FROM_ENV');
+
   if (!networkCode || !clientId || !clientSecret || !refreshToken) {
+    if (syncFromEnv) {
+      logger.warn(
+        '[tenancy] SYNC_GAM_CREDS_FROM_ENV is set but bootstrap skipped — missing one of '
+        + 'GAM_NETWORK_CODE / GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN in process env.'
+      );
+    }
     return null;
   }
 
-  const existing = await getClientByNetworkCode(String(networkCode).trim());
-  if (existing) {
+  // Prefer raw row lookup so a bad/old encryption key cannot block overwrite.
+  let existingRow = await findClientRowByNetworkCode(networkCode);
+
+  // Single-tenant production: env network_code may not match the only DB row.
+  if (!existingRow && syncFromEnv) {
+    const { rows } = await query(
+      'SELECT id, name, network_code FROM gam_clients ORDER BY created_at ASC LIMIT 2'
+    );
+    if (rows.length === 1) {
+      existingRow = rows[0];
+      logger.warn(
+        `[tenancy] SYNC: no gam_clients row for network ${String(networkCode).trim()}; `
+        + `updating sole client "${existingRow.name}" (${existingRow.network_code} → ${String(networkCode).trim()}).`
+      );
+    } else if (rows.length > 1) {
+      logger.warn(
+        `[tenancy] SYNC: no gam_clients row for network ${String(networkCode).trim()} and `
+        + `${rows.length}+ clients exist — not guessing. Update Admin → Client settings, or align GAM_NETWORK_CODE.`
+      );
+    }
+  }
+
+  if (existingRow) {
     // Production: live requests use gam_clients (encrypted), not .env.
     // Set SYNC_GAM_CREDS_FROM_ENV=true once after rotating Google OAuth secrets, then restart.
-    if (String(process.env.SYNC_GAM_CREDS_FROM_ENV || '').toLowerCase() === 'true') {
-      const updated = await updateClientCredentials(existing.id, {
+    if (syncFromEnv) {
+      const updated = await updateClientCredentials(existingRow.id, {
         networkCode,
         googleClientId: clientId,
         googleClientSecret: clientSecret,
@@ -163,7 +209,15 @@ async function ensureBootstrapFromEnv() {
       );
       return updated;
     }
-    return existing;
+    try {
+      return await getClientById(existingRow.id);
+    } catch (e) {
+      logger.warn(
+        `[tenancy] Could not decrypt gam_clients secrets for ${existingRow.id}: ${e.message}. `
+        + 'Set SYNC_GAM_CREDS_FROM_ENV=true and restart to overwrite from env.'
+      );
+      return null;
+    }
   }
 
   const created = await createClient({
