@@ -45,9 +45,22 @@ app.use(compression());
 app.use(express.json());
 
 // CORS
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'http://localhost:3000',
+  'https://dashboard.brainfungames.com',
+  'https://www.dashboard.brainfungames.com',
+];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
-  credentials: true
+  origin: (origin, callback) => {
+    // Allow requests without Origin header (optional, useful for server-to-server tools)
+    if (!origin || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`Not allowed by CORS: ${origin}`));
+  },
+  credentials: true,
 }));
 
 // Rate limiting
