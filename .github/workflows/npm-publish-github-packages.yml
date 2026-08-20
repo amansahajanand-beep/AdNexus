@@ -16,7 +16,12 @@ jobs:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           password: ${{ secrets.VPS_PASSWORD }}
+          port: 22
           script: |
+            echo "SSH Connected Successfully"
+            whoami
+            hostname
+            script: |
             set -e
 
             echo "===== AdNexus Deployment Started ====="
