@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { query } = require('../db');
+const { query, schemaQuery } = require('../db');
 const logger = require('../utils/logger');
 
 const SECRET = () => process.env.JWT_SECRET || 'change_this_secret';
@@ -30,7 +30,8 @@ const DEFAULT_ADMIN_USERNAME = process.env.DEFAULT_ADMIN_USERNAME || 'dashboard.
 const DEFAULT_ADMIN_PASSWORD = process.env.DEFAULT_ADMIN_PASSWORD || 'Mdmtx@3563ye';
 
 async function initUsersSchema() {
-  await query(`
+  // DDL via schemaQuery so FORCE RLS / empty app.client_id cannot block CREATE.
+  await schemaQuery(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       username TEXT UNIQUE NOT NULL,
@@ -45,22 +46,12 @@ async function initUsersSchema() {
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
   `);
-  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by TEXT;`);
-  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS client_id UUID;`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);`);
-  await query(`CREATE INDEX IF NOT EXISTS idx_users_client_id ON users(client_id);`);
+  await schemaQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by TEXT;`);
+  await schemaQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS client_id UUID;`);
+  await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);`);
+  await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_users_client_id ON users(client_id);`);
 
-  try {
-    const { ensureBootstrapFromEnv } = require('./clientStore');
-    const bootstrap = await ensureBootstrapFromEnv();
-    if (bootstrap?.id) {
-      await query(`UPDATE users SET client_id = $1::uuid WHERE client_id IS NULL`, [bootstrap.id]);
-    }
-  } catch (e) {
-    logger.warn('Attach users to bootstrap client:', e.message);
-  }
-
-  await query(`
+  await schemaQuery(`
     CREATE TABLE IF NOT EXISTS user_sessions (
       session_id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -71,7 +62,17 @@ async function initUsersSchema() {
       is_active BOOLEAN NOT NULL DEFAULT true
     );
   `);
-  await query(`CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);`);
+  await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_user_sessions_user_id ON user_sessions(user_id);`);
+
+  try {
+    const { ensureBootstrapFromEnv } = require('./clientStore');
+    const bootstrap = await ensureBootstrapFromEnv();
+    if (bootstrap?.id) {
+      await schemaQuery(`UPDATE users SET client_id = $1::uuid WHERE client_id IS NULL`, [bootstrap.id]);
+    }
+  } catch (e) {
+    logger.warn('Attach users to bootstrap client:', e.message);
+  }
 
   const admin = await getUserByUsername(DEFAULT_ADMIN_USERNAME);
   if (!admin) {
@@ -87,7 +88,7 @@ async function initUsersSchema() {
     });
   }
 
-  logger.info('Users and sessions schema ready');
+  logger.info('Users and sessions schema ready (tables: users, user_sessions)');
 }
 
 async function getAllUsers() {

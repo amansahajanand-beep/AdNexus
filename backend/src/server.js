@@ -86,7 +86,17 @@ async function startServer() {
     logger.warn('PostgreSQL schema init failed (non-fatal, continuing):', e.message);
   }
 
-  await initDB();
+  try {
+    await initDB();
+  } catch (e) {
+    logger.error(
+      'User/session schema init failed — login will not work until tables users + user_sessions exist:',
+      e.message
+    );
+    if (process.env.USE_PG_USERS === 'true') {
+      throw e;
+    }
+  }
 
   // Routes
   app.use('/auth', authRoutes);              // GAM Google OAuth helper
