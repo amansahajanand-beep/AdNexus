@@ -21,7 +21,6 @@ jobs:
             echo "SSH Connected Successfully"
             whoami
             hostname
-            script: |
             set -e
 
             echo "===== AdNexus Deployment Started ====="
