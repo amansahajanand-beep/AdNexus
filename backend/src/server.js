@@ -44,21 +44,26 @@ app.use(helmet());
 app.use(compression());
 app.use(express.json());
 
-// CORS
+// CORS — compare without trailing slash (some proxies send Origin with `/`)
+const normalizeOrigin = (o) => String(o || '').replace(/\/$/, '');
 const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:3000',
+  'http://localhost:3000',
+  'http://localhost:3099',
   'https://dashboard.brainfungames.com',
   'https://www.dashboard.brainfungames.com',
-];
+  ...(process.env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
+].map(normalizeOrigin);
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests without Origin header (optional, useful for server-to-server tools)
-    if (!origin || allowedOrigins.includes(origin)) {
+    // Allow requests without Origin header (server-to-server, curl, etc.)
+    if (!origin || allowedOrigins.includes(normalizeOrigin(origin))) {
       return callback(null, true);
     }
-
-    return callback(new Error(`Not allowed by CORS: ${origin}`));
+    // Deny without throwing — avoids noisy "Unhandled error" 500s
+    logger.warn(`CORS blocked origin: ${origin}`);
+    return callback(null, false);
   },
   credentials: true,
 }));

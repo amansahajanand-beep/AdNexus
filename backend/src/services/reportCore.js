@@ -99,6 +99,34 @@ function getQueue() {
   return _gamSyncQueue;
 }
 
+function isSyncQueueLive() {
+  try {
+    const { isSyncQueueEnabled } = require('../queues/gamSync');
+    return typeof isSyncQueueEnabled === 'function' ? isSyncQueueEnabled() : false;
+  } catch (_) {
+    return false;
+  }
+}
+
+/** Reuse in-flight jobs; drop failed/completed so a cold miss can retry the same jobId. */
+async function reuseOrClearJob(queue, jobId) {
+  if (!queue?.getJob || !jobId) return false;
+  const existing = await queue.getJob(jobId);
+  if (!existing) return false;
+  if (typeof existing.getState !== 'function') {
+    // Disabled stub queue — never treat as a real in-flight job.
+    return false;
+  }
+  const state = await existing.getState().catch(() => null);
+  if (state === 'active' || state === 'waiting' || state === 'delayed' || state === 'paused') {
+    return true;
+  }
+  try {
+    await existing.remove();
+  } catch (_) { /* ignore */ }
+  return false;
+}
+
 /**
  * GET|POST /api/reports/range?startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
  * Returns rows from Redis or Postgres, or queues an on-demand job when no data exists.
@@ -1717,16 +1745,24 @@ async function tryLoadAdhocRowsFromDb(filters) {
 async function enqueueRangeSync(startDate, endDate) {
   const queue = getQueue();
   if (!queue || isMockClient()) return false;
+  if (!isSyncQueueLive()) {
+    logger.info('enqueueRangeSync skipped — BullMQ sync queue disabled');
+    return false;
+  }
   const today = todayInTZ();
   const { getClientId } = require('../utils/clientContext');
   const { shiftYMD } = require('../utils/datetime');
   const clientId = getClientId();
-  const cid = String(clientId || 'na').slice(0, 8);
+  if (!clientId) {
+    logger.warn('enqueueRangeSync skipped — no client context');
+    return false;
+  }
+  const cid = String(clientId).slice(0, 8);
   try {
     if (startDate === today || (startDate <= today && endDate >= today)) {
       const jobId = `sync-today-${cid}-${today}`.slice(0, 120);
-      const existing = await queue.getJob(jobId);
-      if (!existing) {
+      const inFlight = await reuseOrClearJob(queue, jobId);
+      if (!inFlight) {
         await queue.add('sync-today', { date: today, includeFull: false, clientId }, {
           jobId,
           priority: 1,
@@ -1744,8 +1780,8 @@ async function enqueueRangeSync(startDate, endDate) {
     for (let i = 0; i < months.length; i += 1) {
       const { startDate: ms, endDate: me } = months[i];
       const jobId = `sync-month-${cid}-${ms}-${me}`.slice(0, 120);
-      const existing = await queue.getJob(jobId);
-      if (existing) continue;
+      const inFlight = await reuseOrClearJob(queue, jobId);
+      if (inFlight) continue;
       await queue.add('sync-backfill', {
         startDate: ms,
         endDate: me,
@@ -1789,7 +1825,7 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
     useAdhocStore = false,
     persistOnGam = true,
     enqueueSyncOnMiss = false,
-    /** When true, miss → enqueue job and return empty+building (never block on live GAM). */
+    /** When true, miss → enqueue sync; return building if warehouse has coverage, else live GAM. */
     asyncOnMiss = false,
     logLabel = 'Report',
   } = opts;
@@ -1902,39 +1938,79 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
     await enqueueRangeSync(filters.startDate, filters.endDate);
   }
 
-  // Async miss: never block HTTP on live GAM (Dashboard parity).
-  // If enqueue fails, still return building — worker/cron will catch up.
+  // Async miss: prefer non-blocking building when the warehouse already has
+  // some coverage and BullMQ can fill gaps. Cold clients (new user / never
+  // synced) and disabled queues must fall through to live GAM or the UI stays empty.
   if (asyncOnMiss) {
     let jobId = null;
     if (useAdhocStore) {
       jobId = await enqueueAdhocReportJob(filters, cacheKey);
       if (!jobId) {
-        logger.warn(`${logLabel}: async adhoc enqueue failed — returning building (no live GAM)`);
+        logger.warn(`${logLabel}: async adhoc enqueue failed — falling through to live GAM`);
+      } else {
+        let coverage = null;
+        try {
+          const svc = getSyncSvc();
+          if (typeof svc?.getRangeCoverage === 'function') {
+            coverage = await svc.getRangeCoverage(filters.startDate, filters.endDate);
+          }
+        } catch (_) { /* ignore */ }
+        return {
+          rows: [],
+          cacheKey,
+          source: 'building',
+          status: 'building',
+          jobId,
+          coverage,
+          reportWarning: null,
+          reportWarningSkipped: [],
+          reportWarningUsed: [],
+          reportWarningUsedIds: [],
+          reportWarningUsedMetricIds: [],
+        };
       }
+    } else {
+      let coverage = null;
+      try {
+        const svc = getSyncSvc();
+        if (typeof svc?.getRangeCoverage === 'function') {
+          coverage = await svc.getRangeCoverage(filters.startDate, filters.endDate);
+        }
+      } catch (_) { /* ignore */ }
+
+      const queueLive = isSyncQueueLive();
+      const hasAnyCoverage = (coverage?.coveredDays || 0) > 0;
+
+      if (queueLive && hasAnyCoverage) {
+        return {
+          rows: [],
+          cacheKey,
+          source: 'building',
+          status: 'building',
+          jobId,
+          coverage,
+          reportWarning: null,
+          reportWarningSkipped: [],
+          reportWarningUsed: [],
+          reportWarningUsedIds: [],
+          reportWarningUsedMetricIds: [],
+        };
+      }
+
+      if (!queueLive) {
+        logger.warn(`${logLabel}: sync queue disabled — live GAM fallback for ${filters.startDate}..${filters.endDate}`);
+      } else {
+        logger.info(
+          `${logLabel}: cold warehouse (covered=${coverage?.coveredDays || 0}/${coverage?.totalDays || 0})`
+          + ` — live GAM fallback while sync runs`
+        );
+      }
+      // Fall through to live GAM below.
     }
-    let coverage = null;
-    try {
-      const svc = getSyncSvc();
-      if (typeof svc?.getRangeCoverage === 'function') {
-        coverage = await svc.getRangeCoverage(filters.startDate, filters.endDate);
-      }
-    } catch (_) { /* ignore */ }
-    return {
-      rows: [],
-      cacheKey,
-      source: 'building',
-      status: 'building',
-      jobId,
-      coverage,
-      reportWarning: null,
-      reportWarningSkipped: [],
-      reportWarningUsed: [],
-      reportWarningUsedIds: [],
-      reportWarningUsedMetricIds: [],
-    };
   }
 
-  // 4. GAM last resort (blocking) — only when asyncOnMiss is false
+  // 4. GAM last resort (blocking) — also used for asyncOnMiss cold-start /
+  //    queue-disabled fallback so new users are not stuck on an empty warehouse.
   if (!token) {
     return { rows: [], cacheKey, source: 'empty' };
   }
@@ -2030,8 +2106,10 @@ async function enqueueAdhocReportJob(filters, cacheKey) {
     const existing = await gamReportQueue.getJob(jobId);
     if (existing) {
       const state = await existing.getState().catch(() => null);
-      if (state === 'completed') return jobId;
-      if (state === 'active' || state === 'waiting' || state === 'delayed') return jobId;
+      if (state === 'completed' || state === 'active' || state === 'waiting' || state === 'delayed') {
+        return jobId;
+      }
+      try { await existing.remove(); } catch (_) { /* ignore */ }
     }
     await gamReportQueue.add('adhoc-report', {
       startDate: filters.startDate,
@@ -2482,7 +2560,7 @@ async function handleDashboardOverview(req, res) {
       }
     }
 
-    const { rows: rawRows } = await loadReportRowsCacheAside(filters, token, {
+    const loaded = await loadReportRowsCacheAside(filters, token, {
       cachePrefix: 'report_overview_v3',
       fastMode: true,
       persistOnGam: true,
@@ -2490,6 +2568,7 @@ async function handleDashboardOverview(req, res) {
       asyncOnMiss: true,
       logLabel: 'Overview',
     });
+    const rawRows = loaded.rows || [];
     const prepared = invFilterActive
       ? prepareScopedReportRows(rawRows, inventoryFilters, req.user)
       : (isScopedUser
@@ -2505,7 +2584,12 @@ async function handleDashboardOverview(req, res) {
         + ` range=${filters.startDate}..${filters.endDate}`
       );
     }
-    return res.json(applyOverviewVisibility({ summary, isMock: false, currency }, req.user));
+    const body = applyOverviewVisibility({ summary, isMock: false, currency }, req.user);
+    if (loaded.status === 'building' || loaded.source === 'building') {
+      body.status = 'building';
+      body.coverage = loaded.coverage || null;
+    }
+    return res.json(body);
   } catch (err) {
     logger.error('Dashboard overview error:', err.message);
     const { classifyGoogleAuthError } = require('../utils/googleAuthErrors');

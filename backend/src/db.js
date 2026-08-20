@@ -15,14 +15,31 @@ const pool = new Pool({
   connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '30000', 10),
 });
 
+function formatPgError(err) {
+  if (!err) return 'unknown error';
+  const parts = [
+    err.message,
+    err.code && `code=${err.code}`,
+    err.routine && `routine=${err.routine}`,
+  ].filter(Boolean);
+  return parts.join(' ') || String(err);
+}
+
 pool.on('error', (err) => {
-  logger.error('PostgreSQL pool error:', err.message);
+  logger.error('PostgreSQL pool error:', formatPgError(err));
 });
 
 pool.query('SELECT 1').then(() => {
   logger.info(`[DB] PostgreSQL connected → ${process.env.PG_DATABASE}@${process.env.PG_HOST}:${process.env.PG_PORT}`);
 }).catch(err => {
-  logger.error('[DB] PostgreSQL connection FAILED:', err.message);
+  const detail = formatPgError(err);
+  logger.error('[DB] PostgreSQL connection FAILED:', detail);
+  if (err?.routine === 'auth_failed' || /password authentication failed/i.test(detail)) {
+    logger.error(
+      '[DB] Postgres rejected login (auth_failed). Check PG_USER / PG_PASSWORD / PG_HOST on this host — '
+      + 'sync jobs cannot fill report tables until this is fixed.'
+    );
+  }
 });
 
 /**
@@ -146,44 +163,6 @@ async function initSchema() {
       PRIMARY KEY (client_id, query_hash, start_date, end_date)
     );
 
-    CREATE TABLE IF NOT EXISTS report_full_present (
-      id           BIGSERIAL PRIMARY KEY,
-      client_id    UUID        NOT NULL REFERENCES gam_clients(id),
-      report_date  DATE        NOT NULL,
-      slice_key    TEXT        NOT NULL,
-      dim_hash     TEXT        NOT NULL,
-      dimensions   JSONB       NOT NULL DEFAULT '{}',
-      metrics      JSONB       NOT NULL DEFAULT '{}',
-      dim_keys     TEXT[]      NOT NULL DEFAULT '{}',
-      metric_keys  TEXT[]      NOT NULL DEFAULT '{}',
-      currency     CHAR(3)     NOT NULL DEFAULT 'USD',
-      synced_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      inv_domain   TEXT,
-      inv_site     TEXT,
-      inv_ad_unit  TEXT,
-      inv_app      TEXT,
-      UNIQUE (client_id, report_date, slice_key, dim_hash)
-    );
-
-    CREATE TABLE IF NOT EXISTS report_full_daily (
-      id           BIGSERIAL PRIMARY KEY,
-      client_id    UUID        NOT NULL REFERENCES gam_clients(id),
-      report_date  DATE        NOT NULL,
-      slice_key    TEXT        NOT NULL,
-      dim_hash     TEXT        NOT NULL,
-      dimensions   JSONB       NOT NULL DEFAULT '{}',
-      metrics      JSONB       NOT NULL DEFAULT '{}',
-      dim_keys     TEXT[]      NOT NULL DEFAULT '{}',
-      metric_keys  TEXT[]      NOT NULL DEFAULT '{}',
-      currency     CHAR(3)     NOT NULL DEFAULT 'USD',
-      synced_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      inv_domain   TEXT,
-      inv_site     TEXT,
-      inv_ad_unit  TEXT,
-      inv_app      TEXT,
-      UNIQUE (client_id, report_date, slice_key, dim_hash)
-    );
-
     CREATE TABLE IF NOT EXISTS rollup_kpi_daily (
       client_id       UUID        NOT NULL REFERENCES gam_clients(id),
       report_date     DATE        NOT NULL,
@@ -210,6 +189,15 @@ async function initSchema() {
     );
   `);
 
+  // Retired warehouse — drop if leftover from older deploys (frees a lot of disk).
+  try {
+    await schemaQuery(`DROP TABLE IF EXISTS report_full_present CASCADE`);
+    await schemaQuery(`DROP TABLE IF EXISTS report_full_daily CASCADE`);
+    logger.info('Dropped retired tables report_full_present / report_full_daily (if they existed)');
+  } catch (e) {
+    logger.warn('Drop retired report_full_* tables:', e.message);
+  }
+
   // Separate statements so one index failure doesn't abort the whole schema init.
   const ddlStatements = [
     `ALTER TABLE report_daily ADD COLUMN IF NOT EXISTS inv_domain TEXT`,
@@ -229,18 +217,6 @@ async function initSchema() {
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_inv_site ON report_adhoc (LOWER(inv_site))`,
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_inv_ad_unit ON report_adhoc (LOWER(inv_ad_unit))`,
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_inv_app ON report_adhoc (LOWER(inv_app))`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_present_date ON report_full_present (report_date DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_daily_date ON report_full_daily (report_date DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_present_slice ON report_full_present (slice_key, report_date DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_daily_slice ON report_full_daily (slice_key, report_date DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_present_inv_domain ON report_full_present (LOWER(inv_domain))`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_daily_inv_domain ON report_full_daily (LOWER(inv_domain))`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_present_inv_site ON report_full_present (LOWER(inv_site))`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_daily_inv_site ON report_full_daily (LOWER(inv_site))`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_present_inv_ad_unit ON report_full_present (LOWER(inv_ad_unit))`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_daily_inv_ad_unit ON report_full_daily (LOWER(inv_ad_unit))`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_present_inv_app ON report_full_present (LOWER(inv_app))`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_daily_inv_app ON report_full_daily (LOWER(inv_app))`,
     `CREATE INDEX IF NOT EXISTS idx_report_daily_ad_unit_lower
        ON report_daily (LOWER(COALESCE(dimensions->>'AD_UNIT_NAME', dimensions->>'ad_unit_name', dimensions->>'site', '')))`,
     `CREATE INDEX IF NOT EXISTS idx_report_present_ad_unit_lower
@@ -269,8 +245,6 @@ async function initSchema() {
     `CREATE INDEX IF NOT EXISTS idx_rollup_dim_kind_date ON rollup_dim_daily (dim_kind, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_daily_client_date ON report_daily (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_present_client_date ON report_present (client_id, report_date DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_daily_client_date ON report_full_daily (client_id, report_date DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_report_full_present_client_date ON report_full_present (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_client_date ON report_adhoc (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_sync_log_client ON sync_log (client_id, started_at DESC)`,
   ];
@@ -285,8 +259,6 @@ async function initSchema() {
 const TENANT_TABLES = [
   'report_daily',
   'report_present',
-  'report_full_present',
-  'report_full_daily',
   'report_adhoc',
   'report_adhoc_coverage',
   'rollup_kpi_daily',
@@ -393,8 +365,6 @@ async function finishTenantBackfill() {
   const uniqueSwaps = [
     ['report_daily', 'report_daily_client_date_hash', '(client_id, report_date, dim_hash)'],
     ['report_present', 'report_present_client_date_hash', '(client_id, report_date, dim_hash)'],
-    ['report_full_present', 'report_full_present_client_slice_hash', '(client_id, report_date, slice_key, dim_hash)'],
-    ['report_full_daily', 'report_full_daily_client_slice_hash', '(client_id, report_date, slice_key, dim_hash)'],
     ['report_adhoc', 'report_adhoc_client_query_hash', '(client_id, report_date, query_hash, dim_hash)'],
   ];
 

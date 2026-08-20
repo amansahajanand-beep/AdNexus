@@ -1008,14 +1008,39 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
+    const overviewEmpty = !(
+      (Number(overviewData?.summary?.impressions) || 0) > 0
+      || (Number(overviewData?.summary?.revenue) || 0) > 0
+    );
+    const detailEmpty = !(
+      (Number(detailData?.summary?.impressions) || 0) > 0
+      || (Number(detailData?.summary?.revenue) || 0) > 0
+    );
+    const waitingOnSync = (
+      (overviewData?.status === 'building' && overviewEmpty)
+      || (detailData?.status === 'building' && detailEmpty)
+    );
+    const intervalMs = waitingOnSync ? 12_000 : POLL_MS;
     pollRef.current = setInterval(() => {
       if (!(filterApplied && hasInventoryFilterSelection(applied))) {
         loadOverview(undefined, true);
       }
       if (canGenerate && filterApplied) loadDetail(true);
-    }, POLL_MS);
+    }, intervalMs);
     return () => clearInterval(pollRef.current);
-  }, [loadOverview, loadDetail, filterApplied, applied, canGenerate]);
+  }, [
+    loadOverview,
+    loadDetail,
+    filterApplied,
+    applied,
+    canGenerate,
+    overviewData?.status,
+    overviewData?.summary?.impressions,
+    overviewData?.summary?.revenue,
+    detailData?.status,
+    detailData?.summary?.impressions,
+    detailData?.summary?.revenue,
+  ]);
 
   const applyPreset = (p) => {
     if (dateFilterLocked) return;
@@ -2136,9 +2161,11 @@ export default function Dashboard() {
         </div>
       )}
 
-      {!detailLoading && dataStillBuilding && hasChartReportData && (
+      {!detailLoading && dataStillBuilding && (
         <div className="chart-annotation" role="status">
-          Data is still filling in for this range. Totals may change when the sync finishes.
+          {hasChartReportData
+            ? 'Data is still filling in for this range. Totals may change when the sync finishes.'
+            : 'Fetching live metrics for this account. This can take a minute on first login…'}
         </div>
       )}
 
