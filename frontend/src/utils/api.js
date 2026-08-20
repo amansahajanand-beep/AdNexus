@@ -43,6 +43,9 @@ const FAST_API = axios.create({
 });
 
 function attachAuth(config) {
+  const url = String(config.url || '');
+  // Never send a stale Bearer token on login — it triggers false "Session Ended" handling.
+  if (/\/auth\/login(?:\?|$)/.test(url)) return config;
   const token = getToken();
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
@@ -85,19 +88,24 @@ function handleApiError(err) {
     return Promise.reject(qerr);
   }
   if (status === 401 && err.config?.headers?.Authorization) {
-    const code = String(data.code || '');
-    // Only force logout on explicit session invalidation — not every opaque 401.
-    if (
-      code === 'SESSION_REPLACED'
-      || code === 'SESSION_INVALID'
-      || code === 'SESSION_EXPIRED'
-      || code === 'TOKEN_EXPIRED'
-      || code === 'NOT_AUTHENTICATED'
-      || code === 'NO_TOKEN'
-      || code === 'USER_INACTIVE'
-      || /session|token|expired|unauthorized|not authenticated/i.test(String(data.error || data.message || ''))
-    ) {
-      dispatchAuthFailure(code || data.code);
+    // App boot /auth/me restore: clear token quietly — do not show "Session Ended" on the login page.
+    if (err.config?.silentAuth) {
+      clearAuthStorage();
+    } else {
+      const code = String(data.code || '');
+      // Only force logout on explicit session invalidation — not every opaque 401.
+      if (
+        code === 'SESSION_REPLACED'
+        || code === 'SESSION_INVALID'
+        || code === 'SESSION_EXPIRED'
+        || code === 'TOKEN_EXPIRED'
+        || code === 'NOT_AUTHENTICATED'
+        || code === 'NO_TOKEN'
+        || code === 'USER_INACTIVE'
+        || /session|token|expired|unauthorized|not authenticated/i.test(String(data.error || data.message || ''))
+      ) {
+        dispatchAuthFailure(code || data.code);
+      }
     }
   }
 
@@ -215,7 +223,7 @@ export const authAPI = {
 export const sessionAPI = {
   login: (username, password) => FAST_API.post('/auth/login', { username, password }),
   logout: () => FAST_API.post('/auth/logout'),
-  me: () => FAST_API.get('/auth/me'),
+  me: (opts = {}) => FAST_API.get('/auth/me', opts),
   updateProfile: (payload) => FAST_API.put('/auth/me', payload),
 };
 

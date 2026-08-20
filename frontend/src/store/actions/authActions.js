@@ -38,7 +38,8 @@ export const loadUser = () => async (dispatch) => {
   }
   dispatch(authLoading());
   try {
-    const user = await sessionAPI.me();
+    // silentAuth: expired/missing session must not open the "Session Ended" modal on /login.
+    const user = await sessionAPI.me({ silentAuth: true });
     dispatch(authSuccess(user));
   } catch {
     clearRecentFilters();
@@ -51,6 +52,8 @@ export const loadUser = () => async (dispatch) => {
 export const login = (username, password) => async (dispatch) => {
   dispatch(authLoading());
   try {
+    // Drop any expired token before login so the request is clean.
+    setToken(null);
     const { token, user } = await sessionAPI.login(username, password);
     clearSessionSuperseded();
     clearIntentionalLogout();
