@@ -2,11 +2,11 @@ const { Pool } = require('pg');
 const logger = require('./utils/logger');
 
 const pool = new Pool({
-  host:     process.env.PG_HOST     || 'localhost',
+  host:     process.env.PG_HOST     || '127.0.0.1',
   port:     parseInt(process.env.PG_PORT) || 5432,
-  user:     process.env.PG_USER     || 'gam_user',
-  password: process.env.PG_PASSWORD || 'gam_password',
-  database: process.env.PG_DATABASE || 'gam_dashboard',
+  user:     process.env.PG_USER     || 'gam_dashbaord_user',
+  password: process.env.PG_PASSWORD || 'GAM_Mediamonetix',
+  database: process.env.PG_DATABASE || 'gam_dashboard_db',
   ssl:      process.env.PG_SSL === 'true' ? { rejectUnauthorized: false } : false,
   // Sync jobs + API share this pool — keep enough headroom for dashboard reads
   // while hourly backfill is writing.
