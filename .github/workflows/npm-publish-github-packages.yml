@@ -26,9 +26,15 @@ jobs:
             echo "===== AdNexus Deployment Started ====="
 
             cd /var/www/AdNexus
+            echo "===== Fetching Latest Code ====="
+            git fetch origin master
 
-            echo "===== Pulling Latest Code ====="
-            git pull origin master
+            echo "===== Updating Server to Latest Master ====="
+            git reset --hard origin/master
+
+            echo "===== Latest Commit ====="
+            git log -1 --oneline
+            
 
             echo "===== Installing Frontend Dependencies ====="
             cd frontend
