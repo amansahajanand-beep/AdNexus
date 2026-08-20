@@ -25,6 +25,7 @@ jobs:
 
             echo "===== AdNexus Deployment Started ====="
 
+            cd /var/www
             # Agar folder nahi hai ya git repository nahi hai
             if [ ! -d "/var/www/AdNexus/.git" ]; then
               echo "===== Cloning Repository ====="
