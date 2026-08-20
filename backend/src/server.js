@@ -140,6 +140,28 @@ async function startServer() {
   app.listen(PORT, async () => {
     logger.info(`AdNexus backend running on port ${PORT}`);
 
+    // Explicit bootstrap after listen so a swallowed schema-init error cannot leave
+    // production with zero gam_clients. Logs which env keys are present (not values).
+    try {
+      const { ensureBootstrapFromEnv, listActiveClients, listAllClientsPublic } = require('./models/clientStore');
+      const boot = await ensureBootstrapFromEnv();
+      const all = await listAllClientsPublic();
+      const active = await listActiveClients();
+      logger.info(
+        `[tenancy] Startup clients: total=${all.length} active=${active.length}`
+        + (boot ? ` bootstrapId=${boot.id}` : ' bootstrap=null')
+      );
+      if (!active.length) {
+        logger.warn(
+          '[tenancy] No active GAM clients after bootstrap. '
+          + 'Need non-empty GAM_NETWORK_CODE + GOOGLE_CLIENT_ID/SECRET/REFRESH_TOKEN in the PM2 process env, '
+          + 'then SYNC_GAM_CREDS_FROM_ENV=true and restart once (or Admin → Client settings).'
+        );
+      }
+    } catch (e) {
+      logger.warn('[tenancy] Startup bootstrap failed (non-fatal):', e.message);
+    }
+
     setImmediate(async () => {
       try {
         const { finishTenantBackfill } = require('./db');

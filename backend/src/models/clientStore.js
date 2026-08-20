@@ -83,7 +83,18 @@ async function listActiveClients() {
     `SELECT * FROM gam_clients WHERE is_active = true AND google_refresh_token_enc IS NOT NULL
      ORDER BY created_at ASC`
   );
-  return rows.map(mapRuntime);
+  const out = [];
+  for (const row of rows) {
+    try {
+      out.push(mapRuntime(row));
+    } catch (e) {
+      logger.warn(
+        `[tenancy] Skipping gam_clients ${row.id} (decrypt failed: ${e.message}). `
+        + 'Set SYNC_GAM_CREDS_FROM_ENV=true and restart to overwrite secrets from env.'
+      );
+    }
+  }
+  return out;
 }
 
 async function listAllClientsPublic() {
@@ -159,14 +170,18 @@ async function ensureBootstrapFromEnv() {
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
   const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
   const syncFromEnv = envFlagTrue('SYNC_GAM_CREDS_FROM_ENV');
+  const present = {
+    GAM_NETWORK_CODE: !!String(networkCode || '').trim(),
+    GOOGLE_CLIENT_ID: !!String(clientId || '').trim(),
+    GOOGLE_CLIENT_SECRET: !!String(clientSecret || '').trim(),
+    GOOGLE_REFRESH_TOKEN: !!String(refreshToken || '').trim(),
+    SYNC_GAM_CREDS_FROM_ENV: syncFromEnv,
+  };
 
   if (!networkCode || !clientId || !clientSecret || !refreshToken) {
-    if (syncFromEnv) {
-      logger.warn(
-        '[tenancy] SYNC_GAM_CREDS_FROM_ENV is set but bootstrap skipped — missing one of '
-        + 'GAM_NETWORK_CODE / GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REFRESH_TOKEN in process env.'
-      );
-    }
+    logger.warn(
+      `[tenancy] Bootstrap skipped — incomplete env credentials: ${JSON.stringify(present)}`
+    );
     return null;
   }
 
