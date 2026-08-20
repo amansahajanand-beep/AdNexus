@@ -25,7 +25,7 @@ const { requireClientId, tenantKey } = require('../utils/clientContext');
 const {
   redisDel, redisDelByPattern, bumpCacheGeneration, TTL, redisGet, redisSet, MAX_REDIS_ARRAY_ITEMS,
 } = require('../redisClient');
-const { todayInTZ, listCalendarMonthsNewestFirst } = require('../utils/datetime');
+const { todayInTZ, listDateWindowsNewestFirst } = require('../utils/datetime');
 const { normalizeReportRows, rowsHaveMetrics } = require('../utils/rowNormalize');
 const {
   resolveInventoryFields,
@@ -567,10 +567,12 @@ function leanRevenueSqlFragments() {
 function mapLeanDbRow(r) {
   const impression = Math.round(Number(r.impression) || 0);
   const revenue = toDollarsLean(r.revenue_raw);
+  const clicks = Math.round(Number(r.clicks) || 0);
   let viewableRate = Number(r.viewable_raw) || 0;
   if (viewableRate > 0 && viewableRate <= 1) viewableRate = +(viewableRate * 100).toFixed(2);
   else viewableRate = +Number(viewableRate || 0).toFixed(2);
   const ecpm = impression > 0 && revenue > 0 ? +((revenue / impression) * 1000).toFixed(2) : 0;
+  const ctr = impression > 0 && clicks > 0 ? +((clicks / impression) * 100).toFixed(4) : 0;
   const adUnit = r.ad_unit || r.inv_ad_unit || '';
   const domainName = r.domain_name || r.inv_domain || '';
   const siteUrl = r.site_url || r.inv_site || '';
@@ -592,6 +594,8 @@ function mapLeanDbRow(r) {
     appPackage: appId || '',
     impression,
     revenue,
+    clicks,
+    ctr,
     viewableRate,
     ecpm,
     currency: r.currency || 'USD',
@@ -712,7 +716,7 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
       )) = ANY($${params.length}::text[])`;
     }
 
-    const { revenueExpr } = leanRevenueSqlFragments();
+    const { revenueExpr, clickExpr } = leanMetricSql();
     const maxRows = Math.max(
       1000,
       parseInt(process.env.MAX_LEAN_GRAIN_ROWS || '25000', 10) || 25000
@@ -738,6 +742,7 @@ async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
            NULLIF(metrics->>'total_active_view_viewable_impressions_rate','')::double precision,
            0
          ) AS viewable_raw,
+         COALESCE(${clickExpr}, 0)::float8 AS clicks,
          currency
        FROM ${table}
        WHERE report_date BETWEEN $1 AND $2
@@ -851,6 +856,12 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
     WHEN ${viewableRawExpr} > 0 AND ${viewableRawExpr} <= 1 THEN ${viewableRawExpr} * 100.0
     ELSE ${viewableRawExpr}
   END`;
+  const clickExpr = `COALESCE(
+    NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_CLICKS','')::double precision,
+    NULLIF(metrics->>'clicks','')::double precision,
+    NULLIF(metrics->>'total_line_item_level_clicks','')::double precision,
+    0
+  )`;
 
   const run = async (table, from, to) => {
     const params = [from, to];
@@ -861,6 +872,7 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
          COALESCE(SUM(${impressionExpr}), 0)::float8 AS impressions,
          COALESCE(SUM(${revenueExpr}), 0)::float8 AS revenue,
          COALESCE(SUM((${impressionExpr}) * (${viewablePctExpr})), 0)::float8 AS viewable_weight,
+         COALESCE(SUM(${clickExpr}), 0)::float8 AS clicks,
          COUNT(*)::int AS row_count
        FROM ${table}
        WHERE TRUE${extra}`,
@@ -872,6 +884,7 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
   let impressions = 0;
   let revenue = 0;
   let viewableWeight = 0;
+  let clicks = 0;
   let rowCount = 0;
 
   if (rangeIncludesToday(startDate, endDate)) {
@@ -879,6 +892,7 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
     impressions += Number(t.impressions) || 0;
     revenue += Number(t.revenue) || 0;
     viewableWeight += Number(t.viewable_weight) || 0;
+    clicks += Number(t.clicks) || 0;
     rowCount += Number(t.row_count) || 0;
   }
   const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
@@ -887,6 +901,7 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
     impressions += Number(t.impressions) || 0;
     revenue += Number(t.revenue) || 0;
     viewableWeight += Number(t.viewable_weight) || 0;
+    clicks += Number(t.clicks) || 0;
     rowCount += Number(t.row_count) || 0;
   }
 
@@ -896,6 +911,8 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
   return {
     impressions: Math.round(impressions),
     revenue: +Number(revenue).toFixed(2),
+    clicks: Math.round(clicks),
+    ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
     viewability,
     rowCount,
     source: 'grain',
@@ -920,6 +937,12 @@ function leanMetricSql() {
     WHEN ${viewableRawExpr} > 0 AND ${viewableRawExpr} <= 1 THEN ${viewableRawExpr} * 100.0
     ELSE ${viewableRawExpr}
   END`;
+  const clickExpr = `COALESCE(
+    NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_CLICKS','')::double precision,
+    NULLIF(metrics->>'clicks','')::double precision,
+    NULLIF(metrics->>'total_line_item_level_clicks','')::double precision,
+    0
+  )`;
   const domainExpr = `COALESCE(NULLIF(inv_domain,''), dimensions->>'domainName', dimensions->>'domain', dimensions->>'DOMAIN', '')`;
   const siteExpr = `COALESCE(NULLIF(inv_site,''), dimensions->>'siteUrl', dimensions->>'gamSite', dimensions->>'siteName', dimensions->>'URL_NAME', dimensions->>'SITE_NAME', '')`;
   const adUnitExpr = `COALESCE(NULLIF(inv_ad_unit,''), dimensions->>'AD_UNIT_NAME', dimensions->>'ad_unit_name', dimensions->>'site', '')`;
@@ -930,6 +953,7 @@ function leanMetricSql() {
     impressionExpr,
     revenueExpr,
     viewablePctExpr,
+    clickExpr,
     domainExpr,
     siteExpr,
     adUnitExpr,
@@ -966,7 +990,7 @@ async function rebuildRollupsForDates(dates, syncType = 'rollup') {
       const kpiRes = await query(
         `INSERT INTO rollup_kpi_daily (
            client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
-           impressions, revenue, viewable_weight, grain_count, currency
+           impressions, revenue, viewable_weight, clicks, grain_count, currency
          )
          SELECT
            $2::uuid,
@@ -978,6 +1002,7 @@ async function rebuildRollupsForDates(dates, syncType = 'rollup') {
            COALESCE(SUM(${m.impressionExpr}), 0),
            COALESCE(SUM(${m.revenueExpr}), 0),
            COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
+           COALESCE(SUM(${m.clickExpr}), 0),
            COUNT(*)::int,
            COALESCE(MAX(currency), 'USD')
          FROM ${sourceTable}
@@ -1245,6 +1270,7 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
        COALESCE(SUM(impressions), 0)::float8 AS impressions,
        COALESCE(SUM(revenue), 0)::float8 AS revenue,
        COALESCE(SUM(viewable_weight), 0)::float8 AS viewable_weight,
+       COALESCE(SUM(clicks), 0)::float8 AS clicks,
        COALESCE(SUM(grain_count), 0)::int AS row_count
      ${kpiFrom}`,
     filterParams
@@ -1253,6 +1279,7 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
   let impressions = Number(t.impressions) || 0;
   let revenue = Number(t.revenue) || 0;
   let viewableWeight = Number(t.viewable_weight) || 0;
+  let clicks = Number(t.clicks) || 0;
   let grainCount = Number(t.row_count) || 0;
   if (!grainCount || (impressions <= 0 && revenue <= 0)) return null;
 
@@ -1361,6 +1388,7 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
        inv_app AS app_id,
        COALESCE(SUM(impressions), 0)::float8 AS impression,
        COALESCE(SUM(revenue), 0)::float8 AS revenue_raw,
+       COALESCE(SUM(clicks), 0)::float8 AS clicks,
        CASE
          WHEN SUM(impressions) > 0 THEN SUM(viewable_weight) / SUM(impressions)
          ELSE 0
@@ -1383,6 +1411,8 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
     const domainName = r.domain_name || '';
     const siteUrl = r.site_url || '';
     const appId = r.app_id || '';
+    const clicks = Math.round(Number(r.clicks) || 0);
+    const ctr = impression > 0 && clicks > 0 ? +((clicks / impression) * 100).toFixed(4) : 0;
     return {
       date: r.report_date,
       report_date: r.report_date,
@@ -1400,6 +1430,8 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
       appPackage: appId,
       impression,
       revenue: rev,
+      clicks,
+      ctr,
       viewableRate,
       ecpm: impression > 0 && rev > 0 ? +((rev / impression) * 1000).toFixed(2) : 0,
       currency: r.currency || 'USD',
@@ -1418,8 +1450,9 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
     pageViewsChange: 0,
     impressions: Math.round(impressions),
     impressionsChange: 0,
-    clicks: 0,
+    clicks: Math.round(clicks),
     clicksChange: 0,
+    ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
     revenue: +Number(revenue).toFixed(2),
     revenueChange: 0,
     ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
@@ -1519,16 +1552,19 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
       COALESCE(SUM(${m.impressionExpr}), 0)::float8 AS impressions,
       COALESCE(SUM(${m.revenueExpr}), 0)::float8 AS revenue,
       COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0)::float8 AS viewable_weight,
+      COALESCE(SUM(${m.clickExpr}), 0)::float8 AS clicks,
       COUNT(*)::int AS row_count
   `);
   let impressions = 0;
   let revenue = 0;
   let viewableWeight = 0;
+  let clicks = 0;
   let grainCount = 0;
   for (const t of totalsRows) {
     impressions += Number(t.impressions) || 0;
     revenue += Number(t.revenue) || 0;
     viewableWeight += Number(t.viewable_weight) || 0;
+    clicks += Number(t.clicks) || 0;
     grainCount += Number(t.row_count) || 0;
   }
   if (!grainCount || (impressions <= 0 && revenue <= 0)) return null;
@@ -1639,6 +1675,7 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
       ${m.appExpr} AS app_id,
       COALESCE(SUM(${m.impressionExpr}), 0)::float8 AS impression,
       COALESCE(SUM(${m.revenueExpr}), 0)::float8 AS revenue_raw,
+      COALESCE(SUM(${m.clickExpr}), 0)::float8 AS clicks,
       CASE
         WHEN SUM(${m.impressionExpr}) > 0
           THEN SUM((${m.impressionExpr}) * (${m.viewablePctExpr})) / SUM(${m.impressionExpr})
@@ -1660,6 +1697,8 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
     const domainName = r.domain_name || '';
     const siteUrl = r.site_url || '';
     const appId = r.app_id || '';
+    const rowClicks = Math.round(Number(r.clicks) || 0);
+    const ctr = impression > 0 && rowClicks > 0 ? +((rowClicks / impression) * 100).toFixed(4) : 0;
     return {
       date: r.report_date,
       report_date: r.report_date,
@@ -1677,6 +1716,8 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
       appPackage: appId,
       impression,
       revenue: revenueRow,
+      clicks: rowClicks,
+      ctr,
       viewableRate,
       ecpm: impression > 0 && revenueRow > 0 ? +((revenueRow / impression) * 1000).toFixed(2) : 0,
       currency: r.currency || 'USD',
@@ -1695,8 +1736,9 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
     pageViewsChange: 0,
     impressions: Math.round(impressions),
     impressionsChange: 0,
-    clicks: 0,
+    clicks: Math.round(clicks),
     clicksChange: 0,
+    ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
     revenue: +Number(revenue).toFixed(2),
     revenueChange: 0,
     ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
@@ -1802,14 +1844,24 @@ function buildSyncReportXML(dimensions, buildDateXML, startDate, endDate) {
     <dateRangeType>CUSTOM_DATE</dateRangeType>`;
 }
 
-async function fetchFromGAM(startDate, endDate) {
+async function fetchFromGAM(startDate, endDate, onBatch) {
   const { getToken, runReportAndDownload, buildDateXML } = require('../gam/reportTransport');
   const token = await getToken();
   let lastErr;
+  const stream = typeof onBatch === 'function';
   for (const dims of SYNC_DIMENSION_SETS) {
     try {
       const xml = buildSyncReportXML(dims, buildDateXML, startDate, endDate);
-      const raw = await runReportAndDownload(xml, token);
+      const raw = await runReportAndDownload(xml, token, stream ? { onBatch } : {});
+      if (stream) {
+        const count = Number(raw?.count) || 0;
+        if (count > 0) {
+          logger.info(`GAM sync OK dims=[${dims.join(', ')}] rows=${count} range=${startDate}..${endDate} (streamed)`);
+          return raw;
+        }
+        logger.warn(`GAM sync dims=[${dims.join(', ')}] returned 0 rows, trying fallback`);
+        continue;
+      }
       if (Array.isArray(raw) && raw.length) {
         logger.info(`GAM sync OK dims=[${dims.join(', ')}] rows=${raw.length} range=${startDate}..${endDate}`);
         return raw;
@@ -1821,6 +1873,96 @@ async function fetchFromGAM(startDate, endDate) {
     }
   }
   throw lastErr || new Error('GAM sync failed for all dimension sets');
+}
+
+function listSyncWindows(startDate, endDate) {
+  const maxDays = Math.max(1, parseInt(process.env.GAM_SYNC_MAX_DAYS || '7', 10) || 7);
+  return listDateWindowsNewestFirst(startDate, endDate, maxDays);
+}
+
+/**
+ * Stream GAM CSV → upsert in batches. Never holds a month of grain rows in heap.
+ */
+async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill') {
+  const currency = process.env.GAM_CURRENCY || 'USD';
+  const today = todayInTZ();
+  const syncStartedAt = new Date();
+  let total = 0;
+  let presentCount = 0;
+  let dailyCount = 0;
+  const touchedPresent = new Set();
+  const touchedDaily = new Set();
+
+  const result = await fetchFromGAM(startDate, endDate, async (rawChunk) => {
+    if (!rawChunk?.length) return;
+    const normalized = normalizeGAMRows(rawChunk, currency);
+    const todayRows = [];
+    const pastRows = [];
+    for (const row of normalized) {
+      const day = toYmd(row.report_date);
+      if (day === today) {
+        todayRows.push(row);
+        touchedPresent.add(day);
+      } else {
+        pastRows.push(row);
+        if (day) touchedDaily.add(day);
+      }
+    }
+    if (todayRows.length) {
+      presentCount += await insertRowsInto('report_present', todayRows, `${syncType}:${startDate}`);
+    }
+    if (pastRows.length) {
+      dailyCount += await insertRowsInto('report_daily', pastRows, `${syncType}:${startDate}`);
+    }
+    total += todayRows.length + pastRows.length;
+  });
+
+  const count = Number(result?.count) || total;
+  if (touchedPresent.size) {
+    try {
+      await query(
+        `DELETE FROM report_present WHERE client_id = $2::uuid AND synced_at < $1`,
+        [syncStartedAt, requireClientId()]
+      );
+    } catch (e) {
+      logger.warn(`[${syncType}] stale present cleanup skipped:`, e.message);
+    }
+  }
+  const dailyDates = [...touchedDaily];
+  if (dailyDates.length) {
+    try {
+      await query(
+        `DELETE FROM report_daily
+         WHERE client_id = $2::uuid
+           AND report_date = ANY($1::date[])
+           AND synced_at < $3`,
+        [dailyDates, requireClientId(), syncStartedAt]
+      );
+    } catch (e) {
+      logger.warn(`[${syncType}] stale historical cleanup skipped:`, e.message);
+    }
+    try {
+      await query(
+        `DELETE FROM report_daily
+         WHERE client_id = $2::uuid
+           AND report_date = ANY($1::date[])
+           AND NOT ${RICH_DIM_SQL}`,
+        [dailyDates, requireClientId()]
+      );
+    } catch (e) {
+      logger.warn(`[${syncType}] thin-row cleanup skipped:`, e.message);
+    }
+    try {
+      await rebuildRollupsForDates(dailyDates, syncType);
+    } catch (e) {
+      logger.warn(`[${syncType}] rollup rebuild skipped:`, e.message);
+    }
+  }
+  await invalidateCacheForDate(endDate);
+  logger.info(
+    `[${syncType}] ${startDate}..${endDate} streamed rows≈${count} → present=${presentCount} daily=${dailyCount}`
+  );
+  return presentCount + dailyCount;
 }
 
 const RICH_DIM_SQL = `(
@@ -1973,43 +2115,21 @@ async function getRangeCoverage(startDate, endDate) {
 }
 
 /**
- * Pull a date range from GAM (one job per calendar month, newest first)
- * and write daily rows into report_present / report_daily.
+ * Pull a date range from GAM in small windows (newest first)
+ * and stream each window into report_present / report_daily.
  */
 async function syncDateRangeFromGAM(startDate, endDate, syncType = 'sync-backfill') {
-  const months = listCalendarMonthsNewestFirst(startDate, endDate);
-  if (!months.length) return 0;
+  const windows = listSyncWindows(startDate, endDate);
+  if (!windows.length) return 0;
   let total = 0;
-  for (const month of months) {
-    total += await syncOneGamRange(month.startDate, month.endDate, syncType);
+  for (const win of windows) {
+    total += await streamSyncFromGAM(win.startDate, win.endDate, syncType);
   }
   return total;
 }
 
 async function syncOneGamRange(startDate, endDate, syncType) {
-  const currency = process.env.GAM_CURRENCY || 'USD';
-  const today = todayInTZ();
-  const raw = await fetchFromGAM(startDate, endDate);
-  const normalized = normalizeGAMRows(raw, currency);
-  const todayRows = [];
-  const pastRows = [];
-  for (const row of normalized) {
-    const day = toYmd(row.report_date);
-    if (day === today) todayRows.push(row);
-    else pastRows.push(row);
-  }
-  let total = 0;
-  if (todayRows.length) {
-    total += await replacePresentRows(todayRows, `${syncType}:${startDate}`);
-  }
-  if (pastRows.length) {
-    total += await replaceHistoricalRows(pastRows, `${syncType}:${startDate}`);
-  }
-  await invalidateCacheForDate(endDate);
-  logger.info(
-    `[${syncType}] ${startDate}..${endDate} → present=${todayRows.length} daily=${pastRows.length} upserted=${total}`
-  );
-  return total;
+  return streamSyncFromGAM(startDate, endDate, syncType);
 }
 
 /**
@@ -2129,8 +2249,8 @@ async function getReportRange(startDate, endDate, userId = null) {
 }
 
 /**
- * Stable hash for a Reporting-page query (dims/metrics/filters/date range).
- * Used as the key into report_adhoc / report_adhoc_coverage.
+ * Stable hash for a Reporting-page query (dims/metrics/country/date range).
+ * Inventory filters are applied after the dump so one GAM/adhoc rowset is reused.
  */
 function buildAdhocQueryHash(filters = {}) {
   const part = (v) => {
@@ -2142,10 +2262,6 @@ function buildAdhocQueryHash(filters = {}) {
     part(filters.startDate),
     part(filters.endDate),
     part(filters.country),
-    part(filters.domain),
-    part(filters.site),
-    part(filters.domainName),
-    part(filters.domainId),
     part(filters.reportDimensions),
     part(filters.reportMetrics),
   ].join('\n');
@@ -2717,6 +2833,14 @@ function mapFullDbRowToReportRow(row) {
       ?? metrics.TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS
       ?? 0) || 0
   );
+  const clicks = Math.round(
+    Number(metrics.total_line_item_level_clicks
+      ?? metrics.TOTAL_LINE_ITEM_LEVEL_CLICKS
+      ?? 0) || 0
+  );
+  const ctr = impression > 0 && clicks > 0
+    ? +((clicks / impression) * 100).toFixed(4)
+    : Number(metrics.total_line_item_level_ctr ?? metrics.TOTAL_LINE_ITEM_LEVEL_CTR) || 0;
   const revenue = pickRowRevenueDollars({
     metrics,
     TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE: metrics.TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE,
@@ -2741,6 +2865,8 @@ function mapFullDbRowToReportRow(row) {
     currency: row.currency || 'USD',
     impression,
     revenue,
+    clicks,
+    ctr,
     viewableRate,
     site: dimensions.site || dimensions.AD_UNIT_NAME || dimensions.ad_unit_name || '—',
     domainName: dimensions.domainName || dimensions.DOMAIN || dimensions.domain || '',
@@ -2959,6 +3085,7 @@ module.exports = {
   backfillAllRollups,
   rowsHaveLeanMetrics,
   fetchFromGAM,
+  streamSyncFromGAM,
   syncDateRangeFromGAM,
   dailyHasCountryAndDevice,
   presentHasCountryAndDevice,

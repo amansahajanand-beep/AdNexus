@@ -4,6 +4,7 @@
  */
 const axios = require('axios');
 const zlib = require('zlib');
+const readline = require('readline');
 const logger = require('../utils/logger');
 const { GAM_API_VERSION: API_VER } = require('../utils/gamVersion');
 const { getClient, getClientId } = require('../utils/clientContext');
@@ -158,13 +159,58 @@ function splitCSVLine(line) {
 }
 
 function parseCSV(csvText) {
-  const lines = csvText.replace(/\r/g, '').trim().split('\n');
+  const lines = String(csvText || '').replace(/\r/g, '').trim().split('\n');
   if (lines.length < 2) return [];
   const headers = splitCSVLine(lines[0]);
-  return lines.slice(1).map((line) => {
-    const vals = splitCSVLine(line);
-    return headers.reduce((o, h, i) => ({ ...o, [h]: vals[i] ?? '' }), {});
-  });
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    rows.push(rowFromCsvHeaders(headers, line));
+  }
+  return rows;
+}
+
+function rowFromCsvHeaders(headers, line) {
+  const vals = splitCSVLine(line);
+  const o = Object.create(null);
+  for (let i = 0; i < headers.length; i++) o[headers[i]] = vals[i] ?? '';
+  return o;
+}
+
+/** Stream a gzip CSV: never hold the full text + all row objects at once. */
+async function parseGzipCsvStream(inputStream, { onBatch, batchSize = 2000 } = {}) {
+  if (typeof onBatch !== 'function') throw new Error('parseGzipCsvStream requires onBatch');
+  const gunzip = zlib.createGunzip();
+  inputStream.pipe(gunzip);
+  const rl = readline.createInterface({ input: gunzip, crlfDelay: Infinity });
+  let headers = null;
+  let batch = [];
+  let total = 0;
+  try {
+    for await (const rawLine of rl) {
+      const line = String(rawLine || '').replace(/\r/g, '');
+      if (!line) continue;
+      if (!headers) {
+        headers = splitCSVLine(line);
+        continue;
+      }
+      batch.push(rowFromCsvHeaders(headers, line));
+      if (batch.length >= batchSize) {
+        total += batch.length;
+        await onBatch(batch);
+        batch = [];
+      }
+    }
+    if (batch.length) {
+      total += batch.length;
+      await onBatch(batch);
+    }
+  } finally {
+    rl.close();
+    gunzip.destroy();
+  }
+  return total;
 }
 
 async function runReportAndDownload(reportQueryXML, token, opts = {}) {
@@ -197,14 +243,37 @@ async function runReportAndDownload(reportQueryXML, token, opts = {}) {
   logger.info(`GAM download URL ready (${Date.now() - t2}ms)`);
 
   const t3 = Date.now();
-  const csvRes = await axios.get(url, { responseType: 'arraybuffer', timeout: 300000 });
-  const buf = Buffer.isBuffer(csvRes.data) ? csvRes.data : Buffer.from(csvRes.data);
-  const csvText = await new Promise((resolve, reject) =>
-    zlib.gunzip(buf, (err, out) => (err ? reject(err) : resolve(out.toString('utf8'))))
+  const csvRes = await axios.get(url, { responseType: 'stream', timeout: 300000 });
+  const batchSize = Math.max(200, parseInt(process.env.GAM_CSV_BATCH || '2000', 10) || 2000);
+  const onBatch = typeof opts.onBatch === 'function' ? opts.onBatch : null;
+  const maxInMemory = Math.max(
+    1000,
+    parseInt(opts.maxRows || process.env.MAX_IN_MEMORY_GAM_ROWS || '400000', 10) || 400000
   );
-  const rows = parseCSV(csvText);
-  logger.info(`GAM CSV download+parse ${rows.length} rows in ${Date.now() - t3}ms (total job=${Date.now() - t0}ms)`);
-  return rows;
+
+  let total = 0;
+  if (onBatch) {
+    total = await parseGzipCsvStream(csvRes.data, { batchSize, onBatch });
+    logger.info(`GAM CSV stream-parse ${total} rows in ${Date.now() - t3}ms (total job=${Date.now() - t0}ms)`);
+    return { streamed: true, count: total };
+  }
+
+  const collected = [];
+  total = await parseGzipCsvStream(csvRes.data, {
+    batchSize,
+    onBatch: async (rows) => {
+      if (collected.length + rows.length > maxInMemory) {
+        const err = new Error(
+          `GAM CSV exceeds in-memory cap (${maxInMemory} rows). Sync path must stream.`
+        );
+        err.code = 'GAM_CSV_TOO_LARGE';
+        throw err;
+      }
+      for (let i = 0; i < rows.length; i++) collected.push(rows[i]);
+    },
+  });
+  logger.info(`GAM CSV download+parse ${collected.length} rows in ${Date.now() - t3}ms (total job=${Date.now() - t0}ms)`);
+  return collected;
 }
 
 /** Prevent duplicate in-flight GAM jobs for the same cache key. */

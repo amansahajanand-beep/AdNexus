@@ -92,6 +92,26 @@ function listCalendarMonthsNewestFirst(startDate, endDate) {
 }
 
 /**
+ * Inclusive date windows, newest first. Caps GAM CSV size so a month
+ * of ~2.5M grain rows is never parsed as one in-memory array.
+ */
+function listDateWindowsNewestFirst(startDate, endDate, maxDays = 7) {
+  const span = Math.max(1, parseInt(maxDays, 10) || 7);
+  if (!startDate || !endDate || startDate > endDate) return [];
+  const windows = [];
+  let to = endDate;
+  while (to >= startDate) {
+    const from = shiftYMD(to, -(span - 1));
+    windows.push({
+      startDate: from < startDate ? startDate : from,
+      endDate: to,
+    });
+    to = shiftYMD(from < startDate ? startDate : from, -1);
+  }
+  return windows;
+}
+
+/**
  * Past-data window stored in report_daily.
  * HISTORICAL_DAYS (default 365) back from yesterday, at least previous calendar month.
  * Today stays in report_present.
@@ -152,6 +172,7 @@ module.exports = {
   endOfPreviousMonth,
   endOfMonth,
   listCalendarMonthsNewestFirst,
+  listDateWindowsNewestFirst,
   historicalRangeForPresets,
   ymdToObj,
   objToYmd,

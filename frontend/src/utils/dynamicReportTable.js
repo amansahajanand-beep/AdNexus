@@ -137,10 +137,15 @@ const METRIC_DEFS = {
   },
   total_line_item_level_ctr: {
     label: 'CTR',
-    getValue: (r) => Number(r.ctr) || 0,
+    getValue: (r) => {
+      const clicks = Number(r.clicks ?? r.metrics?.total_line_item_level_clicks) || 0;
+      const imp = Number(r.impression ?? r.impressions) || 0;
+      if (imp > 0 && clicks > 0) return +((clicks / imp) * 100).toFixed(4);
+      return Number(r.ctr) || 0;
+    },
     format: 'percent',
     visKey: 'ctr',
-    aggregate: 'avg',
+    aggregate: 'weightedCtr',
   },
   total_fill_rate: {
     label: 'Total Fill Rate',
@@ -171,7 +176,7 @@ const METRIC_DEFS = {
   },
   total_line_item_level_clicks: {
     label: 'Total clicks',
-    getValue: (r) => Number(r.clicks) || 0,
+    getValue: (r) => readMetricValue(r, 'total_line_item_level_clicks', (row) => row.clicks),
     format: 'num',
     visKey: 'ctr',
     aggregate: 'sum',
@@ -400,13 +405,16 @@ export function aggregateRowsByColumns(rows = [], columns = []) {
     const imp = out.impression;
     out.viewableRate = imp > 0 ? +(out._viewWeighted / imp).toFixed(2) : 0;
     out.fillRate = imp > 0 ? +(out._fillWeighted / imp).toFixed(2) : 0;
-    out.ctr = imp > 0 ? +(out._ctrWeighted / imp).toFixed(2) : 0;
+    out.ctr = imp > 0 && out.clicks > 0
+      ? +((out.clicks / imp) * 100).toFixed(4)
+      : (imp > 0 ? +(out._ctrWeighted / imp).toFixed(4) : 0);
     out.ecpm = imp > 0 ? +((out.revenue / imp) * 1000).toFixed(2) : 0;
     out.metrics = {
       ...(out.metrics || {}),
       total_line_item_level_all_revenue: out.revenue,
       total_line_item_level_cpm_and_cpc_revenue: out.revenue,
       total_line_item_level_impressions: imp,
+      total_line_item_level_clicks: out.clicks,
       total_line_item_level_without_cpd_average_ecpm: out.ecpm,
       total_active_view_viewable_impressions_rate: out.viewableRate,
       total_line_item_level_ctr: out.ctr,
@@ -500,6 +508,15 @@ export function aggregateColumn(rows, col) {
       imp += rowImp;
     });
     return imp > 0 ? (rev / imp) * 1000 : 0;
+  }
+  if (col.aggregate === 'weightedCtr') {
+    let clicks = 0;
+    let imp = 0;
+    rows.forEach((r) => {
+      clicks += Number(readMetricValue(r, 'total_line_item_level_clicks', (row) => row.clicks)) || 0;
+      imp += Number(readMetricValue(r, 'total_line_item_level_impressions', (row) => row.impression ?? row.impressions)) || 0;
+    });
+    return imp > 0 ? (clicks / imp) * 100 : 0;
   }
   return '—';
 }

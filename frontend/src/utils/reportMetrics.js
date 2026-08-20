@@ -106,7 +106,13 @@ export function readMetricValue(row, metricId, fallbackFn) {
       const legacy = pickRowRevenueDollars(row);
       if (legacy > 0) return legacy;
     }
-    if (!money && Number.isFinite(v)) return v;
+    if (!money && Number.isFinite(v)) {
+      if (v === 0 && typeof fallbackFn === 'function') {
+        const fb = Number(fallbackFn(row));
+        if (Number.isFinite(fb) && fb !== 0) return fb;
+      }
+      return v;
+    }
   }
 
   if (money && (metricId === 'total_line_item_level_all_revenue'

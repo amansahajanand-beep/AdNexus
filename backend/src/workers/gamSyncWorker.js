@@ -11,12 +11,9 @@ const { Worker } = require('bullmq');
 const { redisSet, TTL, createBullmqConnection, isTransientRedisError } = require('../redisClient');
 const logger     = require('../utils/logger');
 const {
-  replacePresentRows,
-  replaceHistoricalRows,
   promotePresentToDaily,
   migrateStalePresentToDaily,
-  fetchFromGAM,
-  normalizeGAMRows,
+  streamSyncFromGAM,
   syncDateRangeFromGAM,
   invalidateCacheForDate,
   logSync,
@@ -68,7 +65,6 @@ async function processJob(job) {
 }
 
 async function processJobInner(job) {
-  const currency = process.env.GAM_CURRENCY || 'USD';
   logger.info(`[gam-sync] Processing job "${job.name}" id=${job.id}`);
 
   if (job.name === 'promote-present') {
@@ -110,9 +106,7 @@ async function processJobInner(job) {
       } catch (e) {
         logger.warn(`[gam-sync] stale present migrate skipped: ${e.message}`);
       }
-      const rawRows = await fetchFromGAM(day, day);
-      const normalized = normalizeGAMRows(rawRows, currency);
-      totalUpserted = await replacePresentRows(normalized, job.name);
+      totalUpserted = await streamSyncFromGAM(day, day, job.name);
 
       const shouldPromote = job.data?.promoteToDaily === true || isLastHourOfDay();
       if (shouldPromote) {
@@ -123,9 +117,7 @@ async function processJobInner(job) {
       await invalidateCacheForDate(day);
     } else if (job.name === 'sync-day') {
       const day = targetDates[0];
-      const rawRows = await fetchFromGAM(day, day);
-      const normalized = normalizeGAMRows(rawRows, currency);
-      totalUpserted = await replaceHistoricalRows(normalized, job.name);
+      totalUpserted = await streamSyncFromGAM(day, day, job.name);
       await invalidateCacheForDate(day);
     } else if (job.name === 'sync-full-range' || job.name === 'sync-full-today' || job.name === 'sync-full-backfill' || job.name === 'promote-full-present') {
       logger.info(`[gam-sync] ${job.name} skipped — report_full_* warehouse retired`);
@@ -220,7 +212,7 @@ function startReportWorker() {
     logger.error('[gam-report] Worker error:', err.message);
   });
 
-  logger.info('BullMQ gam-report worker started (concurrency=1)');
+  logger.info('BullMQ gam-report worker started (concurrency=1, user jobs priority=1)');
   return reportWorker;
 }
 
@@ -251,6 +243,7 @@ async function processReportJob(job) {
         const result = await helpers.runDetailedReport(gamFilters, token, {
           fastMode: true,
           compatOnly: true,
+          skipAdUnitPql: true,
         });
         const { persistAdhocRows, buildAdhocQueryHash } = require('../services/gamSyncService');
         const queryHash = data.queryHash || buildAdhocQueryHash(gamFilters);

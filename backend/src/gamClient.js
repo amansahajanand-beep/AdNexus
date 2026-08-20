@@ -3,14 +3,36 @@ const NodeCache = require('node-cache');
 const logger = require('./utils/logger');
 const { getClient, tenantKey } = require('./utils/clientContext');
 
-// Default 30 minutes — GAM report data does not change minute-to-minute.
-// Override via CACHE_TTL env var (seconds). Cap entries to avoid heap blowups.
+// NodeCache is L1 only (tiny hot keys in this process). Redis is L2 (shared).
+// Never store grain dumps here — that is what OOM'd the API (~3.5GB heap).
+const MAX_NODE_CACHE_ARRAY = Math.max(
+  100,
+  parseInt(process.env.NODE_CACHE_MAX_ARRAY || '3000', 10) || 3000
+);
+
 const cache = new NodeCache({
   stdTTL: parseInt(process.env.CACHE_TTL) || 1800,
   maxKeys: parseInt(process.env.NODE_CACHE_MAX_KEYS || '250', 10) || 250,
   useClones: false,
   checkperiod: 120,
 });
+
+function nodeCacheValueTooLarge(value) {
+  if (value == null) return false;
+  if (Array.isArray(value)) return value.length > MAX_NODE_CACHE_ARRAY;
+  if (Array.isArray(value.rows) && value.rows.length > MAX_NODE_CACHE_ARRAY) return true;
+  if (typeof value === 'object' && value.streamed) return true;
+  return false;
+}
+
+const _rawCacheSet = cache.set.bind(cache);
+cache.set = function setCompact(key, value, ttl) {
+  if (nodeCacheValueTooLarge(value)) {
+    logger.warn(`NodeCache skip ${key}: too large for process memory (use Redis/Postgres)`);
+    return false;
+  }
+  return ttl == null ? _rawCacheSet(key, value) : _rawCacheSet(key, value, ttl);
+};
 
 // ─── OAuth2 Client ────────────────────────────────────────────────────────────
 function resolveGamCreds(client = getClient()) {

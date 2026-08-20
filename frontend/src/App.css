@@ -1654,6 +1654,17 @@ img, svg, video { max-width: 100%; height: auto; }
   color: var(--muted);
   font-size: 13px;
 }
+.table-tool-btn {
+  box-sizing: border-box;
+  min-width: 88px;
+  height: 32px;
+  padding: 6px 8px;
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
 @media (max-width: 360px) {
   .report-mobile-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 12px; }
 }
@@ -1691,7 +1702,6 @@ img, svg, video { max-width: 100%; height: auto; }
 .segment-filter-clear:hover { text-decoration: underline; }
 
 .table-col-picker { position: relative; }
-.table-tool-btn { padding: 6px 10px; font-size: 12px; }
 .table-col-menu {
   position: absolute; right: 0; top: calc(100% + 6px); z-index: 40;
   min-width: 180px; max-height: 260px; overflow: auto;

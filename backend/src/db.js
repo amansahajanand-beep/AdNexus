@@ -220,6 +220,7 @@ async function initSchema() {
     `ALTER TABLE report_present ADD COLUMN IF NOT EXISTS inv_site TEXT`,
     `ALTER TABLE report_present ADD COLUMN IF NOT EXISTS inv_ad_unit TEXT`,
     `ALTER TABLE report_present ADD COLUMN IF NOT EXISTS inv_app TEXT`,
+    `ALTER TABLE rollup_kpi_daily ADD COLUMN IF NOT EXISTS clicks DOUBLE PRECISION NOT NULL DEFAULT 0`,
     `CREATE INDEX IF NOT EXISTS idx_report_daily_date ON report_daily (report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_present_date ON report_present (report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_query_date ON report_adhoc (query_hash, report_date DESC)`,

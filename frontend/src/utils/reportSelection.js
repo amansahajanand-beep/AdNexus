@@ -1,5 +1,4 @@
 import { DEFAULT_REPORT_METRICS } from './gamReportCatalog';
-import { DASHBOARD_DEFAULT_METRICS } from './dynamicReportTable';
 import { draftHasInventorySelection } from './assignedInventoryFilters';
 
 function asFilterArray(v) {
@@ -25,18 +24,14 @@ export function hasReportSelection(applied = {}) {
   return hasManualReportSelection(applied);
 }
 
-/** Table dimensions for inventory-only reports — mirrors Dashboard breakdown columns. */
+/** Table dimensions from inventory filters the user actually applied. */
 export function inventoryFilterTableDims(applied = {}) {
-  const dims = ['date'];
-  if (asFilterArray(applied.country).length) dims.push('country_name');
-  if (applied.domain?.length) dims.push('domain');
-  if (applied.site?.length) dims.push('site_name');
-  if (applied.domainName?.length) dims.push('ad_unit_name');
-  if (applied.domainId?.length) {
-    dims.push('mobile_app_resolved_id');
-    dims.push('mobile_app_name');
-  }
-  return dims;
+  const dimensions = ['date'];
+  if (asFilterArray(applied.domain).length) dimensions.push('domain');
+  if (asFilterArray(applied.site).length) dimensions.push('site_name');
+  if (asFilterArray(applied.domainName).length) dimensions.push('ad_unit_name');
+  if (asFilterArray(applied.domainId).length) dimensions.push('mobile_app_resolved_id');
+  return dimensions;
 }
 
 /**
@@ -76,9 +71,9 @@ export function resolveReportingQuery(applied = {}) {
   }
 
   return {
-    // Inventory-only: backend picks reliable dimension sets; UI still shows inv columns.
+    // Inventory-only: backend picks warehouse grain; UI shows only applied filter columns.
     dims: hasInv ? [] : invDims,
-    mets: [...DASHBOARD_DEFAULT_METRICS],
+    mets: [...DEFAULT_REPORT_METRICS],
     tableDims: invDims,
   };
 }

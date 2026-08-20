@@ -1,6 +1,18 @@
 import React from 'react';
 import ChartExportButton from './ChartExportButton';
 
+/** Keeps a grid cell so un-hiding a chart restores its original column. */
+export function ChartSlot({ col = 1, wide = false, show, children }) {
+  return (
+    <div
+      className={`chart-slot${wide ? ' wide' : ''}${show ? '' : ' is-hidden'}`}
+      data-col={wide ? 'wide' : String(col)}
+    >
+      {show ? children : null}
+    </div>
+  );
+}
+
 /** Consistent chart card header with optional hint, hide, and PNG export. */
 export default function ChartHeader({ title, hint, exportName, onHide, extra }) {
   const file = exportName || String(title || 'chart').replace(/&amp;/g, 'and');

@@ -21,6 +21,21 @@ const clientsRoutes = require('./routes/clients');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// ── Memory monitoring ───────────────────────────────────────────────
+console.log('[MEMORY] Memory monitor started');
+
+setInterval(() => {
+  const m = process.memoryUsage();
+
+  console.log(
+    `[MEMORY] RSS=${(m.rss / 1024 / 1024).toFixed(0)}MB ` +
+    `HeapUsed=${(m.heapUsed / 1024 / 1024).toFixed(0)}MB ` +
+    `HeapTotal=${(m.heapTotal / 1024 / 1024).toFixed(0)}MB ` +
+    `External=${(m.external / 1024 / 1024).toFixed(0)}MB ` +
+    `ArrayBuffers=${(m.arrayBuffers / 1024 / 1024).toFixed(0)}MB`
+  );
+}, 10000);
+
 // Trust the first proxy hop so express-rate-limit can read X-Forwarded-For safely
 app.set('trust proxy', 1);
 
