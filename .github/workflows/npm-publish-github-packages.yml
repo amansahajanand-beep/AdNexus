@@ -25,16 +25,23 @@ jobs:
 
             echo "===== AdNexus Deployment Started ====="
 
+            # Agar folder nahi hai ya git repository nahi hai
+            if [ ! -d "/var/www/AdNexus/.git" ]; then
+              echo "===== Cloning Repository ====="
+              rm -rf /var/www/AdNexus
+              git clone https://github.com/amansahajanand-beep/AdNexus.git AdNexus
+            fi
+
             cd /var/www/AdNexus
+
             echo "===== Fetching Latest Code ====="
             git fetch origin master
 
-            echo "===== Updating Server to Latest Master ====="
+            echo "===== Updating to Latest Master ====="
             git reset --hard origin/master
 
             echo "===== Latest Commit ====="
             git log -1 --oneline
-            
 
             echo "===== Installing Frontend Dependencies ====="
             cd frontend
