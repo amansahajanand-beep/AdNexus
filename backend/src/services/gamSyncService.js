@@ -5,8 +5,9 @@ const {
   pickBestFullSlice,
 } = require('../utils/fullReportSyncCatalog');
 const {
-  UNIFIED_GRAIN_DIMS,
   UNIFIED_GRAIN_METRICS,
+  LEAN_SYNC_DIM_SLICES,
+  LEAN_SYNC_METRIC_ATTEMPTS,
 } = require('../utils/warehouseGrain');
 const { parseGamMetricValue, gamMoneyToDollars, pickRowRevenueDollars } = require('../utils/gamReportMetrics');
 
@@ -1809,6 +1810,14 @@ function normalizeGAMRows(rawRows, currency = 'USD') {
       dimensions.device_category_name = dimensions.DEVICE_CATEGORY_NAME;
       dimensions.device = dimensions.DEVICE_CATEGORY_NAME;
     }
+    if (dimensions.MOBILE_APP_NAME) {
+      dimensions.mobile_app_name = dimensions.MOBILE_APP_NAME;
+      dimensions.appName = dimensions.MOBILE_APP_NAME;
+    }
+    if (dimensions.MOBILE_APP_RESOLVED_ID) {
+      dimensions.mobile_app_resolved_id = dimensions.MOBILE_APP_RESOLVED_ID;
+      dimensions.appId = dimensions.MOBILE_APP_RESOLVED_ID;
+    }
     // Always attach inventory filter fields (domain / site URL / ad unit / app).
     const { dimensions: enriched } = attachInventoryDimensions(dimensions);
     return { report_date, dimensions: enriched, metrics, currency };
@@ -1816,27 +1825,13 @@ function normalizeGAMRows(rawRows, currency = 'USD') {
 }
 
 /**
- * Preferred → fallback dimension sets for warehouse sync.
- * Unified grain first; shrink if GAM rejects the combo.
+ * Lean warehouse sync: pull compatible dim slices (always keep country + device +
+ * app/site/domain where GAM allows). Shrink metrics before dropping rich dims.
  */
-const SYNC_DIMENSION_SETS = [
-  UNIFIED_GRAIN_DIMS,
-  UNIFIED_GRAIN_DIMS.filter((d) => d !== 'PROGRAMMATIC_CHANNEL_NAME'),
-  UNIFIED_GRAIN_DIMS.filter((d) => d !== 'PROGRAMMATIC_CHANNEL_NAME' && d !== 'DOMAIN'),
-  ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME', 'SITE_NAME', 'MOBILE_APP_NAME'],
-  ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME', 'SITE_NAME'],
-  ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME', 'DOMAIN'],
-  ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME', 'MOBILE_APP_NAME'],
-  ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME'],
-  ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME'],
-  ['DATE', 'COUNTRY_NAME', 'AD_UNIT_NAME'],
-  ['DATE', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME'],
-  ['DATE', 'AD_UNIT_NAME'],
-];
-
-function buildSyncReportXML(dimensions, buildDateXML, startDate, endDate) {
+function buildSyncReportXML(dimensions, metrics, buildDateXML, startDate, endDate) {
   const dimXML = dimensions.map((d) => `<dimensions>${d}</dimensions>`).join('\n    ');
-  const colXML = UNIFIED_GRAIN_METRICS.map((c) => `<columns>${c}</columns>`).join('\n    ');
+  const cols = (metrics && metrics.length) ? metrics : UNIFIED_GRAIN_METRICS;
+  const colXML = cols.map((c) => `<columns>${c}</columns>`).join('\n    ');
   return `
     ${dimXML}
     ${colXML}
@@ -1844,35 +1839,112 @@ function buildSyncReportXML(dimensions, buildDateXML, startDate, endDate) {
     <dateRangeType>CUSTOM_DATE</dateRangeType>`;
 }
 
-async function fetchFromGAM(startDate, endDate, onBatch) {
-  const { getToken, runReportAndDownload, buildDateXML } = require('../gam/reportTransport');
-  const token = await getToken();
-  let lastErr;
+function metricAttemptKey(metrics) {
+  return (metrics || []).join(',');
+}
+
+/**
+ * Try one dim slice with metric fallbacks. Returns { count } when streaming,
+ * or a row array when not. Null when every attempt fails / returns empty.
+ */
+async function pullLeanSlice(dims, label, token, buildDateXML, startDate, endDate, onBatch) {
+  const { runReportAndDownload } = require('../gam/reportTransport');
   const stream = typeof onBatch === 'function';
-  for (const dims of SYNC_DIMENSION_SETS) {
+  const seen = new Set();
+  let lastErr;
+  for (const metrics of LEAN_SYNC_METRIC_ATTEMPTS) {
+    const key = metricAttemptKey(metrics);
+    if (!metrics.length || seen.has(key)) continue;
+    seen.add(key);
     try {
-      const xml = buildSyncReportXML(dims, buildDateXML, startDate, endDate);
+      const xml = buildSyncReportXML(dims, metrics, buildDateXML, startDate, endDate);
       const raw = await runReportAndDownload(xml, token, stream ? { onBatch } : {});
       if (stream) {
         const count = Number(raw?.count) || 0;
         if (count > 0) {
-          logger.info(`GAM sync OK dims=[${dims.join(', ')}] rows=${count} range=${startDate}..${endDate} (streamed)`);
-          return raw;
+          logger.info(
+            `GAM lean slice ${label} OK dims=[${dims.join(', ')}] metrics=${metrics.length}`
+            + ` rows=${count} range=${startDate}..${endDate} (streamed)`
+          );
+          return { streamed: true, count, dims, metrics };
         }
-        logger.warn(`GAM sync dims=[${dims.join(', ')}] returned 0 rows, trying fallback`);
+        logger.warn(`GAM lean slice ${label} returned 0 rows (metrics=${metrics.length})`);
         continue;
       }
       if (Array.isArray(raw) && raw.length) {
-        logger.info(`GAM sync OK dims=[${dims.join(', ')}] rows=${raw.length} range=${startDate}..${endDate}`);
+        logger.info(
+          `GAM lean slice ${label} OK dims=[${dims.join(', ')}] metrics=${metrics.length}`
+          + ` rows=${raw.length} range=${startDate}..${endDate}`
+        );
         return raw;
       }
-      logger.warn(`GAM sync dims=[${dims.join(', ')}] returned 0 rows, trying fallback`);
+      logger.warn(`GAM lean slice ${label} returned 0 rows (metrics=${metrics.length})`);
     } catch (err) {
       lastErr = err;
-      logger.warn(`GAM sync dims=[${dims.join(', ')}] failed: ${err.message}`);
+      logger.warn(
+        `GAM lean slice ${label} failed dims=[${dims.join(', ')}] metrics=${metrics.length}: ${err.message}`
+      );
     }
   }
-  throw lastErr || new Error('GAM sync failed for all dimension sets');
+  if (lastErr) {
+    logger.warn(`GAM lean slice ${label} exhausted metric fallbacks: ${lastErr.message}`);
+  }
+  return null;
+}
+
+/**
+ * Fetch lean warehouse rows for a date range.
+ * Runs each LEAN_SYNC_DIM_SLICES pull (country + device always retained).
+ * When onBatch is provided, streams each successful slice into the callback.
+ * Non-stream mode concatenates rows (for small range-fetch callers).
+ */
+async function fetchFromGAM(startDate, endDate, onBatch) {
+  const { getToken, buildDateXML } = require('../gam/reportTransport');
+  const token = await getToken();
+  const stream = typeof onBatch === 'function';
+  let okSlices = 0;
+  let totalRows = 0;
+  const collected = [];
+  let lastErr;
+
+  for (const slice of LEAN_SYNC_DIM_SLICES) {
+    try {
+      const got = await pullLeanSlice(
+        slice.dims,
+        slice.key,
+        token,
+        buildDateXML,
+        startDate,
+        endDate,
+        onBatch
+      );
+      if (!got) continue;
+      okSlices += 1;
+      if (stream) {
+        totalRows += Number(got.count) || 0;
+      } else if (Array.isArray(got)) {
+        for (let i = 0; i < got.length; i++) collected.push(got[i]);
+        totalRows += got.length;
+      }
+    } catch (err) {
+      lastErr = err;
+      logger.warn(`GAM lean slice ${slice.key} error: ${err.message}`);
+    }
+  }
+
+  if (!okSlices) {
+    throw lastErr || new Error(
+      'GAM lean sync failed for all rich dimension slices (country/device/app).'
+    );
+  }
+
+  logger.info(
+    `GAM lean sync ${startDate}..${endDate}: ${okSlices}/${LEAN_SYNC_DIM_SLICES.length}`
+    + ` slices ok, rows≈${totalRows}${stream ? ' (streamed)' : ''}`
+  );
+
+  if (stream) return { streamed: true, count: totalRows };
+  return collected;
 }
 
 function listSyncWindows(startDate, endDate) {
@@ -3097,7 +3169,7 @@ module.exports = {
   logSync,
   dimHash,
   getReportRange,
-  SYNC_DIMENSION_SETS,
+  LEAN_SYNC_DIM_SLICES,
   buildSyncReportXML,
   buildAdhocQueryHash,
   hasAdhocCoverage,

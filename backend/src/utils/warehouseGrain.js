@@ -12,10 +12,64 @@ const UNIFIED_GRAIN_DIMS = [
   'SITE_NAME',
   'DOMAIN',
   'MOBILE_APP_NAME',
+  'MOBILE_APP_RESOLVED_ID',
   'PROGRAMMATIC_CHANNEL_NAME',
 ];
 
 const UNIFIED_GRAIN_METRICS = [...SAFE_METRICS];
+
+/**
+ * Lean sync pulls these compatible slices separately, then upserts into
+ * report_present / report_daily. Never drop COUNTRY + DEVICE — shrink metrics
+ * or split inventory (web vs app) instead of falling back to AD_UNIT-only grain.
+ */
+const LEAN_SYNC_DIM_SLICES = [
+  {
+    key: 'inventory_core',
+    dims: [
+      'DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME',
+      'AD_UNIT_NAME', 'SITE_NAME', 'MOBILE_APP_NAME',
+    ],
+  },
+  {
+    key: 'inventory_domain',
+    dims: [
+      'DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME',
+      'AD_UNIT_NAME', 'DOMAIN',
+    ],
+  },
+  {
+    key: 'app_id',
+    dims: [
+      'DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME',
+      'AD_UNIT_NAME', 'MOBILE_APP_NAME', 'MOBILE_APP_RESOLVED_ID',
+    ],
+  },
+  {
+    key: 'channel',
+    dims: [
+      'DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME',
+      'AD_UNIT_NAME', 'PROGRAMMATIC_CHANNEL_NAME',
+    ],
+  },
+  {
+    key: 'rich_core',
+    dims: ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME'],
+  },
+];
+
+/** Prefer full SAFE metrics; shrink columns before dims if GAM rejects the combo. */
+const LEAN_SYNC_METRIC_ATTEMPTS = [
+  UNIFIED_GRAIN_METRICS,
+  UNIFIED_GRAIN_METRICS.slice(0, 6),
+  UNIFIED_GRAIN_METRICS.slice(0, 4),
+  [
+    'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS',
+    'TOTAL_LINE_ITEM_LEVEL_CLICKS',
+    'TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE',
+    'TOTAL_LINE_ITEM_LEVEL_WITHOUT_CPD_AVERAGE_ECPM',
+  ],
+];
 
 const GRAIN_DIM_SET = new Set(UNIFIED_GRAIN_DIMS);
 const GRAIN_MET_SET = new Set(UNIFIED_GRAIN_METRICS);
@@ -91,6 +145,8 @@ function classifyReportingQuery(dimensionApis = [], metricApis = []) {
 module.exports = {
   UNIFIED_GRAIN_DIMS,
   UNIFIED_GRAIN_METRICS,
+  LEAN_SYNC_DIM_SLICES,
+  LEAN_SYNC_METRIC_ATTEMPTS,
   MAX_CUSTOM_DIMS,
   MAX_CUSTOM_METS,
   isGrainDimension,

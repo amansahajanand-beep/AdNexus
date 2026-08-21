@@ -2371,10 +2371,20 @@ export default function Dashboard() {
           </div>
           )}
 
-          {(chartOn('ctr') && hasChartData(engagementSeries, ['ctr'])
-            || chartOn('clicks') && hasChartData(engagementSeries, ['clicks'])
-            || chartOn('fill') && hasChartData(engagementSeries, ['fillRate'])) && (
-          <div className="charts-grid">
+          {((chartOn('ctr') && hasChartData(engagementSeries, ['ctr']))
+            || (chartOn('clicks') && hasChartData(engagementSeries, ['clicks']))
+            || (chartOn('fill') && hasChartData(engagementSeries, ['fillRate']))
+            || (chartOn('unfilled') && hasChartData(engagementSeries, ['unfilled']))
+            || (chartOn('yield') && showEcpmCharts && hasChartData(yieldSeries, ['ecpm', 'ctr']))
+            || (chartOn('revenueShare') && hasChartData(shareSeries.revenue))
+            || (chartOn('deviceShare') && hasChartData(shareSeries.device))
+            || (chartOn('countryShare') && hasChartData(shareSeries.country))
+            || (chartOn('dailyEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']))
+            || (chartOn('topSites') && showRevenueCharts && hasChartData(siteShareSeries))
+            || (showImpressionCharts && chartOn('impsDomain') && hasChartData(impressionDomainShare))
+            || (showImpressionCharts && chartOn('impsCountry') && hasChartData(impressionCountryShare))
+            || (chartOn('adUnitMix') && (showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']))) && (
+          <div className="charts-grid" style={{ marginTop: 16 }}>
             {chartOn('ctr') && hasChartData(engagementSeries, ['ctr']) && (
             <div className="chart-card">
               <ChartHeader title="CTR over time" hint="Clicks / impressions" onHide={() => hideChart('ctr')} />
@@ -2463,12 +2473,6 @@ export default function Dashboard() {
               </ScrollableChart>
             </div>
             )}
-          </div>
-          )}
-
-          {(chartOn('unfilled') && hasChartData(engagementSeries, ['unfilled'])
-            || (chartOn('yield') && showEcpmCharts && hasChartData(yieldSeries, ['ecpm', 'ctr']))) && (
-          <div className="charts-grid">
             {chartOn('unfilled') && hasChartData(engagementSeries, ['unfilled']) && (
             <div className="chart-card">
               <ChartHeader title="Unfilled impressions" hint="Demand that did not fill" onHide={() => hideChart('unfilled')} />
@@ -2536,15 +2540,6 @@ export default function Dashboard() {
               </ScrollableChart>
             </div>
             )}
-          </div>
-          )}
-
-          {((chartOn('revenueShare') && hasChartData(shareSeries.revenue))
-            || (chartOn('deviceShare') && hasChartData(shareSeries.device))
-            || (chartOn('countryShare') && hasChartData(shareSeries.country))
-            || (chartOn('dailyEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']))
-            || (chartOn('topSites') && showRevenueCharts && !showEcpmCharts && hasChartData(siteShareSeries))) && (
-          <div className="charts-grid">
             {chartOn('revenueShare') && hasChartData(shareSeries.revenue) && (
             <div className="chart-card">
               <div className="chart-header">
@@ -2596,7 +2591,6 @@ export default function Dashboard() {
               </div>
             </div>
             )}
-
             {chartOn('deviceShare') && hasChartData(shareSeries.device) && (
             <div className="chart-card">
               <ChartHeader title="Device share" hint="Laptop · Mobile · Tablet" onHide={() => hideChart('deviceShare')} />
@@ -2627,7 +2621,6 @@ export default function Dashboard() {
               </ResponsiveContainer>
             </div>
             )}
-
             {chartOn('countryShare') && hasChartData(shareSeries.country) && (
             <div className="chart-card">
               <ChartHeader title="Country share" hint="Top 10 countries" onHide={() => hideChart('countryShare')} />
@@ -2664,8 +2657,7 @@ export default function Dashboard() {
               </div>
             </div>
             )}
-
-            {chartOn('dailyEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']) ? (
+            {chartOn('dailyEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']) && (
               <div className="chart-card">
                 <ChartHeader title="Daily eCPM" hint="Revenue / impressions × 1000" onHide={() => hideChart('dailyEcpm')} />
                 <ScrollableChart pointCount={dailyWithEcpm.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
@@ -2686,7 +2678,8 @@ export default function Dashboard() {
                   </LineChart>
                 </ScrollableChart>
               </div>
-            ) : (chartOn('topSites') && showRevenueCharts && hasChartData(siteShareSeries)) ? (
+            )}
+            {chartOn('topSites') && showRevenueCharts && hasChartData(siteShareSeries) && (
               <div className="chart-card">
                 <ChartHeader title="Top sites" hint="Top 10 by revenue" onHide={() => hideChart('topSites')} />
                 <ResponsiveContainer width="100%" height={260}>
@@ -2704,13 +2697,8 @@ export default function Dashboard() {
                   </BarChart>
                 </ResponsiveContainer>
               </div>
-            ) : null}
-          </div>
-          )}
-
-          {showImpressionCharts && ((chartOn('impsDomain') && hasChartData(impressionDomainShare)) || (chartOn('impsCountry') && hasChartData(impressionCountryShare))) && (
-          <div className="charts-grid">
-            {chartOn('impsDomain') && hasChartData(impressionDomainShare) && (
+            )}
+            {showImpressionCharts && chartOn('impsDomain') && hasChartData(impressionDomainShare) && (
             <div className="chart-card">
               <ChartHeader title="Impressions by domain" hint="Top 10 domains" onHide={() => hideChart('impsDomain')} />
               <ResponsiveContainer width="100%" height={240}>
@@ -2729,7 +2717,7 @@ export default function Dashboard() {
               </ResponsiveContainer>
             </div>
             )}
-            {chartOn('impsCountry') && hasChartData(impressionCountryShare) && (
+            {showImpressionCharts && chartOn('impsCountry') && hasChartData(impressionCountryShare) && (
             <div className="chart-card">
               <ChartHeader title="Impressions by country" hint="Top 10 countries" onHide={() => hideChart('impsCountry')} />
               <ResponsiveContainer width="100%" height={240}>
@@ -2748,11 +2736,34 @@ export default function Dashboard() {
               </ResponsiveContainer>
             </div>
             )}
+            {chartOn('adUnitMix') && (showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']) && (
+              <div className="chart-card">
+                <ChartHeader title="Ad unit mix" hint="Revenue and impressions by ad unit" onHide={() => hideChart('adUnitMix')} />
+                <ResponsiveContainer width="100%" height={240}>
+                  <BarChart data={adUnitMixSeries} layout="vertical" margin={hBarMargins}>
+                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
+                    <XAxis type="number" tick={false} axisLine={false} />
+                    <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
+                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
+                    <Tooltip formatter={(value, name) => (
+                      name === 'Revenue' ? [money(value, currency), name] : [num(value), name]
+                    )} />
+                    <Legend />
+                    {showRevenueCharts && (
+                      <Bar dataKey="revenue" name="Revenue" fill={CHART_SERIES.primary} radius={[0, 6, 6, 0]} />
+                    )}
+                    {showImpressionCharts && (
+                      <Bar dataKey="impressions" name="Impressions" fill={CHART_SERIES.secondary} radius={[0, 6, 6, 0]} />
+                    )}
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
           </div>
           )}
 
           {chartOn('adPerformance') && hasChartData(performanceSeries, ['score', 'value']) && (
-          <div className="chart-card wide">
+          <div className="chart-card wide" style={{ marginTop: 16 }}>
             <ChartHeader title="Ad performance" hint="Compact score by ad unit" onHide={() => hideChart('adPerformance')} />
             <ResponsiveContainer width="100%" height={240}>
               <BarChart data={performanceSeries} layout="vertical" margin={hBarMargins}>
@@ -2768,7 +2779,7 @@ export default function Dashboard() {
           )}
 
           {chartOn('revenueEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['revenue', 'ecpm']) && (
-            <div className="chart-card wide">
+            <div className="chart-card wide" style={{ marginTop: 16 }}>
               <ChartHeader title="Revenue vs eCPM" hint="Daily revenue bars with eCPM overlay" onHide={() => hideChart('revenueEcpm')} />
               <ScrollableChart pointCount={dailyWithEcpm.length} isNarrow={isNarrow} height={isNarrow ? 320 : 310}>
                 <ComposedChart data={dailyWithEcpm} margin={dailyEcpmMargins}>
@@ -2800,55 +2811,6 @@ export default function Dashboard() {
                 </ComposedChart>
               </ScrollableChart>
             </div>
-          )}
-
-          {((chartOn('topSites') && showRevenueCharts && showEcpmCharts && hasChartData(siteShareSeries))
-            || (chartOn('adUnitMix') && (showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']))) && (
-          <div className="charts-grid">
-            {chartOn('topSites') && showRevenueCharts && showEcpmCharts && hasChartData(siteShareSeries) && (
-              <div className="chart-card">
-                <ChartHeader title="Top sites" hint="Top 10 by revenue" onHide={() => hideChart('topSites')} />
-                <ResponsiveContainer width="100%" height={240}>
-                  <BarChart data={siteShareSeries} layout="vertical" margin={hBarMargins}>
-                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
-                    <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
-                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
-                    <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
-                    <Bar dataKey="value" radius={[0, 6, 6, 0]}>
-                      {siteShareSeries.map((entry, idx) => (
-                        <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-
-            {chartOn('adUnitMix') && (showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']) && (
-              <div className="chart-card">
-                <ChartHeader title="Ad unit mix" hint="Revenue and impressions by ad unit" onHide={() => hideChart('adUnitMix')} />
-                <ResponsiveContainer width="100%" height={240}>
-                  <BarChart data={adUnitMixSeries} layout="vertical" margin={hBarMargins}>
-                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
-                    <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
-                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
-                    <Tooltip formatter={(value, name) => (
-                      name === 'Revenue' ? [money(value, currency), name] : [num(value), name]
-                    )} />
-                    <Legend />
-                    {showRevenueCharts && (
-                      <Bar dataKey="revenue" name="Revenue" fill={CHART_SERIES.primary} radius={[0, 6, 6, 0]} />
-                    )}
-                    {showImpressionCharts && (
-                      <Bar dataKey="impressions" name="Impressions" fill={CHART_SERIES.secondary} radius={[0, 6, 6, 0]} />
-                    )}
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-          </div>
           )}
         </>
       )}

@@ -465,7 +465,14 @@ img, svg, video { max-width: 100%; height: auto; }
 /* ─── Charts ──────────────────────────────────────────────────────────────── */
 .charts-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .report-auto-charts { margin-top: 16px; }
-@media (max-width: 900px) { .charts-grid { grid-template-columns: 1fr; } }
+/* On single-column (mobile), orphan stretch is redundant but harmless */
+@media (max-width: 900px) {
+  .charts-grid { grid-template-columns: 1fr; }
+  .charts-grid > .chart-card:only-child,
+  .charts-grid > .chart-card:last-child:nth-child(odd) {
+    grid-column: auto;
+  }
+}
 
 .chart-card {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-card);
@@ -473,6 +480,11 @@ img, svg, video { max-width: 100%; height: auto; }
   width: 100%; min-width: 0; max-width: 100%; box-sizing: border-box;
 }
 .chart-card.wide { grid-column: 1 / -1; }
+/* Stretch orphan / last-row leftover so 2-col grids never leave a blank half */
+.charts-grid > .chart-card:only-child,
+.charts-grid > .chart-card:last-child:nth-child(odd) {
+  grid-column: 1 / -1;
+}
 .charts-grid { overflow: visible; }
 .chart-fill {
   width: 100%;
