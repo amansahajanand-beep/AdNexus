@@ -8,6 +8,7 @@
 const express = require('express');
 const router = express.Router();
 const { verifyPassword, getUserById, getUserByUsername, updateUser, checkPasswordForUser } = require('../models/userStore');
+const { resolveClientForUser } = require('../models/clientStore');
 const { generateTokens, requireAuth } = require('../middleware/auth');
 const { rotateUserSession, clearUserSession, stripSessionFields } = require('../utils/sessionManager');
 const { validatePassword } = require('../utils/passwordPolicy');
@@ -28,6 +29,18 @@ router.post('/login', async (req, res) => {
     if (user.role !== 'admin' && user.permissions && user.permissions.canLogin === false) {
       return res.status(403).json({
         error: 'Your login access has been disabled. Please contact your administrator.',
+      });
+    }
+
+    // Block login before creating a session if there is no usable GAM client.
+    // Avoids "signed in → immediate dashboard 403" when credentials are missing.
+    const client = await resolveClientForUser(user);
+    if (!client) {
+      logger.warn(`Login blocked (no GAM client): ${user.username}`);
+      return res.status(403).json({
+        error:
+          'No GAM client is linked to this account. Connect Google Ad Manager credentials (Admin → Client settings or /onboard) before signing in.',
+        code: 'NO_GAM_CLIENT',
       });
     }
 

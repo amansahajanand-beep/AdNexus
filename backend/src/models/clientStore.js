@@ -164,6 +164,44 @@ async function updateClientCredentials(id, {
   return getClientById(id);
 }
 
+/** True when a runtime client has credentials needed for GAM API calls. */
+function isUsableGamClient(client) {
+  return !!(
+    client
+    && client.isActive !== false
+    && String(client.networkCode || '').trim()
+    && String(client.googleClientId || '').trim()
+    && String(client.googleClientSecret || '').trim()
+    && String(client.refreshToken || '').trim()
+  );
+}
+
+/**
+ * Resolve the GAM client for a portal user (same rules as requireAuth):
+ * linked client_id first, then env bootstrap fallback.
+ * Returns null when nothing usable is available.
+ */
+async function resolveClientForUser(user) {
+  let client = null;
+  try {
+    if (user?.clientId) client = await getClientById(user.clientId);
+  } catch (e) {
+    logger.warn(
+      `[tenancy] Could not load gam_clients for user=${user?.username || user?.id}: ${e.message}`
+    );
+    client = null;
+  }
+  if (!isUsableGamClient(client)) {
+    try {
+      client = await ensureBootstrapFromEnv();
+    } catch (e) {
+      logger.warn(`[tenancy] Bootstrap fallback failed: ${e.message}`);
+      client = null;
+    }
+  }
+  return isUsableGamClient(client) ? client : null;
+}
+
 async function ensureBootstrapFromEnv() {
   const networkCode = process.env.GAM_NETWORK_CODE;
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -257,4 +295,6 @@ module.exports = {
   createClient,
   updateClientCredentials,
   ensureBootstrapFromEnv,
+  isUsableGamClient,
+  resolveClientForUser,
 };

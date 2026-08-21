@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const { getUserById } = require('../models/userStore');
-const { getClientById, ensureBootstrapFromEnv } = require('../models/clientStore');
+const { resolveClientForUser } = require('../models/clientStore');
 const { isActiveSession } = require('../utils/sessionManager');
 const { runWithClient } = require('../utils/clientContext');
 
@@ -83,8 +83,7 @@ async function requireAuth(req, res, next) {
 
   let client = null;
   try {
-    if (user.clientId) client = await getClientById(user.clientId);
-    if (!client) client = await ensureBootstrapFromEnv();
+    client = await resolveClientForUser(user);
   } catch (e) {
     return sendAuthError(res, 401, 'Client lookup failed', AUTH_CODES.USER_INACTIVE);
   }
