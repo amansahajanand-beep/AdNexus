@@ -50,8 +50,8 @@ const allowedOrigins = [
   process.env.FRONTEND_URL || 'http://localhost:3000',
   'http://localhost:3000',
   'http://localhost:3099',
-  'https://dashboard.brainfungames.com',
-  'https://www.dashboard.brainfungames.com',
+  'https://dashboard.mediamonetix.com',
+  'https://www.dashboard.mediamonetix.com',
   ...(process.env.CORS_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean),
 ].map(normalizeOrigin);
 
