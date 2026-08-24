@@ -27,14 +27,21 @@ function gamMoneyToDollars(raw) {
 
 /**
  * Coerce a warehouse revenue sum that may still be raw micros (bad ingest day).
- * Absurd eCPM (>$100) with positive impressions ⇒ treat as micros.
+ *
+ * Do NOT treat |rev| >= 1e6 as micros — multi-month rollup totals are often
+ * millions of dollars and must stay as dollars (that bug showed $2.23M as $2.23).
+ * Only convert when eCPM is absurd for already-normalized dollars (>$100).
+ * With no impressions, leave large values alone (cannot distinguish micros vs $).
  */
 function coerceWarehouseRevenue(revenue, impressions = 0) {
   const rev = Number(revenue) || 0;
   const imp = Number(impressions) || 0;
   if (!rev) return 0;
-  if (Math.abs(rev) >= 1e6) return +(rev / 1e6).toFixed(2);
-  if (imp > 0 && (rev / imp) * 1000 > 100) return +(rev / 1e6).toFixed(2);
+  if (imp > 0) {
+    const ecpm = (rev / imp) * 1000;
+    // Raw micros for a normal ~$1–$5 eCPM day look like eCPM in the millions.
+    if (ecpm > 100) return +(rev / 1e6).toFixed(2);
+  }
   return +rev.toFixed(2);
 }
 

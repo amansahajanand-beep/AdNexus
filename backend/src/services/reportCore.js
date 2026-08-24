@@ -2581,7 +2581,7 @@ async function handleDashboardOverview(req, res) {
     }
 
     const loaded = await loadReportRowsCacheAside(filters, token, {
-      cachePrefix: 'report_overview_v3',
+      cachePrefix: 'report_overview_v4',
       fastMode: true,
       persistOnGam: true,
       enqueueSyncOnMiss: true,
@@ -2722,7 +2722,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = `report_dashboard_resp_v9_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = `report_dashboard_resp_v10_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3186,7 +3186,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v4_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v5_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,

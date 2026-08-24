@@ -110,10 +110,15 @@ export function inferMetricAggregate(metricId) {
 export function readMetricValue(row, metricId, fallbackFn) {
   if (!row) return 0;
   const money = isMoneyMetric(metricId);
+  // Warehouse/dashboard rows already carry dollars — never re-scale.
+  const alreadyDollars = row.revenueDollars === true;
 
   if (row.metrics && Object.prototype.hasOwnProperty.call(row.metrics, metricId)) {
     const v = Number(row.metrics[metricId]);
-    if (Number.isFinite(v) && v !== 0) return money ? gamMoneyToDollars(v) : v;
+    if (Number.isFinite(v) && v !== 0) {
+      if (money && alreadyDollars) return +v.toFixed(4);
+      return money ? gamMoneyToDollars(v) : v;
+    }
     if (v === 0 && money) {
       const legacy = pickRowRevenueDollars(row);
       if (legacy > 0) return legacy;
@@ -135,7 +140,10 @@ export function readMetricValue(row, metricId, fallbackFn) {
 
   if (typeof fallbackFn === 'function') {
     const v = Number(fallbackFn(row));
-    if (Number.isFinite(v) && v !== 0) return money ? gamMoneyToDollars(v) : v;
+    if (Number.isFinite(v) && v !== 0) {
+      if (money && alreadyDollars) return +v.toFixed(4);
+      return money ? gamMoneyToDollars(v) : v;
+    }
   }
   const aliases = LEGACY_ALIASES[metricId] || [];
   for (const key of aliases) {

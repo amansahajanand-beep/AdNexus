@@ -1028,16 +1028,16 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
     };
   });
 
-  const startMs = new Date(`${startDate}T12:00:00`).getTime();
-  const endMs = new Date(`${endDate}T12:00:00`).getTime();
-  const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
-  const perDay = Math.max(15, Math.min(400, Math.ceil(tableLimit / dayCount)));
-  const tableParams = [...baseParams, perDay, tableLimit];
+  const tableParams = [...baseParams, tableLimit];
   const { rows: tableRaw } = await query(
     `WITH agg AS (
        SELECT
          g.report_date,
-         ${domainExpr} AS domain_name,
+         COALESCE(
+           NULLIF(LOWER(TRIM(regexp_replace(COALESCE(${siteExpr}, ''), '^[^.]+\.', ''))), ''),
+           MAX(${domainExpr}),
+           ''
+         ) AS domain_name,
          COALESCE(${siteExpr}, '') AS site_url,
          '' AS ad_unit,
          '' AS app_id,
@@ -1055,50 +1055,70 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
          AND g.report_date BETWEEN $2::date AND $3::date
          AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
          ${clause}
-       GROUP BY g.report_date, ${domainExpr}, ${siteExpr}
+       GROUP BY g.report_date, ${siteExpr}
        HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
      ),
-     ranked AS (
-       SELECT *,
-         ROW_NUMBER() OVER (
-           PARTITION BY report_date
-           ORDER BY revenue_raw DESC, impression DESC
-         ) AS day_rank
-       FROM agg
+     counted AS (
+       SELECT COUNT(*)::int AS agg_count FROM agg
      )
      SELECT
-       to_char(report_date, 'YYYY-MM-DD') AS report_date,
-       domain_name, site_url, ad_unit, app_id,
-       impression, revenue_raw, viewable_raw, clicks, currency
-     FROM ranked
-     WHERE day_rank <= $${tableParams.length - 1}
-     ORDER BY report_date DESC, revenue_raw DESC
+       to_char(a.report_date, 'YYYY-MM-DD') AS report_date,
+       a.domain_name, a.site_url, a.ad_unit, a.app_id,
+       a.impression, a.revenue_raw, a.viewable_raw, a.clicks, a.currency,
+       c.agg_count
+     FROM agg a
+     CROSS JOIN counted c
+     ORDER BY a.report_date DESC, a.revenue_raw DESC, a.impression DESC
      LIMIT $${tableParams.length}`,
     tableParams
   );
   const tableRows = (tableRaw || []).map(mapDomainTableRow);
+  const aggCount = Number(tableRaw?.[0]?.agg_count) || tableRows.length;
+  const truncated = aggCount > tableRows.length;
 
-  const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+  // When the full site table fits, make summary match row sums exactly (no grain vs table drift).
+  let summaryImpressions = Math.round(impressions);
+  let summaryRevenue = +Number(revenue).toFixed(2);
+  let summaryClicks = Math.round(clicks);
+  let summaryViewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+  if (!truncated && tableRows.length) {
+    let rowImp = 0;
+    let rowRev = 0;
+    let rowClicks = 0;
+    let rowViewW = 0;
+    for (const r of tableRows) {
+      const imp = Number(r.impression) || 0;
+      rowImp += imp;
+      rowRev += Number(r.revenue) || 0;
+      rowClicks += Number(r.clicks) || 0;
+      rowViewW += ((Number(r.viewableRate) || 0) / 100) * imp;
+    }
+    summaryImpressions = Math.round(rowImp);
+    summaryRevenue = +rowRev.toFixed(2);
+    summaryClicks = Math.round(rowClicks);
+    summaryViewability = rowImp > 0 ? +(rowViewW / rowImp * 100).toFixed(1) : 0;
+  }
+
   return {
     summary: {
-      totalEarning: +Number(revenue).toFixed(2),
+      totalEarning: summaryRevenue,
       totalEarningChange: 0,
-      selectRange: +Number(revenue).toFixed(2),
+      selectRange: summaryRevenue,
       selectRangeChange: 0,
       last7Days: +trend.slice(-7).reduce((a, x) => a + (x.earning || 0), 0).toFixed(2),
       last7DaysChange: 0,
-      pageViews: Math.round(impressions),
+      pageViews: summaryImpressions,
       pageViewsChange: 0,
-      impressions: Math.round(impressions),
+      impressions: summaryImpressions,
       impressionsChange: 0,
-      clicks: Math.round(clicks),
+      clicks: summaryClicks,
       clicksChange: 0,
-      ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
-      revenue: +Number(revenue).toFixed(2),
+      ctr: summaryImpressions > 0 ? +((summaryClicks / summaryImpressions) * 100).toFixed(4) : 0,
+      revenue: summaryRevenue,
       revenueChange: 0,
-      ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
+      ecpm: summaryImpressions > 0 ? +((summaryRevenue / summaryImpressions) * 1000).toFixed(2) : 0,
       ecpmChange: 0,
-      viewability,
+      viewability: summaryViewability,
       viewabilityChange: 0,
       currency: opts.currency || 'USD',
     },
@@ -1106,10 +1126,10 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
     charts: { revenue: [], device: [], country: [], performance: [] },
     rows: tableRows,
     pagination: {
-      totalRows: tableRows.length,
+      totalRows: truncated ? aggCount : tableRows.length,
       returnedRows: tableRows.length,
-      truncated: grainCount > tableRows.length,
-      allRows: false,
+      truncated,
+      allRows: !truncated,
       compact: true,
     },
     grainCount,

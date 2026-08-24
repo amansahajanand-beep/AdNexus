@@ -1348,8 +1348,9 @@ export default function Dashboard() {
   const tableSummaryTotals = useMemo(() => {
     const hasConcreteSite = applied?.site?.length && !isAllSelection(applied.site);
     const truncated = detailData?.pagination?.truncated;
-    // Footer must match visible site-filtered rows when the API returned the full table.
-    if (hasConcreteSite && tableRows.length && !truncated) {
+    // Prefer summing table rows for site filters so Total matches the breakdown.
+    // Only fall back to API summary when the table was capped (incomplete).
+    if (hasConcreteSite && tableRows.length && truncated !== true) {
       const fromRows = summarizeRowsForOverview(tableRows, currency);
       return {
         total_line_item_level_all_revenue: fromRows.revenue,
