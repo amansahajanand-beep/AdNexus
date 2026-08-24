@@ -234,10 +234,14 @@ function resolveInventoryFields(adUnit, servingUrl, gamDomain, gamSite) {
 
 /** Attach domainName, siteName, siteSub to each report row (keeps legacy siteUrl). */
 function enrichReportRow(row) {
+  const adUnit = row.site && row.site !== '—'
+    ? row.site
+    : (row.ad_unit_name || row.AD_UNIT_NAME || '');
+  const gamDomain = cleanDim(row.gamDomain) || cleanDim(row.domainName) || cleanDim(row.domain);
   const { domainName, siteName, siteSub } = resolveInventoryFields(
-    row.site,
+    adUnit,
     row.siteUrl,
-    row.gamDomain,
+    gamDomain,
     row.gamSite
   );
   const resolvedHost = pickSiteHost(row.gamSite, row.siteUrl, siteName)

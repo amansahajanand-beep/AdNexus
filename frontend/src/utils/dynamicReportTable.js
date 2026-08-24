@@ -34,18 +34,27 @@ export function resolveDashboardTableConfig(applied = {}, filterApplied = false)
   const dimensions = ['date'];
   if (!filterApplied) {
     return {
-      dimensions: ['date', 'domain', 'site_name'],
+      dimensions: ['date', 'domain'],
       metrics: [...DASHBOARD_DEFAULT_METRICS],
     };
   }
+  // Domain name filter → domain grain (matches old Inventory Breakdown / GAM domain report).
   if (applied.domain?.length) dimensions.push('domain');
-  if (applied.site?.length) dimensions.push('site_name');
-  // Ad unit column only when user explicitly filters ad units (matches GAM Site vs Ad unit reports).
-  if (applied.domainName?.length) dimensions.push('ad_unit_name');
+  // Site filter → add site column (domain kept when also selected).
+  if (applied.site?.length) {
+    if (!dimensions.includes('domain')) dimensions.push('domain');
+    dimensions.push('site_name');
+  }
+  // Ad unit column only when user explicitly filters ad units.
+  if (applied.domainName?.length) {
+    if (!dimensions.includes('domain')) dimensions.push('domain');
+    if (applied.site?.length && !dimensions.includes('site_name')) dimensions.push('site_name');
+    dimensions.push('ad_unit_name');
+  }
   if (applied.domainId?.length) dimensions.push('mobile_app_resolved_id');
-  // When filter applied but only dates (no inventory dims), keep a readable default grain.
+  // Date-only generate → default domain breakdown.
   if (dimensions.length === 1) {
-    dimensions.push('domain', 'site_name');
+    dimensions.push('domain');
   }
   return {
     dimensions,
@@ -85,7 +94,14 @@ const DIMENSION_DEFS = {
     },
     cellClass: '',
   },
-  domain: { getValue: (r) => readDomainName(r) || readDimensionValue(r, 'domain') || '—', cellClass: '' },
+  domain: {
+    getValue: (r) => readDomainName(r)
+      || readDimensionValue(r, 'domain')
+      || (r.domainName && r.domainName !== '—' ? r.domainName : '')
+      || (r.domain && r.domain !== '—' ? r.domain : '')
+      || '—',
+    cellClass: '',
+  },
   site_name: {
     getValue: (r) => {
       const fromRow = readSiteName(r);

@@ -1691,11 +1691,29 @@ function rowsToPersistShape(rows, fallbackDate, currency = 'USD') {
   });
 }
 
+const GAM_PERSIST_MAX_ROWS = Math.max(0, parseInt(process.env.GAM_PERSIST_MAX_ROWS || '5000', 10));
+const inflightWarehousePersist = new Map();
+
 function persistReportRowsToStore(rows, syncType, fallbackDate, currency) {
   const svc = getSyncSvc();
   if (!svc?.persistSyncedRows || !rows?.length) return;
-  svc.persistSyncedRows(rowsToPersistShape(rows, fallbackDate, currency), syncType)
-    .catch((e) => logger.warn(`Persist ${syncType} failed:`, e.message));
+
+  if (GAM_PERSIST_MAX_ROWS > 0 && rows.length > GAM_PERSIST_MAX_ROWS) {
+    logger.info(
+      `Persist ${syncType} skipped — ${rows.length} rows exceeds GAM_PERSIST_MAX_ROWS=${GAM_PERSIST_MAX_ROWS}`
+      + ' (BullMQ sync jobs fill report_grain)'
+    );
+    return;
+  }
+
+  const persistKey = `${syncType}:${fallbackDate || ''}:${rows.length}`;
+  if (inflightWarehousePersist.has(persistKey)) return;
+
+  const shaped = rowsToPersistShape(rows, fallbackDate, currency);
+  const job = svc.persistSyncedRows(shaped, syncType)
+    .catch((e) => logger.warn(`Persist ${syncType} failed:`, e.message))
+    .finally(() => inflightWarehousePersist.delete(persistKey));
+  inflightWarehousePersist.set(persistKey, job);
 }
 
 /** Persist Reporting-page custom queries into report_adhoc (not lean dashboard tables). */
@@ -1769,7 +1787,7 @@ async function enqueueRangeSync(startDate, endDate) {
           attempts: 3,
           backoff: { type: 'exponential', delay: 10000 },
         });
-        logger.info(`Enqueued ${jobId} → report_present`);
+        logger.info(`Enqueued ${jobId} → report_grain (today)`);
       }
     }
 
@@ -1793,7 +1811,7 @@ async function enqueueRangeSync(startDate, endDate) {
         attempts: 2,
         backoff: { type: 'fixed', delay: 60000 },
       });
-      logger.info(`Enqueued ${jobId} → report_daily (priority=${3 + i})`);
+      logger.info(`Enqueued ${jobId} → report_grain (priority=${3 + i})`);
     }
     return true;
   } catch (qErr) {
@@ -2057,25 +2075,25 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
       await r.redisSet(cacheKey, payload, r.TTL?.REPORT || REPORT_CACHE_TTL);
     }
     // 5. Store for next request
+    let persistedTo = 'Redis';
     if (persistOnGam) {
+      const syncType = `${String(logLabel).toLowerCase().replace(/\s+/g, '-')}-gam`;
       if (useAdhocStore) {
-        persistAdhocRowsToStore(
-          result.rows,
-          filters,
-          `${String(logLabel).toLowerCase().replace(/\s+/g, '-')}-gam`
-        );
+        persistAdhocRowsToStore(result.rows, filters, syncType);
+        persistedTo = 'report_adhoc/Redis';
+      } else if (GAM_PERSIST_MAX_ROWS > 0 && result.rows.length > GAM_PERSIST_MAX_ROWS) {
+        persistedTo = 'Redis (warehouse via sync queue)';
       } else {
         persistReportRowsToStore(
           result.rows,
-          `${String(logLabel).toLowerCase().replace(/\s+/g, '-')}-gam`,
+          syncType,
           filters.startDate,
           process.env.GAM_CURRENCY || 'USD'
         );
+        persistedTo = 'report_grain/Redis';
       }
     }
-    logger.info(
-      `${logLabel} from GAM (${result.rows.length} rows) — persisted to ${useAdhocStore ? 'report_adhoc' : 'DB'}/Redis`
-    );
+    logger.info(`${logLabel} from GAM (${result.rows.length} rows) — persisted to ${persistedTo}`);
   }
 
   return {
@@ -2445,6 +2463,8 @@ async function handleDashboardOverview(req, res) {
               sites: toFilterArray(filters.site),
               apps: toFilterArray(filters.domainId),
               adUnitNames: toFilterArray(filters.domainName),
+              webInventoryOr: false,
+              skipAdUnitLike: true,
             };
           }
           const totals = await svc.fetchLeanOverviewTotalsFromDB(
@@ -2702,7 +2722,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = `report_dashboard_resp_v4_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = `report_dashboard_resp_v9_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -2737,16 +2757,16 @@ async function handleDashboard(req, res) {
       let sites = toFilterArray(filters.site);
       let apps = toFilterArray(filters.domainId);
       let webInventoryOr = false;
-      let skipAdUnitLike = false;
+      // GAM Domain ∩ Site: exact inv_domain / inv_site match (no LIKE '%domain%').
+      let skipAdUnitLike = true;
       // Scoped children must never see network-wide SQL aggregates.
-      // Domains+sites+apps must not be AND'd — that returns empty for assigned-all users.
       if (isScopedChild) {
         const scoped = resolveScopedSqlInventoryOpts(req.user, filters);
         domains = scoped.domains;
         sites = scoped.sites;
         apps = scoped.apps;
         webInventoryOr = !!scoped.webInventoryOr;
-        skipAdUnitLike = !!scoped.skipAdUnitLike;
+        skipAdUnitLike = scoped.skipAdUnitLike !== false;
       }
       const compat = await fetchLeanDashboardBundleCompatible(svc, filters.startDate, filters.endDate, {
         domains,
@@ -2772,7 +2792,10 @@ async function handleDashboard(req, res) {
             domainName: compat.usedOpts?.adUnitNames ?? filters.domainName,
             domainId: compat.usedOpts?.apps ?? filters.domainId,
           };
-        const scopedRows = (isScopedChild && (bundle.source === 'rollup' || bundle.source === 'compat-union' || bundle.source === 'lean'))
+        // SQL already applied inventory filters — normalize only (do not re-filter).
+        // Re-filtering via catalog hosts often wiped domain labels / collapsed table rows.
+        const sqlApplied = new Set(['rollup', 'compat-union', 'lean', 'grain-app', 'grain-site', 'grain', 'site-merge']);
+        const scopedRows = sqlApplied.has(bundle.source)
           ? normalizeReportRows(bundle.rows || [])
           : prepareScopedReportRows(bundle.rows, rowFilters, req.user);
         logger.info(
@@ -3228,7 +3251,7 @@ async function handleDetailedReport(req, res) {
     let sites = toFilterArray(filters.site);
     let apps = toFilterArray(filters.domainId);
     let webInventoryOr = false;
-    let skipAdUnitLike = false;
+    let skipAdUnitLike = true;
     const isScopedChild = req.user?.role !== 'admin' && userHasAssignedInventory(req.user);
     if (isScopedChild) {
       const scoped = resolveScopedSqlInventoryOpts(req.user, filters);
@@ -3236,7 +3259,7 @@ async function handleDetailedReport(req, res) {
       sites = scoped.sites;
       apps = scoped.apps;
       webInventoryOr = !!scoped.webInventoryOr;
-      skipAdUnitLike = !!scoped.skipAdUnitLike;
+      skipAdUnitLike = scoped.skipAdUnitLike !== false;
     }
     const invOpts = {
       domains,
@@ -3271,7 +3294,10 @@ async function handleDetailedReport(req, res) {
             domainName: compat.usedOpts?.adUnitNames ?? filters.domainName,
             domainId: compat.usedOpts?.apps ?? filters.domainId,
           };
-        const scopedRows = prepareScopedReportRows(bundle.rows || [], rowFilters, req.user);
+        const sqlApplied = new Set(['rollup', 'compat-union', 'lean', 'grain-app', 'grain-site', 'grain', 'site-merge']);
+        const scopedRows = sqlApplied.has(bundle.source)
+          ? normalizeReportRows(bundle.rows || [])
+          : prepareScopedReportRows(bundle.rows || [], rowFilters, req.user);
         const revenue = Number(bundle.summary?.revenue) || 0;
         const body = applyVisibility({
           summary: {

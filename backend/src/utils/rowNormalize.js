@@ -63,7 +63,9 @@ function normalizeReportRow(row = {}) {
   if (!r.gamSite && (r.SITE_NAME || r.site_name)) {
     r.gamSite = r.SITE_NAME || r.site_name;
   }
-  if (!r.gamDomain && r.DOMAIN) r.gamDomain = r.DOMAIN;
+  if (!r.gamDomain && (r.DOMAIN || r.domainName || r.domain)) {
+    r.gamDomain = r.DOMAIN || r.domainName || r.domain;
+  }
 
   if (!r.revenue || r.revenue === 0) {
     r.revenue = pickRowRevenueDollars(r);
@@ -71,6 +73,8 @@ function normalizeReportRow(row = {}) {
       const raw = firstNumeric(r, REVENUE_KEYS.filter((k) => k !== 'revenue'));
       if (raw != null) r.revenue = toDollars(raw);
     }
+  } else if (r.revenueDollars) {
+    r.revenue = +Number(r.revenue).toFixed(2);
   } else {
     r.revenue = toDollars(r.revenue);
   }

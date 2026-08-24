@@ -31,11 +31,20 @@ const LEAN_SYNC_DIM_SLICES = [
       'AD_UNIT_NAME', 'SITE_NAME', 'MOBILE_APP_NAME',
     ],
   },
+  // GAM Site × Domain (Historical). No AD_UNIT — DOMAIN+AD_UNIT often COLUMNS_NOT_SUPPORTED.
+  {
+    key: 'inventory_site_domain',
+    dims: [
+      'DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME',
+      'SITE_NAME', 'DOMAIN',
+    ],
+  },
+  // Domain-only fallback when Site×Domain is rejected.
   {
     key: 'inventory_domain',
     dims: [
       'DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME',
-      'AD_UNIT_NAME', 'DOMAIN',
+      'DOMAIN',
     ],
   },
   {

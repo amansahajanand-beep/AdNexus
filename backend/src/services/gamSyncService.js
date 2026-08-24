@@ -9,20 +9,21 @@ const {
   LEAN_SYNC_DIM_SLICES,
   LEAN_SYNC_METRIC_ATTEMPTS,
 } = require('../utils/warehouseGrain');
-const { parseGamMetricValue, gamMoneyToDollars, pickRowRevenueDollars } = require('../utils/gamReportMetrics');
+const { parseGamMetricValue, gamMoneyToDollars, coerceWarehouseRevenue, pickRowRevenueDollars } = require('../utils/gamReportMetrics');
 
 /**
  * gamSyncService — fetches data from GAM and writes into PostgreSQL.
  * Called by BullMQ workers. Does NOT touch HTTP request/response.
  *
  * Tables:
- *   report_present / report_daily — unified grain (dashboard + Reporting SQL)
+ *   report_grain — typed unified grain (dashboard + Reporting SQL)
  *   report_adhoc — on-demand exotic Reporting queries (query cache)
  *   rollup_* — Dashboard KPI speed layer
+ *   report_archive_manifest — S3 cold storage index (365+ days)
  */
 const crypto  = require('crypto');
 const { query } = require('../db');
-const { requireClientId, tenantKey } = require('../utils/clientContext');
+const { requireClientId, tenantKey, getClientId } = require('../utils/clientContext');
 const {
   redisDel, redisDelByPattern, bumpCacheGeneration, TTL, redisGet, redisSet, MAX_REDIS_ARRAY_ITEMS,
 } = require('../redisClient');
@@ -42,6 +43,20 @@ const {
   isLikelyAppPackage,
 } = require('../utils/appIdentity');
 const logger  = require('../utils/logger');
+const {
+  upsertGrainRows,
+  rebuildRollupsFromGrain,
+  fetchGrainLegacyFromDB,
+  fetchGrainLeanRowsFromDB,
+  fetchGrainDomainTableRows,
+  rollupInvDomainExprSql,
+  grainHasRichDimsForDate,
+  listGrainDatesMissingRichDims,
+  deleteStaleGrain,
+  deleteThinGrainRows,
+  deleteGrainForDate,
+} = require('./reportGrainStore');
+const archiveService = require('./reportArchiveService');
 
 function cleanInv(v) {
   const s = String(v ?? '').trim();
@@ -212,77 +227,21 @@ function dedupeRowsByDimHash(rows = []) {
   return order.map((k) => byKey.get(k));
 }
 
-async function insertRowsInto(table, rows, syncType) {
-  if (table !== 'report_daily' && table !== 'report_present') {
-    throw new Error(`Unsupported report table: ${table}`);
-  }
+async function insertRowsInto(_table, rows, syncType) {
   if (!rows.length) return 0;
-
   const deduped = dedupeRowsByDimHash(rows);
   if (deduped.length < rows.length) {
-    logger.info(`[${syncType}] Deduped ${rows.length} → ${deduped.length} rows before upsert into ${table}`);
+    logger.info(`[${syncType}] Deduped ${rows.length} → ${deduped.length} rows before grain upsert`);
   }
-
-  const BATCH = Math.max(50, parseInt(process.env.PG_UPSERT_BATCH || '250', 10));
-  let upserted = 0;
-
-  for (let i = 0; i < deduped.length; i += BATCH) {
-    const chunk = deduped.slice(i, i + BATCH);
-    const values = [];
-    const params = [];
-    let p = 1;
-    for (const row of chunk) {
-      const inv = row.inv || inventoryFieldsFromDimensions(row.dimensions || {});
-      const hash = dimHash(row.dimensions || {});
-      values.push(
-        `($${p++}, $${p++}, $${p++}, $${p++}::jsonb, $${p++}::jsonb, $${p++}, NOW(), $${p++}, $${p++}, $${p++}, $${p++})`
-      );
-      params.push(
-        requireClientId(),
-        row.report_date,
-        hash,
-        JSON.stringify(row.dimensions || {}),
-        JSON.stringify(row.metrics || {}),
-        row.currency || 'USD',
-        inv.domainName || null,
-        inv.siteUrl || null,
-        inv.adUnit || null,
-        inv.appId || null,
-      );
-    }
-    try {
-      await query(
-        `INSERT INTO ${table}
-           (client_id, report_date, dim_hash, dimensions, metrics, currency, synced_at,
-            inv_domain, inv_site, inv_ad_unit, inv_app)
-         VALUES ${values.join(',\n')}
-         ON CONFLICT (client_id, report_date, dim_hash)
-         DO UPDATE SET
-           dimensions = EXCLUDED.dimensions,
-           metrics    = EXCLUDED.metrics,
-           currency   = EXCLUDED.currency,
-           synced_at  = EXCLUDED.synced_at,
-           inv_domain = EXCLUDED.inv_domain,
-           inv_site   = EXCLUDED.inv_site,
-           inv_ad_unit = EXCLUDED.inv_ad_unit,
-           inv_app    = EXCLUDED.inv_app`,
-        params
-      );
-      upserted += chunk.length;
-    } catch (e) {
-      logger.error(`[${syncType}] ❌ Batch upsert FAILED into ${table} (batch@${i}):`, e.message);
-      throw e;
-    }
-  }
-  return upserted;
+  return upsertGrainRows(deduped, syncType);
 }
 
 /**
  * Historical past data → report_daily (yesterday / 7d / 30d / backfill).
  */
 async function upsertRows(rows, syncType) {
-  const upserted = await insertRowsInto('report_daily', rows, syncType);
-  logger.info(`[${syncType}] Upserted ${upserted} rows into report_daily`);
+  const upserted = await insertRowsInto('report_grain', rows, syncType);
+  logger.info(`[${syncType}] Upserted ${upserted} rows into report_grain`);
   return upserted;
 }
 
@@ -297,10 +256,9 @@ async function replaceHistoricalRows(rows, syncType = 'sync-day') {
   )];
   if (!rows?.length) {
     if (dates.length) {
-      await query(
-        `DELETE FROM report_daily WHERE client_id = $2::uuid AND report_date = ANY($1::date[])`,
-        [dates, requireClientId()]
-      );
+      for (const d of dates) {
+        await deleteGrainForDate(d);
+      }
       try {
         await query(
           `DELETE FROM rollup_kpi_daily WHERE client_id = $2::uuid AND report_date = ANY($1::date[])`,
@@ -316,30 +274,16 @@ async function replaceHistoricalRows(rows, syncType = 'sync-day') {
   }
 
   const syncStartedAt = new Date();
-  // Write new/updated rich rows first (no empty-window for dashboard readers).
   const upserted = await upsertRows(rows, syncType);
 
   if (dates.length) {
     try {
-      // Drop stale grains from older dimension sets (prevents 2× totals on re-sync).
-      await query(
-        `DELETE FROM report_daily
-         WHERE client_id = $2::uuid
-           AND report_date = ANY($1::date[])
-           AND synced_at < $3`,
-        [dates, requireClientId(), syncStartedAt]
-      );
+      await deleteStaleGrain(dates, syncStartedAt);
     } catch (e) {
-      logger.warn(`[${syncType}] stale historical cleanup skipped:`, e.message);
+      logger.warn(`[${syncType}] stale grain cleanup skipped:`, e.message);
     }
     try {
-      await query(
-        `DELETE FROM report_daily
-         WHERE client_id = $2::uuid
-           AND report_date = ANY($1::date[])
-           AND NOT ${RICH_DIM_SQL}`,
-        [dates, requireClientId()]
-      );
+      await deleteThinGrainRows(dates);
     } catch (e) {
       logger.warn(`[${syncType}] thin-row cleanup skipped:`, e.message);
     }
@@ -358,21 +302,11 @@ async function replaceHistoricalRows(rows, syncType = 'sync-day') {
  * (that forced dashboard onto live GAM ~70s).
  */
 async function replacePresentRows(rows, syncType = 'sync-today') {
-  // Never leave yesterday in present — dashboard Today only reads this table.
-  try {
-    await migrateStalePresentToDaily(syncType);
-  } catch (e) {
-    logger.warn(`[${syncType}] stale present migrate skipped:`, e.message);
-  }
-
   const today = todayInTZ();
   const todayRows = (rows || []).filter((r) => toYmd(r.report_date) === today);
 
   if (!todayRows.length) {
-    await query(
-      'DELETE FROM report_present WHERE client_id = $2::uuid AND report_date = $1::date',
-      [today, requireClientId()]
-    );
+    await deleteGrainForDate(today);
     try {
       await query(
         `DELETE FROM rollup_kpi_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
@@ -383,21 +317,18 @@ async function replacePresentRows(rows, syncType = 'sync-today') {
         [today, requireClientId()]
       );
     } catch (_) { /* ignore */ }
-    logger.info(`[${syncType}] No today rows — cleared today's report_present`);
+    logger.info(`[${syncType}] No today rows — cleared today's report_grain`);
     return 0;
   }
 
   const syncStartedAt = new Date();
-  const upserted = await insertRowsInto('report_present', todayRows, syncType);
-  logger.info(`[${syncType}] Upserted ${upserted} rows into report_present (today=${today})`);
+  const upserted = await insertRowsInto('report_grain', todayRows, syncType);
+  logger.info(`[${syncType}] Upserted ${upserted} rows into report_grain (today=${today})`);
 
   try {
-    await query(
-      `DELETE FROM report_present WHERE client_id = $2::uuid AND synced_at < $1`,
-      [syncStartedAt, requireClientId()]
-    );
+    await deleteStaleGrain([today], syncStartedAt);
   } catch (e) {
-    logger.warn(`[${syncType}] stale present cleanup skipped:`, e.message);
+    logger.warn(`[${syncType}] stale grain cleanup skipped:`, e.message);
   }
 
   try {
@@ -422,64 +353,17 @@ function toYmd(value) {
 }
 
 /**
- * Copy leftover (non-today) rows from report_present → report_daily, then delete them.
- * This is the 24h handoff: yesterday's snapshot becomes history and Today stays empty
- * until the next sync-today fills it.
+ * Legacy no-op — report_grain holds today and history in one table.
  */
-async function migrateStalePresentToDaily(syncType = 'migrate-present') {
-  const today = todayInTZ();
-  const { rows } = await query(
-    `SELECT report_date, dimensions, metrics, currency
-     FROM report_present
-     WHERE report_date < $1::date`,
-    [today]
-  );
-  if (!rows.length) return 0;
-
-  const mapped = rows.map((row) => ({
-    report_date: toYmd(row.report_date),
-    dimensions: row.dimensions || {},
-    metrics: row.metrics || {},
-    currency: row.currency || 'USD',
-  })).filter((row) => row.report_date);
-
-  const upserted = await replaceHistoricalRows(mapped, `${syncType}-stale`);
-  await query(
-    `DELETE FROM report_present WHERE client_id = $2::uuid AND report_date < $1::date`,
-    [today, requireClientId()]
-  );
-  logger.info(
-    `[${syncType}] Migrated ${upserted} stale present row(s) → report_daily and deleted them (before ${today})`
-  );
-  return upserted;
+async function migrateStalePresentToDaily(_syncType = 'migrate-present') {
+  return 0;
 }
 
 /**
- * End-of-day: copy the current present snapshot into report_daily.
- * Keeps today's rows in report_present until the next calendar day, then
- * migrateStalePresentToDaily deletes them.
+ * Legacy no-op — promote/migrate retired with unified report_grain.
  */
-async function promotePresentToDaily(syncType = 'promote-present') {
-  const stale = await migrateStalePresentToDaily(syncType);
-  const { rows } = await query(
-    `SELECT report_date, dimensions, metrics, currency
-     FROM report_present`
-  );
-  if (!rows.length) {
-    logger.info(`[${syncType}] No present rows to promote into report_daily`);
-    return stale;
-  }
-
-  const mapped = rows.map((row) => ({
-    report_date: toYmd(row.report_date),
-    dimensions: row.dimensions || {},
-    metrics: row.metrics || {},
-    currency: row.currency || 'USD',
-  })).filter((row) => row.report_date);
-
-  const upserted = await replaceHistoricalRows(mapped, syncType);
-  logger.info(`[${syncType}] Promoted ${upserted} present rows into report_daily`);
-  return upserted + stale;
+async function promotePresentToDaily(_syncType = 'promote-present') {
+  return 0;
 }
 
 /**
@@ -511,37 +395,20 @@ async function persistSyncedRows(rows, syncType = 'sync') {
  *   past overlap  → report_daily
  */
 async function fetchFromDB(startDate, endDate) {
-  const today = todayInTZ();
-  const parts = [];
-  const params = [];
+  const { hotStart, hotEnd, coldStart, coldEnd } = archiveService.splitDateRange(startDate, endDate);
+  let rows = [];
 
-  if (rangeIncludesToday(startDate, endDate)) {
-    params.push(today);
-    parts.push(`
-      SELECT report_date, dimensions, metrics, currency, synced_at, 'present' AS source
-      FROM report_present
-      WHERE report_date = $${params.length}::date
-    `);
+  if (hotStart && hotEnd && hotStart <= hotEnd) {
+    rows = rows.concat(await fetchGrainLegacyFromDB(hotStart, hotEnd));
   }
 
-  const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
-  if (startDate <= pastEnd) {
-    params.push(startDate, pastEnd);
-    const i = params.length;
-    parts.push(`
-        SELECT report_date, dimensions, metrics, currency, synced_at, 'daily' AS source
-        FROM report_daily
-        WHERE report_date BETWEEN $${i - 1} AND $${i}
-    `);
+  if (coldStart && coldEnd && coldStart <= coldEnd && archiveService.isArchiveEnabled()) {
+    const clientId = requireClientId();
+    const archived = await archiveService.fetchArchivedGrain(clientId, coldStart, coldEnd);
+    rows = rows.concat(archived.map(archiveService.archivedGrainToLegacy));
   }
 
-  if (!parts.length) return [];
-
-  const { rows } = await query(
-    `${parts.join(' UNION ALL ')} ORDER BY report_date DESC`,
-    params
-  );
-  return rows;
+  return rows.sort((a, b) => String(b.report_date).localeCompare(String(a.report_date)));
 }
 
 function toDollarsLean(n) {
@@ -619,153 +486,635 @@ function rowsHaveLeanMetrics(rows = []) {
  *   adUnitNames → filters.domainName, apps → filters.domainId
  */
 async function fetchLeanRowsFromDB(startDate, endDate, opts = {}) {
-  const today = todayInTZ();
-  const { sanitizeInventoryFilters, MAX_INVENTORY_FILTER_VALUES } = require('../utils/inventoryFilters');
-  // Cap oversized "select all" lists before building SQL — LIKE ANY with thousands of
-  // patterns freezes Postgres and the API (looks like a hung / logged-out UI).
-  const safeOpts = sanitizeInventoryFilters({
-    domain: opts.domains,
-    site: opts.sites,
-    domainName: opts.adUnitNames,
-    domainId: opts.apps,
+  const { hotStart, hotEnd, coldStart, coldEnd } = archiveService.splitDateRange(startDate, endDate);
+  let rows = [];
+
+  if (hotStart && hotEnd && hotStart <= hotEnd) {
+    rows = rows.concat(await fetchGrainLeanRowsFromDB(hotStart, hotEnd, opts));
+  }
+
+  if (coldStart && coldEnd && coldStart <= coldEnd && archiveService.isArchiveEnabled()) {
+    const clientId = requireClientId();
+    const archived = await archiveService.fetchArchivedGrain(clientId, coldStart, coldEnd);
+    const legacy = archived.map((r) => {
+      const leg = archiveService.archivedGrainToLegacy(r);
+      return {
+        report_date: String(leg.report_date).slice(0, 10),
+        country: leg.dimensions.COUNTRY_NAME || '',
+        device: leg.dimensions.DEVICE_CATEGORY_NAME || '',
+        ad_unit: leg.dimensions.AD_UNIT_NAME || '',
+        domain_name: leg.dimensions.DOMAIN || leg.dimensions.domainName || '',
+        site_url: leg.dimensions.siteUrl || leg.dimensions.SITE_NAME || '',
+        app_id: leg.dimensions.MOBILE_APP_RESOLVED_ID || leg.dimensions.MOBILE_APP_NAME || '',
+        impression: Number(leg.metrics.TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS) || 0,
+        revenue_raw: Number(leg.metrics.revenue) || 0,
+        viewable_raw: Number(leg.metrics.TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE) || 0,
+        clicks: Number(leg.metrics.TOTAL_LINE_ITEM_LEVEL_CLICKS) || 0,
+        currency: leg.currency || 'USD',
+      };
+    });
+    rows = rows.concat(legacy);
+  }
+
+  return rows.map(mapLeanDbRow);
+}
+
+async function resolveGrainClientId() {
+  const id = getClientId();
+  if (id) return id;
+  const { rows } = await query(
+    `SELECT client_id FROM report_grain WHERE client_id IS NOT NULL LIMIT 1`
+  );
+  if (rows[0]?.client_id) return rows[0].client_id;
+  return requireClientId();
+}
+
+/**
+ * App ID filter must use app_id grain slice — channel KPI rollups have empty inv_app.
+ * Returns overview totals or null.
+ */
+async function fetchAppSliceOverviewFromGrain(startDate, endDate, opts = {}) {
+  const apps = (opts.apps || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  if (!apps.length) return null;
+  const clientId = await resolveGrainClientId();
+  const params = [clientId, startDate, endDate];
+  let appClause = sqlAppMatchClause(
+    params,
+    apps,
+    `LOWER(COALESCE(NULLIF(g.app_id, ''), g.app_name, ''))`,
+    `LOWER(COALESCE(da.name, ''))`
+  );
+  if (!appClause) return null;
+
+  const { rows } = await query(
+    `SELECT
+       COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+       COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+       COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
+       COUNT(*)::int AS row_count
+     ${require('./reportGrainStore').GRAIN_JOIN_SQL}
+     WHERE g.client_id = $1::uuid
+       AND g.report_date BETWEEN $2::date AND $3::date
+       AND g.slice_key = 'app_id'
+       ${appClause}`,
+    params
+  );
+  const t = rows[0] || {};
+  const impressions = Number(t.impressions) || 0;
+  const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+  const viewableWeight = Number(t.viewable_weight) || 0;
+  const rowCount = Number(t.row_count) || 0;
+  if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
+  return {
+    impressions: Math.round(impressions),
+    revenue,
+    viewability: impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0,
+    rowCount,
+    source: 'grain-app',
+  };
+}
+
+/**
+ * App ID table/trend bundle from app_id grain slice (GAM mobile-app report grain).
+ */
+async function fetchAppSliceDashboardBundle(startDate, endDate, opts = {}) {
+  const apps = (opts.apps || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  if (!apps.length) return null;
+  const clientId = await resolveGrainClientId();
+  const tableLimit = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 2500, 50), 5000);
+  const { GRAIN_JOIN_SQL } = require('./reportGrainStore');
+
+  const baseParams = [clientId, startDate, endDate];
+  const appClause = sqlAppMatchClause(
+    baseParams,
+    apps,
+    `LOWER(COALESCE(NULLIF(g.app_id, ''), g.app_name, ''))`,
+    `LOWER(COALESCE(da.name, ''))`
+  );
+  if (!appClause) return null;
+
+  const { rows: totalsRows } = await query(
+    `SELECT
+       COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+       COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+       COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
+       COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+       COUNT(*)::int AS row_count
+     ${GRAIN_JOIN_SQL}
+     WHERE g.client_id = $1::uuid
+       AND g.report_date BETWEEN $2::date AND $3::date
+       AND g.slice_key = 'app_id'
+       ${appClause}`,
+    baseParams
+  );
+  const t = totalsRows[0] || {};
+  const impressions = Number(t.impressions) || 0;
+  const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+  const viewableWeight = Number(t.viewable_weight) || 0;
+  const clicks = Number(t.clicks) || 0;
+  const grainCount = Number(t.row_count) || 0;
+  if (!grainCount || (impressions <= 0 && revenue <= 0)) return null;
+
+  const { rows: trendRaw } = await query(
+    `SELECT
+       to_char(g.report_date, 'YYYY-MM-DD') AS date,
+       COALESCE(SUM(g.revenue), 0)::float8 AS earning,
+       COALESCE(SUM(g.impressions), 0)::float8 AS impressions
+     ${GRAIN_JOIN_SQL}
+     WHERE g.client_id = $1::uuid
+       AND g.report_date BETWEEN $2::date AND $3::date
+       AND g.slice_key = 'app_id'
+       ${appClause}
+     GROUP BY g.report_date
+     ORDER BY g.report_date`,
+    baseParams
+  );
+  const trend = trendRaw.map((r) => {
+    const impressions = Math.round(Number(r.impressions) || 0);
+    return {
+      date: r.date,
+      earning: coerceWarehouseRevenue(r.earning, impressions),
+      impressions,
+    };
   });
-  const adUnitNames = (safeOpts.domainName || [])
-    .map((s) => String(s || '').trim().toLowerCase())
-    .filter(Boolean);
-  const adUnitPatterns = (opts.adUnitPatterns || [])
-    .map((s) => String(s || '').trim().toLowerCase())
-    .filter(Boolean)
-    .slice(0, MAX_INVENTORY_FILTER_VALUES);
-  const domains = (safeOpts.domain || [])
-    .map((s) => String(s || '').trim().toLowerCase())
-    .filter(Boolean);
-  const sites = (safeOpts.site || [])
-    .map((s) => String(s || '').trim().toLowerCase())
-    .filter(Boolean);
-  const apps = (safeOpts.domainId || [])
-    .map((s) => String(s || '').trim().toLowerCase())
-    .filter(Boolean);
-  const countryNames = (opts.countryNames || [])
-    .map((s) => String(s || '').trim().toLowerCase())
-    .filter(Boolean);
 
-  const adUnitExpr = `LOWER(COALESCE(NULLIF(inv_ad_unit,''), dimensions->>'AD_UNIT_NAME', dimensions->>'ad_unit_name', dimensions->>'site', ''))`;
-  const domainExpr = `LOWER(COALESCE(NULLIF(inv_domain,''), dimensions->>'domainName', dimensions->>'domain', dimensions->>'DOMAIN', ''))`;
-  const siteExpr = `LOWER(COALESCE(NULLIF(inv_site,''), dimensions->>'siteUrl', dimensions->>'gamSite', dimensions->>'siteName', dimensions->>'site_name', dimensions->>'URL_NAME', dimensions->>'SITE_NAME', ''))`;
-  const appExpr = `LOWER(COALESCE(NULLIF(inv_app,''), dimensions->>'appPackage', dimensions->>'appId', dimensions->>'MOBILE_APP_NAME', dimensions->>'mobile_app_name', dimensions->>'MOBILE_APP_RESOLVED_ID', ''))`;
+  const startMs = new Date(`${startDate}T12:00:00`).getTime();
+  const endMs = new Date(`${endDate}T12:00:00`).getTime();
+  const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+  const perDay = Math.max(15, Math.min(400, Math.ceil(tableLimit / dayCount)));
+  const tableParams = [...baseParams, perDay, tableLimit];
+  const { rows: tableRaw } = await query(
+    `WITH agg AS (
+       SELECT
+         g.report_date,
+         '' AS domain_name,
+         '' AS site_url,
+         '' AS ad_unit,
+         COALESCE(NULLIF(TRIM(g.app_id), ''), NULLIF(TRIM(g.app_name), ''), '') AS app_id,
+         COALESCE(SUM(g.impressions), 0)::float8 AS impression,
+         COALESCE(SUM(g.revenue), 0)::float8 AS revenue_raw,
+         CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+           THEN COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)
+                / COALESCE(SUM(g.impressions), 0)
+           ELSE 0
+         END AS viewable_raw,
+         COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+         COALESCE(MAX(g.currency), 'USD') AS currency
+       ${GRAIN_JOIN_SQL}
+       WHERE g.client_id = $1::uuid
+         AND g.report_date BETWEEN $2::date AND $3::date
+         AND g.slice_key = 'app_id'
+         ${appClause}
+       GROUP BY g.report_date, COALESCE(NULLIF(TRIM(g.app_id), ''), NULLIF(TRIM(g.app_name), ''), '')
+       HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+     ),
+     ranked AS (
+       SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY report_date
+           ORDER BY revenue_raw DESC, impression DESC
+         ) AS day_rank
+       FROM agg
+     )
+     SELECT
+       to_char(report_date, 'YYYY-MM-DD') AS report_date,
+       domain_name, site_url, ad_unit, app_id,
+       impression, revenue_raw, viewable_raw, clicks, currency
+     FROM ranked
+     WHERE day_rank <= $${tableParams.length - 1}
+     ORDER BY report_date DESC, revenue_raw DESC
+     LIMIT $${tableParams.length}`,
+    tableParams
+  );
+  const tableRows = (tableRaw || []).map(mapDomainTableRow);
 
-  const runBranch = async (table, from, to, excludeDates = null) => {
-    const params = [from, to];
-    let extra = '';
-    if (excludeDates && excludeDates.length) {
-      params.push(excludeDates);
-      extra += ` AND report_date <> ALL($${params.length}::date[])`;
-    }
+  const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+  return {
+    summary: {
+      totalEarning: +Number(revenue).toFixed(2),
+      totalEarningChange: 0,
+      selectRange: +Number(revenue).toFixed(2),
+      selectRangeChange: 0,
+      last7Days: +trend.slice(-7).reduce((a, x) => a + (x.earning || 0), 0).toFixed(2),
+      last7DaysChange: 0,
+      pageViews: Math.round(impressions),
+      pageViewsChange: 0,
+      impressions: Math.round(impressions),
+      impressionsChange: 0,
+      clicks: Math.round(clicks),
+      clicksChange: 0,
+      ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
+      revenue: +Number(revenue).toFixed(2),
+      revenueChange: 0,
+      ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
+      ecpmChange: 0,
+      viewability,
+      viewabilityChange: 0,
+      currency: opts.currency || 'USD',
+    },
+    trend,
+    charts: { revenue: [], device: [], country: [], performance: [] },
+    rows: tableRows,
+    pagination: {
+      totalRows: tableRows.length,
+      returnedRows: tableRows.length,
+      truncated: grainCount > tableRows.length,
+      allRows: false,
+      compact: true,
+    },
+    grainCount,
+    source: 'grain-app',
+  };
+}
 
-    if (adUnitNames.length) {
-      params.push(adUnitNames);
-      extra += ` AND ${adUnitExpr} = ANY($${params.length}::text[])`;
-    }
+/** GAM Site hosts: request (gameN/quizN) vs ad-slot (d1.domain). */
+function classifySiteHostSelection(selectedSites = []) {
+  const sites = (selectedSites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  if (!sites.length) return 'none';
+  if (sites.every((s) => /^d\d+\./i.test(s))) return 'slot';
+  if (sites.every((s) => !/^d\d+\./i.test(s))) return 'request';
+  return 'mixed';
+}
 
-    const webParts = [];
-    if (domains.length) {
-      params.push(domains);
-      const i = params.length;
-      webParts.push(opts.skipAdUnitLike
-        ? `(${domainExpr} = ANY($${i}::text[]))`
-        : `(
-        ${domainExpr} = ANY($${i}::text[])
-        OR ${adUnitExpr} LIKE ANY(ARRAY(SELECT '%' || d || '%' FROM unnest($${i}::text[]) AS d))
-      )`);
-    }
+/**
+ * Site filter must cover two host namespaces:
+ *   - inventory_core SITE_NAME (request hosts: gameN / quizN)
+ *   - rollup inv_site (ad-unit slot hosts: d1.domain)
+ * Request-only filters must use grain-site only — channel rollups inflate totals vs table rows.
+ */
+function mergeSiteFilterBundles(rollupBundle, coreBundle, selectedSites = []) {
+  const kind = classifySiteHostSelection(selectedSites);
+  if (kind === 'request') return coreBundle || null;
+  if (kind === 'slot') return rollupBundle || null;
+  if (!rollupBundle) return coreBundle || null;
+  if (!coreBundle) return rollupBundle || null;
 
-    if (sites.length) {
-      params.push(sites);
-      const i = params.length;
-      webParts.push(opts.skipAdUnitLike
-        ? `(${siteExpr} = ANY($${i}::text[]))`
-        : `(
-        ${siteExpr} = ANY($${i}::text[])
-        OR ${adUnitExpr} LIKE ANY(ARRAY(SELECT '%' || s || '%' FROM unnest($${i}::text[]) AS s))
-      )`);
-    }
-
-    if (webParts.length === 1) {
-      extra += ` AND ${webParts[0]}`;
-    } else if (webParts.length > 1) {
-      extra += opts.webInventoryOr
-        ? ` AND (${webParts.join(' OR ')})`
-        : ` AND ${webParts[0]} AND ${webParts[1]}`;
-    }
-
-    if (apps.length) {
-      extra += sqlAppMatchClause(params, apps, appExpr, adUnitExpr);
-    }
-
-    if (!domains.length && !sites.length && !adUnitNames.length && !apps.length && adUnitPatterns.length) {
-      params.push(adUnitPatterns);
-      extra += ` AND ${adUnitExpr} LIKE ANY($${params.length}::text[])`;
-    }
-
-    if (countryNames.length) {
-      params.push(countryNames);
-      extra += ` AND LOWER(COALESCE(
-        dimensions->>'COUNTRY_NAME',
-        dimensions->>'country_name',
-        dimensions->>'country',
-        ''
-      )) = ANY($${params.length}::text[])`;
-    }
-
-    const { revenueExpr, clickExpr } = leanMetricSql();
-    const maxRows = Math.max(
-      1000,
-      parseInt(process.env.MAX_LEAN_GRAIN_ROWS || '25000', 10) || 25000
-    );
-    const { rows } = await query(
-      `SELECT
-         to_char(report_date, 'YYYY-MM-DD') AS report_date,
-         COALESCE(dimensions->>'COUNTRY_NAME', dimensions->>'country_name', dimensions->>'country', '') AS country,
-         COALESCE(dimensions->>'DEVICE_CATEGORY_NAME', dimensions->>'device_category_name', dimensions->>'device', '') AS device,
-         COALESCE(NULLIF(inv_ad_unit,''), dimensions->>'AD_UNIT_NAME', dimensions->>'ad_unit_name', dimensions->>'site', '') AS ad_unit,
-         COALESCE(NULLIF(inv_domain,''), dimensions->>'domainName', dimensions->>'domain', dimensions->>'DOMAIN', '') AS domain_name,
-         COALESCE(NULLIF(inv_site,''), dimensions->>'siteUrl', dimensions->>'gamSite', dimensions->>'siteName', dimensions->>'URL_NAME', dimensions->>'SITE_NAME', '') AS site_url,
-         COALESCE(NULLIF(inv_app,''), dimensions->>'appPackage', dimensions->>'appId', dimensions->>'MOBILE_APP_NAME', dimensions->>'mobile_app_name', '') AS app_id,
-         COALESCE(
-           NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS','')::double precision,
-           NULLIF(metrics->>'impression','')::double precision,
-           0
-         ) AS impression,
-         ${revenueExpr} AS revenue_raw,
-         COALESCE(
-           NULLIF(metrics->>'TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE','')::double precision,
-           NULLIF(metrics->>'viewableRate','')::double precision,
-           NULLIF(metrics->>'total_active_view_viewable_impressions_rate','')::double precision,
-           0
-         ) AS viewable_raw,
-         COALESCE(${clickExpr}, 0)::float8 AS clicks,
-         currency
-       FROM ${table}
-       WHERE report_date BETWEEN $1 AND $2
-       ${extra}
-       ORDER BY report_date DESC
-       LIMIT ${maxRows}`,
-      params
-    );
-    return rows;
+  const selected = new Set(
+    (selectedSites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean)
+  );
+  const keyOf = (r) => String(r.siteUrl || r.gamSite || r.siteName || '').trim().toLowerCase();
+  const inSelected = (r) => {
+    if (!selected.size) return true;
+    const k = keyOf(r);
+    return k && selected.has(k);
   };
 
-  const parts = [];
-  if (rangeIncludesToday(startDate, endDate)) {
-    parts.push(await runBranch('report_present', today, today));
+  const rollupRows = (rollupBundle.rows || []).filter(inSelected);
+  const coreRows = (coreBundle.rows || []).filter(inSelected);
+  const rollupKeys = new Set(rollupRows.map(keyOf).filter(Boolean));
+  const coreKeys = new Set(coreRows.map(keyOf).filter(Boolean));
+
+  // Prefer inventory_core when the same host exists in both; keep rollup-only slot hosts.
+  const merged = [];
+  for (const r of coreRows) merged.push(r);
+  for (const r of rollupRows) {
+    const k = keyOf(r);
+    if (k && coreKeys.has(k)) continue;
+    merged.push(r);
   }
-  const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
-  if (startDate <= pastEnd) {
-    parts.push(await runBranch('report_daily', startDate, pastEnd));
+  if (!merged.length) {
+    if (kind === 'request') return coreBundle || null;
+    if (kind === 'slot') return rollupBundle || null;
+    return (Number(coreBundle.summary?.revenue) || 0) >= (Number(rollupBundle.summary?.revenue) || 0)
+      ? coreBundle
+      : rollupBundle;
   }
 
-  const merged = parts.length === 0 ? [] : parts.length === 1 ? parts[0] : parts.flat();
-  return merged.map(mapLeanDbRow);
+  let impressions = 0;
+  let revenue = 0;
+  let clicks = 0;
+  let viewableWeight = 0;
+  for (const r of merged) {
+    const imp = Number(r.impression) || 0;
+    const rev = Number(r.revenue) || 0;
+    impressions += imp;
+    revenue += rev;
+    clicks += Number(r.clicks) || 0;
+    viewableWeight += ((Number(r.viewableRate) || 0) / 100) * imp;
+  }
+  revenue = +revenue.toFixed(2);
+  const viewability = impressions > 0 ? +(viewableWeight / impressions * 100).toFixed(1) : 0;
+
+  const trendMap = new Map();
+  for (const t of [...(rollupBundle.trend || []), ...(coreBundle.trend || [])]) {
+    // Recompute trend from merged rows only (avoid double-count).
+  }
+  for (const r of merged) {
+    const date = r.date || r.report_date;
+    if (!date) continue;
+    const prev = trendMap.get(date) || { date, earning: 0, impressions: 0 };
+    prev.earning += Number(r.revenue) || 0;
+    prev.impressions += Number(r.impression) || 0;
+    trendMap.set(date, prev);
+  }
+  const trend = [...trendMap.values()]
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .map((t) => ({
+      date: t.date,
+      earning: +Number(t.earning).toFixed(2),
+      impressions: Math.round(t.impressions),
+    }));
+
+  return {
+    summary: {
+      totalEarning: revenue,
+      totalEarningChange: 0,
+      selectRange: revenue,
+      selectRangeChange: 0,
+      last7Days: +trend.slice(-7).reduce((a, x) => a + (x.earning || 0), 0).toFixed(2),
+      last7DaysChange: 0,
+      pageViews: Math.round(impressions),
+      pageViewsChange: 0,
+      impressions: Math.round(impressions),
+      impressionsChange: 0,
+      clicks: Math.round(clicks),
+      clicksChange: 0,
+      ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
+      revenue,
+      revenueChange: 0,
+      ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
+      ecpmChange: 0,
+      viewability,
+      viewabilityChange: 0,
+      currency: coreBundle.summary?.currency || rollupBundle.summary?.currency || 'USD',
+    },
+    trend,
+    charts: { revenue: [], device: [], country: [], performance: [] },
+    rows: merged,
+    pagination: {
+      totalRows: merged.length,
+      returnedRows: merged.length,
+      truncated: false,
+      allRows: false,
+      compact: true,
+    },
+    grainCount: (rollupBundle.grainCount || 0) + (coreBundle.grainCount || 0),
+    source: 'site-merge',
+    _debug: {
+      rollupHosts: rollupKeys.size,
+      coreHosts: coreKeys.size,
+      merged: merged.length,
+    },
+  };
+}
+
+async function fetchRollupSiteOverview(startDate, endDate, opts = {}) {
+  const sites = (opts.sites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  if (!sites.length) return null;
+  const filterParams = [startDate, endDate];
+  let filterExtra = ` AND report_date BETWEEN $1::date AND $2::date`;
+  filterExtra = appendRollupInventoryFilters(filterParams, filterExtra, {
+    ...opts,
+    sites,
+    apps: [],
+    skipAdUnitLike: true,
+  });
+  const { rows } = await query(
+    `SELECT
+       COALESCE(SUM(impressions), 0)::float8 AS impressions,
+       COALESCE(SUM(revenue), 0)::float8 AS revenue,
+       COALESCE(SUM(viewable_weight), 0)::float8 AS viewable_weight,
+       COALESCE(SUM(grain_count), 0)::int AS row_count
+     FROM rollup_kpi_daily
+     WHERE TRUE${filterExtra}`,
+    filterParams
+  );
+  const t = rows[0] || {};
+  const impressions = Number(t.impressions) || 0;
+  const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+  const viewableWeight = Number(t.viewable_weight) || 0;
+  const rowCount = Number(t.row_count) || 0;
+  if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
+  return {
+    impressions: Math.round(impressions),
+    revenue,
+    viewability: impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0,
+    rowCount,
+    source: 'rollup-site',
+  };
+}
+
+function mergeSiteOverviewTotals(rollupTotals, coreTotals, selectedSites = []) {
+  if (!rollupTotals) return coreTotals || null;
+  if (!coreTotals) return rollupTotals || null;
+  const sites = (selectedSites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const allSlot = sites.length > 0 && sites.every((s) => /^d\d+\./i.test(s));
+  const allRequest = sites.length > 0 && sites.every((s) => !/^d\d+\./i.test(s));
+  // Same traffic can be labeled as slot host (rollup) OR request SITE_NAME (core).
+  if (allSlot) return { ...rollupTotals, source: 'rollup-site' };
+  if (allRequest) return { ...coreTotals, source: 'grain-site' };
+  const impressions = (rollupTotals.impressions || 0) + (coreTotals.impressions || 0);
+  const revenue = +((rollupTotals.revenue || 0) + (coreTotals.revenue || 0)).toFixed(2);
+  const viewableWeight = ((rollupTotals.viewability || 0) / 100) * (rollupTotals.impressions || 0)
+    + ((coreTotals.viewability || 0) / 100) * (coreTotals.impressions || 0);
+  return {
+    impressions: Math.round(impressions),
+    revenue,
+    viewability: impressions > 0 ? +(viewableWeight / impressions * 100).toFixed(1) : 0,
+    rowCount: (rollupTotals.rowCount || 0) + (coreTotals.rowCount || 0),
+    source: 'site-merge',
+  };
+}
+
+/**
+ * Site filter must use inventory_core grain — channel/rollups store slot hosts (d1.domain)
+ * while GAM Site / catalog hosts are gameN.domain / quizN.domain in inventory_core.
+ */
+async function fetchInventorySiteOverviewFromGrain(startDate, endDate, opts = {}) {
+  const sites = (opts.sites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  if (!sites.length) return null;
+  const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const clientId = await resolveGrainClientId();
+  const { GRAIN_JOIN_SQL, grainDomainExprSql } = require('./reportGrainStore');
+  const params = [clientId, startDate, endDate];
+  params.push(sites);
+  let clause = ` AND LOWER(TRIM(COALESCE(ds.name, ''))) = ANY($${params.length}::text[])`;
+  if (domains.length) {
+    params.push(domains);
+    clause += ` AND ${grainDomainExprSql()} = ANY($${params.length}::text[])`;
+  }
+
+  const { rows } = await query(
+    `SELECT
+       COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+       COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+       COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
+       COUNT(*)::int AS row_count
+     ${GRAIN_JOIN_SQL}
+     WHERE g.client_id = $1::uuid
+       AND g.report_date BETWEEN $2::date AND $3::date
+       AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
+       ${clause}`,
+    params
+  );
+  const t = rows[0] || {};
+  const impressions = Number(t.impressions) || 0;
+  const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+  const viewableWeight = Number(t.viewable_weight) || 0;
+  const rowCount = Number(t.row_count) || 0;
+  if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
+  return {
+    impressions: Math.round(impressions),
+    revenue,
+    viewability: impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0,
+    rowCount,
+    source: 'grain-site',
+  };
+}
+
+/**
+ * Site (+ optional domain) table/trend bundle from inventory_core (GAM Site × Domain grain).
+ */
+async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) {
+  const sites = (opts.sites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  if (!sites.length) return null;
+  const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const clientId = await resolveGrainClientId();
+  const tableLimit = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 2500, 50), 5000);
+  const { GRAIN_JOIN_SQL, grainDomainExprSql } = require('./reportGrainStore');
+  const domainExpr = grainDomainExprSql();
+  const siteExpr = `NULLIF(LOWER(TRIM(COALESCE(ds.name, ''))), '')`;
+
+  const baseParams = [clientId, startDate, endDate];
+  baseParams.push(sites);
+  let clause = ` AND LOWER(TRIM(COALESCE(ds.name, ''))) = ANY($${baseParams.length}::text[])`;
+  if (domains.length) {
+    baseParams.push(domains);
+    clause += ` AND ${domainExpr} = ANY($${baseParams.length}::text[])`;
+  }
+
+  const { rows: totalsRows } = await query(
+    `SELECT
+       COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+       COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+       COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
+       COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+       COUNT(*)::int AS row_count
+     ${GRAIN_JOIN_SQL}
+     WHERE g.client_id = $1::uuid
+       AND g.report_date BETWEEN $2::date AND $3::date
+       AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
+       ${clause}`,
+    baseParams
+  );
+  const t = totalsRows[0] || {};
+  const impressions = Number(t.impressions) || 0;
+  const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+  const viewableWeight = Number(t.viewable_weight) || 0;
+  const clicks = Number(t.clicks) || 0;
+  const grainCount = Number(t.row_count) || 0;
+  if (!grainCount || (impressions <= 0 && revenue <= 0)) return null;
+
+  const { rows: trendRaw } = await query(
+    `SELECT
+       to_char(g.report_date, 'YYYY-MM-DD') AS date,
+       COALESCE(SUM(g.revenue), 0)::float8 AS earning,
+       COALESCE(SUM(g.impressions), 0)::float8 AS impressions
+     ${GRAIN_JOIN_SQL}
+     WHERE g.client_id = $1::uuid
+       AND g.report_date BETWEEN $2::date AND $3::date
+       AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
+       ${clause}
+     GROUP BY g.report_date
+     ORDER BY g.report_date`,
+    baseParams
+  );
+  const trend = trendRaw.map((r) => {
+    const impressions = Math.round(Number(r.impressions) || 0);
+    return {
+      date: r.date,
+      earning: coerceWarehouseRevenue(r.earning, impressions),
+      impressions,
+    };
+  });
+
+  const startMs = new Date(`${startDate}T12:00:00`).getTime();
+  const endMs = new Date(`${endDate}T12:00:00`).getTime();
+  const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+  const perDay = Math.max(15, Math.min(400, Math.ceil(tableLimit / dayCount)));
+  const tableParams = [...baseParams, perDay, tableLimit];
+  const { rows: tableRaw } = await query(
+    `WITH agg AS (
+       SELECT
+         g.report_date,
+         ${domainExpr} AS domain_name,
+         COALESCE(${siteExpr}, '') AS site_url,
+         '' AS ad_unit,
+         '' AS app_id,
+         COALESCE(SUM(g.impressions), 0)::float8 AS impression,
+         COALESCE(SUM(g.revenue), 0)::float8 AS revenue_raw,
+         CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+           THEN COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)
+                / COALESCE(SUM(g.impressions), 0)
+           ELSE 0
+         END AS viewable_raw,
+         COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+         COALESCE(MAX(g.currency), 'USD') AS currency
+       ${GRAIN_JOIN_SQL}
+       WHERE g.client_id = $1::uuid
+         AND g.report_date BETWEEN $2::date AND $3::date
+         AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
+         ${clause}
+       GROUP BY g.report_date, ${domainExpr}, ${siteExpr}
+       HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+     ),
+     ranked AS (
+       SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY report_date
+           ORDER BY revenue_raw DESC, impression DESC
+         ) AS day_rank
+       FROM agg
+     )
+     SELECT
+       to_char(report_date, 'YYYY-MM-DD') AS report_date,
+       domain_name, site_url, ad_unit, app_id,
+       impression, revenue_raw, viewable_raw, clicks, currency
+     FROM ranked
+     WHERE day_rank <= $${tableParams.length - 1}
+     ORDER BY report_date DESC, revenue_raw DESC
+     LIMIT $${tableParams.length}`,
+    tableParams
+  );
+  const tableRows = (tableRaw || []).map(mapDomainTableRow);
+
+  const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+  return {
+    summary: {
+      totalEarning: +Number(revenue).toFixed(2),
+      totalEarningChange: 0,
+      selectRange: +Number(revenue).toFixed(2),
+      selectRangeChange: 0,
+      last7Days: +trend.slice(-7).reduce((a, x) => a + (x.earning || 0), 0).toFixed(2),
+      last7DaysChange: 0,
+      pageViews: Math.round(impressions),
+      pageViewsChange: 0,
+      impressions: Math.round(impressions),
+      impressionsChange: 0,
+      clicks: Math.round(clicks),
+      clicksChange: 0,
+      ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
+      revenue: +Number(revenue).toFixed(2),
+      revenueChange: 0,
+      ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
+      ecpmChange: 0,
+      viewability,
+      viewabilityChange: 0,
+      currency: opts.currency || 'USD',
+    },
+    trend,
+    charts: { revenue: [], device: [], country: [], performance: [] },
+    rows: tableRows,
+    pagination: {
+      totalRows: tableRows.length,
+      returnedRows: tableRows.length,
+      truncated: grainCount > tableRows.length,
+      allRows: false,
+      compact: true,
+    },
+    grainCount,
+    source: 'grain-site',
+  };
 }
 
 /**
@@ -778,6 +1127,25 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
     || (opts.sites?.length || 0)
     || (opts.adUnitNames?.length || 0);
   const hasApp = (opts.apps?.length || 0) > 0;
+  const siteKind = classifySiteHostSelection(opts.sites);
+
+  // App-only: channel rollups have empty inv_app — read app_id grain slice.
+  if (hasApp && !hasWeb) {
+    const appTotals = await fetchAppSliceOverviewFromGrain(startDate, endDate, opts);
+    if (appTotals) return appTotals;
+  }
+
+  // Site filter: grain SITE_NAME for request hosts; rollups only for d1.* slot hosts.
+  if ((opts.sites || []).length) {
+    const siteTotals = await fetchInventorySiteOverviewFromGrain(startDate, endDate, opts);
+    if (siteKind === 'request') {
+      if (siteTotals) return siteTotals;
+    } else {
+      const rollupSiteTotals = await fetchRollupSiteOverview(startDate, endDate, opts);
+      const merged = mergeSiteOverviewTotals(rollupSiteTotals, siteTotals, opts.sites);
+      if (merged) return merged;
+    }
+  }
 
   // Web + app assignment: OR semantics — two fast SUMs in parallel (never AND).
   if (hasWeb && hasApp) {
@@ -807,108 +1175,58 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
   }
 
   // Prefer typed rollups (fast). Fall back to grain JSONB scan if rollups empty.
-  try {
-    const filterParams = [startDate, endDate];
-    let filterExtra = ` AND report_date BETWEEN $1::date AND $2::date`;
-    filterExtra = appendRollupInventoryFilters(filterParams, filterExtra, opts);
-    const { rows } = await query(
-      `SELECT
+  if (siteKind !== 'request') {
+    try {
+      const filterParams = [startDate, endDate];
+      let filterExtra = ` AND report_date BETWEEN $1::date AND $2::date`;
+      filterExtra = appendRollupInventoryFilters(filterParams, filterExtra, opts);
+      const { rows } = await query(
+        `SELECT
          COALESCE(SUM(impressions), 0)::float8 AS impressions,
          COALESCE(SUM(revenue), 0)::float8 AS revenue,
          COALESCE(SUM(viewable_weight), 0)::float8 AS viewable_weight,
          COALESCE(SUM(grain_count), 0)::int AS row_count
        FROM rollup_kpi_daily
        WHERE TRUE${filterExtra}`,
-      filterParams
-    );
-    const t = rows[0] || {};
-    const impressions = Number(t.impressions) || 0;
-    const revenue = Number(t.revenue) || 0;
-    const viewableWeight = Number(t.viewable_weight) || 0;
-    const rowCount = Number(t.row_count) || 0;
-    if (rowCount > 0 && (impressions > 0 || revenue > 0)) {
-      const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
-      return {
-        impressions: Math.round(impressions),
-        revenue: +Number(revenue).toFixed(2),
-        viewability,
-        rowCount,
-        source: 'rollup',
-      };
+        filterParams
+      );
+      const t = rows[0] || {};
+      const impressions = Number(t.impressions) || 0;
+      const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+      const viewableWeight = Number(t.viewable_weight) || 0;
+      const rowCount = Number(t.row_count) || 0;
+      if (rowCount > 0 && (impressions > 0 || revenue > 0)) {
+        const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+        return {
+          impressions: Math.round(impressions),
+          revenue,
+          viewability,
+          rowCount,
+          source: 'rollup',
+        };
+      }
+    } catch (e) {
+      logger.warn('Overview rollup read failed, falling back to grain:', e.message);
     }
-  } catch (e) {
-    logger.warn('Overview rollup read failed, falling back to grain:', e.message);
   }
 
-  const today = todayInTZ();
-  const impressionExpr = `COALESCE(
-    NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS','')::double precision,
-    NULLIF(metrics->>'impression','')::double precision,
-    0
-  )`;
-  const { revenueExpr } = leanRevenueSqlFragments();
-  const viewableRawExpr = `COALESCE(
-    NULLIF(metrics->>'TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE','')::double precision,
-    NULLIF(metrics->>'viewableRate','')::double precision,
-    NULLIF(metrics->>'total_active_view_viewable_impressions_rate','')::double precision,
-    0
-  )`;
-  const viewablePctExpr = `CASE
-    WHEN ${viewableRawExpr} > 0 AND ${viewableRawExpr} <= 1 THEN ${viewableRawExpr} * 100.0
-    ELSE ${viewableRawExpr}
-  END`;
-  const clickExpr = `COALESCE(
-    NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_CLICKS','')::double precision,
-    NULLIF(metrics->>'clicks','')::double precision,
-    NULLIF(metrics->>'total_line_item_level_clicks','')::double precision,
-    0
-  )`;
-
-  const run = async (table, from, to) => {
-    const params = [from, to];
-    let extra = ` AND report_date BETWEEN $1::date AND $2::date`;
-    extra = appendLeanInventoryFilters(params, extra, opts);
-    const { rows } = await query(
-      `SELECT
-         COALESCE(SUM(${impressionExpr}), 0)::float8 AS impressions,
-         COALESCE(SUM(${revenueExpr}), 0)::float8 AS revenue,
-         COALESCE(SUM((${impressionExpr}) * (${viewablePctExpr})), 0)::float8 AS viewable_weight,
-         COALESCE(SUM(${clickExpr}), 0)::float8 AS clicks,
-         COUNT(*)::int AS row_count
-       FROM ${table}
-       WHERE TRUE${extra}`,
-      params
-    );
-    return rows[0] || { impressions: 0, revenue: 0, viewable_weight: 0, row_count: 0 };
-  };
+  const leanRows = await fetchLeanRowsFromDB(startDate, endDate, { ...opts, kpiSliceOnly: true });
+  if (!leanRows.length) return null;
 
   let impressions = 0;
   let revenue = 0;
   let viewableWeight = 0;
   let clicks = 0;
-  let rowCount = 0;
-
-  if (rangeIncludesToday(startDate, endDate)) {
-    const t = await run('report_present', today, today);
-    impressions += Number(t.impressions) || 0;
-    revenue += Number(t.revenue) || 0;
-    viewableWeight += Number(t.viewable_weight) || 0;
-    clicks += Number(t.clicks) || 0;
-    rowCount += Number(t.row_count) || 0;
+  for (const r of leanRows) {
+    impressions += Number(r.impression) || 0;
+    revenue += Number(r.revenue) || 0;
+    clicks += Number(r.clicks) || 0;
+    viewableWeight += ((Number(r.viewableRate) || 0) / 100) * (Number(r.impression) || 0);
   }
-  const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
-  if (startDate <= pastEnd) {
-    const t = await run('report_daily', startDate, pastEnd);
-    impressions += Number(t.impressions) || 0;
-    revenue += Number(t.revenue) || 0;
-    viewableWeight += Number(t.viewable_weight) || 0;
-    clicks += Number(t.clicks) || 0;
-    rowCount += Number(t.row_count) || 0;
-  }
-
+  const rowCount = leanRows.length;
   if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
 
-  const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+  const viewability = impressions > 0 ? +(viewableWeight / impressions * 100).toFixed(1) : 0;
   return {
     impressions: Math.round(impressions),
     revenue: +Number(revenue).toFixed(2),
@@ -969,100 +1287,19 @@ function leanMetricSql() {
  * Collapses country×device so request-time scans stay small.
  */
 async function rebuildRollupsForDates(dates, syncType = 'rollup') {
-  const uniq = [...new Set((dates || []).map((d) => toYmd(d)).filter(Boolean))];
-  if (!uniq.length) return 0;
-
-  const m = leanMetricSql();
-  const today = todayInTZ();
-  let totalKpi = 0;
-
-  for (const day of uniq) {
-    const sourceTable = day === today ? 'report_present' : 'report_daily';
-    try {
-      await query(
-        `DELETE FROM rollup_kpi_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
-        [day, requireClientId()]
-      );
-      await query(
-        `DELETE FROM rollup_dim_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
-        [day, requireClientId()]
-      );
-
-      const kpiRes = await query(
-        `INSERT INTO rollup_kpi_daily (
-           client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
-           impressions, revenue, viewable_weight, clicks, grain_count, currency
-         )
-         SELECT
-           $2::uuid,
-           report_date,
-           COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.adUnitExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.appExpr}), ''), ''),
-           COALESCE(SUM(${m.impressionExpr}), 0),
-           COALESCE(SUM(${m.revenueExpr}), 0),
-           COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
-           COALESCE(SUM(${m.clickExpr}), 0),
-           COUNT(*)::int,
-           COALESCE(MAX(currency), 'USD')
-         FROM ${sourceTable}
-         WHERE client_id = $2::uuid AND report_date = $1::date
-         GROUP BY report_date,
-           COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.adUnitExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.appExpr}), ''), '')
-         HAVING COALESCE(SUM(${m.impressionExpr}), 0) > 0
-             OR COALESCE(SUM(${m.revenueExpr}), 0) > 0`,
-        [day, requireClientId()]
-      );
-      totalKpi += kpiRes.rowCount || 0;
-
-      // Domain / ad_unit / country / device chart dims
-      const dimInserts = [
-        ['domain', m.domainExpr],
-        ['ad_unit', m.adUnitExpr],
-        ['country', m.countryExpr],
-        ['device', m.deviceExpr],
-      ];
-      for (const [kind, expr] of dimInserts) {
-        await query(
-          `INSERT INTO rollup_dim_daily (client_id, report_date, dim_kind, dim_value, revenue, impressions)
-           SELECT
-             $3::uuid,
-             report_date,
-             $2::text,
-             NULLIF(TRIM(${expr}), ''),
-             COALESCE(SUM(${m.revenueExpr}), 0),
-             COALESCE(SUM(${m.impressionExpr}), 0)
-           FROM ${sourceTable}
-           WHERE client_id = $3::uuid AND report_date = $1::date
-           GROUP BY report_date, NULLIF(TRIM(${expr}), '')
-           HAVING NULLIF(TRIM(${expr}), '') IS NOT NULL
-              AND (COALESCE(SUM(${m.revenueExpr}), 0) > 0 OR COALESCE(SUM(${m.impressionExpr}), 0) > 0)`,
-          [day, kind, requireClientId()]
-        );
-      }
-    } catch (e) {
-      logger.warn(`[${syncType}] rollup rebuild failed for ${day}:`, e.message);
-    }
-  }
-
-  logger.info(`[${syncType}] Rebuilt rollups for ${uniq.length} day(s); kpi rows≈${totalKpi}`);
-  return totalKpi;
+  return rebuildRollupsFromGrain(dates, syncType);
 }
 
 /** One-shot: rebuild rollups for lean dates not yet covered (post-deploy warm). */
 async function backfillAllRollups(syncType = 'rollup-backfill') {
   try {
     const { rows } = await query(`
-      SELECT DISTINCT to_char(d, 'YYYY-MM-DD') AS d FROM (
-        SELECT report_date AS d FROM report_daily
-        UNION
-        SELECT report_date AS d FROM report_present
-      ) x
-      WHERE d NOT IN (SELECT report_date FROM rollup_kpi_daily)
+      SELECT DISTINCT to_char(g.report_date, 'YYYY-MM-DD') AS d
+      FROM report_grain g
+      WHERE NOT EXISTS (
+        SELECT 1 FROM rollup_kpi_daily r
+        WHERE r.client_id = g.client_id AND r.report_date = g.report_date
+      )
       ORDER BY 1
     `);
     const dates = rows.map((r) => r.d).filter(Boolean);
@@ -1103,6 +1340,11 @@ function appendRollupInventoryFilters(params, extra, opts = {}) {
     .map((s) => String(s || '').trim().toLowerCase())
     .filter(Boolean);
 
+  // GAM-style: Domain × Site is an intersection (AND). Loose LIKE is opt-in only.
+  const exact = opts.skipAdUnitLike !== false;
+  const domainExpr = rollupInvDomainExprSql();
+  const siteExpr = `LOWER(TRIM(COALESCE(inv_site, '')))`;
+
   let clause = extra || '';
   if (adUnitNames.length) {
     params.push(adUnitNames);
@@ -1112,27 +1354,28 @@ function appendRollupInventoryFilters(params, extra, opts = {}) {
   if (domains.length) {
     params.push(domains);
     const i = params.length;
-    webParts.push(opts.skipAdUnitLike
-      ? `(LOWER(inv_domain) = ANY($${i}::text[]))`
+    webParts.push(exact
+      ? `(${domainExpr} = ANY($${i}::text[]))`
       : `(
-      LOWER(inv_domain) = ANY($${i}::text[])
+      ${domainExpr} = ANY($${i}::text[])
       OR LOWER(inv_ad_unit) LIKE ANY(ARRAY(SELECT '%' || d || '%' FROM unnest($${i}::text[]) AS d))
     )`);
   }
   if (sites.length) {
     params.push(sites);
     const i = params.length;
-    webParts.push(opts.skipAdUnitLike
-      ? `(LOWER(inv_site) = ANY($${i}::text[]))`
+    // Exact site host match (GAM Site filter). Do NOT LIKE '%domain%' — that equals domain-wide.
+    webParts.push(exact
+      ? `(${siteExpr} = ANY($${i}::text[]))`
       : `(
-      LOWER(inv_site) = ANY($${i}::text[])
+      ${siteExpr} = ANY($${i}::text[])
       OR LOWER(inv_ad_unit) LIKE ANY(ARRAY(SELECT '%' || s || '%' FROM unnest($${i}::text[]) AS s))
     )`);
   }
   if (webParts.length === 1) {
     clause += ` AND ${webParts[0]}`;
   } else if (webParts.length > 1) {
-    // Scoped children: domain+site assignment must OR (AND wipes lean rows).
+    // Default AND = Domain ∩ Site (GAM). OR only when scoped assignment opts in.
     clause += opts.webInventoryOr
       ? ` AND (${webParts.join(' OR ')})`
       : ` AND ${webParts[0]} AND ${webParts[1]}`;
@@ -1190,6 +1433,7 @@ function appendLeanInventoryFilters(params, extra, opts = {}) {
   const domainExpr = `LOWER(COALESCE(NULLIF(inv_domain,''), dimensions->>'domainName', dimensions->>'domain', dimensions->>'DOMAIN', ''))`;
   const siteExpr = `LOWER(COALESCE(NULLIF(inv_site,''), dimensions->>'siteUrl', dimensions->>'gamSite', dimensions->>'siteName', dimensions->>'URL_NAME', dimensions->>'SITE_NAME', ''))`;
   const appExpr = `LOWER(COALESCE(NULLIF(inv_app,''), dimensions->>'appPackage', dimensions->>'appId', dimensions->>'MOBILE_APP_NAME', dimensions->>'mobile_app_name', dimensions->>'MOBILE_APP_RESOLVED_ID', ''))`;
+  const exact = opts.skipAdUnitLike !== false;
 
   let clause = extra || '';
   if (adUnitNames.length) {
@@ -1200,7 +1444,7 @@ function appendLeanInventoryFilters(params, extra, opts = {}) {
   if (domains.length) {
     params.push(domains);
     const i = params.length;
-    webParts.push(opts.skipAdUnitLike
+    webParts.push(exact
       ? `(${domainExpr} = ANY($${i}::text[]))`
       : `(
       ${domainExpr} = ANY($${i}::text[])
@@ -1210,7 +1454,7 @@ function appendLeanInventoryFilters(params, extra, opts = {}) {
   if (sites.length) {
     params.push(sites);
     const i = params.length;
-    webParts.push(opts.skipAdUnitLike
+    webParts.push(exact
       ? `(${siteExpr} = ANY($${i}::text[]))`
       : `(
       ${siteExpr} = ANY($${i}::text[])
@@ -1253,6 +1497,174 @@ function friendlyDeviceBucket(raw) {
   return String(raw).trim();
 }
 
+/** Dashboard table grain: domain rollup by default; finer when inventory filters are active. */
+function resolveTableRollupGroup(opts = {}) {
+  // Ad unit filter → finest grain (date × domain × site × ad unit).
+  if (opts.adUnitNames?.length) return 'ad_unit';
+  // App-only → app grain.
+  if (opts.apps?.length && !opts.domains?.length && !opts.sites?.length) return 'app';
+  // Site filter (with or without domain) → date × domain × site.
+  if (opts.sites?.length) return 'site';
+  // Domain name filter alone (or unfiltered) → date × domain (old dashboard / GAM domain report).
+  return 'domain';
+}
+
+/** Map rollup/grain aggregate row → dashboard table row shape (revenue already in dollars). */
+function mapDomainTableRow(r) {
+  const impression = Math.round(Number(r.impression) || 0);
+  const revenue = coerceWarehouseRevenue(r.revenue_raw, impression);
+  const clicks = Math.round(Number(r.clicks) || 0);
+  let viewableRate = Number(r.viewable_raw) || 0;
+  if (viewableRate > 0 && viewableRate <= 1) viewableRate = +(viewableRate * 100).toFixed(2);
+  else viewableRate = +Number(viewableRate || 0).toFixed(2);
+  const adUnit = r.ad_unit || '';
+  const domainName = r.domain_name || '';
+  const siteUrl = r.site_url || '';
+  const appId = r.app_id || '';
+  const ecpm = impression > 0 && revenue > 0 ? +((revenue / impression) * 1000).toFixed(2) : 0;
+  return {
+    date: r.report_date,
+    report_date: r.report_date,
+    country: '',
+    device: '',
+    site: adUnit || '',
+    AD_UNIT_NAME: adUnit,
+    ad_unit_name: adUnit,
+    domainName: domainName || '',
+    domain: domainName || '',
+    gamDomain: domainName || '',
+    siteUrl: siteUrl || '',
+    gamSite: siteUrl || '',
+    siteName: siteUrl || '',
+    appId: appId || '',
+    appPackage: appId || '',
+    impression,
+    revenue,
+    revenueDollars: true,
+    clicks,
+    ctr: impression > 0 && clicks > 0 ? +((clicks / impression) * 100).toFixed(4) : 0,
+    viewableRate,
+    ecpm,
+    currency: r.currency || 'USD',
+  };
+}
+
+async function fetchBundleDomainTableFromRollup(startDate, endDate, opts, limit) {
+  const domainExpr = rollupInvDomainExprSql();
+  const filterParams = [startDate, endDate];
+  let filterExtra = ` AND report_date BETWEEN $1::date AND $2::date`;
+  filterExtra = appendRollupInventoryFilters(filterParams, filterExtra, opts);
+
+  const grain = resolveTableRollupGroup(opts);
+  let groupBy;
+  let selectCols;
+  let domainHaving = ` AND ${domainExpr} IS NOT NULL AND ${domainExpr} <> ''`;
+
+  if (grain === 'ad_unit') {
+    groupBy = `report_date, ${domainExpr}, NULLIF(LOWER(TRIM(inv_site)), ''), NULLIF(TRIM(inv_ad_unit), '')`;
+    selectCols = `
+       ${domainExpr} AS domain_name,
+       COALESCE(NULLIF(LOWER(TRIM(inv_site)), ''), '') AS site_url,
+       COALESCE(NULLIF(TRIM(inv_ad_unit), ''), '') AS ad_unit,
+       '' AS app_id`;
+  } else if (grain === 'app') {
+    groupBy = `report_date, NULLIF(TRIM(inv_app), '')`;
+    selectCols = `
+       '' AS domain_name,
+       '' AS site_url,
+       '' AS ad_unit,
+       COALESCE(NULLIF(TRIM(inv_app), ''), '') AS app_id`;
+    domainHaving = ` AND NULLIF(TRIM(inv_app), '') IS NOT NULL`;
+  } else if (grain === 'site') {
+    groupBy = `report_date, ${domainExpr}, NULLIF(LOWER(TRIM(inv_site)), '')`;
+    selectCols = `
+       ${domainExpr} AS domain_name,
+       COALESCE(NULLIF(LOWER(TRIM(inv_site)), ''), '') AS site_url,
+       '' AS ad_unit,
+       '' AS app_id`;
+  } else {
+    groupBy = `report_date, ${domainExpr}`;
+    selectCols = `
+       ${domainExpr} AS domain_name,
+       '' AS site_url,
+       '' AS ad_unit,
+       '' AS app_id`;
+  }
+
+  // Fair per-day sample — plain ORDER BY date DESC LIMIT drops early month days.
+  const startMs = new Date(`${startDate}T12:00:00`).getTime();
+  const endMs = new Date(`${endDate}T12:00:00`).getTime();
+  const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+  const perDay = Math.max(15, Math.min(400, Math.ceil(limit / dayCount)));
+  filterParams.push(perDay);
+  const perDayIdx = filterParams.length;
+  filterParams.push(limit);
+  const limitIdx = filterParams.length;
+
+  const { rows } = await query(
+    `WITH agg AS (
+       SELECT
+         report_date,
+         ${selectCols},
+         COALESCE(SUM(impressions), 0)::float8 AS impression,
+         COALESCE(SUM(revenue), 0)::float8 AS revenue_raw,
+         CASE WHEN COALESCE(SUM(impressions), 0) > 0
+           THEN COALESCE(SUM(viewable_weight), 0) / COALESCE(SUM(impressions), 0)
+           ELSE 0
+         END AS viewable_raw,
+         COALESCE(SUM(clicks), 0)::float8 AS clicks,
+         COALESCE(MAX(currency), 'USD') AS currency
+       FROM rollup_kpi_daily
+       WHERE TRUE${filterExtra}${domainHaving}
+       GROUP BY ${groupBy}
+       HAVING COALESCE(SUM(impressions), 0) > 0 OR COALESCE(SUM(revenue), 0) > 0
+     ),
+     ranked AS (
+       SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY report_date
+           ORDER BY revenue_raw DESC, impression DESC
+         ) AS day_rank
+       FROM agg
+     )
+     SELECT
+       to_char(report_date, 'YYYY-MM-DD') AS report_date,
+       domain_name, site_url, ad_unit, app_id,
+       impression, revenue_raw, viewable_raw, clicks, currency
+     FROM ranked
+     WHERE day_rank <= $${perDayIdx}
+     ORDER BY report_date DESC, revenue_raw DESC
+     LIMIT $${limitIdx}`,
+    filterParams
+  );
+  return (rows || []).map(mapDomainTableRow);
+}
+
+/** Full domain-level table rows (SQL aggregates — no raw-row sampling). */
+async function fetchBundleTableRows(startDate, endDate, opts, tableLimit) {
+  const limit = Math.min(Math.max(parseInt(tableLimit, 10) || 2500, 50), 5000);
+  const tableOpts = {
+    countryNames: opts.countryNames,
+    adUnitNames: opts.adUnitNames,
+    domains: opts.domains,
+    sites: opts.sites,
+    apps: opts.apps,
+    tableLimit: limit,
+  };
+
+  // Country filter: rollups lack per-country dims — aggregate from grain.
+  if (opts.countryNames?.length) {
+    const rows = await fetchGrainDomainTableRows(startDate, endDate, tableOpts);
+    return rows.map(mapDomainTableRow);
+  }
+
+  const rollupRows = await fetchBundleDomainTableFromRollup(startDate, endDate, opts, limit);
+  if (rollupRows.length) return rollupRows;
+
+  const grainRows = await fetchGrainDomainTableRows(startDate, endDate, tableOpts);
+  return grainRows.map(mapDomainTableRow);
+}
+
 /**
  * Fast dashboard bundle from precomputed rollups (same numbers as lean grain aggregates).
  * Country filter forces grain fallback (dim rollups are network-wide).
@@ -1278,7 +1690,7 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
   );
   const t = totalsRows[0] || {};
   let impressions = Number(t.impressions) || 0;
-  let revenue = Number(t.revenue) || 0;
+  let revenue = coerceWarehouseRevenue(t.revenue, impressions);
   let viewableWeight = Number(t.viewable_weight) || 0;
   let clicks = Number(t.clicks) || 0;
   let grainCount = Number(t.row_count) || 0;
@@ -1294,25 +1706,32 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
      ORDER BY report_date`,
     filterParams
   );
-  const trend = trendRaw.map((r) => ({
-    date: r.date,
-    earning: +Number(r.earning).toFixed(2),
-    impressions: Math.round(Number(r.impressions) || 0),
-  }));
+  const trend = trendRaw.map((r) => {
+    const impressions = Math.round(Number(r.impressions) || 0);
+    return {
+      date: r.date,
+      earning: coerceWarehouseRevenue(r.earning, impressions),
+      impressions,
+    };
+  });
 
   const { rows: domainRaw } = await query(
     `SELECT
-       NULLIF(TRIM(inv_domain), '') AS name,
+       ${rollupInvDomainExprSql()} AS name,
        COALESCE(SUM(revenue), 0)::float8 AS value
      ${kpiFrom}
      GROUP BY 1
-     HAVING NULLIF(TRIM(inv_domain), '') IS NOT NULL
+     HAVING ${rollupInvDomainExprSql()} IS NOT NULL
+       AND ${rollupInvDomainExprSql()} <> ''
      ORDER BY value DESC
      LIMIT 10`,
     filterParams
   );
   let revenueShare = domainRaw
-    .map((r) => ({ name: String(r.name || '').trim(), value: +Number(r.value || 0).toFixed(2) }))
+    .map((r) => ({
+      name: String(r.name || '').trim(),
+      value: coerceWarehouseRevenue(r.value, impressions),
+    }))
     .filter((r) => r.name && r.value > 0);
 
   const { rows: perfRaw } = await query(
@@ -1328,11 +1747,11 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
     filterParams
   );
   const performance = perfRaw.map((e) => {
-    const rev = Number(e.revenue) || 0;
     const imp = Number(e.impressions) || 0;
+    const rev = coerceWarehouseRevenue(e.revenue, imp);
     return {
       name: String(e.name || '').trim(),
-      revenue: +rev.toFixed(2),
+      revenue: rev,
       impressions: Math.round(imp),
       ecpm: imp > 0 ? +((rev / imp) * 1000).toFixed(2) : 0,
       ctr: 0,
@@ -1380,64 +1799,7 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
       .filter((r) => r.name && r.value > 0);
   }
 
-  const { rows: tableRaw } = await query(
-    `SELECT
-       to_char(report_date, 'YYYY-MM-DD') AS report_date,
-       inv_domain AS domain_name,
-       inv_site AS site_url,
-       inv_ad_unit AS ad_unit,
-       inv_app AS app_id,
-       COALESCE(SUM(impressions), 0)::float8 AS impression,
-       COALESCE(SUM(revenue), 0)::float8 AS revenue_raw,
-       COALESCE(SUM(clicks), 0)::float8 AS clicks,
-       CASE
-         WHEN SUM(impressions) > 0 THEN SUM(viewable_weight) / SUM(impressions)
-         ELSE 0
-       END AS viewable_raw,
-       MAX(currency) AS currency
-     ${kpiFrom}
-     GROUP BY report_date, inv_domain, inv_site, inv_ad_unit, inv_app
-     ORDER BY SUM(revenue) DESC
-     LIMIT ${tableLimit}`,
-    filterParams
-  );
-
-  const tableRows = tableRaw.map((r) => {
-    const impression = Math.round(Number(r.impression) || 0);
-    const rev = +Number(r.revenue_raw || 0).toFixed(2);
-    let viewableRate = Number(r.viewable_raw) || 0;
-    if (viewableRate > 0 && viewableRate <= 1) viewableRate = +(viewableRate * 100).toFixed(2);
-    else viewableRate = +Number(viewableRate || 0).toFixed(2);
-    const adUnit = r.ad_unit || '';
-    const domainName = r.domain_name || '';
-    const siteUrl = r.site_url || '';
-    const appId = r.app_id || '';
-    const clicks = Math.round(Number(r.clicks) || 0);
-    const ctr = impression > 0 && clicks > 0 ? +((clicks / impression) * 100).toFixed(4) : 0;
-    return {
-      date: r.report_date,
-      report_date: r.report_date,
-      country: '',
-      device: '',
-      site: adUnit || '—',
-      AD_UNIT_NAME: adUnit,
-      ad_unit_name: adUnit,
-      domainName,
-      domain: domainName,
-      siteUrl,
-      gamSite: siteUrl,
-      siteName: siteUrl,
-      appId,
-      appPackage: appId,
-      impression,
-      revenue: rev,
-      clicks,
-      ctr,
-      viewableRate,
-      ecpm: impression > 0 && rev > 0 ? +((rev / impression) * 1000).toFixed(2) : 0,
-      currency: r.currency || 'USD',
-    };
-  });
+  const tableRows = await fetchBundleTableRows(startDate, endDate, opts, tableLimit);
 
   const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
   const summary = {
@@ -1503,36 +1865,52 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
  * Returns null when lean tables have no metric rows for the range.
  */
 async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
-  try {
-    const rolled = await fetchDashboardBundleFromRollups(startDate, endDate, opts);
-    if (rolled) return rolled;
-  } catch (e) {
-    logger.warn('Dashboard rollup bundle failed, falling back to grain:', e.message);
+  const hasWeb = (opts.domains?.length || 0)
+    || (opts.sites?.length || 0)
+    || (opts.adUnitNames?.length || 0);
+  const hasApp = (opts.apps?.length || 0) > 0;
+
+  // App-only filter: channel rollups have no inv_app — use app_id grain slice.
+  if (hasApp && !hasWeb) {
+    const appBundle = await fetchAppSliceDashboardBundle(startDate, endDate, opts);
+    if (appBundle) return appBundle;
   }
 
-  const today = todayInTZ();
+  // Site filter: grain SITE_NAME for request hosts; rollups only for d1.* slot hosts.
+  const siteKind = classifySiteHostSelection(opts.sites);
+  if ((opts.sites || []).length) {
+    const siteBundle = await fetchInventorySiteDashboardBundle(startDate, endDate, opts);
+    if (siteKind === 'request') {
+      if (siteBundle) return siteBundle;
+    } else {
+      const rolled = await fetchDashboardBundleFromRollups(startDate, endDate, opts).catch((e) => {
+        logger.warn('Dashboard rollup (site filter) failed:', e.message);
+        return null;
+      });
+      const merged = mergeSiteFilterBundles(rolled, siteBundle, opts.sites);
+      if (merged) return merged;
+      if (siteBundle) return siteBundle;
+    }
+  }
+
+  // Request-style site filters must not fall back to channel rollups (totals ≠ grain-site table).
+  if (siteKind !== 'request') {
+    try {
+      const rolled = await fetchDashboardBundleFromRollups(startDate, endDate, opts);
+      if (rolled) return rolled;
+    } catch (e) {
+      logger.warn('Dashboard rollup bundle failed, falling back to grain:', e.message);
+    }
+  }
+
+  const { typedGrainMetricSql, GRAIN_JOIN_SQL, kpiSliceFilterSql } = require('./reportGrainStore');
   const tableLimit = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 2500, 50), 5000);
-  const m = leanMetricSql();
+  const m = typedGrainMetricSql('g');
 
-  const buildFromClause = (table, from, to, baseParams) => {
-    const params = [...baseParams, from, to];
-    const dateIdx = params.length;
-    let extra = ` AND report_date BETWEEN $${dateIdx - 1}::date AND $${dateIdx}::date`;
-    extra = appendLeanInventoryFilters(params, extra, opts);
-    return {
-      sql: `FROM ${table} WHERE TRUE${extra}`,
-      params,
-    };
-  };
-
-  const branches = [];
-  if (rangeIncludesToday(startDate, endDate)) {
-    branches.push(buildFromClause('report_present', today, today, []));
-  }
-  const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
-  if (startDate <= pastEnd) {
-    branches.push(buildFromClause('report_daily', startDate, pastEnd, []));
-  }
+  const params = [startDate, endDate, requireClientId()];
+  let extra = ` AND g.report_date BETWEEN $1::date AND $2::date AND g.client_id = $3::uuid AND ${kpiSliceFilterSql('g')}`;
+  extra = appendLeanInventoryFilters(params, extra, opts);
+  const branches = [{ sql: `${GRAIN_JOIN_SQL} WHERE TRUE${extra}`, params }];
   if (!branches.length) return null;
 
   // Prefer one query per table then merge — avoids fragile param remapping.
@@ -1572,10 +1950,10 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
 
   const trendRaw = await runAgg(`
     SELECT
-      to_char(report_date, 'YYYY-MM-DD') AS date,
+      to_char(g.report_date, 'YYYY-MM-DD') AS date,
       COALESCE(SUM(${m.revenueExpr}), 0)::float8 AS earning,
       COALESCE(SUM(${m.impressionExpr}), 0)::float8 AS impressions
-    `, 'GROUP BY report_date');
+    `, 'GROUP BY g.report_date');
   const trendMap = new Map();
   for (const r of trendRaw) {
     const date = r.date;
@@ -1666,64 +2044,7 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
     .sort((a, b) => b.revenue - a.revenue)
     .slice(0, 6);
 
-  // Collapse country×device grain for the table — hard-cap in SQL so Node never holds 100k+ groups.
-  const tableRaw = await runAgg(`
-    SELECT
-      to_char(report_date, 'YYYY-MM-DD') AS report_date,
-      ${m.domainExpr} AS domain_name,
-      ${m.siteExpr} AS site_url,
-      ${m.adUnitExpr} AS ad_unit,
-      ${m.appExpr} AS app_id,
-      COALESCE(SUM(${m.impressionExpr}), 0)::float8 AS impression,
-      COALESCE(SUM(${m.revenueExpr}), 0)::float8 AS revenue_raw,
-      COALESCE(SUM(${m.clickExpr}), 0)::float8 AS clicks,
-      CASE
-        WHEN SUM(${m.impressionExpr}) > 0
-          THEN SUM((${m.impressionExpr}) * (${m.viewablePctExpr})) / SUM(${m.impressionExpr})
-        ELSE 0
-      END AS viewable_raw,
-      MAX(currency) AS currency
-    `, `GROUP BY report_date, ${m.domainExpr}, ${m.siteExpr}, ${m.adUnitExpr}, ${m.appExpr}
-       ORDER BY SUM(${m.revenueExpr}) DESC
-       LIMIT ${tableLimit}`);
-
-  tableRaw.sort((a, b) => (Number(b.revenue_raw) || 0) - (Number(a.revenue_raw) || 0));
-  const tableRows = tableRaw.slice(0, tableLimit).map((r) => {
-    const impression = Math.round(Number(r.impression) || 0);
-    const revenueRow = +Number(r.revenue_raw || 0).toFixed(2);
-    let viewableRate = Number(r.viewable_raw) || 0;
-    if (viewableRate > 0 && viewableRate <= 1) viewableRate = +(viewableRate * 100).toFixed(2);
-    else viewableRate = +Number(viewableRate || 0).toFixed(2);
-    const adUnit = r.ad_unit || '';
-    const domainName = r.domain_name || '';
-    const siteUrl = r.site_url || '';
-    const appId = r.app_id || '';
-    const rowClicks = Math.round(Number(r.clicks) || 0);
-    const ctr = impression > 0 && rowClicks > 0 ? +((rowClicks / impression) * 100).toFixed(4) : 0;
-    return {
-      date: r.report_date,
-      report_date: r.report_date,
-      country: '',
-      device: '',
-      site: adUnit || '—',
-      AD_UNIT_NAME: adUnit,
-      ad_unit_name: adUnit,
-      domainName,
-      domain: domainName,
-      siteUrl,
-      gamSite: siteUrl,
-      siteName: siteUrl,
-      appId,
-      appPackage: appId,
-      impression,
-      revenue: revenueRow,
-      clicks: rowClicks,
-      ctr,
-      viewableRate,
-      ecpm: impression > 0 && revenueRow > 0 ? +((revenueRow / impression) * 1000).toFixed(2) : 0,
-      currency: r.currency || 'USD',
-    };
-  });
+  const tableRows = await fetchBundleTableRows(startDate, endDate, opts, tableLimit);
 
   const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
   const summary = {
@@ -1789,11 +2110,12 @@ function shiftDate(ymd, days) {
   return d.toISOString().slice(0, 10);
 }
 
-function normalizeGAMRows(rawRows, currency = 'USD') {
+function normalizeGAMRows(rawRows, currency = 'USD', sliceKey = '') {
   return rawRows.map((row) => {
     const dimensions = {};
     const metrics = {};
     for (const [k, v] of Object.entries(row)) {
+      if (k === '__slice_key') continue;
       if (k.startsWith('Dimension.')) {
         dimensions[k.replace('Dimension.', '')] = v;
       } else if (k.startsWith('Column.')) {
@@ -1820,7 +2142,8 @@ function normalizeGAMRows(rawRows, currency = 'USD') {
     }
     // Always attach inventory filter fields (domain / site URL / ad unit / app).
     const { dimensions: enriched } = attachInventoryDimensions(dimensions);
-    return { report_date, dimensions: enriched, metrics, currency };
+    const sk = sliceKey || row.__slice_key || '';
+    return { report_date, dimensions: enriched, metrics, currency, slice_key: sk };
   });
 }
 
@@ -1909,6 +2232,9 @@ async function fetchFromGAM(startDate, endDate, onBatch) {
 
   for (const slice of LEAN_SYNC_DIM_SLICES) {
     try {
+      const sliceOnBatch = stream && onBatch
+        ? async (rawChunk) => onBatch(rawChunk, slice.key)
+        : onBatch;
       const got = await pullLeanSlice(
         slice.dims,
         slice.key,
@@ -1916,14 +2242,16 @@ async function fetchFromGAM(startDate, endDate, onBatch) {
         buildDateXML,
         startDate,
         endDate,
-        onBatch
+        sliceOnBatch
       );
       if (!got) continue;
       okSlices += 1;
       if (stream) {
         totalRows += Number(got.count) || 0;
       } else if (Array.isArray(got)) {
-        for (let i = 0; i < got.length; i++) collected.push(got[i]);
+        for (let i = 0; i < got.length; i++) {
+          collected.push({ __slice_key: slice.key, ...got[i] });
+        }
         totalRows += got.length;
       }
     } catch (err) {
@@ -1957,84 +2285,47 @@ function listSyncWindows(startDate, endDate) {
  */
 async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill') {
   const currency = process.env.GAM_CURRENCY || 'USD';
-  const today = todayInTZ();
   const syncStartedAt = new Date();
   let total = 0;
-  let presentCount = 0;
-  let dailyCount = 0;
-  const touchedPresent = new Set();
-  const touchedDaily = new Set();
+  let grainCount = 0;
+  const touchedDates = new Set();
 
-  const result = await fetchFromGAM(startDate, endDate, async (rawChunk) => {
+  const result = await fetchFromGAM(startDate, endDate, async (rawChunk, sliceKey) => {
     if (!rawChunk?.length) return;
-    const normalized = normalizeGAMRows(rawChunk, currency);
-    const todayRows = [];
-    const pastRows = [];
+    const normalized = normalizeGAMRows(rawChunk, currency, sliceKey);
+    const n = await insertRowsInto('report_grain', normalized, `${syncType}:${startDate}`);
+    grainCount += n;
+    total += normalized.length;
     for (const row of normalized) {
       const day = toYmd(row.report_date);
-      if (day === today) {
-        todayRows.push(row);
-        touchedPresent.add(day);
-      } else {
-        pastRows.push(row);
-        if (day) touchedDaily.add(day);
-      }
+      if (day) touchedDates.add(day);
     }
-    if (todayRows.length) {
-      presentCount += await insertRowsInto('report_present', todayRows, `${syncType}:${startDate}`);
-    }
-    if (pastRows.length) {
-      dailyCount += await insertRowsInto('report_daily', pastRows, `${syncType}:${startDate}`);
-    }
-    total += todayRows.length + pastRows.length;
   });
 
   const count = Number(result?.count) || total;
-  if (touchedPresent.size) {
+  const dates = [...touchedDates];
+  if (dates.length) {
     try {
-      await query(
-        `DELETE FROM report_present WHERE client_id = $2::uuid AND synced_at < $1`,
-        [syncStartedAt, requireClientId()]
-      );
+      await deleteStaleGrain(dates, syncStartedAt);
     } catch (e) {
-      logger.warn(`[${syncType}] stale present cleanup skipped:`, e.message);
-    }
-  }
-  const dailyDates = [...touchedDaily];
-  if (dailyDates.length) {
-    try {
-      await query(
-        `DELETE FROM report_daily
-         WHERE client_id = $2::uuid
-           AND report_date = ANY($1::date[])
-           AND synced_at < $3`,
-        [dailyDates, requireClientId(), syncStartedAt]
-      );
-    } catch (e) {
-      logger.warn(`[${syncType}] stale historical cleanup skipped:`, e.message);
+      logger.warn(`[${syncType}] stale grain cleanup skipped:`, e.message);
     }
     try {
-      await query(
-        `DELETE FROM report_daily
-         WHERE client_id = $2::uuid
-           AND report_date = ANY($1::date[])
-           AND NOT ${RICH_DIM_SQL}`,
-        [dailyDates, requireClientId()]
-      );
+      await deleteThinGrainRows(dates);
     } catch (e) {
       logger.warn(`[${syncType}] thin-row cleanup skipped:`, e.message);
     }
     try {
-      await rebuildRollupsForDates(dailyDates, syncType);
+      await rebuildRollupsForDates(dates, syncType);
     } catch (e) {
       logger.warn(`[${syncType}] rollup rebuild skipped:`, e.message);
     }
   }
   await invalidateCacheForDate(endDate);
   logger.info(
-    `[${syncType}] ${startDate}..${endDate} streamed rows≈${count} → present=${presentCount} daily=${dailyCount}`
+    `[${syncType}] ${startDate}..${endDate} streamed rows≈${count} → report_grain=${grainCount}`
   );
-  return presentCount + dailyCount;
+  return grainCount;
 }
 
 const RICH_DIM_SQL = `(
@@ -2063,91 +2354,96 @@ async function tableHasCountryAndDevice(table) {
 
 /** True when historical rows already carry country + device dimensions. */
 async function dailyHasCountryAndDevice() {
-  return tableHasCountryAndDevice('report_daily');
+  const { rows } = await query(
+    `SELECT 1 AS ok FROM report_grain g
+     WHERE g.country_id <> 0 AND g.device_id <> 0 LIMIT 1`
+  );
+  return rows.length > 0;
 }
 
-/** True when today's present snapshot already carries country + device dimensions. */
 async function presentHasCountryAndDevice() {
   const today = todayInTZ();
-  try {
-    const { rows } = await query(
-      `SELECT 1 AS ok
-       FROM report_present
-       WHERE report_date = $1::date
-         AND ${RICH_DIM_SQL}
-       LIMIT 1`,
-      [today]
-    );
-    return rows.length > 0;
-  } catch (e) {
-    logger.warn('report_present country/device check failed:', e.message);
-    return false;
-  }
+  return grainHasRichDimsForDate(today);
 }
 
-/**
- * Calendar dates in [startDate, endDate] that lack country+device in report_daily.
- * Used to decide whether 7d / 30d / last-month history needs a re-fetch.
- */
-async function listDatesMissingRichDims(startDate, endDate) {
-  try {
-    const { rows } = await query(
-      `WITH days AS (
-         SELECT generate_series($1::date, $2::date, interval '1 day')::date AS d
-       )
-       SELECT to_char(days.d, 'YYYY-MM-DD') AS report_date
-       FROM days
-       LEFT JOIN (
-         SELECT DISTINCT report_date
-         FROM report_daily
-         WHERE report_date BETWEEN $1 AND $2
-           AND ${RICH_DIM_SQL}
-       ) rich ON rich.report_date = days.d
-       WHERE rich.report_date IS NULL
-       ORDER BY 1`,
-      [startDate, endDate]
-    );
-    return rows.map((r) => r.report_date);
-  } catch (e) {
-    logger.warn('listDatesMissingRichDims failed:', e.message);
-    return [];
-  }
+/** Days with no KPI-ready grain rows (warehouse gap). */
+async function listMissingGrainDates(startDate, endDate) {
+  const clientId = requireClientId();
+  const { kpiSliceFilterSql } = require('./reportGrainStore');
+  const { rows } = await query(
+    `WITH days AS (
+       SELECT d::date AS d
+       FROM generate_series($2::date, $3::date, '1 day'::interval) AS d
+     )
+     SELECT to_char(days.d, 'YYYY-MM-DD') AS report_date
+     FROM days
+     LEFT JOIN LATERAL (
+       SELECT COALESCE(SUM(g.impressions), 0)::bigint AS imps
+       FROM report_grain g
+       WHERE g.client_id = $1::uuid AND g.report_date = days.d
+         AND ${kpiSliceFilterSql('g')}
+     ) k ON true
+     WHERE COALESCE(k.imps, 0) <= 0
+     ORDER BY 1`,
+    [clientId, startDate, endDate]
+  );
+  return rows.map((r) => r.report_date);
 }
 
-/**
- * True when every day in [startDate, endDate] is covered:
- *   today → report_present (rich dims)
- *   past  → report_daily (rich dims)
- * Used so dashboard/report APIs can serve from Postgres instead of live GAM.
- */
-async function hasCompleteDbCoverage(startDate, endDate) {
-  if (!startDate || !endDate || startDate > endDate) return false;
-  const today = todayInTZ();
-
-  const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
-  if (startDate <= pastEnd) {
-    const missing = await listDatesMissingRichDims(startDate, pastEnd);
-    if (missing.length) return false;
+/** Pull GAM for each day missing canonical KPI grain in range. */
+async function fillMissingGrainDates(startDate, endDate, syncType = 'fill-gaps') {
+  const missing = await listMissingGrainDates(startDate, endDate);
+  if (!missing.length) {
+    logger.info(`[${syncType}] No missing grain days in ${startDate}..${endDate}`);
+    return 0;
   }
-
-  if (startDate <= today && endDate >= today) {
+  logger.info(
+    `[${syncType}] Filling ${missing.length} missing day(s) in ${startDate}..${endDate}`
+    + ` (${missing[0]} → ${missing[missing.length - 1]})`
+  );
+  let total = 0;
+  for (const day of missing) {
     try {
-      const { rows } = await query(
-        `SELECT 1 AS ok
-         FROM report_present
-         WHERE report_date = $1
-           AND ${RICH_DIM_SQL}
-         LIMIT 1`,
-        [today]
-      );
-      if (!rows.length) return false;
+      total += await streamSyncFromGAM(day, day, syncType);
     } catch (e) {
-      logger.warn('hasCompleteDbCoverage present check failed:', e.message);
-      return false;
+      logger.warn(`[${syncType}] Failed to sync ${day}:`, e.message);
+    }
+  }
+  return total;
+}
+
+async function listDatesMissingRichDims(startDate, endDate) {
+  const cutoff = archiveService.getArchiveCutoff();
+  const clientId = requireClientId();
+  let missing = [];
+
+  const hotStart = startDate >= cutoff ? startDate : cutoff;
+  const hotEnd = endDate;
+  if (hotStart <= hotEnd) {
+    try {
+      missing = missing.concat(await listGrainDatesMissingRichDims(hotStart, hotEnd));
+    } catch (e) {
+      logger.warn('listGrainDatesMissingRichDims failed:', e.message);
     }
   }
 
-  return true;
+  const coldEnd = endDate < cutoff ? endDate : archiveService.splitDateRange(startDate, endDate).coldEnd;
+  if (startDate < cutoff && coldEnd && startDate <= coldEnd && archiveService.isArchiveEnabled()) {
+    let cursor = startDate;
+    while (cursor <= coldEnd) {
+      const archived = await archiveService.isDayFullyArchived(clientId, cursor);
+      if (!archived) missing.push(cursor);
+      cursor = shiftDate(cursor, 1);
+    }
+  }
+
+  return [...new Set(missing)].sort();
+}
+
+async function hasCompleteDbCoverage(startDate, endDate) {
+  if (!startDate || !endDate || startDate > endDate) return false;
+  const missing = await listDatesMissingRichDims(startDate, endDate);
+  return missing.length === 0;
 }
 
 /**
@@ -2168,12 +2464,16 @@ async function getRangeCoverage(startDate, endDate) {
   let missing = [];
   const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
   if (startDate <= pastEnd) {
-    missing = await listDatesMissingRichDims(startDate, pastEnd);
+    const [richMissing, grainMissing] = await Promise.all([
+      listDatesMissingRichDims(startDate, pastEnd),
+      listMissingGrainDates(startDate, pastEnd),
+    ]);
+    missing = [...new Set([...richMissing, ...grainMissing])].sort();
   }
   let presentMissing = 0;
   if (startDate <= today && endDate >= today) {
-    const ok = await presentHasCountryAndDevice();
-    if (!ok) presentMissing = 1;
+    const todayGaps = await listMissingGrainDates(today, today);
+    if (todayGaps.length) presentMissing = 1;
   }
   const missingDays = missing.length + presentMissing;
   const coveredDays = Math.max(0, totalDays - missingDays);
@@ -3162,6 +3462,8 @@ module.exports = {
   dailyHasCountryAndDevice,
   presentHasCountryAndDevice,
   listDatesMissingRichDims,
+  listMissingGrainDates,
+  fillMissingGrainDates,
   hasCompleteDbCoverage,
   getRangeCoverage,
   normalizeGAMRows,
@@ -3181,4 +3483,5 @@ module.exports = {
   promoteFullPresentToDaily,
   migrateStaleFullPresentToDaily,
   syncFullDateRangeFromGAM,
+  archiveColdDaysForClient: archiveService.archiveColdDaysForClient,
 };
