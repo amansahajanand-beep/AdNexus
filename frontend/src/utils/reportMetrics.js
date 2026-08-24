@@ -24,14 +24,21 @@ export function readDimensionValue(row, dimensionId) {
   return '—';
 }
 
+/**
+ * GAM ReportService money is in micros (1e-6 currency units).
+ * Warehouse / dashboard rows are already dollars — do not re-convert those.
+ * Heuristic: only treat as micros when |n| >= 1e6, or small whole micros (1..999).
+ */
 export function gamMoneyToDollars(raw) {
   const num = Number(raw);
   if (!Number.isFinite(num) || num === 0) return 0;
-  if (Math.abs(num) >= 1000) return +(num / 1e6).toFixed(4);
-  if (Math.abs(num) > 0 && Math.abs(num) < 1) return +num.toFixed(4);
-  if (Math.abs(num) >= 1 && Math.abs(num) < 1000 && num === Math.floor(num)) {
-    return +(num / 1e6).toFixed(4);
-  }
+  const abs = Math.abs(num);
+  // True GAM micros (e.g. $5,414.95 → 5_414_950_000).
+  if (abs >= 1e6) return +(num / 1e6).toFixed(4);
+  // Already dollars (fractional) or day-level dollar totals under $1M.
+  if (num !== Math.floor(num) || abs >= 1000) return +num.toFixed(4);
+  // Tiny whole micros (1..999) → fractional cents.
+  if (abs >= 1 && abs < 1000) return +(num / 1e6).toFixed(4);
   return +num.toFixed(4);
 }
 
@@ -45,6 +52,11 @@ const REVENUE_METRIC_KEYS = [
 /** Best revenue dollars from a report row (GAM Total revenue preferred). */
 export function pickRowRevenueDollars(row = {}) {
   if (!row) return 0;
+  // Dashboard/warehouse aggregates are already dollars — never re-scale.
+  if (row.revenueDollars && row.revenue != null && row.revenue !== '') {
+    const n = Number(row.revenue);
+    return Number.isFinite(n) ? +n.toFixed(4) : 0;
+  }
   if (row.revenue != null && row.revenue !== '' && Number(row.revenue) !== 0) {
     return gamMoneyToDollars(row.revenue);
   }

@@ -11,7 +11,7 @@
 const cron   = require('node-cron');
 const logger = require('../utils/logger');
 const { gamSyncQueue } = require('../queues/gamSync');
-const { todayInTZ, isLastHourOfDay, historicalRangeForPresets, listCalendarMonthsNewestFirst } = require('../utils/datetime');
+const { todayInTZ, historicalRangeForPresets, listCalendarMonthsNewestFirst, shiftYMD } = require('../utils/datetime');
 
 async function eachActiveClient(fn) {
   const { listActiveClients } = require('../models/clientStore');
@@ -28,7 +28,6 @@ async function eachActiveClient(fn) {
 async function enqueueLeanToday({ reason } = {}) {
   const today = todayInTZ();
   const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
-  const promoteToDaily = isLastHourOfDay();
   const tag = reason ? ` (${reason})` : '';
 
   await eachActiveClient(async (client) => {
@@ -36,7 +35,6 @@ async function enqueueLeanToday({ reason } = {}) {
     try {
       await gamSyncQueue.add('sync-today', {
         date: today,
-        promoteToDaily,
         includeFull: false,
         clientId: cid,
       }, {
@@ -47,7 +45,6 @@ async function enqueueLeanToday({ reason } = {}) {
       });
       logger.info(
         `Cron: enqueued lean sync-today for ${today} client=${cid.slice(0, 8)}${tag}`
-        + (promoteToDaily ? ' (last-of-day → copy into report_daily)' : '')
       );
     } catch (e) {
       logger.error('Cron: failed to enqueue sync-today:', e.message);
@@ -82,11 +79,38 @@ async function enqueueLeanYesterdayAndFullToday({ reason } = {}) {
 }
 
 /** Back-compat for server boot kickoff. */
+async function enqueueRecentGapFill({ reason, days = 30 } = {}) {
+  const today = todayInTZ();
+  const start = shiftYMD(today, -(Math.max(1, days) - 1));
+  const tag = reason ? ` (${reason})` : '';
+  await eachActiveClient(async (client) => {
+    const cid = client.id;
+    try {
+      await gamSyncQueue.add('sync-fill-gaps', {
+        startDate: start,
+        endDate: today,
+        clientId: cid,
+      }, {
+        jobId: `sync-fill-gaps-${cid.slice(0, 8)}-${today}`,
+        priority: 2,
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 30000 },
+      });
+      logger.info(
+        `Cron: enqueued sync-fill-gaps ${start}..${today} client=${cid.slice(0, 8)}${tag}`
+      );
+    } catch (e) {
+      logger.error('Cron: failed to enqueue sync-fill-gaps:', e.message);
+    }
+  });
+}
+
 async function enqueueHourlyLeanSync({ reason } = {}) {
   await enqueueLeanToday({ reason });
-  // On boot, also refresh yesterday + full-today once (not every hour).
+  // On boot, also refresh yesterday + fill recent warehouse gaps.
   if (reason === 'boot') {
     await enqueueLeanYesterdayAndFullToday({ reason: 'boot' });
+    await enqueueRecentGapFill({ reason: 'boot', days: 30 });
   }
 }
 
@@ -139,52 +163,27 @@ function startCron() {
   // Weekly full warehouse retired — grain months are filled at 2 AM.
 
 
-  // ── 23:05: copy today's present snapshot into report_daily (keep present) ─
-  cron.schedule('5 23 * * *', async () => {
-    const today = todayInTZ();
+  // ── 3 AM daily: archive grain + rollups older than HISTORICAL_DAYS to S3 ──
+  cron.schedule('0 3 * * *', async () => {
+    if (process.env.ARCHIVE_ENABLED !== 'true') return;
     await eachActiveClient(async (client) => {
       const cid = client.id;
       try {
-        await gamSyncQueue.add('promote-present', {
-          date: today,
-          clientId: cid,
-        }, {
-          jobId: `promote-present-${cid.slice(0, 8)}-${today}`,
-          priority: 1,
+        await gamSyncQueue.add('archive-cold-data', { clientId: cid }, {
+          jobId: `archive-cold-${cid.slice(0, 8)}-${todayInTZ()}`,
+          priority: 4,
           attempts: 2,
-          backoff: { type: 'fixed', delay: 30000 },
+          backoff: { type: 'fixed', delay: 60000 },
         });
-        logger.info(`Cron: enqueued promote-present for ${today} client=${cid.slice(0, 8)}`);
+        logger.info(`Cron: enqueued archive-cold-data client=${cid.slice(0, 8)}`);
       } catch (e) {
-        logger.error('Cron: failed to enqueue promote-present:', e.message);
-      }
-    });
-  }, { timezone: 'Asia/Singapore' });
-
-  // ── 00:05: after the day rolls, move leftover present → daily and delete ─
-  cron.schedule('5 0 * * *', async () => {
-    const today = todayInTZ();
-    await eachActiveClient(async (client) => {
-      const cid = client.id;
-      try {
-        await gamSyncQueue.add('promote-present', {
-          date: today,
-          clientId: cid,
-        }, {
-          jobId: `migrate-present-${cid.slice(0, 8)}-${today}`,
-          priority: 1,
-          attempts: 2,
-          backoff: { type: 'fixed', delay: 30000 },
-        });
-        logger.info(`Cron: enqueued migrate leftover present → daily client=${cid.slice(0, 8)}`);
-      } catch (e) {
-        logger.error('Cron: failed to enqueue present migrate:', e.message);
+        logger.error('Cron: failed to enqueue archive-cold-data:', e.message);
       }
     });
   }, { timezone: 'Asia/Singapore' });
 
   logger.info(
-    'Cron jobs started: hourly today, 6h yesterday, 2AM month-chunk backfill, 23:05 promote, 00:05 migrate, boot kickoff'
+    'Cron jobs started: hourly today, 6h yesterday, 2AM month-chunk backfill, 3AM archive, boot kickoff'
   );
 
   // Don't wait until the next clock hour — fill today's present now.
@@ -195,4 +194,4 @@ function startCron() {
   });
 }
 
-module.exports = { startCron, enqueueHourlyLeanSync };
+module.exports = { startCron, enqueueHourlyLeanSync, enqueueRecentGapFill };

@@ -8,17 +8,34 @@ const MONEY_APIS = /REVENUE|ECPM|CPC|EARNINGS|COST_PER/;
 const PERCENT_APIS = /CTR|RATE|PERCENT|VIEWABLE_TIME/;
 const COUNT_APIS = /IMPRESSIONS|CLICKS|REQUESTS|RESPONSES|VIEWS/;
 
-/** Convert GAM money columns (micros) or already-normalized dollar floats. */
+/**
+ * Convert GAM money columns (micros) or already-normalized dollar floats.
+ * Display-safe: day totals like 5414 stay dollars. Sub-$1 micros (1000..999999)
+ * are converted on the sync ingest path via moneyFromMetric, not here.
+ */
 function gamMoneyToDollars(raw) {
   const num = Number(raw);
   if (!Number.isFinite(num) || num === 0) return 0;
-  if (Math.abs(num) >= 1000) return +(num / 1e6).toFixed(4);
-  if (Math.abs(num) > 0 && Math.abs(num) < 1) return +num.toFixed(4);
-  // GAM micros are whole numbers, often 1–999 ($0.000001–$0.001).
-  if (Math.abs(num) >= 1 && Math.abs(num) < 1000 && num === Math.floor(num)) {
-    return +(num / 1e6).toFixed(4);
-  }
+  const abs = Math.abs(num);
+  if (abs >= 1e6) return +(num / 1e6).toFixed(4);
+  // Fractional → dollars. Integers >= 1000 treated as dollar totals (not micros).
+  if (num !== Math.floor(num) || abs >= 1000) return +num.toFixed(4);
+  // Tiny whole micros (1..999).
+  if (abs >= 1 && abs < 1000) return +(num / 1e6).toFixed(4);
   return +num.toFixed(4);
+}
+
+/**
+ * Coerce a warehouse revenue sum that may still be raw micros (bad ingest day).
+ * Absurd eCPM (>$100) with positive impressions ⇒ treat as micros.
+ */
+function coerceWarehouseRevenue(revenue, impressions = 0) {
+  const rev = Number(revenue) || 0;
+  const imp = Number(impressions) || 0;
+  if (!rev) return 0;
+  if (Math.abs(rev) >= 1e6) return +(rev / 1e6).toFixed(2);
+  if (imp > 0 && (rev / imp) * 1000 > 100) return +(rev / 1e6).toFixed(2);
+  return +rev.toFixed(2);
 }
 
 function parseGamMetricValue(api, raw) {
@@ -225,6 +242,7 @@ module.exports = {
   catalogIdToGamEnum,
   gamEnumToCatalogId,
   gamMoneyToDollars,
+  coerceWarehouseRevenue,
   pickRowRevenueDollars,
   parseGamMetricValue,
   mockMetricValue,

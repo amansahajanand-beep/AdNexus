@@ -11,14 +11,13 @@ const { Worker } = require('bullmq');
 const { redisSet, TTL, createBullmqConnection, isTransientRedisError } = require('../redisClient');
 const logger     = require('../utils/logger');
 const {
-  promotePresentToDaily,
-  migrateStalePresentToDaily,
   streamSyncFromGAM,
   syncDateRangeFromGAM,
+  fillMissingGrainDates,
   invalidateCacheForDate,
   logSync,
 } = require('../services/gamSyncService');
-const { todayInTZ, isLastHourOfDay, shiftYMD } = require('../utils/datetime');
+const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { runWithClient } = require('../utils/clientContext');
 const { getClientById, ensureBootstrapFromEnv } = require('../models/clientStore');
 
@@ -67,17 +66,23 @@ async function processJob(job) {
 async function processJobInner(job) {
   logger.info(`[gam-sync] Processing job "${job.name}" id=${job.id}`);
 
-  if (job.name === 'promote-present') {
+  if (job.name === 'archive-cold-data') {
     try {
-      const promoted = await promotePresentToDaily(job.name);
-      await invalidateCacheForDate(todayInTZ());
-      await logSync(job.name, 'success', promoted);
-      logger.info(`[gam-sync] Job "${job.name}" done — ${promoted} rows promoted`);
+      const { archiveColdDaysForClient } = require('../services/reportArchiveService');
+      const archived = await archiveColdDaysForClient(client.id);
+      await logSync(job.name, 'success', archived);
+      logger.info(`[gam-sync] Job "${job.name}" done — ${archived} day(s) archived`);
     } catch (err) {
       logger.error(`[gam-sync] Job "${job.name}" failed:`, err.message);
       await logSync(job.name, 'failed', 0, err.message);
       throw err;
     }
+    return;
+  }
+
+  if (job.name === 'promote-present') {
+    logger.info(`[gam-sync] Job "${job.name}" skipped — report_grain unified storage`);
+    await logSync(job.name, 'success', 0);
     return;
   }
 
@@ -100,25 +105,21 @@ async function processJobInner(job) {
 
     if (job.name === 'sync-today') {
       const day = targetDates[targetDates.length - 1];
-      // Move yesterday (or older) out of present before writing today's snapshot.
-      try {
-        await migrateStalePresentToDaily(job.name);
-      } catch (e) {
-        logger.warn(`[gam-sync] stale present migrate skipped: ${e.message}`);
-      }
       totalUpserted = await streamSyncFromGAM(day, day, job.name);
-
-      const shouldPromote = job.data?.promoteToDaily === true || isLastHourOfDay();
-      if (shouldPromote) {
-        const promoted = await promotePresentToDaily('promote-present');
-        logger.info(`[gam-sync] Last-of-day promote: ${promoted} rows copied into report_daily`);
-        await logSync('promote-present', 'success', promoted);
-      }
       await invalidateCacheForDate(day);
     } else if (job.name === 'sync-day') {
       const day = targetDates[0];
       totalUpserted = await streamSyncFromGAM(day, day, job.name);
       await invalidateCacheForDate(day);
+    } else if (job.name === 'sync-fill-gaps') {
+      const start = job.data?.startDate || targetDates[0];
+      const end = job.data?.endDate || targetDates[targetDates.length - 1];
+      totalUpserted = await fillMissingGrainDates(start, end, job.name);
+    } else if (job.name === 'sync-backfill' && Array.isArray(job.data?.dates) && job.data.dates.length) {
+      for (const day of job.data.dates) {
+        totalUpserted += await streamSyncFromGAM(day, day, job.name);
+        await invalidateCacheForDate(day);
+      }
     } else if (job.name === 'sync-full-range' || job.name === 'sync-full-today' || job.name === 'sync-full-backfill' || job.name === 'promote-full-present') {
       logger.info(`[gam-sync] ${job.name} skipped — report_full_* warehouse retired`);
       return;

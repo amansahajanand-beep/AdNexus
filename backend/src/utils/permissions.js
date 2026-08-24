@@ -311,10 +311,10 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
     sites,
     apps,
     adUnitNames,
-    // Domain+site together (partial picks) match either dim, not intersection.
-    webInventoryOr: domains.length > 0 && sites.length > 0,
-    // Always equality on inv_* for scoped SQL — LIKE ANY was the main reason domain users
-    // were seconds slower than admin on the same rollup path.
+    // Explicit Domain+Site picks use GAM intersection (AND). OR only when expanding
+    // full assignment with no request (legacy empty-filter scope path).
+    webInventoryOr: !anyRequest && domains.length > 0 && sites.length > 0,
+    // Equality on inv_* — LIKE '%domain%' made Site filter equal Domain-wide.
     skipAdUnitLike: true,
   };
 }

@@ -187,7 +187,144 @@ async function initSchema() {
       impressions  DOUBLE PRECISION NOT NULL DEFAULT 0,
       PRIMARY KEY (client_id, report_date, dim_kind, dim_value)
     );
+
+    CREATE TABLE IF NOT EXISTS dim_country (
+      id   SMALLINT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE
+    );
+
+    CREATE TABLE IF NOT EXISTS dim_device (
+      id   SMALLINT PRIMARY KEY,
+      name TEXT NOT NULL UNIQUE
+    );
+
+    CREATE TABLE IF NOT EXISTS dim_ad_unit (
+      id        SERIAL PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id),
+      name      TEXT NOT NULL,
+      UNIQUE (client_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS dim_domain (
+      id        SERIAL PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id),
+      name      TEXT NOT NULL,
+      UNIQUE (client_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS dim_site (
+      id        SERIAL PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id),
+      name      TEXT NOT NULL,
+      UNIQUE (client_id, name)
+    );
+
+    CREATE TABLE IF NOT EXISTS report_grain (
+      client_id     UUID NOT NULL REFERENCES gam_clients(id),
+      report_date   DATE NOT NULL,
+      country_id    SMALLINT NOT NULL DEFAULT 0 REFERENCES dim_country(id),
+      device_id     SMALLINT NOT NULL DEFAULT 0 REFERENCES dim_device(id),
+      ad_unit_id    INT NOT NULL DEFAULT 0,
+      domain_id     INT NOT NULL DEFAULT 0,
+      site_id       INT NOT NULL DEFAULT 0,
+      channel_name  TEXT NOT NULL DEFAULT '',
+      app_name      TEXT NOT NULL DEFAULT '',
+      app_id        TEXT NOT NULL DEFAULT '',
+      slice_key     TEXT NOT NULL DEFAULT '',
+      impressions   BIGINT NOT NULL DEFAULT 0,
+      clicks        INT NOT NULL DEFAULT 0,
+      revenue       DOUBLE PRECISION NOT NULL DEFAULT 0,
+      viewable_pct  REAL,
+      ecpm          REAL,
+      unfilled      BIGINT,
+      currency      CHAR(3) NOT NULL DEFAULT 'USD',
+      synced_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (
+        client_id, report_date, country_id, device_id,
+        ad_unit_id, domain_id, site_id, channel_name, app_name, app_id
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS report_archive_manifest (
+      client_id    UUID NOT NULL REFERENCES gam_clients(id),
+      report_date  DATE NOT NULL,
+      archive_kind TEXT NOT NULL,
+      object_key   TEXT NOT NULL,
+      row_count    INT NOT NULL DEFAULT 0,
+      byte_size    BIGINT NOT NULL DEFAULT 0,
+      checksum     TEXT,
+      format       TEXT NOT NULL DEFAULT 'json.gz',
+      archived_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (client_id, report_date, archive_kind)
+    );
   `);
+
+  try {
+    await schemaQuery(`INSERT INTO dim_country (id, name) VALUES (0, '') ON CONFLICT (id) DO NOTHING`);
+    await schemaQuery(`INSERT INTO dim_device (id, name) VALUES (0, '') ON CONFLICT (id) DO NOTHING`);
+  } catch (e) {
+    logger.warn('dim sentinel seed:', e.message);
+  }
+
+  try {
+    await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS grain_retention_days INT DEFAULT 365`);
+    await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS rollup_retention_days INT DEFAULT 365`);
+    await schemaQuery(`ALTER TABLE report_grain ADD COLUMN IF NOT EXISTS slice_key TEXT NOT NULL DEFAULT ''`);
+  } catch (e) {
+    logger.warn('gam_clients retention columns:', e.message);
+  }
+
+  try {
+    const { rows } = await schemaQuery(`
+      SELECT 1 FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE c.relname = 'report_grain' AND c.relkind = 'p'
+    `);
+    if (!rows.length) {
+      await schemaQuery(`
+        ALTER TABLE report_grain RENAME TO report_grain_legacy_flat
+      `).catch(() => {});
+      await schemaQuery(`
+        CREATE TABLE IF NOT EXISTS report_grain (
+          client_id     UUID NOT NULL REFERENCES gam_clients(id),
+          report_date   DATE NOT NULL,
+          country_id    SMALLINT NOT NULL DEFAULT 0 REFERENCES dim_country(id),
+          device_id     SMALLINT NOT NULL DEFAULT 0 REFERENCES dim_device(id),
+          ad_unit_id    INT NOT NULL DEFAULT 0,
+          domain_id     INT NOT NULL DEFAULT 0,
+          site_id       INT NOT NULL DEFAULT 0,
+          channel_name  TEXT NOT NULL DEFAULT '',
+          app_name      TEXT NOT NULL DEFAULT '',
+          app_id        TEXT NOT NULL DEFAULT '',
+          slice_key     TEXT NOT NULL DEFAULT '',
+          impressions   BIGINT NOT NULL DEFAULT 0,
+          clicks        INT NOT NULL DEFAULT 0,
+          revenue       DOUBLE PRECISION NOT NULL DEFAULT 0,
+          viewable_pct  REAL,
+          ecpm          REAL,
+          unfilled      BIGINT,
+          currency      CHAR(3) NOT NULL DEFAULT 'USD',
+          synced_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+          PRIMARY KEY (
+            client_id, report_date, country_id, device_id,
+            ad_unit_id, domain_id, site_id, channel_name, app_name, app_id
+          )
+        ) PARTITION BY RANGE (report_date)
+      `).catch(() => {});
+      await schemaQuery(`
+        CREATE TABLE IF NOT EXISTS report_grain_default PARTITION OF report_grain DEFAULT
+      `).catch(() => {});
+    }
+  } catch (e) {
+    logger.warn('report_grain partition setup:', e.message);
+  }
+
+  // Partition conversion creates a fresh report_grain — ensure slice_key exists after that step.
+  try {
+    await schemaQuery(`ALTER TABLE report_grain ADD COLUMN IF NOT EXISTS slice_key TEXT NOT NULL DEFAULT ''`);
+  } catch (e) {
+    logger.warn('report_grain slice_key column:', e.message);
+  }
 
   // Retired warehouse — drop if leftover from older deploys (frees a lot of disk).
   try {
@@ -247,6 +384,12 @@ async function initSchema() {
     `CREATE INDEX IF NOT EXISTS idx_report_present_client_date ON report_present (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_client_date ON report_adhoc (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_sync_log_client ON sync_log (client_id, started_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date ON report_grain (client_id, report_date DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_report_grain_date ON report_grain (report_date DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_archive_manifest_date ON report_archive_manifest (client_id, report_date DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_dim_ad_unit_client ON dim_ad_unit (client_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_dim_domain_client ON dim_domain (client_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_dim_site_client ON dim_site (client_id)`,
   ];
   await migrateMultiClientTenancy();
 
@@ -259,6 +402,8 @@ async function initSchema() {
 const TENANT_TABLES = [
   'report_daily',
   'report_present',
+  'report_grain',
+  'report_archive_manifest',
   'report_adhoc',
   'report_adhoc_coverage',
   'rollup_kpi_daily',

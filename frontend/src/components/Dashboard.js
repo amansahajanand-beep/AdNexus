@@ -1338,7 +1338,26 @@ export default function Dashboard() {
     [tableConfig, vis]
   );
 
+  const tableRows = useMemo(() => {
+    if (!detailData) return [];
+    const raw = detailData?.rows || [];
+    const enriched = enrichReportRows(raw, tableConfig.dimensions, tableConfig.metrics, { useProxy: false });
+    return aggregateRowsByColumns(enriched, tableColumns);
+  }, [detailData, tableConfig, tableColumns]);
+
   const tableSummaryTotals = useMemo(() => {
+    const hasConcreteSite = applied?.site?.length && !isAllSelection(applied.site);
+    const truncated = detailData?.pagination?.truncated;
+    // Footer must match visible site-filtered rows when the API returned the full table.
+    if (hasConcreteSite && tableRows.length && !truncated) {
+      const fromRows = summarizeRowsForOverview(tableRows, currency);
+      return {
+        total_line_item_level_all_revenue: fromRows.revenue,
+        total_line_item_level_impressions: fromRows.impressions,
+        total_line_item_level_without_cpd_average_ecpm: fromRows.ecpm,
+        total_active_view_viewable_impressions_rate: fromRows.viewability,
+      };
+    }
     const s = detailData?.summary;
     if (!s) return null;
     return {
@@ -1347,14 +1366,13 @@ export default function Dashboard() {
       total_line_item_level_without_cpd_average_ecpm: s.ecpm ?? 0,
       total_active_view_viewable_impressions_rate: s.viewability ?? 0,
     };
-  }, [detailData?.summary]);
-
-  const tableRows = useMemo(() => {
-    if (!detailData) return [];
-    const raw = detailData?.rows || [];
-    const enriched = enrichReportRows(raw, tableConfig.dimensions, tableConfig.metrics, { useProxy: false });
-    return aggregateRowsByColumns(enriched, tableColumns);
-  }, [detailData, tableConfig, tableColumns]);
+  }, [
+    detailData?.summary,
+    detailData?.pagination?.truncated,
+    applied?.site,
+    tableRows,
+    currency,
+  ]);
 
   const overviewSummary = useMemo(() => {
     const fromDetail = mapDetailSummary(detailData?.summary);
@@ -1448,7 +1466,26 @@ export default function Dashboard() {
     return buildDailySeries(enrichedRows, trend);
   }, [enrichedRows, detailData?.trend]);
 
-  const engagementSeries = useMemo(() => buildEngagementSeries(enrichedRows), [enrichedRows]);
+  const engagementSeries = useMemo(() => {
+    // Prefer full-range trend for daily impressions so truncated table rows don't hide early days.
+    const trend = detailData?.trend || [];
+    if (Array.isArray(trend) && trend.length) {
+      const fromTrend = trend.map((item) => {
+        const impressions = toNumber(item.impressions);
+        const clicks = toNumber(item.clicks);
+        return {
+          date: item.date,
+          impressions,
+          clicks,
+          unfilled: 0,
+          ctr: impressions > 0 && clicks > 0 ? +((clicks / impressions) * 100).toFixed(2) : 0,
+          fillRate: 0,
+        };
+      }).filter((d) => d.date);
+      if (fromTrend.some((d) => d.impressions > 0)) return fromTrend;
+    }
+    return buildEngagementSeries(enrichedRows);
+  }, [enrichedRows, detailData?.trend]);
 
   const shareSeries = useMemo(() => {
     const charts = detailData?.charts;
