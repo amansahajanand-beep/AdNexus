@@ -493,9 +493,19 @@ export default function Reporting() {
         country: applied.country,
         reportSettings: applied.reportSettings,
       };
-      // Return the full capped table (up to 2500 rows) so a 30-day report is not
-      // chopped to a single 50-row page. The UI paginates those rows client-side.
-      const reportFilters = { ...dateFilters, allRows: true };
+      // Cap table payload for long ranges — UI paginates; avoid shipping 2500 rows first.
+      const daySpan = (() => {
+        try {
+          const a = new Date(`${applied.startDate || todayInit.startDate}T12:00:00Z`).getTime();
+          const b = new Date(`${applied.endDate || todayInit.endDate}T12:00:00Z`).getTime();
+          return Math.max(1, Math.round((b - a) / 86400000) + 1);
+        } catch (_) {
+          return 1;
+        }
+      })();
+      const reportFilters = daySpan <= 7
+        ? { ...dateFilters, allRows: true }
+        : { ...dateFilters, allRows: false, limit: 100 };
       const [detailed, programmatic] = await Promise.all([
         cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters) : Promise.resolve(null),
         cfg.mode === 'programmatic' ? reportsAPI.getProgrammatic(reportFilters).catch(() => null) : Promise.resolve(null),

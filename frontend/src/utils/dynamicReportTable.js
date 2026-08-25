@@ -126,6 +126,10 @@ const DIMENSION_DEFS = {
   placement_id: { getValue: (r) => readDimensionValue(r, 'placement_id'), cellClass: 'td-mono' },
   placement_name: { getValue: (r) => readDimensionValue(r, 'placement_name'), cellClass: '' },
   url_name: { getValue: (r) => readDimensionValue(r, 'url_name') || r.siteUrl || '—', cellClass: '' },
+  device_category_name: {
+    getValue: (r) => readDimensionValue(r, 'device_category_name'),
+    cellClass: '',
+  },
   mobile_device_name: { getValue: (r) => readDimensionValue(r, 'mobile_device_name'), cellClass: '' },
 };
 

@@ -3271,18 +3271,109 @@ async function handleDetailedReport(req, res) {
       webInventoryOr = !!scoped.webInventoryOr;
       skipAdUnitLike = scoped.skipAdUnitLike !== false;
     }
+    const reportDimIds = asArray(filters.reportDimensions).map(String);
+    const wantsCountryCol = reportDimIds.some((d) => (
+      d === 'country_name' || d === 'country' || d === 'COUNTRY_NAME'
+    )) || toFilterArray(filters.country).length > 0;
+    const wantsDeviceCol = reportDimIds.some((d) => (
+      d === 'device_category_name'
+      || d === 'mobile_device_name'
+      || d === 'device'
+      || d === 'DEVICE_CATEGORY_NAME'
+    ));
+    let tableLimit = 2000;
+    try {
+      const { reportingTableLimit } = require('./reportGrainStore');
+      tableLimit = reportingTableLimit(filters.startDate, filters.endDate, 2000);
+    } catch (_) { /* ignore */ }
     const invOpts = {
       domains,
       sites,
       adUnitNames: toFilterArray(filters.domainName),
       apps,
-      countryNames: toFilterArray(filters.country).map((c) => String(c)),
+      countryNames: resolveCountryNamesForDb(filters.country),
       currency,
-      tableLimit: 5000,
+      tableLimit,
       selectedDomains: domains,
       webInventoryOr,
       skipAdUnitLike,
+      groupByCountry: wantsCountryCol,
+      groupByDevice: wantsDeviceCol,
+      // Reporting: skip dashboard chart scans; use lateral day samples for long ranges.
+      reportingFast: true,
+      skipCharts: true,
     };
+
+    // ── Reporting fast path (rollup or ID-filtered grain — seconds, not minutes) ─
+    if (useGrainSql && typeof svc?.fetchReportingBundleFromDB === 'function') {
+      const t0 = Date.now();
+      try {
+        const bundle = await svc.fetchReportingBundleFromDB(
+          filters.startDate,
+          filters.endDate,
+          invOpts
+        );
+        if (bundle) {
+          const scopedRows = normalizeReportRows(bundle.rows || []);
+          const revenue = Number(bundle.summary?.revenue) || 0;
+          const body = applyVisibility({
+            summary: {
+              totalRevenue: revenue,
+              totalDomains: new Set(scopedRows.map((r) => r.site).filter(Boolean)).size
+                + new Set(scopedRows.map((r) => r.appId).filter(Boolean)).size,
+              offeredRecords: bundle.grainCount || scopedRows.length,
+              currency: currency || bundle.summary?.currency || 'USD',
+            },
+            rows: wantAllRows
+              ? scopedRows
+              : paginateRows(scopedRows, {
+                ...paginationOpts,
+                limit: Math.min(paginationOpts.limit || 50, MAX_REPORTING_CLIENT_ROWS),
+              }).rows,
+            trend: bundle.trend || [],
+            isMock: false,
+            reportWarning: (classified.skippedDims?.length || classified.skippedMets?.length)
+              ? 'partial' : null,
+            reportWarningSkipped: [
+              ...(classified.skippedDims || []),
+              ...(classified.skippedMets || []),
+            ],
+            reportWarningUsed: classified.usedDims || [],
+            reportWarningUsedIds: classified.mode === 'grain' ? dimIds.filter((id) => {
+              const api = catalogIdToGamEnum(id);
+              return !api || classified.usedDims.includes(api) || api === 'DATE';
+            }) : [],
+            reportWarningUsedMetricIds: classified.mode === 'grain' ? metIds.filter((id) => {
+              const api = catalogIdToGamEnum(id);
+              return !api || classified.usedMetrics.includes(api);
+            }) : [],
+            pagination: bundle.pagination || {
+              totalRows: bundle.grainCount || scopedRows.length,
+              truncated: Boolean(bundle.pagination?.truncated),
+            },
+          }, req.user);
+          if (!wantAllRows && scopedRows.length) {
+            const paged = paginateRows(scopedRows, {
+              ...paginationOpts,
+              limit: Math.min(paginationOpts.limit || 50, MAX_REPORTING_CLIENT_ROWS),
+            });
+            body.rows = paged.rows;
+            body.pagination = {
+              ...paged.pagination,
+              totalRows: bundle.grainCount || scopedRows.length,
+              truncated: Boolean(bundle.pagination?.truncated),
+            };
+          }
+          logger.info(
+            `Reporting fast ${bundle.source || 'bundle'} ${filters.startDate}..${filters.endDate}`
+            + ` grain≈${bundle.grainCount || 0} in ${Date.now() - t0}ms`
+          );
+          return res.json(await cacheDetailedResponse(body));
+        }
+      } catch (fastErr) {
+        logger.warn('Reporting fast path failed, falling back:', fastErr.message);
+      }
+    }
 
     // ── Grain SQL: Dashboard lean/rollup path (including select-all / grain subset) ─
     if (useGrainSql && typeof svc?.fetchLeanDashboardBundleFromDB === 'function') {

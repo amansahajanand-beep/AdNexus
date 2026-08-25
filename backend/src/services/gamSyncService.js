@@ -49,6 +49,7 @@ const {
   fetchGrainLegacyFromDB,
   fetchGrainLeanRowsFromDB,
   fetchGrainDomainTableRows,
+  reportingTableLimit,
   rollupInvDomainExprSql,
   grainHasRichDimsForDate,
   listGrainDatesMissingRichDims,
@@ -984,11 +985,9 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
   const countries = (opts.countryNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const adUnits = (opts.adUnitNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const clientId = await resolveGrainClientId();
-  const tableLimit = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 2500, 50), 5000);
+  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
   const { GRAIN_JOIN_SQL, grainDomainExprSql } = require('./reportGrainStore');
   const domainExpr = grainDomainExprSql();
-  const siteExpr = `NULLIF(LOWER(TRIM(COALESCE(ds.name, ''))), '')`;
-  const adUnitExpr = `NULLIF(LOWER(TRIM(COALESCE(da.name, ''))), '')`;
 
   const baseParams = [clientId, startDate, endDate];
   baseParams.push(sites);
@@ -1006,43 +1005,54 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
     clause += ` AND LOWER(TRIM(COALESCE(da.name, ''))) = ANY($${baseParams.length}::text[])`;
   }
 
-  const { rows: totalsRows } = await query(
-    `SELECT
-       COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
-       COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
-       COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
-       COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
-       COUNT(*)::int AS row_count
-     ${GRAIN_JOIN_SQL}
-     WHERE g.client_id = $1::uuid
-       AND g.report_date BETWEEN $2::date AND $3::date
-       AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
-       ${clause}`,
-    baseParams
-  );
+  const [{ rows: totalsRows }, { rows: trendRaw }, tableRaw] = await Promise.all([
+    query(
+      `SELECT
+         COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+         COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+         COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
+         COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+         COUNT(*)::int AS row_count
+       ${GRAIN_JOIN_SQL}
+       WHERE g.client_id = $1::uuid
+         AND g.report_date BETWEEN $2::date AND $3::date
+         AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
+         ${clause}`,
+      baseParams
+    ),
+    query(
+      `SELECT
+         to_char(g.report_date, 'YYYY-MM-DD') AS date,
+         COALESCE(SUM(g.revenue), 0)::float8 AS earning,
+         COALESCE(SUM(g.impressions), 0)::float8 AS impressions
+       ${GRAIN_JOIN_SQL}
+       WHERE g.client_id = $1::uuid
+         AND g.report_date BETWEEN $2::date AND $3::date
+         AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
+         ${clause}
+       GROUP BY g.report_date
+       ORDER BY g.report_date`,
+      baseParams
+    ),
+    fetchGrainDomainTableRows(startDate, endDate, {
+      ...opts,
+      sites,
+      domains,
+      countryNames: opts.countryNames,
+      adUnitNames: opts.adUnitNames,
+      tableLimit,
+    }),
+  ]);
+
   const t = totalsRows[0] || {};
   const impressions = Number(t.impressions) || 0;
   const revenue = coerceWarehouseRevenue(t.revenue, impressions);
   const viewableWeight = Number(t.viewable_weight) || 0;
   const clicks = Number(t.clicks) || 0;
   const grainCount = Number(t.row_count) || 0;
-  if (!grainCount || (impressions <= 0 && revenue <= 0)) return null;
+  if ((!grainCount || (impressions <= 0 && revenue <= 0)) && !(tableRaw || []).length) return null;
 
-  const { rows: trendRaw } = await query(
-    `SELECT
-       to_char(g.report_date, 'YYYY-MM-DD') AS date,
-       COALESCE(SUM(g.revenue), 0)::float8 AS earning,
-       COALESCE(SUM(g.impressions), 0)::float8 AS impressions
-     ${GRAIN_JOIN_SQL}
-     WHERE g.client_id = $1::uuid
-       AND g.report_date BETWEEN $2::date AND $3::date
-       AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
-       ${clause}
-     GROUP BY g.report_date
-     ORDER BY g.report_date`,
-    baseParams
-  );
-  const trend = trendRaw.map((r) => {
+  const trend = (trendRaw || []).map((r) => {
     const impressions = Math.round(Number(r.impressions) || 0);
     return {
       date: r.date,
@@ -1051,74 +1061,9 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
     };
   });
 
-  const startMs = new Date(`${startDate}T12:00:00`).getTime();
-  const endMs = new Date(`${endDate}T12:00:00`).getTime();
-  const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
-  const perDay = Math.max(10, Math.min(400, Math.ceil(tableLimit / dayCount)));
-  const groupAdUnit = adUnits.length > 0;
-  const groupBySql = groupAdUnit
-    ? `g.report_date, ${siteExpr}, ${adUnitExpr}`
-    : `g.report_date, ${siteExpr}`;
-  const selectAdUnit = groupAdUnit
-    ? `COALESCE(${adUnitExpr}, '') AS ad_unit`
-    : `'' AS ad_unit`;
-  const tableParams = [...baseParams, perDay, tableLimit];
-  const { rows: tableRaw } = await query(
-    `WITH agg AS (
-       SELECT
-         g.report_date,
-         COALESCE(
-           NULLIF(LOWER(TRIM(regexp_replace(COALESCE(${siteExpr}, ''), '^[^.]+\.', ''))), ''),
-           MAX(${domainExpr}),
-           ''
-         ) AS domain_name,
-         COALESCE(${siteExpr}, '') AS site_url,
-         ${selectAdUnit},
-         '' AS app_id,
-         COALESCE(SUM(g.impressions), 0)::float8 AS impression,
-         COALESCE(SUM(g.revenue), 0)::float8 AS revenue_raw,
-         CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
-           THEN COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)
-                / COALESCE(SUM(g.impressions), 0)
-           ELSE 0
-         END AS viewable_raw,
-         COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
-         COALESCE(MAX(g.currency), 'USD') AS currency
-       ${GRAIN_JOIN_SQL}
-       WHERE g.client_id = $1::uuid
-         AND g.report_date BETWEEN $2::date AND $3::date
-         AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
-         ${clause}
-       GROUP BY ${groupBySql}
-       HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
-     ),
-     ranked AS (
-       SELECT *,
-         ROW_NUMBER() OVER (
-           PARTITION BY report_date
-           ORDER BY revenue_raw DESC, impression DESC
-         ) AS day_rank
-       FROM agg
-     ),
-     counted AS (
-       SELECT COUNT(*)::int AS agg_count FROM agg
-     )
-     SELECT
-       to_char(r.report_date, 'YYYY-MM-DD') AS report_date,
-       r.domain_name, r.site_url, r.ad_unit, r.app_id,
-       r.impression, r.revenue_raw, r.viewable_raw, r.clicks, r.currency,
-       c.agg_count
-     FROM ranked r
-     CROSS JOIN counted c
-     WHERE r.day_rank <= $${tableParams.length - 1}
-     -- Interleave days so first page spans the full range, not only endDate.
-     ORDER BY r.day_rank ASC, r.report_date DESC, r.revenue_raw DESC
-     LIMIT $${tableParams.length}`,
-    tableParams
-  );
   const tableRows = (tableRaw || []).map(mapDomainTableRow);
-  const aggCount = Number(tableRaw?.[0]?.agg_count) || tableRows.length;
-  const truncated = aggCount > tableRows.length;
+  const aggCount = tableRows.length;
+  const truncated = grainCount > tableRows.length;
 
   // Summary always from full-range SQL (not truncated table sample).
   const summaryImpressions = Math.round(impressions);
@@ -1557,6 +1502,15 @@ function resolveTableRollupGroup(opts = {}) {
   return 'domain';
 }
 
+/** True when Reporting (or filters) need country / device kept in table rows. */
+function wantsGeoTableDims(opts = {}) {
+  return Boolean(
+    opts.groupByCountry
+    || opts.groupByDevice
+    || (opts.countryNames && opts.countryNames.length)
+  );
+}
+
 /** Map rollup/grain aggregate row → dashboard table row shape (revenue already in dollars). */
 function mapDomainTableRow(r) {
   const impression = Math.round(Number(r.impression) || 0);
@@ -1569,12 +1523,16 @@ function mapDomainTableRow(r) {
   const domainName = r.domain_name || '';
   const siteUrl = r.site_url || '';
   const appId = r.app_id || '';
+  const country = r.country || '';
+  const device = r.device || '';
   const ecpm = impression > 0 && revenue > 0 ? +((revenue / impression) * 1000).toFixed(2) : 0;
   return {
     date: r.report_date,
     report_date: r.report_date,
-    country: '',
-    device: '',
+    country,
+    device,
+    COUNTRY_NAME: country,
+    DEVICE_CATEGORY_NAME: device,
     site: adUnit || '',
     AD_UNIT_NAME: adUnit,
     ad_unit_name: adUnit,
@@ -1699,10 +1657,12 @@ async function fetchBundleTableRows(startDate, endDate, opts, tableLimit) {
     sites: opts.sites,
     apps: opts.apps,
     tableLimit: limit,
+    groupByCountry: opts.groupByCountry,
+    groupByDevice: opts.groupByDevice,
   };
 
-  // Country filter: rollups lack per-country dims — aggregate from grain.
-  if (opts.countryNames?.length) {
+  // Country/device dims (or country filter): rollups lack geo — aggregate from grain.
+  if (wantsGeoTableDims(opts)) {
     const rows = await fetchGrainDomainTableRows(startDate, endDate, tableOpts);
     return rows.map(mapDomainTableRow);
   }
@@ -1721,22 +1681,37 @@ async function fetchBundleTableRows(startDate, endDate, opts, tableLimit) {
 async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
   if (opts.countryNames && opts.countryNames.length) return null;
 
-  const tableLimit = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 2500, 50), 5000);
+  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
+  const skipCharts = Boolean(opts.skipCharts || opts.reportingFast);
   const filterParams = [startDate, endDate];
   let filterExtra = ` AND report_date BETWEEN $1::date AND $2::date`;
   filterExtra = appendRollupInventoryFilters(filterParams, filterExtra, opts);
   const kpiFrom = `FROM rollup_kpi_daily WHERE TRUE${filterExtra}`;
 
-  const { rows: totalsRows } = await query(
-    `SELECT
-       COALESCE(SUM(impressions), 0)::float8 AS impressions,
-       COALESCE(SUM(revenue), 0)::float8 AS revenue,
-       COALESCE(SUM(viewable_weight), 0)::float8 AS viewable_weight,
-       COALESCE(SUM(clicks), 0)::float8 AS clicks,
-       COALESCE(SUM(grain_count), 0)::int AS row_count
-     ${kpiFrom}`,
-    filterParams
-  );
+  const [{ rows: totalsRows }, { rows: trendRaw }, tableRowsEarly] = await Promise.all([
+    query(
+      `SELECT
+         COALESCE(SUM(impressions), 0)::float8 AS impressions,
+         COALESCE(SUM(revenue), 0)::float8 AS revenue,
+         COALESCE(SUM(viewable_weight), 0)::float8 AS viewable_weight,
+         COALESCE(SUM(clicks), 0)::float8 AS clicks,
+         COALESCE(SUM(grain_count), 0)::int AS row_count
+       ${kpiFrom}`,
+      filterParams
+    ),
+    query(
+      `SELECT
+         to_char(report_date, 'YYYY-MM-DD') AS date,
+         COALESCE(SUM(revenue), 0)::float8 AS earning,
+         COALESCE(SUM(impressions), 0)::float8 AS impressions
+       ${kpiFrom}
+       GROUP BY report_date
+       ORDER BY report_date`,
+      filterParams
+    ),
+    skipCharts ? fetchBundleTableRows(startDate, endDate, opts, tableLimit) : Promise.resolve(null),
+  ]);
+
   const t = totalsRows[0] || {};
   let impressions = Number(t.impressions) || 0;
   let revenue = coerceWarehouseRevenue(t.revenue, impressions);
@@ -1745,17 +1720,7 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
   let grainCount = Number(t.row_count) || 0;
   if (!grainCount || (impressions <= 0 && revenue <= 0)) return null;
 
-  const { rows: trendRaw } = await query(
-    `SELECT
-       to_char(report_date, 'YYYY-MM-DD') AS date,
-       COALESCE(SUM(revenue), 0)::float8 AS earning,
-       COALESCE(SUM(impressions), 0)::float8 AS impressions
-     ${kpiFrom}
-     GROUP BY report_date
-     ORDER BY report_date`,
-    filterParams
-  );
-  const trend = trendRaw.map((r) => {
+  const trend = (trendRaw || []).map((r) => {
     const impressions = Math.round(Number(r.impressions) || 0);
     return {
       date: r.date,
@@ -1763,6 +1728,47 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
       impressions,
     };
   });
+
+  if (skipCharts) {
+    const tableRows = tableRowsEarly || [];
+    const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+    return {
+      summary: {
+        totalEarning: +Number(revenue).toFixed(2),
+        totalEarningChange: 0,
+        selectRange: +Number(revenue).toFixed(2),
+        selectRangeChange: 0,
+        last7Days: +trend.slice(-7).reduce((a, x) => a + (x.earning || 0), 0).toFixed(2),
+        last7DaysChange: 0,
+        pageViews: Math.round(impressions),
+        pageViewsChange: 0,
+        impressions: Math.round(impressions),
+        impressionsChange: 0,
+        clicks: Math.round(clicks),
+        clicksChange: 0,
+        ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
+        revenue: +Number(revenue).toFixed(2),
+        revenueChange: 0,
+        ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
+        ecpmChange: 0,
+        viewability,
+        viewabilityChange: 0,
+        currency: opts.currency || 'USD',
+      },
+      trend,
+      charts: { revenue: [], device: [], country: [], performance: [] },
+      rows: tableRows,
+      pagination: {
+        totalRows: tableRows.length,
+        returnedRows: tableRows.length,
+        truncated: grainCount > tableRows.length,
+        allRows: false,
+        compact: true,
+      },
+      grainCount,
+      source: 'rollup',
+    };
+  }
 
   const { rows: domainRaw } = await query(
     `SELECT
@@ -1904,6 +1910,341 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
     },
     grainCount,
     source: 'rollup',
+  };
+}
+
+/**
+ * Resolve inventory filter names → typed dim IDs (one query per dim table).
+ * Lets Reporting filter report_grain by integer IDs with no JOINs on the hot path.
+ */
+async function resolveInventoryFilterIds(clientId, opts = {}) {
+  const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const sites = (opts.sites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const adUnits = (opts.adUnitNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const countries = (opts.countryNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+
+  const [domainRows, siteRows, adUnitRows, countryRows] = await Promise.all([
+    domains.length
+      ? query(
+        `SELECT id, LOWER(TRIM(name)) AS n FROM dim_domain
+         WHERE client_id = $1::uuid AND LOWER(TRIM(name)) = ANY($2::text[])`,
+        [clientId, domains]
+      )
+      : Promise.resolve({ rows: [] }),
+    sites.length
+      ? query(
+        `SELECT id, LOWER(TRIM(name)) AS n FROM dim_site
+         WHERE client_id = $1::uuid AND LOWER(TRIM(name)) = ANY($2::text[])`,
+        [clientId, sites]
+      )
+      : Promise.resolve({ rows: [] }),
+    adUnits.length
+      ? query(
+        `SELECT id, LOWER(TRIM(name)) AS n FROM dim_ad_unit
+         WHERE client_id = $1::uuid AND LOWER(TRIM(name)) = ANY($2::text[])`,
+        [clientId, adUnits]
+      )
+      : Promise.resolve({ rows: [] }),
+    countries.length
+      ? query(
+        `SELECT id, LOWER(TRIM(name)) AS n FROM dim_country
+         WHERE LOWER(TRIM(name)) = ANY($1::text[])`,
+        [countries]
+      )
+      : Promise.resolve({ rows: [] }),
+  ]);
+
+  return {
+    domainIds: domainRows.rows.map((r) => Number(r.id)).filter((n) => n > 0),
+    siteIds: siteRows.rows.map((r) => Number(r.id)).filter((n) => n > 0),
+    adUnitIds: adUnitRows.rows.map((r) => Number(r.id)).filter((n) => n > 0),
+    countryIds: countryRows.rows.map((r) => Number(r.id)).filter((n) => n > 0),
+  };
+}
+
+async function hydrateGrainIdRows(rawRows) {
+  if (!rawRows?.length) return [];
+  const domainIds = [...new Set(rawRows.map((r) => Number(r.domain_id) || 0).filter((n) => n > 0))];
+  const siteIds = [...new Set(rawRows.map((r) => Number(r.site_id) || 0).filter((n) => n > 0))];
+  const adUnitIds = [...new Set(rawRows.map((r) => Number(r.ad_unit_id) || 0).filter((n) => n > 0))];
+  const countryIds = [...new Set(rawRows.map((r) => Number(r.country_id) || 0).filter((n) => n > 0))];
+  const deviceIds = [...new Set(rawRows.map((r) => Number(r.device_id) || 0).filter((n) => n > 0))];
+
+  const [domains, sites, adUnits, countries, devices] = await Promise.all([
+    domainIds.length
+      ? query(`SELECT id, name FROM dim_domain WHERE id = ANY($1::int[])`, [domainIds])
+      : Promise.resolve({ rows: [] }),
+    siteIds.length
+      ? query(`SELECT id, name FROM dim_site WHERE id = ANY($1::int[])`, [siteIds])
+      : Promise.resolve({ rows: [] }),
+    adUnitIds.length
+      ? query(`SELECT id, name FROM dim_ad_unit WHERE id = ANY($1::int[])`, [adUnitIds])
+      : Promise.resolve({ rows: [] }),
+    countryIds.length
+      ? query(`SELECT id, name FROM dim_country WHERE id = ANY($1::int[])`, [countryIds])
+      : Promise.resolve({ rows: [] }),
+    deviceIds.length
+      ? query(`SELECT id, name FROM dim_device WHERE id = ANY($1::int[])`, [deviceIds])
+      : Promise.resolve({ rows: [] }),
+  ]);
+
+  const dMap = new Map(domains.rows.map((r) => [Number(r.id), r.name]));
+  const sMap = new Map(sites.rows.map((r) => [Number(r.id), r.name]));
+  const aMap = new Map(adUnits.rows.map((r) => [Number(r.id), r.name]));
+  const cMap = new Map(countries.rows.map((r) => [Number(r.id), r.name]));
+  const vMap = new Map(devices.rows.map((r) => [Number(r.id), r.name]));
+
+  return rawRows.map((r) => mapDomainTableRow({
+    report_date: r.report_date,
+    domain_name: dMap.get(Number(r.domain_id)) || '',
+    site_url: sMap.get(Number(r.site_id)) || '',
+    ad_unit: aMap.get(Number(r.ad_unit_id)) || '',
+    app_id: r.app_id || '',
+    country: cMap.get(Number(r.country_id)) || '',
+    device: vMap.get(Number(r.device_id)) || '',
+    impression: r.impression,
+    revenue_raw: r.revenue_raw,
+    viewable_raw: r.viewable_raw,
+    clicks: r.clicks,
+    currency: r.currency,
+  }));
+}
+
+/**
+ * Reporting-only fast path: rollups when safe; otherwise ID-filtered grain
+ * aggregates (no dim JOINs on millions of rows). Target: seconds, not minutes.
+ */
+async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
+  const t0 = Date.now();
+  const siteKind = classifySiteHostSelection(opts.sites);
+  const hasAppsOnly = (opts.apps || []).length > 0
+    && !(opts.domains || []).length
+    && !(opts.sites || []).length
+    && !(opts.adUnitNames || []).length;
+
+  // Rollup path is ~100–800ms for multi-month ranges (same as Dashboard).
+  // Skip for request-host sites, app-only, country filter, or geo table dims
+  // (geo table previously fell back to JOIN-heavy grain and took minutes).
+  if (
+    !opts.countryNames?.length
+    && siteKind !== 'request'
+    && !hasAppsOnly
+    && !wantsGeoTableDims(opts)
+  ) {
+    try {
+      const rolled = await fetchDashboardBundleFromRollups(startDate, endDate, {
+        ...opts,
+        skipCharts: true,
+        reportingFast: true,
+      });
+      if (rolled) {
+        logger.info(
+          `Reporting rollup-fast ${startDate}..${endDate}`
+          + ` grain≈${rolled.grainCount || 0} in ${Date.now() - t0}ms`
+        );
+        return { ...rolled, source: 'reporting-rollup' };
+      }
+    } catch (e) {
+      logger.warn('Reporting rollup-fast failed:', e.message);
+    }
+  }
+
+  const clientId = requireClientId();
+  const ids = await resolveInventoryFilterIds(clientId, opts);
+  // Filters were provided but nothing resolved — empty result, not a full scan.
+  if ((opts.domains || []).length && !ids.domainIds.length) return null;
+  if ((opts.sites || []).length && !ids.siteIds.length) return null;
+  if ((opts.adUnitNames || []).length && !ids.adUnitIds.length) return null;
+  if ((opts.countryNames || []).length && !ids.countryIds.length) return null;
+
+  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
+  const startMs = new Date(`${startDate}T12:00:00`).getTime();
+  const endMs = new Date(`${endDate}T12:00:00`).getTime();
+  const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+  const perDay = Math.max(6, Math.min(40, Math.ceil(tableLimit / dayCount)));
+
+  const byCountry = Boolean(opts.groupByCountry || ids.countryIds.length);
+  const byDevice = Boolean(opts.groupByDevice);
+  const byAdUnit = Boolean(ids.adUnitIds.length || (opts.adUnitNames || []).length);
+  const byApp = hasAppsOnly;
+
+  const params = [clientId, startDate, endDate];
+  let whereCore = `g.client_id = $1::uuid AND g.slice_key = '${byApp ? 'app_id' : 'inventory_core'}'`;
+
+  if (ids.domainIds.length) {
+    params.push(ids.domainIds);
+    whereCore += ` AND g.domain_id = ANY($${params.length}::int[])`;
+  }
+  if (ids.siteIds.length) {
+    params.push(ids.siteIds);
+    whereCore += ` AND g.site_id = ANY($${params.length}::int[])`;
+  }
+  if (ids.adUnitIds.length) {
+    params.push(ids.adUnitIds);
+    whereCore += ` AND g.ad_unit_id = ANY($${params.length}::int[])`;
+  }
+  if (ids.countryIds.length) {
+    params.push(ids.countryIds);
+    whereCore += ` AND g.country_id = ANY($${params.length}::int[])`;
+  }
+  if ((opts.apps || []).length) {
+    const apps = (opts.apps || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+    params.push(apps);
+    whereCore += ` AND (LOWER(COALESCE(g.app_id, '')) = ANY($${params.length}::text[])
+      OR LOWER(COALESCE(g.app_name, '')) = ANY($${params.length}::text[]))`;
+  }
+  const whereRange = `${whereCore} AND g.report_date BETWEEN $2::date AND $3::date`;
+  const whereDay = `${whereCore} AND g.report_date = d.day::date`;
+
+  const groupCols = ['g.report_date'];
+  const selectIds = [`g.report_date`];
+  if (byApp) {
+    groupCols.push(`COALESCE(NULLIF(TRIM(g.app_id), ''), NULLIF(TRIM(g.app_name), ''), '')`);
+    selectIds.push(`COALESCE(NULLIF(TRIM(g.app_id), ''), NULLIF(TRIM(g.app_name), ''), '') AS app_id`);
+    selectIds.push(`0 AS domain_id`, `0 AS site_id`, `0 AS ad_unit_id`);
+  } else {
+    groupCols.push('g.domain_id', 'g.site_id');
+    selectIds.push('g.domain_id', 'g.site_id');
+    if (byAdUnit) {
+      groupCols.push('g.ad_unit_id');
+      selectIds.push('g.ad_unit_id');
+    } else {
+      selectIds.push('0 AS ad_unit_id');
+    }
+    selectIds.push(`'' AS app_id`);
+  }
+  if (byCountry) {
+    groupCols.push('g.country_id');
+    selectIds.push('g.country_id');
+  } else {
+    selectIds.push('0 AS country_id');
+  }
+  if (byDevice) {
+    groupCols.push('g.device_id');
+    selectIds.push('g.device_id');
+  } else {
+    selectIds.push('0 AS device_id');
+  }
+
+  const tableParams = [...params, perDay, tableLimit];
+  const perDayIdx = tableParams.length - 1;
+  const limitIdx = tableParams.length;
+
+  const [totalsRes, trendRes, tableRes] = await Promise.all([
+    query(
+      `SELECT
+         COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+         COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+         COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
+         COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+         COUNT(*)::int AS row_count
+       FROM report_grain g
+       WHERE ${whereRange}`,
+      params
+    ),
+    query(
+      `SELECT
+         to_char(g.report_date, 'YYYY-MM-DD') AS date,
+         COALESCE(SUM(g.revenue), 0)::float8 AS earning,
+         COALESCE(SUM(g.impressions), 0)::float8 AS impressions
+       FROM report_grain g
+       WHERE ${whereRange}
+       GROUP BY g.report_date
+       ORDER BY g.report_date`,
+      params
+    ),
+    query(
+      `SELECT
+         to_char(day_rows.report_date, 'YYYY-MM-DD') AS report_date,
+         day_rows.domain_id, day_rows.site_id, day_rows.ad_unit_id,
+         day_rows.country_id, day_rows.device_id, day_rows.app_id,
+         day_rows.impression, day_rows.revenue_raw, day_rows.viewable_raw,
+         day_rows.clicks, day_rows.currency
+       FROM generate_series($2::date, $3::date, '1 day'::interval) AS d(day)
+       CROSS JOIN LATERAL (
+         SELECT
+           ${selectIds.join(',\n           ')},
+           COALESCE(SUM(g.impressions), 0)::float8 AS impression,
+           COALESCE(SUM(g.revenue), 0)::float8 AS revenue_raw,
+           CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+             THEN COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)
+                  / COALESCE(SUM(g.impressions), 0)
+             ELSE 0
+           END AS viewable_raw,
+           COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+           COALESCE(MAX(g.currency), 'USD') AS currency
+         FROM report_grain g
+         WHERE ${whereDay}
+         GROUP BY ${groupCols.join(', ')}
+         HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+         ORDER BY COALESCE(SUM(g.revenue), 0) DESC, COALESCE(SUM(g.impressions), 0) DESC
+         LIMIT $${perDayIdx}
+       ) AS day_rows
+       ORDER BY day_rows.report_date DESC, day_rows.revenue_raw DESC
+       LIMIT $${limitIdx}`,
+      tableParams
+    ),
+  ]);
+
+  const t = totalsRes.rows[0] || {};
+  const impressions = Number(t.impressions) || 0;
+  const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+  const viewableWeight = Number(t.viewable_weight) || 0;
+  const clicks = Number(t.clicks) || 0;
+  const grainCount = Number(t.row_count) || 0;
+  const tableRows = await hydrateGrainIdRows(tableRes.rows || []);
+  if (!grainCount && !tableRows.length) return null;
+
+  const trend = (trendRes.rows || []).map((r) => {
+    const imps = Math.round(Number(r.impressions) || 0);
+    return {
+      date: r.date,
+      earning: coerceWarehouseRevenue(r.earning, imps),
+      impressions: imps,
+    };
+  });
+  const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+
+  logger.info(
+    `Reporting id-grain-fast ${startDate}..${endDate}`
+    + ` grain≈${grainCount} table=${tableRows.length} in ${Date.now() - t0}ms`
+  );
+
+  return {
+    summary: {
+      totalEarning: +Number(revenue).toFixed(2),
+      totalEarningChange: 0,
+      selectRange: +Number(revenue).toFixed(2),
+      selectRangeChange: 0,
+      last7Days: +trend.slice(-7).reduce((a, x) => a + (x.earning || 0), 0).toFixed(2),
+      last7DaysChange: 0,
+      pageViews: Math.round(impressions),
+      pageViewsChange: 0,
+      impressions: Math.round(impressions),
+      impressionsChange: 0,
+      clicks: Math.round(clicks),
+      clicksChange: 0,
+      ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
+      revenue: +Number(revenue).toFixed(2),
+      revenueChange: 0,
+      ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
+      ecpmChange: 0,
+      viewability,
+      viewabilityChange: 0,
+      currency: opts.currency || 'USD',
+    },
+    trend,
+    charts: { revenue: [], device: [], country: [], performance: [] },
+    rows: tableRows,
+    pagination: {
+      totalRows: tableRows.length,
+      returnedRows: tableRows.length,
+      truncated: grainCount > tableRows.length,
+      allRows: false,
+      compact: true,
+    },
+    grainCount: grainCount || tableRows.length,
+    source: 'reporting-id-grain',
   };
 }
 
@@ -3594,6 +3935,7 @@ module.exports = {
   fetchLeanRowsFromDB,
   fetchLeanOverviewTotalsFromDB,
   fetchLeanDashboardBundleFromDB,
+  fetchReportingBundleFromDB,
   fetchFullReportBundleFromDB,
   pickBestFullSlice,
   rebuildRollupsForDates,

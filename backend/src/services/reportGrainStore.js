@@ -553,26 +553,52 @@ function appendGrainInventoryFilters(params, extra, opts = {}) {
   } else if (opts.sliceKey) {
     const sk = String(opts.sliceKey).replace(/'/g, "''");
     clause += ` AND g.slice_key = '${sk}'`;
+  } else if (opts.inventorySlicesOnly) {
+    clause += ` AND g.slice_key IN ('inventory_core', 'inventory_site_domain', 'inventory_domain', 'rich_core')`;
   }
   return clause;
 }
 
+function reportingTableLimit(startDate, endDate, requested) {
+  const startMs = new Date(`${startDate}T12:00:00`).getTime();
+  const endMs = new Date(`${endDate}T12:00:00`).getTime();
+  const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+  const base = Math.min(Math.max(parseInt(requested, 10) || 2500, 50), 5000);
+  if (dayCount <= 7) return base;
+  if (dayCount <= 31) return Math.min(base, 2000);
+  if (dayCount <= 93) return Math.min(base, 1500);
+  return Math.min(base, 1000);
+}
+
 /**
- * Full domain (or site/ad-unit/app) aggregates for the dashboard table — no row sampling.
+ * Fast Reporting table: one LATERAL top-N per day (partition pruning) instead of
+ * aggregating the entire multi-month range into a giant hash before LIMIT.
  */
 async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
   const clientId = requireClientId();
   const params = [clientId, startDate, endDate];
-  // Site hosts live on inventory_core (GAM SITE_NAME). Channel KPI slice uses slot hosts (d1.*).
-  const filterOpts = (opts.sites || []).length
-    ? { ...opts, kpiSliceOnly: false, sliceKey: 'inventory_core' }
-    : { ...opts, kpiSliceOnly: true };
+  const wantsGeo = Boolean(
+    opts.groupByCountry || opts.groupByDevice || (opts.countryNames && opts.countryNames.length)
+  );
+  let filterOpts;
+  if (wantsGeo) {
+    filterOpts = { ...opts, kpiSliceOnly: false, inventorySlicesOnly: true };
+    delete filterOpts.sliceKey;
+  } else if ((opts.sites || []).length) {
+    filterOpts = { ...opts, kpiSliceOnly: false, sliceKey: 'inventory_core' };
+  } else {
+    filterOpts = { ...opts, kpiSliceOnly: true };
+  }
   let extra = appendGrainInventoryFilters(params, '', filterOpts);
 
   const domainExpr = grainDomainExprSql();
   const siteExpr = `NULLIF(LOWER(TRIM(COALESCE(ds.name, ''))), '')`;
   const adUnitExpr = `NULLIF(TRIM(COALESCE(da.name, '')), '')`;
   const appExpr = `NULLIF(TRIM(COALESCE(NULLIF(g.app_id, ''), g.app_name, '')), '')`;
+  const countryExpr = `COALESCE(NULLIF(TRIM(dc.name), ''), '')`;
+  const deviceExpr = `COALESCE(NULLIF(TRIM(dd.name), ''), '')`;
+  const byCountry = Boolean(opts.groupByCountry || (opts.countryNames && opts.countryNames.length));
+  const byDevice = Boolean(opts.groupByDevice);
 
   let groupExprs;
   let selectDims;
@@ -606,11 +632,24 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
        '' AS app_id`;
   }
 
-  const tableLimit = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 2500, 50), 5000);
+  if (byCountry) {
+    groupExprs.push(countryExpr);
+    selectDims += `,\n       ${countryExpr} AS country`;
+  } else {
+    selectDims += `,\n       '' AS country`;
+  }
+  if (byDevice) {
+    groupExprs.push(deviceExpr);
+    selectDims += `,\n       ${deviceExpr} AS device`;
+  } else {
+    selectDims += `,\n       '' AS device`;
+  }
+
+  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
   const startMs = new Date(`${startDate}T12:00:00`).getTime();
   const endMs = new Date(`${endDate}T12:00:00`).getTime();
   const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
-  const perDay = Math.max(15, Math.min(400, Math.ceil(tableLimit / dayCount)));
+  const perDay = Math.max(8, Math.min(80, Math.ceil(tableLimit / dayCount)));
   params.push(perDay);
   const perDayIdx = params.length;
   params.push(tableLimit);
@@ -622,7 +661,13 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
     : '';
 
   const { rows } = await query(
-    `WITH agg AS (
+    `SELECT
+       to_char(day_rows.report_date, 'YYYY-MM-DD') AS report_date,
+       day_rows.domain_name, day_rows.site_url, day_rows.ad_unit, day_rows.app_id,
+       day_rows.country, day_rows.device,
+       day_rows.impression, day_rows.revenue_raw, day_rows.viewable_raw, day_rows.clicks, day_rows.currency
+     FROM generate_series($2::date, $3::date, '1 day'::interval) AS d(day)
+     CROSS JOIN LATERAL (
        SELECT
          g.report_date,
          ${selectDims},
@@ -637,27 +682,17 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
          COALESCE(MAX(g.currency), 'USD') AS currency
        ${GRAIN_JOIN_SQL}
        WHERE g.client_id = $1::uuid
-         AND g.report_date BETWEEN $2::date AND $3::date
+         AND g.report_date = d.day::date
          ${extra}${havingDomain}
        GROUP BY ${groupBy}
        HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
-     ),
-     ranked AS (
-       SELECT *,
-         ROW_NUMBER() OVER (
-           PARTITION BY report_date
-           ORDER BY revenue_raw DESC, impression DESC
-         ) AS day_rank
-       FROM agg
-     )
-     SELECT
-       to_char(report_date, 'YYYY-MM-DD') AS report_date,
-       domain_name, site_url, ad_unit, app_id,
-       impression, revenue_raw, viewable_raw, clicks, currency
-     FROM ranked
-     WHERE day_rank <= $${perDayIdx}
-     -- Interleave days so first page spans the full range, not only endDate.
-     ORDER BY day_rank ASC, report_date DESC, revenue_raw DESC
+       ORDER BY
+         CASE WHEN NULLIF(TRIM(${byCountry ? countryExpr : `''`}), '') IS NOT NULL THEN 0 ELSE 1 END,
+         COALESCE(SUM(g.revenue), 0) DESC,
+         COALESCE(SUM(g.impressions), 0) DESC
+       LIMIT $${perDayIdx}
+     ) AS day_rows
+     ORDER BY day_rows.report_date DESC, day_rows.revenue_raw DESC
      LIMIT $${limitIdx}`,
     params
   );
@@ -749,6 +784,8 @@ module.exports = {
   fetchGrainLegacyFromDB,
   fetchGrainLeanRowsFromDB,
   fetchGrainDomainTableRows,
+  reportingTableLimit,
+  appendGrainInventoryFilters,
   grainHasRichDimsForDate,
   listGrainDatesMissingRichDims,
   deleteStaleGrain,
