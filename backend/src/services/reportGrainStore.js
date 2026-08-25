@@ -489,7 +489,7 @@ async function fetchGrainLeanRowsFromDB(startDate, endDate, opts = {}) {
               impression, revenue_raw, viewable_raw, clicks, currency
        FROM ranked
        WHERE day_rank <= $${perDayIdx}
-       ORDER BY report_date DESC, revenue_raw DESC
+       ORDER BY day_rank ASC, report_date DESC, revenue_raw DESC
        LIMIT $${limitIdx}`,
       params
     );
@@ -656,7 +656,8 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
        impression, revenue_raw, viewable_raw, clicks, currency
      FROM ranked
      WHERE day_rank <= $${perDayIdx}
-     ORDER BY report_date DESC, revenue_raw DESC
+     -- Interleave days so first page spans the full range, not only endDate.
+     ORDER BY day_rank ASC, report_date DESC, revenue_raw DESC
      LIMIT $${limitIdx}`,
     params
   );

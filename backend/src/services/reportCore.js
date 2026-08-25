@@ -2933,7 +2933,11 @@ async function handleDomainUserReport(req, res) {
   const { cursor, limit, sortColumn, sortDir, search } = req.query;
   const filters = applyDateRestrictionToFilters({ startDate, endDate }, req.user);
   const paginationOpts = parsePaginationQuery({ cursor, limit, sortColumn, sortDir });
-  const wantAllRows = req.query.allRows === '1' || req.query.allRows === 'true';
+  // POST JSON sends allRows:true (boolean); GET sends "true" string — accept both.
+  const wantAllRows = req.query.allRows === true
+    || req.query.allRows === 1
+    || req.query.allRows === '1'
+    || req.query.allRows === 'true';
 
   const buildResponse = (allRows, currency, isMock, siteCtx = null) => {
     const prepared = req.user?.role === 'admin'
@@ -3092,7 +3096,12 @@ async function handleDetailedReport(req, res) {
   }, req.user);
   const paginationOpts = parsePaginationQuery({ cursor, limit, sortColumn, sortDir });
 
-  const wantAllRows = req.query.allRows === '1' || req.query.allRows === 'true';
+  // POST JSON sends allRows:true (boolean); GET sends "true" string — accept both.
+  // Without this, multi-filter POSTs paginate to 50 rows ordered by date DESC → "today only".
+  const wantAllRows = req.query.allRows === true
+    || req.query.allRows === 1
+    || req.query.allRows === '1'
+    || req.query.allRows === 'true';
   const MAX_REPORTING_CLIENT_ROWS = 5000;
 
   const buildScopedFromRows = (
@@ -3186,7 +3195,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v5_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v7_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3196,6 +3205,7 @@ async function handleDetailedReport(req, res) {
     domainId: filters.domainId,
     reportDimensions: filters.reportDimensions,
     reportMetrics: filters.reportMetrics,
+    allRows: wantAllRows ? '1' : '0',
   })}_${pageKey}`;
 
   try {
@@ -3299,6 +3309,8 @@ async function handleDetailedReport(req, res) {
           ? normalizeReportRows(bundle.rows || [])
           : prepareScopedReportRows(bundle.rows || [], rowFilters, req.user);
         const revenue = Number(bundle.summary?.revenue) || 0;
+        const truncated = Boolean(bundle.pagination?.truncated)
+          || (Number(bundle.grainCount) || 0) > scopedRows.length;
         const body = applyVisibility({
           summary: {
             totalRevenue: revenue,
@@ -3331,10 +3343,17 @@ async function handleDetailedReport(req, res) {
             const api = catalogIdToGamEnum(id);
             return !api || classified.usedMetrics.includes(api);
           }) : [],
-          pagination: bundle.pagination || {
-            totalRows: bundle.grainCount || scopedRows.length,
-            truncated: Boolean(bundle.pagination?.truncated),
-          },
+          pagination: wantAllRows
+            ? {
+              totalRows: scopedRows.length,
+              returnedRows: scopedRows.length,
+              truncated,
+              allRows: true,
+            }
+            : (bundle.pagination || {
+              totalRows: bundle.grainCount || scopedRows.length,
+              truncated,
+            }),
         }, req.user);
         if (!wantAllRows && scopedRows.length) {
           const paged = paginateRows(scopedRows, {
@@ -3344,8 +3363,9 @@ async function handleDetailedReport(req, res) {
           body.rows = paged.rows;
           body.pagination = {
             ...paged.pagination,
-            totalRows: bundle.grainCount || scopedRows.length,
-            truncated: Boolean(bundle.pagination?.truncated),
+            // Use returned table size — not raw grainCount — so UI pages across days.
+            totalRows: scopedRows.length,
+            truncated: truncated || scopedRows.length > paged.rows.length,
           };
         }
         logger.info(

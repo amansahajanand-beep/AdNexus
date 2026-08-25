@@ -5,8 +5,9 @@
  *
  * Tuned for Upstash command budget + heap safety:
  *   - Hourly: lean today only
- *   - Every 6h: lean yesterday + full-today (not every hour)
- *   - 2AM: lean backfill only (full backfill weekly unless FULL_BACKFILL_DAILY=true)
+ *   - Every 6h: lean yesterday
+ *   - 2AM: one job per calendar month until every day has KPI grain
+ *   - Boot: today + yesterday + recent gaps + incomplete months
  */
 const cron   = require('node-cron');
 const logger = require('../utils/logger');
@@ -78,7 +79,7 @@ async function enqueueLeanYesterdayAndFullToday({ reason } = {}) {
   });
 }
 
-/** Back-compat for server boot kickoff. */
+/** Fill missing days in a rolling window (default last 30 days). */
 async function enqueueRecentGapFill({ reason, days = 30 } = {}) {
   const today = todayInTZ();
   const start = shiftYMD(today, -(Math.max(1, days) - 1));
@@ -105,12 +106,53 @@ async function enqueueRecentGapFill({ reason, days = 30 } = {}) {
   });
 }
 
+/**
+ * One sync-backfill job per calendar month in the historical window.
+ * Worker uses syncCompleteDateRangeFromGAM — skips months already fully covered,
+ * otherwise fills missing days oldest-first until 1..N are present.
+ */
+async function enqueueMonthCompleteBackfill({ reason } = {}) {
+  const range = historicalRangeForPresets();
+  const months = listCalendarMonthsNewestFirst(range.startDate, range.endDate);
+  const tag = reason ? ` (${reason})` : '';
+  const daySlot = todayInTZ();
+
+  await eachActiveClient(async (client) => {
+    const cid = client.id;
+    for (let i = 0; i < months.length; i += 1) {
+      const { startDate: ms, endDate: me } = months[i];
+      try {
+        await gamSyncQueue.add('sync-backfill', {
+          startDate: ms,
+          endDate: me,
+          completeMonth: true,
+          includeFull: false,
+          clientId: cid,
+        }, {
+          // Include day so boot + 2AM can both enqueue without colliding forever.
+          jobId: `sync-month-${cid.slice(0, 8)}-${ms}-${me}-${daySlot}`,
+          priority: 3 + i,
+          attempts: 2,
+          backoff: { type: 'fixed', delay: 120000 },
+        });
+        logger.info(
+          `Cron: enqueued complete-month ${ms} → ${me} client=${cid.slice(0, 8)}`
+          + ` priority=${3 + i}${tag}`
+        );
+      } catch (e) {
+        logger.error('Cron: failed to enqueue sync-month:', e.message);
+      }
+    }
+  });
+}
+
 async function enqueueHourlyLeanSync({ reason } = {}) {
   await enqueueLeanToday({ reason });
-  // On boot, also refresh yesterday + fill recent warehouse gaps.
+  // On boot, also refresh yesterday + recent gaps + full historical months.
   if (reason === 'boot') {
     await enqueueLeanYesterdayAndFullToday({ reason: 'boot' });
     await enqueueRecentGapFill({ reason: 'boot', days: 30 });
+    await enqueueMonthCompleteBackfill({ reason: 'boot' });
   }
 }
 
@@ -125,43 +167,15 @@ function startCron() {
     await enqueueLeanToday({ reason: 'hourly' });
   }, { timezone: 'Asia/Singapore' });
 
-  // ── Every 6 hours: yesterday lean + full-today ───────────────────────────
+  // ── Every 6 hours: yesterday lean ────────────────────────────────────────
   cron.schedule('15 */6 * * *', async () => {
     await enqueueLeanYesterdayAndFullToday({ reason: '6h' });
   }, { timezone: 'Asia/Singapore' });
 
-  // ── 2 AM daily: grain past window, one job per calendar month (newest first) ─
+  // ── 2 AM daily: complete each calendar month (all days 1..end) ───────────
   cron.schedule('0 2 * * *', async () => {
-    const range = historicalRangeForPresets();
-    const months = listCalendarMonthsNewestFirst(range.startDate, range.endDate);
-    await eachActiveClient(async (client) => {
-      const cid = client.id;
-      for (let i = 0; i < months.length; i += 1) {
-        const { startDate: ms, endDate: me } = months[i];
-        try {
-          await gamSyncQueue.add('sync-backfill', {
-            startDate: ms,
-            endDate: me,
-            includeFull: false,
-            clientId: cid,
-          }, {
-            jobId: `sync-month-${cid.slice(0, 8)}-${ms}-${me}`,
-            priority: 3 + i,
-            attempts: 1,
-            backoff: { type: 'fixed', delay: 120000 },
-          });
-          logger.info(
-            `Cron: enqueued sync-month ${ms} → ${me} client=${cid.slice(0, 8)} priority=${3 + i}`
-          );
-        } catch (e) {
-          logger.error('Cron: failed to enqueue sync-month:', e.message);
-        }
-      }
-    });
+    await enqueueMonthCompleteBackfill({ reason: '2am' });
   }, { timezone: 'Asia/Singapore' });
-
-  // Weekly full warehouse retired — grain months are filled at 2 AM.
-
 
   // ── 3 AM daily: archive grain + rollups older than HISTORICAL_DAYS to S3 ──
   cron.schedule('0 3 * * *', async () => {
@@ -183,7 +197,7 @@ function startCron() {
   }, { timezone: 'Asia/Singapore' });
 
   logger.info(
-    'Cron jobs started: hourly today, 6h yesterday, 2AM month-chunk backfill, 3AM archive, boot kickoff'
+    'Cron jobs started: hourly today, 6h yesterday, 2AM complete-month backfill, 3AM archive, boot kickoff'
   );
 
   // Don't wait until the next clock hour — fill today's present now.
@@ -194,4 +208,9 @@ function startCron() {
   });
 }
 
-module.exports = { startCron, enqueueHourlyLeanSync, enqueueRecentGapFill };
+module.exports = {
+  startCron,
+  enqueueHourlyLeanSync,
+  enqueueRecentGapFill,
+  enqueueMonthCompleteBackfill,
+};

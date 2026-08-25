@@ -4,8 +4,9 @@
  *
  * Job types:
  *   sync-today    → report_present (unified grain)
- *   sync-day      → one historical day in report_daily
- *   sync-backfill → one calendar month (newest first) into report_daily
+ *   sync-day      → one historical day
+ *   sync-backfill → calendar month / range until every day has KPI grain
+ *   sync-fill-gaps → missing days in range (complete-month semantics)
  */
 const { Worker } = require('bullmq');
 const { redisSet, TTL, createBullmqConnection, isTransientRedisError } = require('../redisClient');
@@ -13,7 +14,7 @@ const logger     = require('../utils/logger');
 const {
   streamSyncFromGAM,
   syncDateRangeFromGAM,
-  fillMissingGrainDates,
+  syncCompleteDateRangeFromGAM,
   invalidateCacheForDate,
   logSync,
 } = require('../services/gamSyncService');
@@ -114,15 +115,17 @@ async function processJobInner(job) {
     } else if (job.name === 'sync-fill-gaps') {
       const start = job.data?.startDate || targetDates[0];
       const end = job.data?.endDate || targetDates[targetDates.length - 1];
-      totalUpserted = await fillMissingGrainDates(start, end, job.name);
+      // Full-range completeness: fill gaps, then verify/retry via complete path.
+      totalUpserted = await syncCompleteDateRangeFromGAM(start, end, job.name);
     } else if (job.name === 'sync-backfill' && Array.isArray(job.data?.dates) && job.data.dates.length) {
-      for (const day of job.data.dates) {
-        totalUpserted += await streamSyncFromGAM(day, day, job.name);
-        await invalidateCacheForDate(day);
-      }
+      // Sparse missing-day list: still complete the full enclosing range (1..N of month).
+      totalUpserted = await syncCompleteDateRangeFromGAM(startDate, endDate, job.name);
     } else if (job.name === 'sync-full-range' || job.name === 'sync-full-today' || job.name === 'sync-full-backfill' || job.name === 'promote-full-present') {
       logger.info(`[gam-sync] ${job.name} skipped — report_full_* warehouse retired`);
       return;
+    } else if (job.name === 'sync-backfill' || job.data?.completeMonth) {
+      // Calendar-month backfill: do not stop after newest 7-day windows only.
+      totalUpserted = await syncCompleteDateRangeFromGAM(startDate, endDate, job.name);
     } else {
       totalUpserted = await syncDateRangeFromGAM(startDate, endDate, job.name);
     }

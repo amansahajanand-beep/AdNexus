@@ -27,7 +27,7 @@ const { requireClientId, tenantKey, getClientId } = require('../utils/clientCont
 const {
   redisDel, redisDelByPattern, bumpCacheGeneration, TTL, redisGet, redisSet, MAX_REDIS_ARRAY_ITEMS,
 } = require('../redisClient');
-const { todayInTZ, listDateWindowsNewestFirst } = require('../utils/datetime');
+const { todayInTZ, listDateWindowsNewestFirst, listDateWindowsOldestFirst } = require('../utils/datetime');
 const { normalizeReportRows, rowsHaveMetrics } = require('../utils/rowNormalize');
 const {
   resolveInventoryFields,
@@ -682,7 +682,7 @@ async function fetchAppSliceDashboardBundle(startDate, endDate, opts = {}) {
        impression, revenue_raw, viewable_raw, clicks, currency
      FROM ranked
      WHERE day_rank <= $${tableParams.length - 1}
-     ORDER BY report_date DESC, revenue_raw DESC
+     ORDER BY day_rank ASC, report_date DESC, revenue_raw DESC
      LIMIT $${tableParams.length}`,
     tableParams
   );
@@ -924,6 +924,8 @@ async function fetchInventorySiteOverviewFromGrain(startDate, endDate, opts = {}
   const sites = (opts.sites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   if (!sites.length) return null;
   const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const countries = (opts.countryNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const adUnits = (opts.adUnitNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const clientId = await resolveGrainClientId();
   const { GRAIN_JOIN_SQL, grainDomainExprSql } = require('./reportGrainStore');
   const params = [clientId, startDate, endDate];
@@ -932,6 +934,14 @@ async function fetchInventorySiteOverviewFromGrain(startDate, endDate, opts = {}
   if (domains.length) {
     params.push(domains);
     clause += ` AND ${grainDomainExprSql()} = ANY($${params.length}::text[])`;
+  }
+  if (countries.length) {
+    params.push(countries);
+    clause += ` AND LOWER(TRIM(COALESCE(dc.name, ''))) = ANY($${params.length}::text[])`;
+  }
+  if (adUnits.length) {
+    params.push(adUnits);
+    clause += ` AND LOWER(TRIM(COALESCE(da.name, ''))) = ANY($${params.length}::text[])`;
   }
 
   const { rows } = await query(
@@ -963,17 +973,22 @@ async function fetchInventorySiteOverviewFromGrain(startDate, endDate, opts = {}
 }
 
 /**
- * Site (+ optional domain) table/trend bundle from inventory_core (GAM Site × Domain grain).
+ * Site (+ optional domain / country / ad unit) table/trend from inventory_core.
+ * Fair per-day sampling so 30d / 3m / 12m ranges keep every day in the table
+ * (plain ORDER BY date DESC LIMIT would collapse to recent/today only).
  */
 async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) {
   const sites = (opts.sites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   if (!sites.length) return null;
   const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const countries = (opts.countryNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const adUnits = (opts.adUnitNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const clientId = await resolveGrainClientId();
   const tableLimit = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 2500, 50), 5000);
   const { GRAIN_JOIN_SQL, grainDomainExprSql } = require('./reportGrainStore');
   const domainExpr = grainDomainExprSql();
   const siteExpr = `NULLIF(LOWER(TRIM(COALESCE(ds.name, ''))), '')`;
+  const adUnitExpr = `NULLIF(LOWER(TRIM(COALESCE(da.name, ''))), '')`;
 
   const baseParams = [clientId, startDate, endDate];
   baseParams.push(sites);
@@ -981,6 +996,14 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
   if (domains.length) {
     baseParams.push(domains);
     clause += ` AND ${domainExpr} = ANY($${baseParams.length}::text[])`;
+  }
+  if (countries.length) {
+    baseParams.push(countries);
+    clause += ` AND LOWER(TRIM(COALESCE(dc.name, ''))) = ANY($${baseParams.length}::text[])`;
+  }
+  if (adUnits.length) {
+    baseParams.push(adUnits);
+    clause += ` AND LOWER(TRIM(COALESCE(da.name, ''))) = ANY($${baseParams.length}::text[])`;
   }
 
   const { rows: totalsRows } = await query(
@@ -1028,7 +1051,18 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
     };
   });
 
-  const tableParams = [...baseParams, tableLimit];
+  const startMs = new Date(`${startDate}T12:00:00`).getTime();
+  const endMs = new Date(`${endDate}T12:00:00`).getTime();
+  const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+  const perDay = Math.max(10, Math.min(400, Math.ceil(tableLimit / dayCount)));
+  const groupAdUnit = adUnits.length > 0;
+  const groupBySql = groupAdUnit
+    ? `g.report_date, ${siteExpr}, ${adUnitExpr}`
+    : `g.report_date, ${siteExpr}`;
+  const selectAdUnit = groupAdUnit
+    ? `COALESCE(${adUnitExpr}, '') AS ad_unit`
+    : `'' AS ad_unit`;
+  const tableParams = [...baseParams, perDay, tableLimit];
   const { rows: tableRaw } = await query(
     `WITH agg AS (
        SELECT
@@ -1039,7 +1073,7 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
            ''
          ) AS domain_name,
          COALESCE(${siteExpr}, '') AS site_url,
-         '' AS ad_unit,
+         ${selectAdUnit},
          '' AS app_id,
          COALESCE(SUM(g.impressions), 0)::float8 AS impression,
          COALESCE(SUM(g.revenue), 0)::float8 AS revenue_raw,
@@ -1055,20 +1089,30 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
          AND g.report_date BETWEEN $2::date AND $3::date
          AND g.slice_key IN ('inventory_core', 'inventory_site_domain')
          ${clause}
-       GROUP BY g.report_date, ${siteExpr}
+       GROUP BY ${groupBySql}
        HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+     ),
+     ranked AS (
+       SELECT *,
+         ROW_NUMBER() OVER (
+           PARTITION BY report_date
+           ORDER BY revenue_raw DESC, impression DESC
+         ) AS day_rank
+       FROM agg
      ),
      counted AS (
        SELECT COUNT(*)::int AS agg_count FROM agg
      )
      SELECT
-       to_char(a.report_date, 'YYYY-MM-DD') AS report_date,
-       a.domain_name, a.site_url, a.ad_unit, a.app_id,
-       a.impression, a.revenue_raw, a.viewable_raw, a.clicks, a.currency,
+       to_char(r.report_date, 'YYYY-MM-DD') AS report_date,
+       r.domain_name, r.site_url, r.ad_unit, r.app_id,
+       r.impression, r.revenue_raw, r.viewable_raw, r.clicks, r.currency,
        c.agg_count
-     FROM agg a
+     FROM ranked r
      CROSS JOIN counted c
-     ORDER BY a.report_date DESC, a.revenue_raw DESC, a.impression DESC
+     WHERE r.day_rank <= $${tableParams.length - 1}
+     -- Interleave days so first page spans the full range, not only endDate.
+     ORDER BY r.day_rank ASC, r.report_date DESC, r.revenue_raw DESC
      LIMIT $${tableParams.length}`,
     tableParams
   );
@@ -1076,28 +1120,11 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
   const aggCount = Number(tableRaw?.[0]?.agg_count) || tableRows.length;
   const truncated = aggCount > tableRows.length;
 
-  // When the full site table fits, make summary match row sums exactly (no grain vs table drift).
-  let summaryImpressions = Math.round(impressions);
-  let summaryRevenue = +Number(revenue).toFixed(2);
-  let summaryClicks = Math.round(clicks);
-  let summaryViewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
-  if (!truncated && tableRows.length) {
-    let rowImp = 0;
-    let rowRev = 0;
-    let rowClicks = 0;
-    let rowViewW = 0;
-    for (const r of tableRows) {
-      const imp = Number(r.impression) || 0;
-      rowImp += imp;
-      rowRev += Number(r.revenue) || 0;
-      rowClicks += Number(r.clicks) || 0;
-      rowViewW += ((Number(r.viewableRate) || 0) / 100) * imp;
-    }
-    summaryImpressions = Math.round(rowImp);
-    summaryRevenue = +rowRev.toFixed(2);
-    summaryClicks = Math.round(rowClicks);
-    summaryViewability = rowImp > 0 ? +(rowViewW / rowImp * 100).toFixed(1) : 0;
-  }
+  // Summary always from full-range SQL (not truncated table sample).
+  const summaryImpressions = Math.round(impressions);
+  const summaryRevenue = +Number(revenue).toFixed(2);
+  const summaryClicks = Math.round(clicks);
+  const summaryViewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
 
   return {
     summary: {
@@ -1497,12 +1524,13 @@ function appendLeanInventoryFilters(params, extra, opts = {}) {
   }
   if (countryNames.length) {
     params.push(countryNames);
-    clause += ` AND LOWER(COALESCE(
+    clause += ` AND LOWER(TRIM(COALESCE(
+      dc.name,
       dimensions->>'COUNTRY_NAME',
       dimensions->>'country_name',
       dimensions->>'country',
       ''
-    )) = ANY($${params.length}::text[])`;
+    ))) = ANY($${params.length}::text[])`;
   }
   return clause;
 }
@@ -1653,7 +1681,8 @@ async function fetchBundleDomainTableFromRollup(startDate, endDate, opts, limit)
        impression, revenue_raw, viewable_raw, clicks, currency
      FROM ranked
      WHERE day_rank <= $${perDayIdx}
-     ORDER BY report_date DESC, revenue_raw DESC
+     -- Interleave days (rank then date) so page-1 is not only the latest day.
+     ORDER BY day_rank ASC, report_date DESC, revenue_raw DESC
      LIMIT $${limitIdx}`,
     filterParams
   );
@@ -1896,9 +1925,10 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
     if (appBundle) return appBundle;
   }
 
-  // Site filter: grain SITE_NAME for request hosts; rollups only for d1.* slot hosts.
+  // Site filter (request hosts): inventory_core path. Apply country/ad-unit in the same query.
+  // Do not early-return when apps are also set — caller uses compat-union for web|app.
   const siteKind = classifySiteHostSelection(opts.sites);
-  if ((opts.sites || []).length) {
+  if ((opts.sites || []).length && !hasApp) {
     const siteBundle = await fetchInventorySiteDashboardBundle(startDate, endDate, opts);
     if (siteKind === 'request') {
       if (siteBundle) return siteBundle;
@@ -1914,6 +1944,9 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
   }
 
   // Request-style site filters must not fall back to channel rollups (totals ≠ grain-site table).
+  if (siteKind === 'request' && (opts.sites || []).length && !hasApp) {
+    return null;
+  }
   if (siteKind !== 'request') {
     try {
       const rolled = await fetchDashboardBundleFromRollups(startDate, endDate, opts);
@@ -2295,8 +2328,11 @@ async function fetchFromGAM(startDate, endDate, onBatch) {
   return collected;
 }
 
-function listSyncWindows(startDate, endDate) {
+function listSyncWindows(startDate, endDate, opts = {}) {
   const maxDays = Math.max(1, parseInt(process.env.GAM_SYNC_MAX_DAYS || '7', 10) || 7);
+  if (opts.oldestFirst) {
+    return listDateWindowsOldestFirst(startDate, endDate, maxDays);
+  }
   return listDateWindowsNewestFirst(startDate, endDate, maxDays);
 }
 
@@ -2410,7 +2446,7 @@ async function listMissingGrainDates(startDate, endDate) {
   return rows.map((r) => r.report_date);
 }
 
-/** Pull GAM for each day missing canonical KPI grain in range. */
+/** Pull GAM for each day missing canonical KPI grain in range (oldest first). */
 async function fillMissingGrainDates(startDate, endDate, syncType = 'fill-gaps') {
   const missing = await listMissingGrainDates(startDate, endDate);
   if (!missing.length) {
@@ -2421,15 +2457,52 @@ async function fillMissingGrainDates(startDate, endDate, syncType = 'fill-gaps')
     `[${syncType}] Filling ${missing.length} missing day(s) in ${startDate}..${endDate}`
     + ` (${missing[0]} → ${missing[missing.length - 1]})`
   );
+
+  // Batch consecutive missing days into windows (oldest first) — faster than 1 GAM report/day.
+  const maxDays = Math.max(1, parseInt(process.env.GAM_SYNC_MAX_DAYS || '7', 10) || 7);
+  const windows = [];
+  let runStart = missing[0];
+  let runEnd = missing[0];
+  for (let i = 1; i < missing.length; i += 1) {
+    const prev = missing[i - 1];
+    const cur = missing[i];
+    const nextOfPrev = shiftDate(prev, 1);
+    const span = daysBetweenYmd(runStart, cur) + 1;
+    if (cur === nextOfPrev && span <= maxDays) {
+      runEnd = cur;
+    } else {
+      windows.push({ startDate: runStart, endDate: runEnd });
+      runStart = cur;
+      runEnd = cur;
+    }
+  }
+  windows.push({ startDate: runStart, endDate: runEnd });
+
   let total = 0;
-  for (const day of missing) {
+  for (const win of windows) {
     try {
-      total += await streamSyncFromGAM(day, day, syncType);
+      total += await streamSyncFromGAM(win.startDate, win.endDate, syncType);
     } catch (e) {
-      logger.warn(`[${syncType}] Failed to sync ${day}:`, e.message);
+      logger.warn(
+        `[${syncType}] Window ${win.startDate}..${win.endDate} failed, falling back day-by-day: ${e.message}`
+      );
+      let cursor = win.startDate;
+      while (cursor <= win.endDate) {
+        try {
+          total += await streamSyncFromGAM(cursor, cursor, syncType);
+        } catch (dayErr) {
+          logger.warn(`[${syncType}] Failed to sync ${cursor}:`, dayErr.message);
+        }
+        cursor = shiftDate(cursor, 1);
+      }
     }
   }
   return total;
+}
+
+function daysBetweenYmd(a, b) {
+  const ms = new Date(`${b}T12:00:00Z`) - new Date(`${a}T12:00:00Z`);
+  return Math.round(ms / 86400000);
 }
 
 async function listDatesMissingRichDims(startDate, endDate) {
@@ -2516,6 +2589,56 @@ async function syncDateRangeFromGAM(startDate, endDate, syncType = 'sync-backfil
   let total = 0;
   for (const win of windows) {
     total += await streamSyncFromGAM(win.startDate, win.endDate, syncType);
+  }
+  return total;
+}
+
+/**
+ * Ensure every day in [startDate, endDate] has KPI grain — full month completeness.
+ * Prefer missing-day fill (oldest first) so early-month gaps are not left until last.
+ * Verifies coverage and retries once; does not stop after only scraping month-end windows.
+ */
+async function syncCompleteDateRangeFromGAM(startDate, endDate, syncType = 'sync-backfill') {
+  if (!startDate || !endDate || startDate > endDate) return 0;
+
+  let missing = await listMissingGrainDates(startDate, endDate);
+  if (!missing.length) {
+    logger.info(`[${syncType}] Range ${startDate}..${endDate} already complete — skip`);
+    return 0;
+  }
+
+  logger.info(
+    `[${syncType}] Completing ${startDate}..${endDate}: ${missing.length} missing day(s)`
+    + ` (oldest ${missing[0]}, newest ${missing[missing.length - 1]})`
+  );
+
+  let total = await fillMissingGrainDates(startDate, endDate, syncType);
+
+  missing = await listMissingGrainDates(startDate, endDate);
+  if (missing.length) {
+    logger.warn(
+      `[${syncType}] ${missing.length} day(s) still missing after fill —`
+      + ` window-sync oldest-first ${missing[0]}..${missing[missing.length - 1]}`
+    );
+    const windows = listSyncWindows(missing[0], missing[missing.length - 1], { oldestFirst: true });
+    for (const win of windows) {
+      try {
+        total += await streamSyncFromGAM(win.startDate, win.endDate, syncType);
+      } catch (e) {
+        logger.warn(`[${syncType}] Window ${win.startDate}..${win.endDate} failed: ${e.message}`);
+      }
+    }
+    total += await fillMissingGrainDates(startDate, endDate, `${syncType}:gap-retry`);
+    missing = await listMissingGrainDates(startDate, endDate);
+  }
+
+  if (missing.length) {
+    logger.warn(
+      `[${syncType}] INCOMPLETE ${startDate}..${endDate}: ${missing.length} day(s) still missing`
+      + ` (${missing[0]} → ${missing[missing.length - 1]})`
+    );
+  } else {
+    logger.info(`[${syncType}] COMPLETE ${startDate}..${endDate} — all days have KPI grain`);
   }
   return total;
 }
@@ -3479,6 +3602,7 @@ module.exports = {
   fetchFromGAM,
   streamSyncFromGAM,
   syncDateRangeFromGAM,
+  syncCompleteDateRangeFromGAM,
   dailyHasCountryAndDevice,
   presentHasCountryAndDevice,
   listDatesMissingRichDims,

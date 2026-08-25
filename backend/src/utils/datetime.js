@@ -111,6 +111,21 @@ function listDateWindowsNewestFirst(startDate, endDate, maxDays = 7) {
   return windows;
 }
 
+/** Inclusive date windows, oldest first — full-month completeness (day 1 onward). */
+function listDateWindowsOldestFirst(startDate, endDate, maxDays = 7) {
+  const span = Math.max(1, parseInt(maxDays, 10) || 7);
+  if (!startDate || !endDate || startDate > endDate) return [];
+  const windows = [];
+  let from = startDate;
+  while (from <= endDate) {
+    let to = shiftYMD(from, span - 1);
+    if (to > endDate) to = endDate;
+    windows.push({ startDate: from, endDate: to });
+    from = shiftYMD(to, 1);
+  }
+  return windows;
+}
+
 /**
  * Past-data window stored in report_daily.
  * HISTORICAL_DAYS (default 365) back from yesterday, at least previous calendar month.
@@ -173,6 +188,7 @@ module.exports = {
   endOfMonth,
   listCalendarMonthsNewestFirst,
   listDateWindowsNewestFirst,
+  listDateWindowsOldestFirst,
   historicalRangeForPresets,
   ymdToObj,
   objToYmd,
