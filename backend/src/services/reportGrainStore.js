@@ -223,35 +223,43 @@ async function upsertGrainFromJsonbRows(jsonbRows, syncType) {
   return upsertGrainRows(normalized, syncType);
 }
 
-/** SQL: domain from dim_domain, else ad-unit prefix (matches legacy inv_domain backfill). */
+/** SQL: canonical domain for inventory — prefer real SITE_NAME root, then ad-unit, then DOMAIN dim.
+ * Matches GAM Historical Domain better than channel/ad-unit-only inference. */
 function grainDomainExprSql() {
   const au = `COALESCE(da.name, '')`;
-  return `COALESCE(
-    NULLIF(LOWER(TRIM(dm.name)), ''),
-    CASE
+  const auRoot = `CASE
       WHEN ${au} <> '' AND ${au} LIKE '%.%_%'
       THEN NULLIF(LOWER(TRIM(split_part(
         regexp_replace(${au}, '\\s*\\(\\d+\\)\\s*$', ''),
         '_', 1
       ))), '')
-      ELSE ''
-    END
+      ELSE NULL
+    END`;
+  // Last two hostname labels: www.gamisco.com / game1.gamisco.com → gamisco.com
+  const siteRoot = `NULLIF(LOWER(SUBSTRING(TRIM(COALESCE(ds.name, '')) FROM '[^.]+\\.[^.]+$')), '')`;
+  return `COALESCE(
+    ${siteRoot},
+    ${auRoot},
+    NULLIF(LOWER(TRIM(dm.name)), '')
   )`;
 }
 
 /** Same inference on rollup_kpi_daily flat columns (works before rollup rebuild). */
 function rollupInvDomainExprSql() {
   const au = `COALESCE(inv_ad_unit, '')`;
-  return `COALESCE(
-    NULLIF(LOWER(TRIM(inv_domain)), ''),
-    CASE
+  const auRoot = `CASE
       WHEN ${au} <> '' AND ${au} LIKE '%.%_%'
       THEN NULLIF(LOWER(TRIM(split_part(
         regexp_replace(${au}, '\\s*\\(\\d+\\)\\s*$', ''),
         '_', 1
       ))), '')
-      ELSE ''
-    END
+      ELSE NULL
+    END`;
+  const siteRoot = `NULLIF(LOWER(SUBSTRING(TRIM(COALESCE(inv_site, '')) FROM '[^.]+\\.[^.]+$')), '')`;
+  return `COALESCE(
+    ${siteRoot},
+    ${auRoot},
+    NULLIF(LOWER(TRIM(inv_domain)), '')
   )`;
 }
 
@@ -355,6 +363,65 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
     }
   }
   logger.info(`[${syncType}] Rebuilt rollups from grain for ${uniq.length} day(s); kpi rows≈${totalKpi}`);
+  await rebuildInventoryRollupsFromGrain(uniq, syncType);
+  return totalKpi;
+}
+
+/**
+ * Rebuild Site/Domain rollups from inventory_core (real GAM SITE_NAME hosts).
+ * Channel KPI rollups keep d1.* slot hosts for overview; inventory table uses this.
+ */
+async function rebuildInventoryRollupsFromGrain(dates, syncType = 'rollup') {
+  const uniq = [...new Set((dates || []).map((d) => String(d).slice(0, 10)).filter(Boolean))];
+  if (!uniq.length) return 0;
+
+  const m = typedGrainMetricSql('g');
+  let totalKpi = 0;
+  const clientId = requireClientId();
+
+  for (const day of uniq) {
+    try {
+      await query(
+        `DELETE FROM rollup_inventory_kpi_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
+        [day, clientId]
+      );
+      // Collapse to date × domain × site (no ad-unit) — Inventory Breakdown default grain.
+      const kpiRes = await query(
+        `INSERT INTO rollup_inventory_kpi_daily (
+           client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
+           impressions, revenue, viewable_weight, clicks, grain_count, currency
+         )
+         SELECT
+           $2::uuid,
+           g.report_date,
+           COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
+           COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
+           '',
+           '',
+           COALESCE(SUM(${m.impressionExpr}), 0),
+           COALESCE(SUM(${m.revenueExpr}), 0),
+           COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
+           COALESCE(SUM(${m.clickExpr}), 0),
+           COUNT(*)::int,
+           COALESCE(MAX(${m.currencyExpr}), 'USD')
+         ${GRAIN_JOIN_SQL}
+         WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+           AND g.slice_key = 'inventory_core'
+         GROUP BY g.report_date,
+           COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
+           COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), '')
+         HAVING COALESCE(SUM(${m.impressionExpr}), 0) > 0
+             OR COALESCE(SUM(${m.revenueExpr}), 0) > 0`,
+        [day, clientId]
+      );
+      totalKpi += kpiRes.rowCount || 0;
+    } catch (e) {
+      logger.warn(`[${syncType}] inventory rollup rebuild failed for ${day}:`, e.message);
+    }
+  }
+  if (totalKpi > 0) {
+    logger.info(`[${syncType}] Rebuilt inventory rollups for ${uniq.length} day(s); rows≈${totalKpi}`);
+  }
   return totalKpi;
 }
 
@@ -533,10 +600,37 @@ function appendGrainInventoryFilters(params, extra, opts = {}) {
   }
   if (domains.length) {
     params.push(domains);
-    clause += ` AND ${domainExpr} = ANY($${params.length}::text[])`;
+    // Match canonical domain, dim name, ad-unit root, or site-host root so
+    // mis-tagged DOMAIN rows for gamisco (etc.) still resolve correctly.
+    clause += ` AND (
+      ${domainExpr} = ANY($${params.length}::text[])
+      OR LOWER(COALESCE(dm.name, '')) = ANY($${params.length}::text[])
+      OR LOWER(SPLIT_PART(REGEXP_REPLACE(COALESCE(da.name, ''), '\\s*\\(\\d+\\)\\s*$', ''), '_', 1))
+           = ANY($${params.length}::text[])
+      OR NULLIF(LOWER(SUBSTRING(TRIM(COALESCE(ds.name, '')) FROM '[^.]+\\.[^.]+$')), '')
+           = ANY($${params.length}::text[])
+    )`;
   }
   if (sites.length) {
-    params.push(sites);
+    const expanded = [];
+    const seen = new Set();
+    for (const raw of sites) {
+      const s = String(raw || '').trim().toLowerCase();
+      if (!s || seen.has(s)) continue;
+      seen.add(s);
+      expanded.push(s);
+      if (s.startsWith('www.') && !seen.has(s.slice(4))) {
+        seen.add(s.slice(4));
+        expanded.push(s.slice(4));
+      } else if ((s.match(/\./g) || []).length === 1) {
+        const www = `www.${s}`;
+        if (!seen.has(www)) {
+          seen.add(www);
+          expanded.push(www);
+        }
+      }
+    }
+    params.push(expanded);
     clause += ` AND LOWER(COALESCE(ds.name, '')) = ANY($${params.length}::text[])`;
   }
   if (apps.length) {
@@ -563,11 +657,10 @@ function reportingTableLimit(startDate, endDate, requested) {
   const startMs = new Date(`${startDate}T12:00:00`).getTime();
   const endMs = new Date(`${endDate}T12:00:00`).getTime();
   const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
-  const base = Math.min(Math.max(parseInt(requested, 10) || 2500, 50), 5000);
-  if (dayCount <= 7) return base;
-  if (dayCount <= 31) return Math.min(base, 2000);
-  if (dayCount <= 93) return Math.min(base, 1500);
-  return Math.min(base, 1000);
+  const base = Math.min(Math.max(parseInt(requested, 10) || 2500, 50), 15000);
+  // Keep enough capacity that every day can contribute rows across long presets.
+  const fairMin = Math.min(15000, Math.max(200, dayCount * 40));
+  return Math.min(15000, Math.max(base, fairMin));
 }
 
 /**
@@ -584,10 +677,9 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
   if (wantsGeo) {
     filterOpts = { ...opts, kpiSliceOnly: false, inventorySlicesOnly: true };
     delete filterOpts.sliceKey;
-  } else if ((opts.sites || []).length) {
-    filterOpts = { ...opts, kpiSliceOnly: false, sliceKey: 'inventory_core' };
   } else {
-    filterOpts = { ...opts, kpiSliceOnly: true };
+    // Inventory Breakdown must use inventory_core (SITE_NAME), not channel KPI slice.
+    filterOpts = { ...opts, kpiSliceOnly: false, sliceKey: opts.sliceKey || 'inventory_core' };
   }
   let extra = appendGrainInventoryFilters(params, '', filterOpts);
 
@@ -616,7 +708,7 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
        '' AS site_url,
        '' AS ad_unit,
        COALESCE(${appExpr}, '') AS app_id`;
-  } else if (opts.sites?.length) {
+  } else if (opts.sites?.length || opts.groupBySite) {
     groupExprs = [`g.report_date`, domainExpr, siteExpr];
     selectDims = `
        ${domainExpr} AS domain_name,
@@ -624,10 +716,11 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
        '' AS ad_unit,
        '' AS app_id`;
   } else {
-    groupExprs = [`g.report_date`, domainExpr];
+    // Default inventory table: date × domain × site (not domain-only).
+    groupExprs = [`g.report_date`, domainExpr, siteExpr];
     selectDims = `
        ${domainExpr} AS domain_name,
-       '' AS site_url,
+       COALESCE(${siteExpr}, '') AS site_url,
        '' AS ad_unit,
        '' AS app_id`;
   }
@@ -669,30 +762,38 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
      FROM generate_series($2::date, $3::date, '1 day'::interval) AS d(day)
      CROSS JOIN LATERAL (
        SELECT
-         g.report_date,
-         ${selectDims},
-         COALESCE(SUM(g.impressions), 0)::float8 AS impression,
-         COALESCE(SUM(g.revenue), 0)::float8 AS revenue_raw,
-         CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
-           THEN COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)
-                / COALESCE(SUM(g.impressions), 0)
-           ELSE 0
-         END AS viewable_raw,
-         COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
-         COALESCE(MAX(g.currency), 'USD') AS currency
-       ${GRAIN_JOIN_SQL}
-       WHERE g.client_id = $1::uuid
-         AND g.report_date = d.day::date
-         ${extra}${havingDomain}
-       GROUP BY ${groupBy}
-       HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
-       ORDER BY
-         CASE WHEN NULLIF(TRIM(${byCountry ? countryExpr : `''`}), '') IS NOT NULL THEN 0 ELSE 1 END,
-         COALESCE(SUM(g.revenue), 0) DESC,
-         COALESCE(SUM(g.impressions), 0) DESC
-       LIMIT $${perDayIdx}
+         ranked.*,
+         ROW_NUMBER() OVER (
+           ORDER BY ranked.revenue_raw DESC, ranked.impression DESC
+         ) AS day_rank
+       FROM (
+         SELECT
+           g.report_date,
+           ${selectDims},
+           COALESCE(SUM(g.impressions), 0)::float8 AS impression,
+           COALESCE(SUM(g.revenue), 0)::float8 AS revenue_raw,
+           CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+             THEN COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)
+                  / COALESCE(SUM(g.impressions), 0)
+             ELSE 0
+           END AS viewable_raw,
+           COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+           COALESCE(MAX(g.currency), 'USD') AS currency
+         ${GRAIN_JOIN_SQL}
+         WHERE g.client_id = $1::uuid
+           AND g.report_date = d.day::date
+           ${extra}${havingDomain}
+         GROUP BY ${groupBy}
+         HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+         ORDER BY
+           CASE WHEN NULLIF(TRIM(${byCountry ? countryExpr : `''`}), '') IS NOT NULL THEN 0 ELSE 1 END,
+           COALESCE(SUM(g.revenue), 0) DESC,
+           COALESCE(SUM(g.impressions), 0) DESC
+         LIMIT $${perDayIdx}
+       ) ranked
      ) AS day_rows
-     ORDER BY day_rows.report_date DESC, day_rows.revenue_raw DESC
+     -- Interleave days (rank then date) so page-1 is not only the latest day.
+     ORDER BY day_rows.day_rank ASC, day_rows.report_date DESC, day_rows.revenue_raw DESC
      LIMIT $${limitIdx}`,
     params
   );
@@ -781,6 +882,7 @@ module.exports = {
   upsertGrainFromJsonbRows,
   typedGrainMetricSql,
   rebuildRollupsFromGrain,
+  rebuildInventoryRollupsFromGrain,
   fetchGrainLegacyFromDB,
   fetchGrainLeanRowsFromDB,
   fetchGrainDomainTableRows,

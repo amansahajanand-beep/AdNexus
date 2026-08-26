@@ -231,6 +231,12 @@ function asArray(v) {
   return (Array.isArray(v) ? v : [v]).map(s => String(s).trim()).filter(Boolean);
 }
 
+function inclusiveDayCount(startDate, endDate) {
+  const startMs = new Date(`${startDate}T12:00:00`).getTime();
+  const endMs = new Date(`${endDate}T12:00:00`).getTime();
+  return Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+}
+
 function enrichRowsWithCountryFilter(rows, countryIds) {
   const ids = asArray(countryIds).map(String).filter(Boolean);
   if (!ids.length) return rows;
@@ -518,7 +524,14 @@ function mockDetailed({
     asArray(reportDimensions)
   );
   const totalRevenue = +enriched.reduce((a, r) => a + r.revenue, 0).toFixed(2);
-  const totalDomains = new Set(enriched.map(r => r.site)).size + new Set(enriched.map(r => r.appId)).size;
+  const domainKeys = new Set();
+  for (const r of enriched) {
+    const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+    const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+    if (domain) domainKeys.add(`web:${domain}`);
+    if (app) domainKeys.add(`app:${app}`);
+  }
+  const totalDomains = domainKeys.size;
   const trend = dates.map(date => ({ date, earning: +(trendMap[date] || 0).toFixed(2) }));
 
   return {
@@ -2262,7 +2275,7 @@ function buildDashboardChartsFromRows(rows = [], opts = {}) {
 }
 
 /** Never ship unbounded grain rows to the browser — caps payload + freezes. */
-const MAX_DASHBOARD_CLIENT_ROWS = 2500;
+const MAX_DASHBOARD_CLIENT_ROWS = 15000;
 
 function emptyDashboardCompatPayload(filters, currency) {
   const skipped = inventoryFilterFamilyLabels(filters);
@@ -2722,7 +2735,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = `report_dashboard_resp_v10_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = `report_dashboard_resp_v19_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -2794,7 +2807,20 @@ async function handleDashboard(req, res) {
           };
         // SQL already applied inventory filters — normalize only (do not re-filter).
         // Re-filtering via catalog hosts often wiped domain labels / collapsed table rows.
-        const sqlApplied = new Set(['rollup', 'compat-union', 'lean', 'grain-app', 'grain-site', 'grain', 'site-merge']);
+        const sqlApplied = new Set([
+          'rollup',
+          'rollup+inventory-core-table',
+          'reporting-rollup',
+          'reporting-rollup+inventory-core',
+          'compat-union',
+          'lean',
+          'grain-app',
+          'grain-site',
+          'grain-inventory-core',
+          'reporting-inventory-core',
+          'grain',
+          'site-merge',
+        ]);
         const scopedRows = sqlApplied.has(bundle.source)
           ? normalizeReportRows(bundle.rows || [])
           : prepareScopedReportRows(bundle.rows, rowFilters, req.user);
@@ -2899,6 +2925,33 @@ async function handleDashboard(req, res) {
   }
 
   // memory → Redis → Postgres (present/past for this query) → GAM → persist
+  // Long ranges: never block the UI on live GAM — warehouse sync runs in background.
+  const rangeDays = inclusiveDayCount(filters.startDate, filters.endDate);
+  if (!isScopedChild && rangeDays > 14) {
+    logger.info(
+      `Dashboard SQL miss ${filters.startDate}..${filters.endDate} (${rangeDays}d)`
+      + ' — returning empty (no GAM wait)'
+    );
+    enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
+    const empty = applyVisibility({
+      summary: {
+        impressions: 0,
+        revenue: 0,
+        ecpm: 0,
+        viewability: 0,
+        currency: currency || 'USD',
+      },
+      rows: [],
+      trend: [],
+      charts: { revenue: [], device: [], country: [], performance: [] },
+      isMock: false,
+      pagination: { totalRows: 0, truncated: false },
+      reportWarning: 'partial',
+      reportWarningSkipped: ['Warehouse data still loading for this date range'],
+    }, req.user, visibilityOpts);
+    return res.json(empty);
+  }
+
   try {
     const token = await getToken();
     const loaded = await loadReportRowsCacheAside(filters, token, {
@@ -3138,7 +3191,16 @@ async function handleDetailedReport(req, res) {
       : rows.length;
     const totalDomains = precomputed?.summary?.totalDomains != null
       ? precomputed.summary.totalDomains
-      : (new Set(rows.map((r) => r.site)).size + new Set(rows.map((r) => r.appId)).size);
+      : (() => {
+        const keys = new Set();
+        for (const r of rows) {
+          const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+          const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+          if (domain) keys.add(`web:${domain}`);
+          if (app) keys.add(`app:${app}`);
+        }
+        return keys.size;
+      })();
     const summary = { totalRevenue, totalDomains, offeredRecords, currency };
     const warningFields = {
       reportWarning,
@@ -3195,7 +3257,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v7_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v16_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3281,6 +3343,9 @@ async function handleDetailedReport(req, res) {
       || d === 'device'
       || d === 'DEVICE_CATEGORY_NAME'
     ));
+    const wantsSiteCol = reportDimIds.some((d) => (
+      d === 'site_name' || d === 'site' || d === 'SITE_NAME' || d === 'url_name'
+    )) || reportDimIds.length === 0; // default inventory table includes site
     let tableLimit = 2000;
     try {
       const { reportingTableLimit } = require('./reportGrainStore');
@@ -3299,6 +3364,8 @@ async function handleDetailedReport(req, res) {
       skipAdUnitLike,
       groupByCountry: wantsCountryCol,
       groupByDevice: wantsDeviceCol,
+      groupBySite: wantsSiteCol,
+      tableGrain: wantsSiteCol ? 'site' : 'domain',
       // Reporting: skip dashboard chart scans; use lateral day samples for long ranges.
       reportingFast: true,
       skipCharts: true,
@@ -3316,11 +3383,23 @@ async function handleDetailedReport(req, res) {
         if (bundle) {
           const scopedRows = normalizeReportRows(bundle.rows || []);
           const revenue = Number(bundle.summary?.revenue) || 0;
+          const totalDomains = bundle.summary?.totalDomains != null
+            ? Number(bundle.summary.totalDomains) || 0
+            : (() => {
+              const keys = new Set();
+              for (const r of scopedRows) {
+                const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+                const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+                if (domain) keys.add(`web:${domain}`);
+                if (app) keys.add(`app:${app}`);
+              }
+              return keys.size;
+            })();
           const body = applyVisibility({
             summary: {
+              ...(bundle.summary || {}),
               totalRevenue: revenue,
-              totalDomains: new Set(scopedRows.map((r) => r.site).filter(Boolean)).size
-                + new Set(scopedRows.map((r) => r.appId).filter(Boolean)).size,
+              totalDomains,
               offeredRecords: bundle.grainCount || scopedRows.length,
               currency: currency || bundle.summary?.currency || 'USD',
             },
@@ -3347,10 +3426,23 @@ async function handleDetailedReport(req, res) {
               const api = catalogIdToGamEnum(id);
               return !api || classified.usedMetrics.includes(api);
             }) : [],
-            pagination: bundle.pagination || {
-              totalRows: bundle.grainCount || scopedRows.length,
-              truncated: Boolean(bundle.pagination?.truncated),
-            },
+            pagination: wantAllRows
+              ? {
+                totalRows: scopedRows.length,
+                returnedRows: scopedRows.length,
+                truncated: Boolean(bundle.pagination?.truncated),
+                allRows: true,
+                offeredRecords: bundle.grainCount || scopedRows.length,
+              }
+              : {
+                ...(paginateRows(scopedRows, {
+                  ...paginationOpts,
+                  limit: Math.min(paginationOpts.limit || 50, MAX_REPORTING_CLIENT_ROWS),
+                }).pagination),
+                totalRows: scopedRows.length,
+                truncated: Boolean(bundle.pagination?.truncated),
+                offeredRecords: bundle.grainCount || scopedRows.length,
+              },
           }, req.user);
           if (!wantAllRows && scopedRows.length) {
             const paged = paginateRows(scopedRows, {
@@ -3360,8 +3452,9 @@ async function handleDetailedReport(req, res) {
             body.rows = paged.rows;
             body.pagination = {
               ...paged.pagination,
-              totalRows: bundle.grainCount || scopedRows.length,
+              totalRows: scopedRows.length,
               truncated: Boolean(bundle.pagination?.truncated),
+              offeredRecords: bundle.grainCount || scopedRows.length,
             };
           }
           logger.info(
@@ -3395,18 +3488,43 @@ async function handleDetailedReport(req, res) {
             domainName: compat.usedOpts?.adUnitNames ?? filters.domainName,
             domainId: compat.usedOpts?.apps ?? filters.domainId,
           };
-        const sqlApplied = new Set(['rollup', 'compat-union', 'lean', 'grain-app', 'grain-site', 'grain', 'site-merge']);
+        const sqlApplied = new Set([
+          'rollup',
+          'rollup+inventory-core-table',
+          'reporting-rollup',
+          'reporting-rollup+inventory-core',
+          'compat-union',
+          'lean',
+          'grain-app',
+          'grain-site',
+          'grain-inventory-core',
+          'reporting-inventory-core',
+          'grain',
+          'site-merge',
+        ]);
         const scopedRows = sqlApplied.has(bundle.source)
           ? normalizeReportRows(bundle.rows || [])
           : prepareScopedReportRows(bundle.rows || [], rowFilters, req.user);
         const revenue = Number(bundle.summary?.revenue) || 0;
         const truncated = Boolean(bundle.pagination?.truncated)
           || (Number(bundle.grainCount) || 0) > scopedRows.length;
+        const totalDomains = bundle.summary?.totalDomains != null
+          ? Number(bundle.summary.totalDomains) || 0
+          : (() => {
+            const keys = new Set();
+            for (const r of scopedRows) {
+              const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+              const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+              if (domain) keys.add(`web:${domain}`);
+              if (app) keys.add(`app:${app}`);
+            }
+            return keys.size;
+          })();
         const body = applyVisibility({
           summary: {
+            ...(bundle.summary || {}),
             totalRevenue: revenue,
-            totalDomains: new Set(scopedRows.map((r) => r.site).filter(Boolean)).size
-              + new Set(scopedRows.map((r) => r.appId).filter(Boolean)).size,
+            totalDomains,
             offeredRecords: bundle.grainCount || scopedRows.length,
             currency: currency || bundle.summary?.currency || 'USD',
           },
