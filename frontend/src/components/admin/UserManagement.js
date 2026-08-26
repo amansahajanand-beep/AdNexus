@@ -14,6 +14,46 @@ import { PermissionSaveSummary, UserEditChangeSummary } from './PermissionChange
 import SuccessModal from '../ui/SuccessModal';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 
+function DomainUserPasswordCell({ user }) {
+  const [visible, setVisible] = useState(false);
+  if (user.role === 'admin') {
+    return <span className="admin-password-muted">—</span>;
+  }
+  const pwd = user.password;
+  if (!pwd) {
+    return (
+      <span className="admin-password-muted" title="Edit user and set a password to store a viewable copy">
+        Reset to view
+      </span>
+    );
+  }
+  return (
+    <div className="admin-password-cell">
+      <code className="admin-password-value">{visible ? pwd : '••••••••'}</code>
+      <button
+        type="button"
+        className="link-action"
+        onClick={() => setVisible((v) => !v)}
+        title={visible ? 'Hide password' : 'Show password'}
+      >
+        {visible ? 'Hide' : 'Show'}
+      </button>
+      <button
+        type="button"
+        className="link-action"
+        onClick={() => {
+          try {
+            navigator.clipboard?.writeText(pwd);
+          } catch (_) { /* ignore */ }
+        }}
+        title="Copy password"
+      >
+        Copy
+      </button>
+    </div>
+  );
+}
+
 /**
  * User List table with Add / Edit / Edit-Channels / Delete actions.
  * Persistence is delegated to parent callbacks (each returns a promise).
@@ -38,14 +78,12 @@ export default function UserManagement({
   const [formError, setFormError] = useState(null);
   const [search, setSearch] = useState('');
   const [successMsg, setSuccessMsg] = useState(null);
-  const [deleteTarget, setDeleteTarget] = useState(null);
-  const [deleting, setDeleting] = useState(false);
 
   const showSuccess = (msg) => setSuccessMsg(msg);
 
   const filteredUsers = useMemo(
     () => filterRowsBySearch(users, search, (u) => [
-      u.username, u.role, u.id,
+      u.username, u.role, u.id, u.password,
       ...(u.permissions?.allowedDomains || []),
       ...(u.permissions?.allowedSites || []),
       ...(u.permissions?.allowedAppIds || []),
@@ -98,6 +136,9 @@ export default function UserManagement({
         await onCreate(payload);
         setFormOpen(false);
         const changes = payload.role !== 'admin' ? buildNewUserInventorySummary(payload) : [];
+        if (payload.role !== 'admin' && payload.password) {
+          changes.unshift({ type: 'added', text: `Password: ${payload.password}` });
+        }
         showSuccess({ type: 'add', username: payload.username, changes });
       }
     } catch (err) {
@@ -189,6 +230,7 @@ export default function UserManagement({
               <th>ID No.</th>
               <th>User Name</th>
               <th>Role</th>
+              <th>Password</th>
               <th>Permissions</th>
               <th>Domains</th>
               <th style={{ textAlign: 'right' }}>Actions</th>
@@ -197,12 +239,12 @@ export default function UserManagement({
           <tbody>
             {loading ? (
               Array.from({ length: 5 }).map((_, i) => (
-                <tr key={i}>{Array.from({ length: 6 }).map((_, j) => (
+                <tr key={i}>{Array.from({ length: 7 }).map((_, j) => (
                   <td key={j} data-label=""><div className="skeleton" style={{ height: 16 }} /></td>
                 ))}</tr>
               ))
             ) : filteredUsers.length === 0 ? (
-              <tr><td colSpan="6" style={{ textAlign: 'center', color: '#888', padding: 30 }}>
+              <tr><td colSpan="7" style={{ textAlign: 'center', color: '#888', padding: 30 }}>
                 {search.trim() ? 'No users match your search' : 'No users'}
               </td></tr>
             ) : filteredUsers.map((u, i) => (
@@ -213,6 +255,9 @@ export default function UserManagement({
                   <span className={`role-badge ${u.role === 'admin' ? 'admin' : 'child'}`}>
                     {u.role === 'admin' ? 'Admin' : 'Domain User'}
                   </span>
+                </td>
+                <td data-label="Password">
+                  <DomainUserPasswordCell user={u} />
                 </td>
                 <td data-label="Permissions">
                   <div className="perm-badge-row">

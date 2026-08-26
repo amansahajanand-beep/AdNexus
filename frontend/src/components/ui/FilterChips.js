@@ -11,7 +11,7 @@ export default function FilterChips({
   chips = [],
   onRemove,
   onAddFilter,
-  expanded = true,
+  expanded = false,
   onToggleExpand,
   title = 'Applied filters',
   hasData = null,
@@ -38,7 +38,7 @@ export default function FilterChips({
 
   if (!chips.length) return null;
 
-  const showToggle = hasOverflow || (expanded && chips.length > 8);
+  const showToggle = Boolean(onToggleExpand) && (expanded || hasOverflow || chips.length > 8);
 
   const chipVariant = hasData === true ? 'green' : hasData === false ? 'red' : '';
 

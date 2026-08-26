@@ -26,9 +26,7 @@ export function hasReportSelection(applied = {}) {
 
 /** Table dimensions from inventory filters the user actually applied. */
 export function inventoryFilterTableDims(applied = {}) {
-  const dimensions = ['date'];
-  if (asFilterArray(applied.domain).length) dimensions.push('domain');
-  if (asFilterArray(applied.site).length) dimensions.push('site_name');
+  const dimensions = ['date', 'domain', 'site_name'];
   if (asFilterArray(applied.domainName).length) dimensions.push('ad_unit_name');
   if (asFilterArray(applied.domainId).length) dimensions.push('mobile_app_resolved_id');
   return dimensions;
@@ -36,8 +34,8 @@ export function inventoryFilterTableDims(applied = {}) {
 
 /**
  * Resolve GAM query dims/metrics for /reports/detailed.
- * Date-only (nothing selected) → default overview: Date + Total revenue (+ impressions)
- * so summary cards always have values.
+ * Date-only (nothing selected) → Date + Domain + Site + default metrics
+ * so summary cards and the table always have values.
  *
  * Site/App/Ad unit filters without Report Builder dimensions still need table dims
  * (date + site_name / app id / …). If the user picked metrics but left dimensions
@@ -48,13 +46,14 @@ export function resolveReportingQuery(applied = {}) {
   const userMets = applied.reportMetrics || [];
   const invDims = inventoryFilterTableDims(applied);
   const hasInv = draftHasInventorySelection(applied);
+  const defaultDims = ['date', 'domain', 'site_name'];
 
-  // Nothing selected beyond date → still load Total Revenue overview for cards.
+  // Nothing selected beyond date → load default domain+site overview.
   if (!hasReportSelection(applied)) {
     return {
-      dims: ['date'],
+      dims: defaultDims,
       mets: [...DEFAULT_REPORT_METRICS],
-      tableDims: ['date'],
+      tableDims: defaultDims,
     };
   }
 
@@ -62,7 +61,7 @@ export function resolveReportingQuery(applied = {}) {
     // Metrics-only + inventory filters → still request site/app breakdown dims.
     const dims = userDims.length
       ? userDims
-      : (hasInv ? invDims : ['date']);
+      : (hasInv ? invDims : defaultDims);
     return {
       dims,
       mets: userMets.length ? userMets : [...DEFAULT_REPORT_METRICS],
@@ -71,8 +70,8 @@ export function resolveReportingQuery(applied = {}) {
   }
 
   return {
-    // Inventory-only: backend picks warehouse grain; UI shows only applied filter columns.
-    dims: hasInv ? [] : invDims,
+    // Inventory-only: backend picks warehouse grain; UI shows domain + site (+ filter cols).
+    dims: hasInv ? invDims : defaultDims,
     mets: [...DEFAULT_REPORT_METRICS],
     tableDims: invDims,
   };

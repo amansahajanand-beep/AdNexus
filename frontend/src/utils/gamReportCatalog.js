@@ -49,7 +49,7 @@ export const GAM_CATALOG_STATS = {
  * Empty dims → resolveReportTableConfig picks 'inventory' mode → getDetailed() runs
  * → summary cards (revenue, totalDomains, offeredRecords) get real values from backend.
  */
-export const DEFAULT_REPORT_DIMENSIONS = [];
+export const DEFAULT_REPORT_DIMENSIONS = ['date', 'domain', 'site_name'];
 export const DEFAULT_REPORT_METRICS = [
   'total_line_item_level_cpm_and_cpc_revenue',
   'total_line_item_level_impressions',

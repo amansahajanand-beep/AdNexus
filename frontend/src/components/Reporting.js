@@ -141,7 +141,7 @@ export default function Reporting() {
     ...todayInit,
     country: [],
     ...EMPTY_INVENTORY_FILTERS,
-    reportDimensions: [],
+    reportDimensions: [...DEFAULT_REPORT_DIMENSIONS],
     // Total revenue (+ impressions) by default so cards load without Apply.
     reportMetrics: [...DEFAULT_REPORT_METRICS],
     reportSettings: DEFAULT_REPORT_SETTINGS,
@@ -189,9 +189,11 @@ export default function Reporting() {
 
   const [filtersOpen, setFiltersOpen] = useState(() => saved?.filtersOpen ?? !filterVisibility.isScopedUser);
   const [breakdownOpen, setBreakdownOpen] = useState(() => saved?.breakdownOpen ?? true);
-  const [chipsExpanded, setChipsExpanded] = useState(() => saved?.chipsExpanded ?? true);
+  const [chipsExpanded, setChipsExpanded] = useState(false);
   // Restore saved builder state; default metrics = Total revenue (+ impressions).
-  const [reportDimensions, setReportDimensions] = useState(() => saved?.reportDimensions ?? []);
+  const [reportDimensions, setReportDimensions] = useState(() => (
+    saved?.reportDimensions?.length ? saved.reportDimensions : [...DEFAULT_REPORT_DIMENSIONS]
+  ));
   const [reportMetrics, setReportMetrics] = useState(
     () => (saved?.reportMetrics?.length ? saved.reportMetrics : [...DEFAULT_REPORT_METRICS])
   );
@@ -416,7 +418,7 @@ export default function Reporting() {
     setReportMetrics(nextMets);
     setReportSettings(nextSettings);
     setPage(1);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setFiltersOpen(true);
     setData(null);
     setProgData(null);
@@ -493,19 +495,9 @@ export default function Reporting() {
         country: applied.country,
         reportSettings: applied.reportSettings,
       };
-      // Cap table payload for long ranges — UI paginates; avoid shipping 2500 rows first.
-      const daySpan = (() => {
-        try {
-          const a = new Date(`${applied.startDate || todayInit.startDate}T12:00:00Z`).getTime();
-          const b = new Date(`${applied.endDate || todayInit.endDate}T12:00:00Z`).getTime();
-          return Math.max(1, Math.round((b - a) / 86400000) + 1);
-        } catch (_) {
-          return 1;
-        }
-      })();
-      const reportFilters = daySpan <= 7
-        ? { ...dateFilters, allRows: true }
-        : { ...dateFilters, allRows: false, limit: 100 };
+      // Always request the full SQL-capped sample (fair per-day). Sending
+      // limit:100 + allRows:false sorted DESC made 30d/3m/6m look like "today only".
+      const reportFilters = { ...dateFilters, allRows: true };
       const [detailed, programmatic] = await Promise.all([
         cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters) : Promise.resolve(null),
         cfg.mode === 'programmatic' ? reportsAPI.getProgrammatic(reportFilters).catch(() => null) : Promise.resolve(null),
@@ -810,7 +802,7 @@ export default function Reporting() {
     setStartDate(r.startDate);
     setEndDate(r.endDate);
     setPage(1);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     if (resolveReportingQuery({ ...applied, startDate: r.startDate, endDate: r.endDate })) {
       setData(null);
       setProgData(null);
@@ -848,7 +840,7 @@ export default function Reporting() {
     });
     persistRecentFilter();
     setFiltersOpen(false);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     loadCatalog(true);
     const qs = encodeReportShare({
       preset,
@@ -895,7 +887,7 @@ export default function Reporting() {
     setData(null);
     setProgData(null);
     setHasApplied(true);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setApplied({
       startDate: dates.startDate,
       endDate: dates.endDate,
@@ -948,7 +940,7 @@ export default function Reporting() {
     setFiltersOpen((open) => {
       const next = !open;
       if (!next) {
-        setChipsExpanded(true);
+        setChipsExpanded(false);
         setBreakdownOpen(false);
       }
       return next;
@@ -1220,12 +1212,12 @@ export default function Reporting() {
     setSite([]);
     setDomainName([]);
     setDomainId([]);
-    setReportDimensions([]);
+    setReportDimensions([...DEFAULT_REPORT_DIMENSIONS]);
     setReportMetrics([...DEFAULT_REPORT_METRICS]);
     setReportSettings(DEFAULT_REPORT_SETTINGS);
     setFiltersOpen(!filterVisibility.isScopedUser);
     setBreakdownOpen(true);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setSearch('');
     setPage(1);
     setData(null);
@@ -1243,7 +1235,7 @@ export default function Reporting() {
       ...r,
       ...EMPTY_INVENTORY_FILTERS,
       country: [],
-      reportDimensions: [],
+      reportDimensions: [...DEFAULT_REPORT_DIMENSIONS],
       reportMetrics: [...DEFAULT_REPORT_METRICS],
       reportSettings: DEFAULT_REPORT_SETTINGS,
     });
