@@ -19,6 +19,7 @@ if (usePg) {
     verifyPassword: async (username, password) => await pg.verifyPassword(username, password),
     checkPasswordForUser: (user, password) => pg.checkPasswordForUser(user, password),
     hashPassword: (pw) => pg.hashPassword(pw),
+    toAdminSafeUser: (user) => pg.toAdminSafeUser(user),
   };
 } else {
   const fs = require('fs');
@@ -66,14 +67,29 @@ if (usePg) {
     return crypto.createHash('sha256').update(password + process.env.JWT_SECRET).digest('hex');
   }
 
+  function toAdminSafeUser(user) {
+    if (!user) return null;
+    const { passwordHash, passwordEncrypted, activeSessionId, ...safe } = user;
+    if (safe.role !== 'admin') {
+      if (passwordEncrypted) {
+        try {
+          const { decryptSecret } = require('../utils/credentialsCrypto');
+          safe.password = decryptSecret(passwordEncrypted);
+        } catch (_) {
+          safe.password = null;
+        }
+      } else {
+        safe.password = null;
+      }
+    }
+    return safe;
+  }
+
   // ─── User CRUD ────────────────────────────────────────────────────────────────
 
   function getAllUsers() {
     const db = readDB();
-    return db.users.map(u => {
-      const { passwordHash, activeSessionId, ...safe } = u;
-      return safe;
-    });
+    return db.users.map((u) => toAdminSafeUser(u));
   }
 
   function getUsersByClientId(clientId) {
@@ -98,11 +114,13 @@ if (usePg) {
       throw new Error('Username already exists');
     }
 
+    const { encryptSecret } = require('../utils/credentialsCrypto');
     const user = {
       id: `user-${Date.now()}`,
       username,
       email,
       passwordHash: hashPassword(password),
+      passwordEncrypted: password ? encryptSecret(password) : null,
       role: role || 'child', // 'admin' | 'child'
       clientId: clientId || null,
       permissions: permissions || {
@@ -135,8 +153,7 @@ if (usePg) {
 
     db.users.push(user);
     writeDB(db);
-    const { passwordHash, activeSessionId, ...safe } = user;
-    return safe;
+    return toAdminSafeUser(user);
   }
 
   function updateUser(id, updates) {
@@ -145,14 +162,15 @@ if (usePg) {
     if (idx === -1) throw new Error('User not found');
 
     if (updates.password) {
+      const { encryptSecret } = require('../utils/credentialsCrypto');
       updates.passwordHash = hashPassword(updates.password);
+      updates.passwordEncrypted = encryptSecret(updates.password);
       delete updates.password;
     }
 
     db.users[idx] = { ...db.users[idx], ...updates, id };
     writeDB(db);
-    const { passwordHash, activeSessionId, ...safe } = db.users[idx];
-    return safe;
+    return db.users[idx];
   }
 
   function deleteUser(id) {
@@ -174,7 +192,8 @@ if (usePg) {
 
     // Update last login
     updateUser(user.id, { lastLogin: new Date().toISOString() });
-    return { ...user, passwordHash: undefined };
+    const { passwordHash, passwordEncrypted, ...safe } = user;
+    return safe;
   }
 
   function checkPasswordForUser(user, password) {
@@ -193,6 +212,7 @@ if (usePg) {
     deleteUser,
     verifyPassword,
     checkPasswordForUser,
-    hashPassword
+    hashPassword,
+    toAdminSafeUser,
   };
 }

@@ -141,7 +141,7 @@ export default function Reporting() {
     ...todayInit,
     country: [],
     ...EMPTY_INVENTORY_FILTERS,
-    reportDimensions: [],
+    reportDimensions: [...DEFAULT_REPORT_DIMENSIONS],
     // Total revenue (+ impressions) by default so cards load without Apply.
     reportMetrics: [...DEFAULT_REPORT_METRICS],
     reportSettings: DEFAULT_REPORT_SETTINGS,
@@ -189,9 +189,11 @@ export default function Reporting() {
 
   const [filtersOpen, setFiltersOpen] = useState(() => saved?.filtersOpen ?? !filterVisibility.isScopedUser);
   const [breakdownOpen, setBreakdownOpen] = useState(() => saved?.breakdownOpen ?? true);
-  const [chipsExpanded, setChipsExpanded] = useState(() => saved?.chipsExpanded ?? true);
+  const [chipsExpanded, setChipsExpanded] = useState(false);
   // Restore saved builder state; default metrics = Total revenue (+ impressions).
-  const [reportDimensions, setReportDimensions] = useState(() => saved?.reportDimensions ?? []);
+  const [reportDimensions, setReportDimensions] = useState(() => (
+    saved?.reportDimensions?.length ? saved.reportDimensions : [...DEFAULT_REPORT_DIMENSIONS]
+  ));
   const [reportMetrics, setReportMetrics] = useState(
     () => (saved?.reportMetrics?.length ? saved.reportMetrics : [...DEFAULT_REPORT_METRICS])
   );
@@ -416,7 +418,7 @@ export default function Reporting() {
     setReportMetrics(nextMets);
     setReportSettings(nextSettings);
     setPage(1);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setFiltersOpen(true);
     setData(null);
     setProgData(null);
@@ -493,8 +495,8 @@ export default function Reporting() {
         country: applied.country,
         reportSettings: applied.reportSettings,
       };
-      // Return the full capped table (up to 2500 rows) so a 30-day report is not
-      // chopped to a single 50-row page. The UI paginates those rows client-side.
+      // Always request the full SQL-capped sample (fair per-day). Sending
+      // limit:100 + allRows:false sorted DESC made 30d/3m/6m look like "today only".
       const reportFilters = { ...dateFilters, allRows: true };
       const [detailed, programmatic] = await Promise.all([
         cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters) : Promise.resolve(null),
@@ -800,7 +802,7 @@ export default function Reporting() {
     setStartDate(r.startDate);
     setEndDate(r.endDate);
     setPage(1);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     if (resolveReportingQuery({ ...applied, startDate: r.startDate, endDate: r.endDate })) {
       setData(null);
       setProgData(null);
@@ -838,7 +840,7 @@ export default function Reporting() {
     });
     persistRecentFilter();
     setFiltersOpen(false);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     loadCatalog(true);
     const qs = encodeReportShare({
       preset,
@@ -885,7 +887,7 @@ export default function Reporting() {
     setData(null);
     setProgData(null);
     setHasApplied(true);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setApplied({
       startDate: dates.startDate,
       endDate: dates.endDate,
@@ -938,7 +940,7 @@ export default function Reporting() {
     setFiltersOpen((open) => {
       const next = !open;
       if (!next) {
-        setChipsExpanded(true);
+        setChipsExpanded(false);
         setBreakdownOpen(false);
       }
       return next;
@@ -1210,12 +1212,12 @@ export default function Reporting() {
     setSite([]);
     setDomainName([]);
     setDomainId([]);
-    setReportDimensions([]);
+    setReportDimensions([...DEFAULT_REPORT_DIMENSIONS]);
     setReportMetrics([...DEFAULT_REPORT_METRICS]);
     setReportSettings(DEFAULT_REPORT_SETTINGS);
     setFiltersOpen(!filterVisibility.isScopedUser);
     setBreakdownOpen(true);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setSearch('');
     setPage(1);
     setData(null);
@@ -1233,7 +1235,7 @@ export default function Reporting() {
       ...r,
       ...EMPTY_INVENTORY_FILTERS,
       country: [],
-      reportDimensions: [],
+      reportDimensions: [...DEFAULT_REPORT_DIMENSIONS],
       reportMetrics: [...DEFAULT_REPORT_METRICS],
       reportSettings: DEFAULT_REPORT_SETTINGS,
     });

@@ -231,6 +231,12 @@ function asArray(v) {
   return (Array.isArray(v) ? v : [v]).map(s => String(s).trim()).filter(Boolean);
 }
 
+function inclusiveDayCount(startDate, endDate) {
+  const startMs = new Date(`${startDate}T12:00:00`).getTime();
+  const endMs = new Date(`${endDate}T12:00:00`).getTime();
+  return Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
+}
+
 function enrichRowsWithCountryFilter(rows, countryIds) {
   const ids = asArray(countryIds).map(String).filter(Boolean);
   if (!ids.length) return rows;
@@ -518,7 +524,14 @@ function mockDetailed({
     asArray(reportDimensions)
   );
   const totalRevenue = +enriched.reduce((a, r) => a + r.revenue, 0).toFixed(2);
-  const totalDomains = new Set(enriched.map(r => r.site)).size + new Set(enriched.map(r => r.appId)).size;
+  const domainKeys = new Set();
+  for (const r of enriched) {
+    const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+    const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+    if (domain) domainKeys.add(`web:${domain}`);
+    if (app) domainKeys.add(`app:${app}`);
+  }
+  const totalDomains = domainKeys.size;
   const trend = dates.map(date => ({ date, earning: +(trendMap[date] || 0).toFixed(2) }));
 
   return {
@@ -2262,7 +2275,7 @@ function buildDashboardChartsFromRows(rows = [], opts = {}) {
 }
 
 /** Never ship unbounded grain rows to the browser — caps payload + freezes. */
-const MAX_DASHBOARD_CLIENT_ROWS = 2500;
+const MAX_DASHBOARD_CLIENT_ROWS = 15000;
 
 function emptyDashboardCompatPayload(filters, currency) {
   const skipped = inventoryFilterFamilyLabels(filters);
@@ -2722,7 +2735,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = `report_dashboard_resp_v10_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = `report_dashboard_resp_v19_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -2794,7 +2807,20 @@ async function handleDashboard(req, res) {
           };
         // SQL already applied inventory filters — normalize only (do not re-filter).
         // Re-filtering via catalog hosts often wiped domain labels / collapsed table rows.
-        const sqlApplied = new Set(['rollup', 'compat-union', 'lean', 'grain-app', 'grain-site', 'grain', 'site-merge']);
+        const sqlApplied = new Set([
+          'rollup',
+          'rollup+inventory-core-table',
+          'reporting-rollup',
+          'reporting-rollup+inventory-core',
+          'compat-union',
+          'lean',
+          'grain-app',
+          'grain-site',
+          'grain-inventory-core',
+          'reporting-inventory-core',
+          'grain',
+          'site-merge',
+        ]);
         const scopedRows = sqlApplied.has(bundle.source)
           ? normalizeReportRows(bundle.rows || [])
           : prepareScopedReportRows(bundle.rows, rowFilters, req.user);
@@ -2899,6 +2925,33 @@ async function handleDashboard(req, res) {
   }
 
   // memory → Redis → Postgres (present/past for this query) → GAM → persist
+  // Long ranges: never block the UI on live GAM — warehouse sync runs in background.
+  const rangeDays = inclusiveDayCount(filters.startDate, filters.endDate);
+  if (!isScopedChild && rangeDays > 14) {
+    logger.info(
+      `Dashboard SQL miss ${filters.startDate}..${filters.endDate} (${rangeDays}d)`
+      + ' — returning empty (no GAM wait)'
+    );
+    enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
+    const empty = applyVisibility({
+      summary: {
+        impressions: 0,
+        revenue: 0,
+        ecpm: 0,
+        viewability: 0,
+        currency: currency || 'USD',
+      },
+      rows: [],
+      trend: [],
+      charts: { revenue: [], device: [], country: [], performance: [] },
+      isMock: false,
+      pagination: { totalRows: 0, truncated: false },
+      reportWarning: 'partial',
+      reportWarningSkipped: ['Warehouse data still loading for this date range'],
+    }, req.user, visibilityOpts);
+    return res.json(empty);
+  }
+
   try {
     const token = await getToken();
     const loaded = await loadReportRowsCacheAside(filters, token, {
@@ -3138,7 +3191,16 @@ async function handleDetailedReport(req, res) {
       : rows.length;
     const totalDomains = precomputed?.summary?.totalDomains != null
       ? precomputed.summary.totalDomains
-      : (new Set(rows.map((r) => r.site)).size + new Set(rows.map((r) => r.appId)).size);
+      : (() => {
+        const keys = new Set();
+        for (const r of rows) {
+          const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+          const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+          if (domain) keys.add(`web:${domain}`);
+          if (app) keys.add(`app:${app}`);
+        }
+        return keys.size;
+      })();
     const summary = { totalRevenue, totalDomains, offeredRecords, currency };
     const warningFields = {
       reportWarning,
@@ -3195,7 +3257,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v7_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v16_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3271,18 +3333,140 @@ async function handleDetailedReport(req, res) {
       webInventoryOr = !!scoped.webInventoryOr;
       skipAdUnitLike = scoped.skipAdUnitLike !== false;
     }
+    const reportDimIds = asArray(filters.reportDimensions).map(String);
+    const wantsCountryCol = reportDimIds.some((d) => (
+      d === 'country_name' || d === 'country' || d === 'COUNTRY_NAME'
+    )) || toFilterArray(filters.country).length > 0;
+    const wantsDeviceCol = reportDimIds.some((d) => (
+      d === 'device_category_name'
+      || d === 'mobile_device_name'
+      || d === 'device'
+      || d === 'DEVICE_CATEGORY_NAME'
+    ));
+    const wantsSiteCol = reportDimIds.some((d) => (
+      d === 'site_name' || d === 'site' || d === 'SITE_NAME' || d === 'url_name'
+    )) || reportDimIds.length === 0; // default inventory table includes site
+    let tableLimit = 2000;
+    try {
+      const { reportingTableLimit } = require('./reportGrainStore');
+      tableLimit = reportingTableLimit(filters.startDate, filters.endDate, 2000);
+    } catch (_) { /* ignore */ }
     const invOpts = {
       domains,
       sites,
       adUnitNames: toFilterArray(filters.domainName),
       apps,
-      countryNames: toFilterArray(filters.country).map((c) => String(c)),
+      countryNames: resolveCountryNamesForDb(filters.country),
       currency,
-      tableLimit: 5000,
+      tableLimit,
       selectedDomains: domains,
       webInventoryOr,
       skipAdUnitLike,
+      groupByCountry: wantsCountryCol,
+      groupByDevice: wantsDeviceCol,
+      groupBySite: wantsSiteCol,
+      tableGrain: wantsSiteCol ? 'site' : 'domain',
+      // Reporting: skip dashboard chart scans; use lateral day samples for long ranges.
+      reportingFast: true,
+      skipCharts: true,
     };
+
+    // ── Reporting fast path (rollup or ID-filtered grain — seconds, not minutes) ─
+    if (useGrainSql && typeof svc?.fetchReportingBundleFromDB === 'function') {
+      const t0 = Date.now();
+      try {
+        const bundle = await svc.fetchReportingBundleFromDB(
+          filters.startDate,
+          filters.endDate,
+          invOpts
+        );
+        if (bundle) {
+          const scopedRows = normalizeReportRows(bundle.rows || []);
+          const revenue = Number(bundle.summary?.revenue) || 0;
+          const totalDomains = bundle.summary?.totalDomains != null
+            ? Number(bundle.summary.totalDomains) || 0
+            : (() => {
+              const keys = new Set();
+              for (const r of scopedRows) {
+                const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+                const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+                if (domain) keys.add(`web:${domain}`);
+                if (app) keys.add(`app:${app}`);
+              }
+              return keys.size;
+            })();
+          const body = applyVisibility({
+            summary: {
+              ...(bundle.summary || {}),
+              totalRevenue: revenue,
+              totalDomains,
+              offeredRecords: bundle.grainCount || scopedRows.length,
+              currency: currency || bundle.summary?.currency || 'USD',
+            },
+            rows: wantAllRows
+              ? scopedRows
+              : paginateRows(scopedRows, {
+                ...paginationOpts,
+                limit: Math.min(paginationOpts.limit || 50, MAX_REPORTING_CLIENT_ROWS),
+              }).rows,
+            trend: bundle.trend || [],
+            isMock: false,
+            reportWarning: (classified.skippedDims?.length || classified.skippedMets?.length)
+              ? 'partial' : null,
+            reportWarningSkipped: [
+              ...(classified.skippedDims || []),
+              ...(classified.skippedMets || []),
+            ],
+            reportWarningUsed: classified.usedDims || [],
+            reportWarningUsedIds: classified.mode === 'grain' ? dimIds.filter((id) => {
+              const api = catalogIdToGamEnum(id);
+              return !api || classified.usedDims.includes(api) || api === 'DATE';
+            }) : [],
+            reportWarningUsedMetricIds: classified.mode === 'grain' ? metIds.filter((id) => {
+              const api = catalogIdToGamEnum(id);
+              return !api || classified.usedMetrics.includes(api);
+            }) : [],
+            pagination: wantAllRows
+              ? {
+                totalRows: scopedRows.length,
+                returnedRows: scopedRows.length,
+                truncated: Boolean(bundle.pagination?.truncated),
+                allRows: true,
+                offeredRecords: bundle.grainCount || scopedRows.length,
+              }
+              : {
+                ...(paginateRows(scopedRows, {
+                  ...paginationOpts,
+                  limit: Math.min(paginationOpts.limit || 50, MAX_REPORTING_CLIENT_ROWS),
+                }).pagination),
+                totalRows: scopedRows.length,
+                truncated: Boolean(bundle.pagination?.truncated),
+                offeredRecords: bundle.grainCount || scopedRows.length,
+              },
+          }, req.user);
+          if (!wantAllRows && scopedRows.length) {
+            const paged = paginateRows(scopedRows, {
+              ...paginationOpts,
+              limit: Math.min(paginationOpts.limit || 50, MAX_REPORTING_CLIENT_ROWS),
+            });
+            body.rows = paged.rows;
+            body.pagination = {
+              ...paged.pagination,
+              totalRows: scopedRows.length,
+              truncated: Boolean(bundle.pagination?.truncated),
+              offeredRecords: bundle.grainCount || scopedRows.length,
+            };
+          }
+          logger.info(
+            `Reporting fast ${bundle.source || 'bundle'} ${filters.startDate}..${filters.endDate}`
+            + ` grain≈${bundle.grainCount || 0} in ${Date.now() - t0}ms`
+          );
+          return res.json(await cacheDetailedResponse(body));
+        }
+      } catch (fastErr) {
+        logger.warn('Reporting fast path failed, falling back:', fastErr.message);
+      }
+    }
 
     // ── Grain SQL: Dashboard lean/rollup path (including select-all / grain subset) ─
     if (useGrainSql && typeof svc?.fetchLeanDashboardBundleFromDB === 'function') {
@@ -3304,18 +3488,43 @@ async function handleDetailedReport(req, res) {
             domainName: compat.usedOpts?.adUnitNames ?? filters.domainName,
             domainId: compat.usedOpts?.apps ?? filters.domainId,
           };
-        const sqlApplied = new Set(['rollup', 'compat-union', 'lean', 'grain-app', 'grain-site', 'grain', 'site-merge']);
+        const sqlApplied = new Set([
+          'rollup',
+          'rollup+inventory-core-table',
+          'reporting-rollup',
+          'reporting-rollup+inventory-core',
+          'compat-union',
+          'lean',
+          'grain-app',
+          'grain-site',
+          'grain-inventory-core',
+          'reporting-inventory-core',
+          'grain',
+          'site-merge',
+        ]);
         const scopedRows = sqlApplied.has(bundle.source)
           ? normalizeReportRows(bundle.rows || [])
           : prepareScopedReportRows(bundle.rows || [], rowFilters, req.user);
         const revenue = Number(bundle.summary?.revenue) || 0;
         const truncated = Boolean(bundle.pagination?.truncated)
           || (Number(bundle.grainCount) || 0) > scopedRows.length;
+        const totalDomains = bundle.summary?.totalDomains != null
+          ? Number(bundle.summary.totalDomains) || 0
+          : (() => {
+            const keys = new Set();
+            for (const r of scopedRows) {
+              const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+              const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+              if (domain) keys.add(`web:${domain}`);
+              if (app) keys.add(`app:${app}`);
+            }
+            return keys.size;
+          })();
         const body = applyVisibility({
           summary: {
+            ...(bundle.summary || {}),
             totalRevenue: revenue,
-            totalDomains: new Set(scopedRows.map((r) => r.site).filter(Boolean)).size
-              + new Set(scopedRows.map((r) => r.appId).filter(Boolean)).size,
+            totalDomains,
             offeredRecords: bundle.grainCount || scopedRows.length,
             currency: currency || bundle.summary?.currency || 'USD',
           },

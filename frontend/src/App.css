@@ -862,6 +862,26 @@ img, svg, video { max-width: 100%; height: auto; }
 .filter-field input, .filter-field select {
   padding: 8px 12px; font-size: 13px; border: 1px solid #dadce0;
   border-radius: 8px; background: #fff; color: #202124; outline: none; width: 100%;
+  box-sizing: border-box;
+}
+/* Keep dropdown / calendar icons inset from the right edge */
+.filter-field select {
+  padding-right: 36px;
+  appearance: none;
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' viewBox='0 0 24 24' fill='none' stroke='%235f6368' stroke-width='2.25' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 16px 16px;
+}
+.filter-field select::-ms-expand { display: none; }
+.filter-field input[type="date"] {
+  padding-right: 12px;
+}
+.filter-field input[type="date"]::-webkit-calendar-picker-indicator {
+  margin-right: 6px;
+  cursor: pointer;
 }
 .filter-field input:focus, .filter-field select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(37, 99, 235,0.15); }
 .preset-pills { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -1423,7 +1443,25 @@ img, svg, video { max-width: 100%; height: auto; }
   min-width: 20px; height: 20px; display: inline-flex; align-items: center; justify-content: center;
   padding: 0 6px; border-radius: 10px;
 }
-.gam-filter-cat-caret { flex-shrink: 0; color: #5f6368; font-size: 12px; width: 14px; text-align: center; }
+.gam-filter-cat-caret {
+  flex-shrink: 0;
+  color: #5f6368;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s ease;
+}
+.gam-filter-cat-caret svg {
+  width: 18px;
+  height: 18px;
+  max-width: none;
+  display: block;
+}
+.gam-filter-cat-caret:not(.is-open) {
+  transform: rotate(-90deg);
+}
 .gam-filter-empty { font-size: 12px; color: #80868b; padding: 16px 8px; margin: 0; text-align: center; }
 .gam-report-settings { display: flex; flex-direction: column; gap: 12px; }
 .filter-field-wide { grid-column: 1 / -1; }
@@ -1459,7 +1497,25 @@ img, svg, video { max-width: 100%; height: auto; }
 .ms-placeholder { color: #80868b; }
 .ms-clear { color: #80868b; font-size: 16px; line-height: 1; padding: 0 2px; border-radius: 4px; }
 .ms-clear:hover { color: #d93025; background: #fce8e6; }
-.ms-caret { color: #5f6368; font-size: 11px; }
+.ms-caret {
+  flex-shrink: 0;
+  color: #5f6368;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.15s ease;
+}
+.ms-caret svg {
+  width: 18px;
+  height: 18px;
+  max-width: none;
+  display: block;
+}
+.ms-caret:not(.is-open) {
+  transform: rotate(-90deg);
+}
 .ms-disabled .ms-control { opacity: 0.55; cursor: not-allowed; }
 .ms-menu {
   position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; right: 0;
@@ -2853,6 +2909,24 @@ select.ui-field-input { border-radius: 10px; cursor: pointer; }
 /* Tablet: wide tables scroll horizontally */
 .report-table, .orders-table, .inventory-table { min-width: 720px; }
 .admin-table { min-width: 640px; }
+.admin-password-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.admin-password-value {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+  color: var(--text, #1a1a1a);
+  background: rgba(0, 0, 0, 0.04);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.admin-password-muted {
+  color: var(--muted, #888);
+  font-size: 12px;
+}
 .admin-page .admin-panel-head .ui-btn { flex-shrink: 0; }
 .domain-perm-actions .ui-btn { min-width: 140px; }
 .domain-user-page .dash-card-value.is-small { font-size: 15px; }

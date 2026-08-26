@@ -187,49 +187,55 @@ function cleanDim(v) {
 
 /**
  * Resolve GAM-aligned domain / site fields for a report row.
- * Prefers live GAM DOMAIN / SITE_NAME when present (from enrichReportRow).
+ * Prefers ad-unit root + real SITE_NAME. When DOMAIN conflicts with the ad-unit
+ * or site host root (e.g. gamisco unit tagged as another DOMAIN), trust ad-unit/site.
  */
 function resolveInventoryFields(adUnit, servingUrl, gamDomain, gamSite) {
   const domainFromGAM = cleanDim(gamDomain);
   const siteHost = pickSiteHost(gamSite, servingUrl);
   const urlHost = normalizeHost(servingUrl);
+  const fromUnit = domainFromAdUnit(adUnit);
+  const fromSite = siteHost ? rootDomainFromHost(siteHost) : '';
+  const fromUrl = urlHost ? rootDomainFromHost(urlHost) : '';
+  const fromGam = normalizeHost(domainFromGAM) || '';
 
-  if (domainFromGAM || siteHost) {
-    const domainName = normalizeHost(domainFromGAM)
-      || (siteHost ? rootDomainFromHost(siteHost) : '')
-      || domainFromAdUnit(adUnit);
-    const siteName = siteHost || normalizeHost(domainFromGAM) || '—';
-    const siteSub = siteHost && domainName && domainName !== '—'
+  // Prefer sources that agree; on conflict drop DOMAIN in favor of ad-unit / site.
+  let domainName = '';
+  if (fromUnit && fromSite && fromUnit.toLowerCase() === fromSite.toLowerCase()) {
+    domainName = fromUnit;
+  } else if (fromUnit && fromGam && fromUnit.toLowerCase() === fromGam.toLowerCase()) {
+    domainName = fromUnit;
+  } else if (fromSite && fromGam && fromSite.toLowerCase() === fromGam.toLowerCase()) {
+    domainName = fromSite;
+  } else if (fromUnit && fromGam && fromUnit.toLowerCase() !== fromGam.toLowerCase()) {
+    domainName = fromUnit;
+  } else if (fromSite && fromGam && fromSite.toLowerCase() !== fromGam.toLowerCase()) {
+    domainName = fromSite || fromUnit || fromGam;
+  } else {
+    domainName = fromUnit || fromSite || fromUrl || fromGam;
+  }
+
+  let siteName = '—';
+  let siteSub = '';
+  if (siteHost && (!domainName || adUnitAlignsWithSiteHost(adUnit, siteHost)
+    || !fromUnit
+    || rootDomainFromHost(siteHost) === domainName.toLowerCase())) {
+    siteName = siteHost;
+    siteSub = domainName && domainName !== '—'
       ? (subFromHost(siteHost, domainName) || '')
-      : siteSubFromAdUnit(adUnit);
-    return { domainName: domainName || '—', siteName: siteName || '—', siteSub };
+      : '';
+  } else if (urlHost && (!domainName || rootDomainFromHost(urlHost) === domainName.toLowerCase())) {
+    siteName = urlHost;
+    siteSub = subFromHost(urlHost, domainName) || siteSubFromAdUnit(adUnit);
+  } else if (fromUnit) {
+    const slot = siteSubFromAdUnit(adUnit);
+    siteName = slot ? `${fromUnit} · ${slot}` : fromUnit;
+    siteSub = slot;
+  } else if (fromGam) {
+    siteName = fromGam;
   }
 
-  if (urlHost) {
-    const root = rootDomainFromHost(urlHost);
-    return {
-      domainName: root || domainFromAdUnit(adUnit) || '—',
-      siteName: urlHost,
-      siteSub: subFromHost(urlHost, root) || siteSubFromAdUnit(adUnit),
-    };
-  }
-
-  const domainFromUnit = domainFromAdUnit(adUnit);
-  const slot = siteSubFromAdUnit(adUnit);
-
-  if (slot) {
-    return {
-      domainName: domainFromUnit || '—',
-      siteName: domainFromUnit ? `${domainFromUnit} · ${slot}` : slot,
-      siteSub: slot,
-    };
-  }
-
-  return {
-    domainName: domainFromUnit || '—',
-    siteName: '—',
-    siteSub: '',
-  };
+  return { domainName: domainName || '—', siteName: siteName || '—', siteSub };
 }
 
 /** Attach domainName, siteName, siteSub to each report row (keeps legacy siteUrl). */

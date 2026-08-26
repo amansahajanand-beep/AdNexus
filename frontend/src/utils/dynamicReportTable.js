@@ -29,12 +29,12 @@ export const DASHBOARD_DEFAULT_METRICS = [
   'total_active_view_viewable_impressions_rate',
 ];
 
-/** Dashboard table — date + inventory columns from applied filters (defaults when none). */
+/** Dashboard table — date + domain + site by default. */
 export function resolveDashboardTableConfig(applied = {}, filterApplied = false) {
   const dimensions = ['date'];
   if (!filterApplied) {
     return {
-      dimensions: ['date', 'domain'],
+      dimensions: ['date', 'domain', 'site_name'],
       metrics: [...DASHBOARD_DEFAULT_METRICS],
     };
   }
@@ -48,13 +48,15 @@ export function resolveDashboardTableConfig(applied = {}, filterApplied = false)
   // Ad unit column only when user explicitly filters ad units.
   if (applied.domainName?.length) {
     if (!dimensions.includes('domain')) dimensions.push('domain');
-    if (applied.site?.length && !dimensions.includes('site_name')) dimensions.push('site_name');
+    if (!dimensions.includes('site_name')) dimensions.push('site_name');
     dimensions.push('ad_unit_name');
   }
   if (applied.domainId?.length) dimensions.push('mobile_app_resolved_id');
-  // Date-only generate → default domain breakdown.
+  // Date-only / domain-only generate → default domain + site breakdown.
   if (dimensions.length === 1) {
-    dimensions.push('domain');
+    dimensions.push('domain', 'site_name');
+  } else if (dimensions.includes('domain') && !dimensions.includes('site_name') && !applied.domainName?.length) {
+    dimensions.push('site_name');
   }
   return {
     dimensions,
@@ -112,7 +114,10 @@ const DIMENSION_DEFS = {
     },
     cellClass: '',
   },
-  ad_unit_name: { getValue: (r) => r.site || readDimensionValue(r, 'ad_unit_name') || '—', cellClass: '' },
+  ad_unit_name: {
+    getValue: (r) => r.AD_UNIT_NAME || r.ad_unit_name || r.site || readDimensionValue(r, 'ad_unit_name') || '—',
+    cellClass: '',
+  },
   programmatic_channel_name: {
     getValue: (r) => r.channel || readDimensionValue(r, 'programmatic_channel_name'),
     cellClass: '',
@@ -126,6 +131,10 @@ const DIMENSION_DEFS = {
   placement_id: { getValue: (r) => readDimensionValue(r, 'placement_id'), cellClass: 'td-mono' },
   placement_name: { getValue: (r) => readDimensionValue(r, 'placement_name'), cellClass: '' },
   url_name: { getValue: (r) => readDimensionValue(r, 'url_name') || r.siteUrl || '—', cellClass: '' },
+  device_category_name: {
+    getValue: (r) => readDimensionValue(r, 'device_category_name'),
+    cellClass: '',
+  },
   mobile_device_name: { getValue: (r) => readDimensionValue(r, 'mobile_device_name'), cellClass: '' },
 };
 

@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const { query, schemaQuery } = require('../db');
 const logger = require('../utils/logger');
+const { encryptSecret, decryptSecret } = require('../utils/credentialsCrypto');
 
 const SECRET = () => process.env.JWT_SECRET || 'change_this_secret';
 
@@ -15,6 +16,7 @@ function mapDbRowToUser(row) {
     username: row.username,
     email: row.email,
     passwordHash: row.password_hash,
+    passwordEncrypted: row.password_encrypted || null,
     role: row.role,
     clientId: row.client_id || null,
     permissions: row.permissions || {},
@@ -24,6 +26,25 @@ function mapDbRowToUser(row) {
     createdBy: row.created_by,
     createdAt: row.created_at,
   };
+}
+
+/** Admin list/detail: never expose hashes; reveal plaintext only for domain users (child). */
+function toAdminSafeUser(user) {
+  if (!user) return null;
+  const { passwordHash, passwordEncrypted, ...safe } = user;
+  if (safe.role !== 'admin') {
+    if (passwordEncrypted) {
+      try {
+        safe.password = decryptSecret(passwordEncrypted);
+      } catch (e) {
+        logger.warn(`Decrypt password failed for user ${safe.username}:`, e.message);
+        safe.password = null;
+      }
+    } else {
+      safe.password = null;
+    }
+  }
+  return safe;
 }
 
 const DEFAULT_ADMIN_USERNAME = process.env.DEFAULT_ADMIN_USERNAME || 'dashboard.mediamonetix';
@@ -48,6 +69,8 @@ async function initUsersSchema() {
   `);
   await schemaQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_by TEXT;`);
   await schemaQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS client_id UUID;`);
+  // Reversible copy so admins can view domain-user passwords (hash remains for login).
+  await schemaQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS password_encrypted TEXT;`);
   await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);`);
   await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_users_client_id ON users(client_id);`);
 
@@ -93,13 +116,11 @@ async function initUsersSchema() {
 
 async function getAllUsers() {
   const { rows } = await query(
-    'SELECT id, username, email, role, client_id, permissions, active_session_id, last_login, is_active, created_by, created_at, password_hash FROM users'
+    `SELECT id, username, email, role, client_id, permissions, active_session_id,
+            last_login, is_active, created_by, created_at, password_hash, password_encrypted
+     FROM users`
   );
-  return rows.map((row) => {
-    const user = mapDbRowToUser(row);
-    const { passwordHash, ...safe } = user;
-    return safe;
-  });
+  return rows.map((row) => toAdminSafeUser(mapDbRowToUser(row)));
 }
 
 async function getUserById(id) {
@@ -115,24 +136,23 @@ async function getUserByUsername(username) {
 async function getUsersByClientId(clientId) {
   if (!clientId) return [];
   const { rows } = await query(
-    `SELECT id, username, email, role, client_id, permissions, active_session_id, last_login, is_active, created_by, created_at, password_hash
+    `SELECT id, username, email, role, client_id, permissions, active_session_id,
+            last_login, is_active, created_by, created_at, password_hash, password_encrypted
      FROM users WHERE client_id = $1`,
     [clientId]
   );
-  return rows.map((row) => {
-    const user = mapDbRowToUser(row);
-    const { passwordHash, ...safe } = user;
-    return safe;
-  });
+  return rows.map((row) => toAdminSafeUser(mapDbRowToUser(row)));
 }
 
 async function createUser({ id, username, email, password, passwordHash, role, permissions, createdBy, clientId }) {
   const uid = id || `user-${Date.now()}`;
-  const pwHash = password
-    ? hashPassword(password)
+  const plain = password || null;
+  const pwHash = plain
+    ? hashPassword(plain)
     : passwordHash
       ? passwordHash
       : hashPassword(Math.random().toString(36).slice(2, 10));
+  const pwEnc = plain ? encryptSecret(plain) : null;
   const perms = permissions || {};
 
   const existing = await getUserByUsername(username);
@@ -140,14 +160,15 @@ async function createUser({ id, username, email, password, passwordHash, role, p
     throw new Error('Username already exists');
   }
 
-  await query(`INSERT INTO users (id, username, email, password_hash, role, permissions, created_by, created_at, is_active, client_id)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),true,$8)`, [uid, username, email, pwHash, role || 'child', perms, createdBy || null, clientId || null]);
+  await query(
+    `INSERT INTO users (
+       id, username, email, password_hash, password_encrypted, role, permissions,
+       created_by, created_at, is_active, client_id
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),true,$9)`,
+    [uid, username, email, pwHash, pwEnc, role || 'child', perms, createdBy || null, clientId || null]
+  );
 
-  const created = await getUserById(uid);
-  if (created) {
-    delete created.passwordHash;
-  }
-  return created;
+  return toAdminSafeUser(await getUserById(uid));
 }
 
 async function updateUser(id, updates) {
@@ -156,7 +177,9 @@ async function updateUser(id, updates) {
   let i = 1;
 
   if (updates.password) {
-    updates.password_hash = hashPassword(updates.password);
+    const plain = updates.password;
+    updates.password_hash = hashPassword(plain);
+    updates.password_encrypted = encryptSecret(plain);
     delete updates.password;
   }
 
@@ -181,7 +204,9 @@ async function updateUser(id, updates) {
   params.push(id);
   const sql = `UPDATE users SET ${fields.join(', ')} WHERE id = $${i} RETURNING *`;
   const { rows } = await query(sql, params);
-  return rows[0] ? mapDbRowToUser(rows[0]) : null;
+  const updated = rows[0] ? mapDbRowToUser(rows[0]) : null;
+  // Internal callers (verifyPassword) need the hash; strip for admin API via toAdminSafeUser at route.
+  return updated;
 }
 
 async function deleteUser(id) {
@@ -237,6 +262,7 @@ async function verifyPassword(username, password) {
       const repaired = await getUserById(user.id);
       const safeRepaired = { ...repaired };
       delete safeRepaired.passwordHash;
+      delete safeRepaired.passwordEncrypted;
       return safeRepaired;
     }
     return null;
@@ -244,6 +270,7 @@ async function verifyPassword(username, password) {
   await updateUser(user.id, { lastLogin: new Date().toISOString() });
   const safe = { ...user };
   delete safe.passwordHash;
+  delete safe.passwordEncrypted;
   return safe;
 }
 
@@ -268,4 +295,5 @@ module.exports = {
   verifyPassword,
   checkPasswordForUser,
   hashPassword,
+  toAdminSafeUser,
 };

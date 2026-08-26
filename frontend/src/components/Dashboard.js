@@ -288,7 +288,7 @@ function buildDailySeries(rows = [], trend = []) {
 
 const SHARE_LABEL_FALLBACKS = {
   domain: ['gamDomain', 'DOMAIN', 'inv_domain'],
-  site_name: ['siteName', 'site', 'gamSite', 'SITE_NAME'],
+  site_name: ['siteName', 'siteUrl', 'gamSite', 'site', 'SITE_NAME'],
   ad_unit_name: ['adUnitName', 'ad_unit_name', 'AD_UNIT_NAME', 'site'],
   mobile_app_name: ['appName', 'mobileAppName', 'mobile_app_name', 'appId'],
   country_name: ['countryName', 'country', 'COUNTRY_NAME', 'COUNTRY', 'country_code', 'countryCode'],
@@ -556,7 +556,7 @@ export default function Dashboard() {
   const [lastUpdated, setLastUpdated] = useState(() => saved?.lastUpdated ?? null);
   const [fetchedAt, setFetchedAt] = useState(() => saved?.fetchedAt ?? null);
   const [breakdownOpen, setBreakdownOpen] = useState(() => saved?.breakdownOpen ?? true);
-  const [chipsExpanded, setChipsExpanded] = useState(() => saved?.chipsExpanded ?? true);
+  const [chipsExpanded, setChipsExpanded] = useState(false);
   const [slowDetail, setSlowDetail] = useState(false);
   const [tableDensity, setTableDensity] = useState(() => {
     try {
@@ -1058,7 +1058,7 @@ export default function Dashboard() {
     setStartDate(r.startDate);
     setEndDate(r.endDate);
     setPage(1);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setOverviewData(null);
     setDetailData(null);
     if (scopedAutoLoad) {
@@ -1105,7 +1105,7 @@ export default function Dashboard() {
     setDomainName(nextDomainName);
     setDomainId(nextDomainId);
     setPage(1);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setBreakdownOpen(true);
     setOverviewData(null);
     setDetailData(null);
@@ -1137,7 +1137,7 @@ export default function Dashboard() {
     setFilterApplied(true);
     persistRecentFilter();
     setBreakdownOpen(true);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     loadCatalog(true);
     const apiFilters = normalizeInventorySelections(nextApplied, {
       domainOptions: domainRootOptions,
@@ -1250,7 +1250,7 @@ export default function Dashboard() {
     setSite([]);
     setSearch('');
     setBreakdownOpen(filterVisibility.isScopedUser);
-    setChipsExpanded(true);
+    setChipsExpanded(false);
     setFilterApplied(false);
     setDetailData(null);
     setOverviewData(null);
@@ -1348,10 +1348,11 @@ export default function Dashboard() {
   const tableSummaryTotals = useMemo(() => {
     const hasConcreteSite = applied?.site?.length && !isAllSelection(applied.site);
     const truncated = detailData?.pagination?.truncated;
+    const fromRows = tableRows.length ? summarizeRowsForOverview(tableRows, currency) : null;
+    const s = detailData?.summary;
     // Prefer summing table rows for site filters so Total matches the breakdown.
     // Only fall back to API summary when the table was capped (incomplete).
-    if (hasConcreteSite && tableRows.length && truncated !== true) {
-      const fromRows = summarizeRowsForOverview(tableRows, currency);
+    if (hasConcreteSite && fromRows && truncated !== true) {
       return {
         total_line_item_level_all_revenue: fromRows.revenue,
         total_line_item_level_impressions: fromRows.impressions,
@@ -1359,12 +1360,38 @@ export default function Dashboard() {
         total_active_view_viewable_impressions_rate: fromRows.viewability,
       };
     }
-    const s = detailData?.summary;
-    if (!s) return null;
+    if (!s) {
+      if (!fromRows) return null;
+      return {
+        total_line_item_level_all_revenue: fromRows.revenue,
+        total_line_item_level_impressions: fromRows.impressions,
+        total_line_item_level_without_cpd_average_ecpm: fromRows.ecpm,
+        total_active_view_viewable_impressions_rate: fromRows.viewability,
+      };
+    }
+    const apiRev = Number(s.revenue ?? s.selectRange ?? 0) || 0;
+    const apiImp = Number(s.impressions ?? 0) || 0;
+    const apiEcpm = Number(s.ecpm ?? 0) || 0;
+    // Guard against bad long-range coercion ($4.50 revenue / $0 eCPM with huge imps).
+    if (
+      fromRows
+      && apiImp > 0
+      && fromRows.revenue > 0
+      && apiRev > 0
+      && apiRev < fromRows.revenue * 0.01
+      && (apiEcpm <= 0 || apiRev < 100)
+    ) {
+      return {
+        total_line_item_level_all_revenue: fromRows.revenue,
+        total_line_item_level_impressions: fromRows.impressions,
+        total_line_item_level_without_cpd_average_ecpm: fromRows.ecpm,
+        total_active_view_viewable_impressions_rate: fromRows.viewability,
+      };
+    }
     return {
-      total_line_item_level_all_revenue: s.revenue ?? s.selectRange ?? 0,
-      total_line_item_level_impressions: s.impressions ?? 0,
-      total_line_item_level_without_cpd_average_ecpm: s.ecpm ?? 0,
+      total_line_item_level_all_revenue: apiRev,
+      total_line_item_level_impressions: apiImp,
+      total_line_item_level_without_cpd_average_ecpm: apiEcpm,
       total_active_view_viewable_impressions_rate: s.viewability ?? 0,
     };
   }, [
@@ -1377,13 +1404,14 @@ export default function Dashboard() {
 
   const overviewSummary = useMemo(() => {
     const fromDetail = mapDetailSummary(detailData?.summary);
+    const fromRows = tableRows.length ? summarizeRowsForOverview(tableRows, currency) : null;
     let base = {};
 
     if (isScopedDashboardUser) {
       if (hasInventoryFilter) {
         if (fromDetail && !detailLoading) base = fromDetail;
         else if (fromDetail) base = fromDetail;
-        else if (detailData && tableRows.length) base = summarizeRowsForOverview(tableRows, currency);
+        else if (fromRows) base = fromRows;
         else base = {};
       } else {
         base = overviewData?.summary || {};
@@ -1391,9 +1419,22 @@ export default function Dashboard() {
     } else if (hasInventoryFilter && fromDetail && !detailLoading) {
       base = fromDetail;
     } else if (hasInventoryFilter && detailData) {
-      base = fromDetail || summarizeRowsForOverview(tableRows, currency);
+      base = fromDetail || fromRows || {};
     } else {
       base = overviewData?.summary || {};
+    }
+
+    // If API summary was mangled (tiny revenue / $0 eCPM) while table rows look sane, prefer rows.
+    const apiRev = Number(base.revenue ?? base.selectRange ?? 0) || 0;
+    const apiEcpm = Number(base.ecpm ?? 0) || 0;
+    if (
+      fromRows
+      && fromRows.revenue > 0
+      && apiRev > 0
+      && apiRev < fromRows.revenue * 0.01
+      && (apiEcpm <= 0 || apiRev < 100)
+    ) {
+      base = { ...base, ...fromRows };
     }
 
     const priorSum = priorDetail?.summary || priorOverview?.summary || null;
@@ -1535,16 +1576,29 @@ export default function Dashboard() {
     [dailySeries, priorDailySeries]
   );
 
+  const siteShareSeries = useMemo(
+    () => buildSiteRevenueShare(enrichedRows, 10),
+    [enrichedRows]
+  );
+  const priorSiteShareSeries = useMemo(
+    () => buildSiteRevenueShare(priorDetail?.rows || [], 10),
+    [priorDetail?.rows]
+  );
+
   const insightItems = useMemo(() => {
-    const currentShare = Array.isArray(detailData?.charts?.revenue)
-      ? detailData.charts.revenue
-      : [];
+    const currentShare = siteShareSeries;
     const currentCountry = Array.isArray(detailData?.charts?.country)
       ? detailData.charts.country
       : [];
-    const priorShare = Array.isArray(priorDetail?.charts?.revenue) ? priorDetail.charts.revenue : [];
+    const priorShare = priorSiteShareSeries;
     const priorCountry = Array.isArray(priorDetail?.charts?.country) ? priorDetail.charts.country : [];
-    if (!priorShare.length && !priorCountry.length && !priorDetail?.summary && !priorOverview?.summary) {
+    if (
+      !priorShare.length
+      && !currentShare.length
+      && !priorCountry.length
+      && !priorDetail?.summary
+      && !priorOverview?.summary
+    ) {
       return [];
     }
     return buildInsights({
@@ -1556,7 +1610,15 @@ export default function Dashboard() {
       priorCountry,
       comparePhrase: compareLabel,
     });
-  }, [overviewSummary, priorOverview, priorDetail, detailData?.charts, compareLabel]);
+  }, [
+    overviewSummary,
+    priorOverview,
+    priorDetail,
+    detailData?.charts?.country,
+    compareLabel,
+    siteShareSeries,
+    priorSiteShareSeries,
+  ]);
 
   const stickyKpis = useMemo(() => ([
     { key: 'imps', label: 'Imps', value: overviewSummary?.impressions, change: overviewSummary?.impressionsChange },
@@ -1649,10 +1711,6 @@ export default function Dashboard() {
   const hBarMargins = useMemo(
     () => ({ top: 8, right: 16, left: isNarrow ? 4 : 8, bottom: 8 }),
     [isNarrow]
-  );
-  const siteShareSeries = useMemo(
-    () => buildSiteRevenueShare(enrichedRows, 10),
-    [enrichedRows]
   );
   const adUnitMixSeries = useMemo(
     () => (performanceSeries || []).map((row) => ({

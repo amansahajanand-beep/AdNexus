@@ -178,6 +178,23 @@ async function initSchema() {
       PRIMARY KEY (client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app)
     );
 
+    -- Site/Domain inventory rollups from inventory_core (real SITE_NAME hosts).
+    CREATE TABLE IF NOT EXISTS rollup_inventory_kpi_daily (
+      client_id       UUID        NOT NULL REFERENCES gam_clients(id),
+      report_date     DATE        NOT NULL,
+      inv_domain      TEXT        NOT NULL DEFAULT '',
+      inv_site        TEXT        NOT NULL DEFAULT '',
+      inv_ad_unit     TEXT        NOT NULL DEFAULT '',
+      inv_app         TEXT        NOT NULL DEFAULT '',
+      impressions     DOUBLE PRECISION NOT NULL DEFAULT 0,
+      revenue         DOUBLE PRECISION NOT NULL DEFAULT 0,
+      viewable_weight DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks          DOUBLE PRECISION NOT NULL DEFAULT 0,
+      grain_count     INT         NOT NULL DEFAULT 0,
+      currency        CHAR(3)     NOT NULL DEFAULT 'USD',
+      PRIMARY KEY (client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app)
+    );
+
     CREATE TABLE IF NOT EXISTS rollup_dim_daily (
       client_id    UUID        NOT NULL REFERENCES gam_clients(id),
       report_date  DATE        NOT NULL,
@@ -346,6 +363,7 @@ async function initSchema() {
     `ALTER TABLE report_present ADD COLUMN IF NOT EXISTS inv_ad_unit TEXT`,
     `ALTER TABLE report_present ADD COLUMN IF NOT EXISTS inv_app TEXT`,
     `ALTER TABLE rollup_kpi_daily ADD COLUMN IF NOT EXISTS clicks DOUBLE PRECISION NOT NULL DEFAULT 0`,
+    `ALTER TABLE rollup_inventory_kpi_daily ADD COLUMN IF NOT EXISTS clicks DOUBLE PRECISION NOT NULL DEFAULT 0`,
     `CREATE INDEX IF NOT EXISTS idx_report_daily_date ON report_daily (report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_present_date ON report_present (report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_query_date ON report_adhoc (query_hash, report_date DESC)`,
@@ -379,6 +397,9 @@ async function initSchema() {
     `CREATE INDEX IF NOT EXISTS idx_rollup_kpi_site ON rollup_kpi_daily (report_date, LOWER(inv_site))`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_kpi_ad_unit ON rollup_kpi_daily (report_date, LOWER(inv_ad_unit))`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_kpi_app ON rollup_kpi_daily (report_date, LOWER(inv_app))`,
+    `CREATE INDEX IF NOT EXISTS idx_rollup_inv_kpi_date ON rollup_inventory_kpi_daily (report_date DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_rollup_inv_kpi_domain ON rollup_inventory_kpi_daily (report_date, LOWER(inv_domain))`,
+    `CREATE INDEX IF NOT EXISTS idx_rollup_inv_kpi_site ON rollup_inventory_kpi_daily (report_date, LOWER(inv_site))`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_dim_kind_date ON rollup_dim_daily (dim_kind, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_daily_client_date ON report_daily (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_present_client_date ON report_present (client_id, report_date DESC)`,
@@ -386,6 +407,13 @@ async function initSchema() {
     `CREATE INDEX IF NOT EXISTS idx_sync_log_client ON sync_log (client_id, started_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date ON report_grain (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_grain_date ON report_grain (report_date DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date_slice ON report_grain (client_id, report_date, slice_key)`,
+    `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date_site ON report_grain (client_id, report_date, site_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date_domain ON report_grain (client_id, report_date, domain_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_report_grain_inv_core_date
+       ON report_grain (client_id, report_date)
+       INCLUDE (domain_id, site_id, impressions, revenue, clicks, viewable_pct, currency)
+       WHERE slice_key = 'inventory_core'`,
     `CREATE INDEX IF NOT EXISTS idx_archive_manifest_date ON report_archive_manifest (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_dim_ad_unit_client ON dim_ad_unit (client_id)`,
     `CREATE INDEX IF NOT EXISTS idx_dim_domain_client ON dim_domain (client_id)`,
@@ -407,6 +435,7 @@ const TENANT_TABLES = [
   'report_adhoc',
   'report_adhoc_coverage',
   'rollup_kpi_daily',
+  'rollup_inventory_kpi_daily',
   'rollup_dim_daily',
   'sync_log',
 ];
@@ -533,6 +562,7 @@ async function finishTenantBackfill() {
   const pkSwaps = [
     ['report_adhoc_coverage', 'report_adhoc_coverage_client_pkey', '(client_id, query_hash, start_date, end_date)'],
     ['rollup_kpi_daily', 'rollup_kpi_daily_pkey', '(client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app)'],
+    ['rollup_inventory_kpi_daily', 'rollup_inventory_kpi_daily_pkey', '(client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app)'],
     ['rollup_dim_daily', 'rollup_dim_daily_pkey', '(client_id, report_date, dim_kind, dim_value)'],
   ];
   for (const [table, newName, cols] of pkSwaps) {

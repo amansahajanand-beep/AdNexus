@@ -132,7 +132,7 @@ function shareName(row) {
 }
 
 /**
- * Ranked “what changed” vs prior period (domains / countries / KPIs).
+ * Ranked “what changed” vs prior period (sites / countries / KPIs).
  */
 export function buildInsights({
   currentSummary,
@@ -176,7 +176,7 @@ export function buildInsights({
     const pct = pctChange(shareValue(row), prevVal);
     if (pct == null || Math.abs(pct) < 8) return;
     items.push({
-      id: `dom-${name}`,
+      id: `site-${name}`,
       text: `${name} revenue ${pct > 0 ? '+' : ''}${pct}%`,
       tone: pct < 0 ? 'down' : 'up',
     });

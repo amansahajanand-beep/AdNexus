@@ -58,7 +58,14 @@ function normalizeHostVal(v) {
 }
 
 function readDomainName(r) {
-  const d = normalizeHostVal(r.domainName) || rootDomainFromHost(normalizeHostVal(r.siteUrl) || normalizeHostVal(r.siteName));
+  // Prefer explicit domain fields / site host root — do not treat `site` as ad-unit
+  // (backend historically stuffed AD_UNIT_NAME into `site`).
+  const fromUnit = domainFromAdUnit(r.ad_unit_name || r.AD_UNIT_NAME || '');
+  const d = normalizeHostVal(r.domainName)
+    || normalizeHostVal(r.domain)
+    || normalizeHostVal(r.gamDomain)
+    || rootDomainFromHost(normalizeHostVal(r.siteUrl) || normalizeHostVal(r.siteName) || normalizeHostVal(r.gamSite))
+    || fromUnit;
   return d || '—';
 }
 

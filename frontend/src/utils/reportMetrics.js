@@ -6,7 +6,9 @@ const LEGACY_DIMENSION_READ = {
   mobile_app_name: (r) => (r.appName && r.appName !== '—' ? r.appName : ''),
   ad_unit_name: (r) => r.site,
   url_name: (r) => r.siteUrl || r.gamSite,
-  country_name: (r) => r.country,
+  country_name: (r) => r.country || r.countryName || r.COUNTRY_NAME || r.country_name,
+  device_category_name: (r) => r.device || r.deviceCategory || r.device_category_name || r.DEVICE_CATEGORY_NAME,
+  mobile_device_name: (r) => r.device || r.deviceCategory || r.mobile_device_name || r.device_category_name,
   programmatic_channel_name: (r) => r.channel,
 };
 

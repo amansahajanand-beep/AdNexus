@@ -20,7 +20,9 @@ const {
 
   updateUser,
 
-  deleteUser
+  deleteUser,
+
+  toAdminSafeUser,
 
 } = require('../models/userStore');
 
@@ -236,7 +238,7 @@ router.post('/', async (req, res) => {
       clientId: req.user.clientId || req.client?.id,
 
     });
-    console.log("User data :",user)
+
     logger.info(`User created: ${user.username} by ${req.user.username}`);
 
     res.status(201).json(user);
@@ -299,9 +301,16 @@ router.put('/:id', async (req, res) => {
 
   try {
 
-    const user = await updateUser(req.params.id, updates);
+    const updated = await updateUser(req.params.id, updates);
+    const safe = typeof toAdminSafeUser === 'function'
+      ? toAdminSafeUser(updated)
+      : (() => {
+        if (!updated) return null;
+        const { passwordHash, passwordEncrypted, ...rest } = updated;
+        return rest;
+      })();
 
-    res.json(user);
+    res.json(safe);
 
   } catch (err) {
 
@@ -335,7 +344,7 @@ router.put('/:id/permissions', async (req, res) => {
     const user = await updateUser(req.params.id, {
       permissions: mergePermissionsFromBody(existing.permissions, req.body),
     });
-    res.json(user);
+    res.json(typeof toAdminSafeUser === 'function' ? toAdminSafeUser(user) : user);
   } catch (err) {
 
     res.status(400).json({ error: err.message });
