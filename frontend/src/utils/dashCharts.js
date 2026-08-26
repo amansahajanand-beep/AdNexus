@@ -12,12 +12,8 @@ export const DASH_CHARTS = [
   { id: 'deviceShare', label: 'Device share' },
   { id: 'countryShare', label: 'Country share' },
   { id: 'dailyEcpm', label: 'Daily eCPM' },
-  { id: 'impsDomain', label: 'Impressions by domain' },
   { id: 'impsCountry', label: 'Impressions by country' },
-  { id: 'adPerformance', label: 'Ad performance' },
   { id: 'revenueEcpm', label: 'Revenue vs eCPM' },
-  { id: 'topSites', label: 'Top sites' },
-  { id: 'adUnitMix', label: 'Ad unit mix' },
 ];
 
 const VALID = new Set(DASH_CHARTS.map((c) => c.id));

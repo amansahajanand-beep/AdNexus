@@ -2735,7 +2735,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = `report_dashboard_resp_v19_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = `report_dashboard_resp_v21_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -2810,6 +2810,7 @@ async function handleDashboard(req, res) {
         const sqlApplied = new Set([
           'rollup',
           'rollup+inventory-core-table',
+          'inventory-rollup',
           'reporting-rollup',
           'reporting-rollup+inventory-core',
           'compat-union',
@@ -3491,6 +3492,7 @@ async function handleDetailedReport(req, res) {
         const sqlApplied = new Set([
           'rollup',
           'rollup+inventory-core-table',
+          'inventory-rollup',
           'reporting-rollup',
           'reporting-rollup+inventory-core',
           'compat-union',
