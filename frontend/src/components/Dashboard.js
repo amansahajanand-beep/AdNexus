@@ -404,41 +404,6 @@ function buildRevenueDomainShare(rows = [], selectedDomains = []) {
     .slice(0, 10);
 }
 
-function buildPerformanceSeries(rows = []) {
-  const totals = new Map();
-  rows.forEach((row) => {
-    const label = resolveLabel(row, ['ad_unit_name', 'site_name', 'domain', 'mobile_app_name', 'line_item_name', 'campaign_name', 'adUnitName', 'siteName', 'domainName', 'appName', 'mobileAppName', 'campaignName']);
-    if (!label || label === 'Uncategorized') return;
-    const entry = totals.get(label) || {
-      name: label,
-      revenue: 0,
-      impressions: 0,
-      ctr: 0,
-      ecpm: 0,
-      viewability: 0,
-      count: 0,
-    };
-    entry.revenue += toNumber(readValue(row, ['revenue', 'total_line_item_level_cpm_and_cpc_revenue'], ['earnings']));
-    entry.impressions += toNumber(readValue(row, ['impression', 'impressions', 'total_line_item_level_impressions'], ['impressionsTotal']));
-    entry.ctr += toNumber(readValue(row, ['ctr', 'total_line_item_level_ctr'], ['clickThroughRate']));
-    entry.ecpm += toNumber(readValue(row, ['ecpm', 'total_line_item_level_without_cpd_average_ecpm'], ['averageEcpM']));
-    entry.viewability += toNumber(readValue(row, ['viewability', 'viewableRate', 'total_active_view_viewable_impressions_rate'], ['viewableRatePercent']));
-    entry.count += 1;
-    totals.set(label, entry);
-  });
-  return Array.from(totals.values())
-    .map((entry) => ({
-      ...entry,
-      ctr: entry.count ? entry.ctr / entry.count : 0,
-      ecpm: entry.count ? entry.ecpm / entry.count : 0,
-      viewability: entry.count ? entry.viewability / entry.count : 0,
-      score: Math.max(0, (entry.ctr || 0) * 400 + (entry.ecpm || 0) * 3 + (entry.viewability || 0) * 200),
-    }))
-    .filter((entry) => entry.revenue > 0 || entry.impressions > 0)
-    .sort((a, b) => b.revenue - a.revenue)
-    .slice(0, 6);
-}
-
 function withDailyEcpm(series = []) {
   return (Array.isArray(series) ? series : []).map((item) => {
     const revenue = toNumber(item.revenue);
@@ -1552,13 +1517,6 @@ export default function Dashboard() {
     };
   }, [enrichedRows, applied?.domain, detailData?.charts]);
 
-  const performanceSeries = useMemo(() => {
-    if (Array.isArray(detailData?.charts?.performance) && detailData.charts.performance.length) {
-      return detailData.charts.performance;
-    }
-    return buildPerformanceSeries(enrichedRows);
-  }, [enrichedRows, detailData?.charts?.performance]);
-
   const dailyWithEcpm = useMemo(() => withDailyEcpm(dailySeries), [dailySeries]);
 
   const priorDailySeries = useMemo(() => {
@@ -1712,14 +1670,6 @@ export default function Dashboard() {
     () => ({ top: 8, right: 16, left: isNarrow ? 4 : 8, bottom: 8 }),
     [isNarrow]
   );
-  const adUnitMixSeries = useMemo(
-    () => (performanceSeries || []).map((row) => ({
-      name: row.name,
-      revenue: toNumber(row.revenue),
-      impressions: toNumber(row.impressions),
-    })).filter((row) => row.revenue > 0 || row.impressions > 0),
-    [performanceSeries]
-  );
   const yieldSeries = useMemo(() => {
     if (!dailyWithEcpm.length || !engagementSeries.length) return [];
     const ctrByDate = new Map(engagementSeries.map((d) => [d.date, toNumber(d.ctr)]));
@@ -1730,10 +1680,6 @@ export default function Dashboard() {
     }));
     return merged.some((d) => d.ecpm > 0 && d.ctr > 0) ? merged : [];
   }, [dailyWithEcpm, engagementSeries]);
-  const impressionDomainShare = useMemo(
-    () => buildShareSeries(enrichedRows, ['domain', 'inv_domain', 'gamDomain', 'DOMAIN'], 'impressions', { topN: 10 }),
-    [enrichedRows]
-  );
   const impressionCountryShare = useMemo(
     () => buildShareSeries(enrichedRows, [
       'country_name', 'country', 'COUNTRY_NAME', 'countryName', 'countryCode',
@@ -2476,10 +2422,7 @@ export default function Dashboard() {
             || (chartOn('deviceShare') && hasChartData(shareSeries.device))
             || (chartOn('countryShare') && hasChartData(shareSeries.country))
             || (chartOn('dailyEcpm') && showEcpmCharts && hasChartData(dailyWithEcpm, ['ecpm']))
-            || (chartOn('topSites') && showRevenueCharts && hasChartData(siteShareSeries))
-            || (showImpressionCharts && chartOn('impsDomain') && hasChartData(impressionDomainShare))
-            || (showImpressionCharts && chartOn('impsCountry') && hasChartData(impressionCountryShare))
-            || (chartOn('adUnitMix') && (showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']))) && (
+            || (showImpressionCharts && chartOn('impsCountry') && hasChartData(impressionCountryShare))) && (
           <div className="charts-grid" style={{ marginTop: 16 }}>
             {chartOn('ctr') && hasChartData(engagementSeries, ['ctr']) && (
             <div className="chart-card">
@@ -2775,44 +2718,6 @@ export default function Dashboard() {
                 </ScrollableChart>
               </div>
             )}
-            {chartOn('topSites') && showRevenueCharts && hasChartData(siteShareSeries) && (
-              <div className="chart-card">
-                <ChartHeader title="Top sites" hint="Top 10 by revenue" onHide={() => hideChart('topSites')} />
-                <ResponsiveContainer width="100%" height={260}>
-                  <BarChart data={siteShareSeries} layout="vertical" margin={hBarMargins}>
-                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
-                    <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
-                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
-                    <Tooltip formatter={(value, _n, item) => [money(value, currency), item?.payload?.name || 'Site']} />
-                    <Bar dataKey="value" radius={[0, 6, 6, 0]}>
-                      {siteShareSeries.map((entry, idx) => (
-                        <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-            {showImpressionCharts && chartOn('impsDomain') && hasChartData(impressionDomainShare) && (
-            <div className="chart-card">
-              <ChartHeader title="Impressions by domain" hint="Top 10 domains" onHide={() => hideChart('impsDomain')} />
-              <ResponsiveContainer width="100%" height={240}>
-                <BarChart data={impressionDomainShare} layout="vertical" margin={hBarMargins}>
-                  <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
-                  <XAxis type="number" tick={false} axisLine={false} />
-                  <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
-                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
-                  <Tooltip formatter={(value, _n, item) => [num(value), item?.payload?.name || 'Domain']} />
-                  <Bar dataKey="value" radius={[0, 6, 6, 0]}>
-                    {impressionDomainShare.map((entry, idx) => (
-                      <Cell key={`${entry.name}-${idx}`} fill={SHARE_COLORS[idx % SHARE_COLORS.length]} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-            )}
             {showImpressionCharts && chartOn('impsCountry') && hasChartData(impressionCountryShare) && (
             <div className="chart-card">
               <ChartHeader title="Impressions by country" hint="Top 10 countries" onHide={() => hideChart('impsCountry')} />
@@ -2832,45 +2737,6 @@ export default function Dashboard() {
               </ResponsiveContainer>
             </div>
             )}
-            {chartOn('adUnitMix') && (showRevenueCharts || showImpressionCharts) && hasChartData(adUnitMixSeries, ['revenue', 'impressions']) && (
-              <div className="chart-card">
-                <ChartHeader title="Ad unit mix" hint="Revenue and impressions by ad unit" onHide={() => hideChart('adUnitMix')} />
-                <ResponsiveContainer width="100%" height={240}>
-                  <BarChart data={adUnitMixSeries} layout="vertical" margin={hBarMargins}>
-                    <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
-                    <XAxis type="number" tick={false} axisLine={false} />
-                    <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
-                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
-                    <Tooltip formatter={(value, name) => (
-                      name === 'Revenue' ? [money(value, currency), name] : [num(value), name]
-                    )} />
-                    <Legend />
-                    {showRevenueCharts && (
-                      <Bar dataKey="revenue" name="Revenue" fill={CHART_SERIES.primary} radius={[0, 6, 6, 0]} />
-                    )}
-                    {showImpressionCharts && (
-                      <Bar dataKey="impressions" name="Impressions" fill={CHART_SERIES.secondary} radius={[0, 6, 6, 0]} />
-                    )}
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-          </div>
-          )}
-
-          {chartOn('adPerformance') && hasChartData(performanceSeries, ['score', 'value']) && (
-          <div className="chart-card wide" style={{ marginTop: 16 }}>
-            <ChartHeader title="Ad performance" hint="Compact score by ad unit" onHide={() => hideChart('adPerformance')} />
-            <ResponsiveContainer width="100%" height={240}>
-              <BarChart data={performanceSeries} layout="vertical" margin={hBarMargins}>
-                <CartesianGrid strokeDasharray={CHART_GRID.strokeDasharray} stroke={CHART_GRID.stroke} />
-                <XAxis type="number" tick={false} axisLine={false} />
-                <YAxis dataKey="name" type="category" width={catAxisW} tick={{ fontSize: isNarrow ? 10 : 11 }} axisLine={false} tickLine={false}
-                    tickFormatter={(v) => truncateAxisLabel(v, catLabelMax)} />
-                <Tooltip formatter={(value) => [Number(value).toFixed(0), 'Performance score']} />
-                <Bar dataKey="score" radius={[0, 6, 6, 0]} fill={CHART_SERIES.danger} />
-              </BarChart>
-            </ResponsiveContainer>
           </div>
           )}
 
