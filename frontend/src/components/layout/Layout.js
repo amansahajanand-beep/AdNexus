@@ -15,6 +15,7 @@ const FOCUS_KEY = 'adnexus.focusMode';
 const NAV_ITEMS = [
   { to: '/dashboard', label: 'Dashboard', short: 'D', page: 'dashboard' },
   { to: '/reporting', label: 'Reporting', short: 'R', page: 'reporting' },
+  { to: '/roi', label: 'ROI', short: 'O', page: 'roi' },
   { to: '/admin', label: 'Admin', short: 'A', adminOnly: true },
   { to: '/domain-user', label: 'Domain User', short: 'U', page: 'domain-user' },
 ];

@@ -43,7 +43,9 @@ export function getUserFacingMessage(err, contextFallback) {
       : 'Your session has expired. Please sign in again.';
   }
   if (status === 404) {
-    return 'The requested report data was not found.';
+    return serverMsg && !isTechnicalMessage(serverMsg)
+      ? serverMsg
+      : (contextFallback || 'The requested resource was not found.');
   }
   if (status === 400) {
     return serverMsg && !isTechnicalMessage(serverMsg)

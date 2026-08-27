@@ -12,6 +12,7 @@
 const cron   = require('node-cron');
 const logger = require('../utils/logger');
 const { gamSyncQueue } = require('../queues/gamSync');
+const { adsSyncQueue } = require('../queues/adsSync');
 const { todayInTZ, historicalRangeForPresets, listCalendarMonthsNewestFirst, shiftYMD } = require('../utils/datetime');
 
 async function eachActiveClient(fn) {
@@ -196,8 +197,33 @@ function startCron() {
     });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── 4 AM daily: Google Ads spend sync (lookback window) ──
+  cron.schedule('0 4 * * *', async () => {
+    const lookback = parseInt(process.env.GOOGLE_ADS_SYNC_LOOKBACK_DAYS || '30', 10) || 30;
+    const end = todayInTZ();
+    const start = shiftYMD(end, -(lookback - 1));
+    await eachActiveClient(async (client) => {
+      const cid = client.id;
+      try {
+        await adsSyncQueue.add('ads-sync-all', {
+          clientId: cid,
+          startDate: start,
+          endDate: end,
+        }, {
+          jobId: `ads-sync-${cid.slice(0, 8)}-${end}`,
+          priority: 3,
+          attempts: 2,
+          backoff: { type: 'exponential', delay: 30000 },
+        });
+        logger.info(`Cron: enqueued ads-sync-all client=${cid.slice(0, 8)} ${start}→${end}`);
+      } catch (e) {
+        logger.error('Cron: failed to enqueue ads-sync:', e.message);
+      }
+    });
+  }, { timezone: 'Asia/Singapore' });
+
   logger.info(
-    'Cron jobs started: hourly today, 6h yesterday, 2AM complete-month backfill, 3AM archive, boot kickoff'
+    'Cron jobs started: hourly today, 6h yesterday, 2AM complete-month backfill, 3AM archive, 4AM ads-sync, boot kickoff'
   );
 
   // Don't wait until the next clock hour — fill today's present now.

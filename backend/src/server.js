@@ -7,6 +7,7 @@ const rateLimit = require('express-rate-limit');
 const logger = require('./utils/logger');
 
 const authRoutes = require('./routes/auth');
+const authAdsRoutes = require('./routes/authAds');
 const sessionRoutes = require('./routes/session');
 const usersRoutes = require('./routes/users');
 const domainsRoutes = require('./routes/domains');
@@ -14,6 +15,8 @@ const reportsRoutes = require('./routes/reports');
 const ordersRoutes = require('./routes/orders');
 const inventoryRoutes = require('./routes/inventory');
 const networkRoutes = require('./routes/network');
+const adsRoutes = require('./routes/ads');
+const roiRoutes = require('./routes/roi');
 const { initDB } = require('./models/userStore');
 const onboardRoutes = require('./routes/onboard');
 const clientsRoutes = require('./routes/clients');
@@ -22,19 +25,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // ── Memory monitoring ───────────────────────────────────────────────
-console.log('[MEMORY] Memory monitor started');
 
-setInterval(() => {
-  const m = process.memoryUsage();
-
-  console.log(
-    `[MEMORY] RSS=${(m.rss / 1024 / 1024).toFixed(0)}MB ` +
-    `HeapUsed=${(m.heapUsed / 1024 / 1024).toFixed(0)}MB ` +
-    `HeapTotal=${(m.heapTotal / 1024 / 1024).toFixed(0)}MB ` +
-    `External=${(m.external / 1024 / 1024).toFixed(0)}MB ` +
-    `ArrayBuffers=${(m.arrayBuffers / 1024 / 1024).toFixed(0)}MB`
-  );
-}, 10000);
 
 // Trust the first proxy hop so express-rate-limit can read X-Forwarded-For safely
 app.set('trust proxy', 1);
@@ -118,8 +109,11 @@ async function startServer() {
 
   // Routes
   app.use('/auth', authRoutes);              // GAM Google OAuth helper
+  app.use('/auth/ads', authAdsRoutes);       // Google Ads OAuth
   app.use('/api/onboard', onboardRoutes);    // Public client self-onboard
   app.use('/api/clients', clientsRoutes);    // Client admin credential settings
+  app.use('/api/ads', adsRoutes);            // Google Ads accounts / mapping / expenses
+  app.use('/api/roi', roiRoutes);            // ROI summary
   app.use('/api/auth', sessionRoutes);       // Dashboard user login/session
   app.use('/api/users', usersRoutes);        // Admin user management
   app.use('/api/domains', domainsRoutes);    // Domain / channel catalogue
@@ -202,8 +196,10 @@ async function startServer() {
     if (process.env.SYNC_DISABLED !== 'true' && process.env.RUN_IN_PROCESS_WORKERS !== 'false') {
       try {
         const { startWorker, startReportWorker } = require('./workers/gamSyncWorker');
+        const { startAdsWorker } = require('./workers/adsSyncWorker');
         startWorker();
         startReportWorker();
+        startAdsWorker();
       } catch (e) {
         logger.warn('BullMQ worker failed to start (non-fatal):', e.message);
       }

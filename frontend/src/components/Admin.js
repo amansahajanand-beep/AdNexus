@@ -6,6 +6,8 @@ import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions, normalizeDomainP
 import { isLikelyAppPackage } from '../utils/appPackage';
 import UserManagement from './admin/UserManagement';
 import ClientSettings from './admin/ClientSettings';
+import AdsAccountsAdmin from './admin/AdsAccountsAdmin';
+import AdsCampaignMapping from './admin/AdsCampaignMapping';
 import DomainPermissions from './admin/DomainPermissions';
 import PageHeader from './ui/PageHeader';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
@@ -13,17 +15,24 @@ const TABS = [
   { id: 'user', label: 'Users' },
   { id: 'domains', label: 'Assign Permissions' },
   { id: 'client', label: 'GAM credentials' },
+  { id: 'ads', label: 'Google Ads accounts' },
+  { id: 'ads-map', label: 'Campaign mapping' },
 ];
 
 export default function Admin() {
   const { user } = useAuth();
   const location = useLocation();
-  const [tab, setTab] = useState(() => (
-    new URLSearchParams(location.search).get('oauth') ? 'client' : 'user'
-  ));
+  const [tab, setTab] = useState(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get('tab') === 'ads' || params.get('ads_oauth')) return 'ads';
+    if (params.get('oauth')) return 'client';
+    return 'user';
+  });
 
   useEffect(() => {
-    if (new URLSearchParams(location.search).get('oauth')) setTab('client');
+    const params = new URLSearchParams(location.search);
+    if (params.get('tab') === 'ads' || params.get('ads_oauth')) setTab('ads');
+    else if (params.get('oauth')) setTab('client');
   }, [location.search]);
   const [users, setUsers] = useState([]);
   const [usersLoading, setUsersLoading] = useState(true);
@@ -141,8 +150,15 @@ export default function Admin() {
     <div className="dashboard-page admin-page">
       <PageHeader
         title="Admin"
-        subtitle="Users, inventory permissions, and GAM OAuth credentials"
-        summary={tab === 'user' ? 'User management' : tab === 'domains' ? 'Assign inventory access' : 'Client OAuth settings'}
+        subtitle="Users, inventory permissions, GAM OAuth, and Google Ads ROI setup"
+        summary={
+          tab === 'user' ? 'User management'
+            : tab === 'domains' ? 'Assign inventory access'
+              : tab === 'client' ? 'Client OAuth settings'
+                : tab === 'ads' ? 'Google Ads MCC & accounts'
+                  : tab === 'ads-map' ? 'Campaign → site/app mapping'
+                    : ''
+        }
       />
 
       <div className="admin-tabs" role="tablist" aria-label="Admin sections">
@@ -180,6 +196,15 @@ export default function Admin() {
       )}
 
       {tab === 'client' && <ClientSettings />}
+
+      {tab === 'ads' && <AdsAccountsAdmin />}
+
+      {tab === 'ads-map' && (
+        <AdsCampaignMapping
+          siteHosts={catalogLists.siteHosts || []}
+          appIds={catalogLists.appIds || []}
+        />
+      )}
 
       {tab === 'domains' && (
         <DomainPermissions

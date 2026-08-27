@@ -343,6 +343,100 @@ async function initSchema() {
     logger.warn('report_grain slice_key column:', e.message);
   }
 
+  // Google Ads ROI tables (MCC + client accounts, campaign map, spend, other expenses)
+  await schemaQuery(`
+    CREATE TABLE IF NOT EXISTS ads_accounts (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_type TEXT NOT NULL CHECK (account_type IN ('mcc', 'client')),
+      customer_id TEXT NOT NULL DEFAULT '',
+      descriptive_name TEXT NOT NULL DEFAULT '',
+      parent_mcc_id UUID REFERENCES ads_accounts(id) ON DELETE SET NULL,
+      login_customer_id TEXT,
+      google_refresh_token_enc TEXT,
+      is_active BOOLEAN DEFAULT true,
+      include_in_roi BOOLEAN DEFAULT true,
+      last_sync_at TIMESTAMPTZ,
+      last_sync_error TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (client_id, customer_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ads_campaign_map (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      campaign_id TEXT NOT NULL,
+      campaign_name TEXT NOT NULL DEFAULT '',
+      target_type TEXT NOT NULL CHECK (target_type IN ('site', 'app')),
+      target_key TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (client_id, ads_account_id, campaign_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ads_spend_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      campaign_id TEXT NOT NULL,
+      campaign_name TEXT NOT NULL DEFAULT '',
+      cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks INT NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      conversions DOUBLE PRECISION NOT NULL DEFAULT 0,
+      conversion_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+      currency CHAR(3) NOT NULL DEFAULT 'USD',
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (client_id, ads_account_id, report_date, campaign_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS roi_other_expenses (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      expense_date DATE NOT NULL,
+      amount DOUBLE PRECISION NOT NULL,
+      label TEXT NOT NULL DEFAULT '',
+      target_type TEXT NOT NULL CHECK (target_type IN ('site', 'app', 'general')),
+      target_key TEXT NOT NULL DEFAULT '',
+      notes TEXT,
+      created_by TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  try {
+    // Existing installs may have created_by as UUID; app user ids are TEXT (e.g. user-…).
+    await schemaQuery(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'roi_other_expenses'
+            AND column_name = 'created_by'
+            AND data_type = 'uuid'
+        ) THEN
+          ALTER TABLE roi_other_expenses
+            ALTER COLUMN created_by TYPE TEXT USING created_by::text;
+        END IF;
+      END $$;
+    `);
+  } catch (e) {
+    logger.warn('roi_other_expenses.created_by TEXT migrate:', e.message);
+  }
+
+  try {
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_accounts_client ON ads_accounts (client_id)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_spend_client_date ON ads_spend_daily (client_id, report_date)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_campaign_map_client ON ads_campaign_map (client_id)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_roi_expenses_client_date ON roi_other_expenses (client_id, expense_date)`);
+  } catch (e) {
+    logger.warn('ads ROI indexes:', e.message);
+  }
+
   // Retired warehouse — drop if leftover from older deploys (frees a lot of disk).
   try {
     await schemaQuery(`DROP TABLE IF EXISTS report_full_present CASCADE`);
@@ -438,6 +532,10 @@ const TENANT_TABLES = [
   'rollup_inventory_kpi_daily',
   'rollup_dim_daily',
   'sync_log',
+  'ads_accounts',
+  'ads_campaign_map',
+  'ads_spend_daily',
+  'roi_other_expenses',
 ];
 
 function safeIdent(name) {

@@ -469,6 +469,7 @@ function trendFromRows(rows = []) {
 const DEFAULT_CHILD_PERMISSIONS = {
   canAccessDashboard: true,
   canAccessReporting: true,
+  canAccessRoi: true,
   canAccessDomainUser: true,
   canLogin: true,
   canGenerateReports: true,
@@ -490,7 +491,7 @@ const DEFAULT_CHILD_PERMISSIONS = {
 };
 
 const FLAG_KEYS = [
-  'canAccessDashboard', 'canAccessReporting', 'canAccessDomainUser',
+  'canAccessDashboard', 'canAccessReporting', 'canAccessRoi', 'canAccessDomainUser',
   'canLogin', 'canGenerateReports', 'canDownloadReports', 'canUseFilters', 'canUseReportBuilder',
   'canSeeRevenue', 'canSeeImpressions', 'canSeeCTR', 'canSeeECPM', 'canSeeProgrammatic',
   'canSeeOrders', 'canSeeInventory',
@@ -530,6 +531,7 @@ function canAccessPage(user, page) {
   const map = {
     dashboard: 'canAccessDashboard',
     reporting: 'canAccessReporting',
+    roi: 'canAccessRoi',
     'domain-user': 'canAccessDomainUser',
     admin: null,
   };
@@ -542,7 +544,7 @@ function canAccessPage(user, page) {
 function buildVisibility(user) {
   if (isAdmin(user)) {
     return {
-      pages: { dashboard: true, reporting: true, domainUser: true },
+      pages: { dashboard: true, reporting: true, roi: true, domainUser: true },
       revenue: true, impressions: true, ctr: true, ecpm: true, programmatic: true,
       generate: true, download: true, filters: true, reportBuilder: true,
       orders: true, inventory: true,
@@ -553,6 +555,7 @@ function buildVisibility(user) {
     pages: {
       dashboard: p.canAccessDashboard !== false,
       reporting: p.canAccessReporting !== false,
+      roi: p.canAccessRoi !== false,
       domainUser: p.canAccessDomainUser !== false,
     },
     revenue: p.canSeeRevenue !== false,

@@ -47,6 +47,9 @@ export default function CommandPalette() {
     if (canPage('reporting')) {
       list.push({ id: 'rep', label: 'Reporting', hint: 'Build a report', to: '/reporting' });
     }
+    if (canPage('roi')) {
+      list.push({ id: 'roi', label: 'ROI', hint: 'Spend vs earn', to: '/roi' });
+    }
     if (canPage('dashboard')) {
       getSavedFilters(SAVED_FILTERS_PAGES.dashboard, user?.id).slice(0, 6).forEach((f) => {
         list.push({

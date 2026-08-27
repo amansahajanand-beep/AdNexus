@@ -16,9 +16,11 @@ async function main() {
   }
 
   const { startWorker, startReportWorker } = require('./workers/gamSyncWorker');
+  const { startAdsWorker } = require('./workers/adsSyncWorker');
   startWorker();
   startReportWorker();
-  logger.info('gam-worker process ready');
+  startAdsWorker();
+  logger.info('gam-worker process ready (GAM + Ads)');
 }
 
 main().catch((err) => {

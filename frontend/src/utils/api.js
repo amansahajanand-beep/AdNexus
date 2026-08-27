@@ -235,6 +235,30 @@ export const clientsAPI = {
   oauthUrl: () => FAST_API.get('/clients/me/oauth-url'),
 };
 
+export const adsAPI = {
+  listAccounts: () => FAST_API.get('/ads/accounts'),
+  mccOauthUrl: () => FAST_API.post('/ads/accounts/mcc/oauth-url'),
+  createMcc: (payload) => FAST_API.post('/ads/accounts/mcc', payload),
+  createIndividual: (payload) => FAST_API.post('/ads/accounts/individual', payload),
+  accountOauthUrl: (id) => FAST_API.get(`/ads/accounts/${id}/oauth-url`),
+  updateAccount: (id, payload) => FAST_API.patch(`/ads/accounts/${id}`, payload),
+  deleteAccount: (id) => FAST_API.delete(`/ads/accounts/${id}`),
+  refreshChildren: (id) => FAST_API.post(`/ads/accounts/${id}/refresh-children`),
+  listCampaigns: (id) => FAST_API.get(`/ads/accounts/${id}/campaigns`),
+  listCampaignMaps: () => FAST_API.get('/ads/campaign-maps'),
+  saveCampaignMap: (payload) => FAST_API.put('/ads/campaign-maps', payload),
+  deleteCampaignMap: (id) => FAST_API.delete(`/ads/campaign-maps/${id}`),
+  syncAll: (payload) => FAST_API.post('/ads/sync', payload || {}),
+  syncAccount: (id, payload) => FAST_API.post(`/ads/accounts/${id}/sync`, payload || {}),
+  listExpenses: (params) => FAST_API.get('/ads/expenses', { params }),
+  createExpense: (payload) => FAST_API.post('/ads/expenses', payload),
+  deleteExpense: (id) => FAST_API.delete(`/ads/expenses/${id}`),
+};
+
+export const roiAPI = {
+  summary: (params) => FAST_API.get('/roi/summary', { params }),
+};
+
 export const usersAPI = {
   getAll: () => FAST_API.get('/users'),
   getInventoryPicker: () => FAST_API.get('/users/inventory-picker'),

@@ -3297,7 +3297,191 @@ select.ui-field-input { border-radius: 10px; cursor: pointer; }
   font-size: 13px;
 }
 
+/* Google Ads / ROI — reuse Dashboard/Reporting shells; keep only ROI-specific bits */
+.ads-admin-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 1100px;
+}
+.ads-admin-page .admin-panel-head {
+  align-items: flex-start;
+  gap: 12px;
+}
+.ads-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.ads-form-card,
+.ads-section-card {
+  margin: 0;
+}
+.ads-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px 16px;
+  margin-top: 4px;
+}
+.ads-map-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.ads-mcc-card {
+  border: 1px solid #e8eaed;
+  border-radius: 10px;
+  padding: 14px 16px;
+  margin-top: 12px;
+  background: #fafbfc;
+}
+.ads-mcc-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+.ads-mcc-identity {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+.ads-mcc-name { font-size: 14px; }
+.ads-mcc-id { color: #5f6368; font-size: 13px; }
+.ads-mcc-hint { margin: 10px 0 0; }
+.ads-nested-table {
+  margin-top: 12px;
+  border: 1px solid #e8eaed;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #fff;
+}
+.ads-badge {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #eef1f4;
+  color: #5f6368;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+}
+.ads-badge.ok { background: #e6f4ea; color: #137333; }
+.ads-badge.warn { background: #fef7e0; color: #b06000; }
+.ads-badge.ads-type-app { background: #e8f0fe; color: #1967d2; }
+.ads-badge.ads-type-site { background: #f3e8fd; color: #7627bb; }
+.ads-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  cursor: pointer;
+  user-select: none;
+}
+.ads-inline-input {
+  width: 100%;
+  min-width: 120px;
+  max-width: 220px;
+  height: 34px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.ads-sync-err {
+  margin-top: 4px;
+  font-size: 11px;
+  color: #c5221f;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ads-campaign-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  align-items: flex-start;
+}
+.ads-campaign-id { font-size: 11px; }
+.ads-table-empty {
+  text-align: center;
+  color: #80868b;
+  padding: 36px 16px !important;
+}
+.ads-empty {
+  padding: 28px 16px;
+  text-align: center;
+}
+.ads-empty-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #202124;
+}
+.ads-empty-desc {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: #80868b;
+}
+.ads-admin-wrap .client-settings-card { max-width: 1100px; }
+.ads-admin-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+.ads-section-title { margin: 16px 0 8px; font-size: 14px; }
+.ads-child-list { list-style: none; margin: 0; padding: 0; }
+.ads-child-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 0;
+  border-top: 1px solid #eee;
+  font-size: 13px;
+}
+.ads-individual-form, .ads-map-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #eee;
+}
+.roi-summary-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) auto;
+  margin-top: 16px;
+}
+.roi-page .report-summary-row ~ .filter-card,
+.roi-page .warn-card ~ .filter-card {
+  margin-top: 16px;
+}
+.roi-pos { color: var(--success, #137333); font-weight: 600; }
+.roi-neg { color: #c5221f; font-weight: 600; }
+.roi-expense-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.roi-expense-pair .filter-field {
+  border: 1px solid var(--border, #e8eaed);
+  border-radius: var(--radius-card, 10px);
+  padding: 12px 14px;
+  background: var(--surface, #fff);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.roi-page .roi-report-table {
+  min-width: 900px;
+}
+.muted { color: #80868b; font-size: 13px; }
+@media (max-width: 900px) {
+  .ads-map-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 @media (max-width: 720px) {
+  .ads-form-grid,
+  .ads-map-grid { grid-template-columns: 1fr; }
+  .ads-inline-input { max-width: none; }
+  .roi-expense-pair { grid-template-columns: 1fr; }
+  .roi-summary-grid { grid-template-columns: 1fr 1fr; }
   .saved-filters-bar {
     width: 100%;
   }

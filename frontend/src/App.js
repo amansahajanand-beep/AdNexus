@@ -6,6 +6,7 @@ import Login from './pages/Login';
 import Onboard from './pages/Onboard';
 import Dashboard from './components/Dashboard';
 import Reporting from './components/Reporting';
+import Roi from './components/Roi';
 import Admin from './components/Admin';
 import DomainUser from './components/DomainUser';
 import ProtectedRoute from './components/routing/ProtectedRoute';
@@ -107,6 +108,7 @@ function AppRoutes() {
         <Route index element={<HomeRedirect />} />
         <Route path="/dashboard" element={<PermissionRoute page="dashboard"><Dashboard /></PermissionRoute>} />
         <Route path="/reporting" element={<PermissionRoute page="reporting"><Reporting /></PermissionRoute>} />
+        <Route path="/roi" element={<PermissionRoute page="roi"><Roi /></PermissionRoute>} />
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
       </Route>
