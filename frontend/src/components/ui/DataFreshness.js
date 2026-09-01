@@ -1,17 +1,40 @@
 import React from 'react';
 import { buildFreshnessLabel, relativeFreshness } from '../../utils/dataFreshness';
+import { buildFreshnessHint } from '../../utils/report/dataFreshness';
 
 /**
- * Compact “data as of” line for page Live chips / Layout.
- * Prefer server sync times from network info; fall back to client fetch time.
+ * Compact sync-time line (Layout live chip) or coverage/reconciliation hint (Dashboard/Reporting).
  */
 export default function DataFreshness({
+  coverage,
   networkInfo,
+  status,
   fetchedAt = null,
   tzLabel = 'SGT',
   className = '',
   compact = false,
 }) {
+  const hintMode = coverage != null || status != null;
+  const hint = hintMode ? buildFreshnessHint({ coverage, networkInfo, status }) : null;
+
+  if (hint) {
+    const partial = status === 'partial' || (coverage && !coverage.complete);
+    const fixing = networkInfo?.reconciliationStatus === 'fixing';
+    const divergent = networkInfo?.reconciliationStatus === 'divergent';
+
+    let tone = 'freshness-ok';
+    if (fixing) tone = 'freshness-fixing';
+    else if (divergent) tone = 'freshness-warn';
+    else if (partial) tone = 'freshness-partial';
+
+    return (
+      <span className={`data-freshness ${tone} ${className}`.trim()} title={hint}>
+        {fixing && <span className="dot-pulse" aria-hidden="true" />}
+        {hint}
+      </span>
+    );
+  }
+
   const label = buildFreshnessLabel(networkInfo, { fetchedAt, tzLabel });
   if (!label) return null;
 

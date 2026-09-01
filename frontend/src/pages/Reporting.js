@@ -1416,6 +1416,12 @@ export default function Reporting() {
           </>
         )}
       </PageHeader>
+      <DataFreshness
+        coverage={data?.coverage || progData?.coverage}
+        networkInfo={networkInfo}
+        status={data?.status || progData?.status}
+        className="report-freshness"
+      />
       {dateRestriction && (
         <p className="form-note page-restriction-note">
           {dateFilterLocked

@@ -23,7 +23,22 @@ const UNIFIED_GRAIN_METRICS = [...SAFE_METRICS];
  * report_present / report_daily. Never drop COUNTRY + DEVICE — shrink metrics
  * or split inventory (web vs app) instead of falling back to AD_UNIT-only grain.
  */
+/** Network-wide KPI — one row per day (GAM Totals only). ALL_REVENUE required. */
+const NETWORK_KPI_METRICS = [
+  'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS',
+  'TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE',
+  'TOTAL_LINE_ITEM_LEVEL_WITHOUT_CPD_AVERAGE_ECPM',
+  'TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE',
+];
+
+/** Slices that must include ALL_REVENUE — never fall back to CPM-only bundles. */
+const REVENUE_STRICT_SLICES = new Set(['network_kpi', 'inventory_core', 'channel']);
+
 const LEAN_SYNC_DIM_SLICES = [
+  {
+    key: 'network_kpi',
+    dims: ['DATE'],
+  },
   {
     key: 'inventory_core',
     dims: [
@@ -66,6 +81,27 @@ const LEAN_SYNC_DIM_SLICES = [
     dims: ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME'],
   },
 ];
+
+/** Metric attempts per slice — revenue-strict slices never drop ALL_REVENUE. */
+function getMetricAttemptsForSlice(sliceKey) {
+  const sk = String(sliceKey || '').trim();
+  if (sk === 'network_kpi') {
+    return [NETWORK_KPI_METRICS];
+  }
+  if (REVENUE_STRICT_SLICES.has(sk)) {
+    return [
+      UNIFIED_GRAIN_METRICS,
+      UNIFIED_GRAIN_METRICS.slice(0, 6),
+      [
+        'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS',
+        'TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE',
+        'TOTAL_LINE_ITEM_LEVEL_WITHOUT_CPD_AVERAGE_ECPM',
+        'TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE',
+      ],
+    ];
+  }
+  return LEAN_SYNC_METRIC_ATTEMPTS;
+}
 
 /** Prefer full SAFE metrics; shrink columns before dims if GAM rejects the combo. */
 const LEAN_SYNC_METRIC_ATTEMPTS = [
@@ -154,8 +190,11 @@ function classifyReportingQuery(dimensionApis = [], metricApis = []) {
 module.exports = {
   UNIFIED_GRAIN_DIMS,
   UNIFIED_GRAIN_METRICS,
+  NETWORK_KPI_METRICS,
+  REVENUE_STRICT_SLICES,
   LEAN_SYNC_DIM_SLICES,
   LEAN_SYNC_METRIC_ATTEMPTS,
+  getMetricAttemptsForSlice,
   MAX_CUSTOM_DIMS,
   MAX_CUSTOM_METS,
   isGrainDimension,

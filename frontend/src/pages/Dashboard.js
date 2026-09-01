@@ -1946,6 +1946,12 @@ export default function Dashboard() {
           </>
         )}
       </PageHeader>
+      <DataFreshness
+        coverage={overviewData?.coverage}
+        networkInfo={networkInfo}
+        status={overviewData?.status}
+        className="dash-freshness"
+      />
       {canGenerate && (
         <CompareRangeBar
           mode={compareMode}

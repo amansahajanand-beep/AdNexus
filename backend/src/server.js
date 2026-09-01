@@ -201,10 +201,27 @@ async function startServer() {
         startReportWorker();
         startAdsWorker();
       } catch (e) {
-        logger.warn('BullMQ worker failed to start (non-fatal):', e.message);
+        logger.error('BullMQ worker failed to start — hourly sync jobs will NOT run:', e.message);
       }
     } else if (process.env.RUN_IN_PROCESS_WORKERS === 'false') {
       logger.info('In-process BullMQ workers skipped (RUN_IN_PROCESS_WORKERS=false)');
+    }
+
+    // ── Background GAM reconciliation (compare DB vs live, auto-fix) ─────────
+    if (process.env.SYNC_DISABLED !== 'true') {
+      setImmediate(async () => {
+        try {
+          const { listActiveClients } = require('./models/clientStore');
+          const { runWithClient } = require('./utils/clientContext');
+          const { runBootReconciliation } = require('./services/gamReconciliationService');
+          const clients = await listActiveClients();
+          for (const client of clients) {
+            await runWithClient(client, () => runBootReconciliation());
+          }
+        } catch (e) {
+          logger.warn('Reconciliation boot failed (non-fatal):', e.message);
+        }
+      });
     }
 
     // ── Cron jobs ─────────────────────────────────────────────────────────────

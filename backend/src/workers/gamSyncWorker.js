@@ -70,11 +70,93 @@ async function processJobInner(job) {
   if (job.name === 'archive-cold-data') {
     try {
       const { archiveColdDaysForClient } = require('../services/reportArchiveService');
-      const archived = await archiveColdDaysForClient(client.id);
+      const { requireClientId } = require('../utils/clientContext');
+      const archived = await archiveColdDaysForClient(requireClientId());
       await logSync(job.name, 'success', archived);
       logger.info(`[gam-sync] Job "${job.name}" done — ${archived} day(s) archived`);
     } catch (err) {
       logger.error(`[gam-sync] Job "${job.name}" failed:`, err.message);
+      await logSync(job.name, 'failed', 0, err.message);
+      throw err;
+    }
+    return;
+  }
+
+  if (job.name === 'reconcile-day') {
+    const day = job.data?.date;
+    if (!day) {
+      logger.warn('[gam-sync] reconcile-day missing date');
+      return;
+    }
+    try {
+      const { reconcileDayJob } = require('../services/gamReconciliationService');
+      const res = await reconcileDayJob(day);
+      await logSync(job.name, 'success', res.action === 'fix' ? 1 : 0);
+      logger.info(`[gam-sync] reconcile-day ${day} → ${res.action} delta=${res.deltaPct}%`);
+    } catch (err) {
+      await logSync(job.name, 'failed', 0, err.message);
+      throw err;
+    }
+    return;
+  }
+
+  if (job.name === 'reconcile-range') {
+    const start = job.data?.startDate;
+    const end = job.data?.endDate;
+    if (!start || !end) {
+      logger.warn('[gam-sync] reconcile-range missing dates');
+      return;
+    }
+    try {
+      const { fixRange } = require('../services/gamReconciliationService');
+      const res = await fixRange(start, end);
+      const n = Number(res.fixed?.length) || 0;
+      await logSync(job.name, 'success', n);
+      logger.info(
+        `[gam-sync] reconcile-range ${start}..${end} checked=${res.checked}`
+        + ` divergent=${res.divergent} fixes=${n}`
+      );
+    } catch (err) {
+      await logSync(job.name, 'failed', 0, err.message);
+      throw err;
+    }
+    return;
+  }
+
+  if (job.name === 'sync-network-kpi') {
+    const day = job.data?.date;
+    if (!day) {
+      logger.warn('[gam-sync] sync-network-kpi missing date');
+      return;
+    }
+    try {
+      if (!getGAMHelpers()) {
+        logger.warn('[gam-sync] GAM helpers not available — skipping network_kpi');
+        await logSync(job.name, 'skipped', 0, 'helpers not ready');
+        return;
+      }
+      const totalUpserted = await streamSyncFromGAM(day, day, job.name, { kpiOnly: true });
+      await invalidateCacheForDate(day);
+      const { compareDay } = require('../services/gamReconciliationService');
+      const { updateNetworkReconciliation, writeReconciliationLog } = require('../services/networkRollupStore');
+      const cmp = await compareDay(day);
+      if (cmp.gamRev != null && cmp.ok) {
+        await updateNetworkReconciliation(day, {
+          gamRevenue: cmp.gamRev,
+          deltaPct: cmp.deltaPct,
+          impressions: cmp.gamImp || cmp.dbImp,
+          revenue: cmp.gamRev,
+        });
+        await writeReconciliationLog(day, cmp.dbRev, cmp.gamRev, cmp.deltaPct, 'ok');
+      } else if (cmp.gamRev != null) {
+        await writeReconciliationLog(day, cmp.dbRev, cmp.gamRev, cmp.deltaPct, 'divergent');
+        logger.warn(
+          `[gam-sync] sync-network-kpi ${day} still off after pull: db=${cmp.dbRev} gam=${cmp.gamRev}`
+        );
+      }
+      await logSync(job.name, 'success', totalUpserted);
+      logger.info(`[gam-sync] Job "${job.name}" done — ${totalUpserted} rows (${day})`);
+    } catch (err) {
       await logSync(job.name, 'failed', 0, err.message);
       throw err;
     }
@@ -139,6 +221,24 @@ async function processJobInner(job) {
   }
 }
 
+function scheduleDrainAfterJob(job) {
+  if (!job || job.name === 'archive-cold-data') return;
+  setImmediate(() => {
+    drainAfterJob(job).catch((e) => logger.warn(`[gam-sync] drain after ${job.name}:`, e.message));
+  });
+}
+
+async function drainAfterJob(job) {
+  let client = null;
+  try {
+    if (job.data?.clientId) client = await getClientById(job.data.clientId);
+    if (!client) client = await ensureBootstrapFromEnv();
+  } catch (_) { /* ignore */ }
+  if (!client) return;
+  const { drainIncompleteHistory } = require('../services/gamReconciliationService');
+  await runWithClient(client, () => drainIncompleteHistory());
+}
+
 function startWorker() {
   if (process.env.REDIS_DISABLED === 'true' || process.env.SYNC_DISABLED === 'true' || !process.env.REDIS_URL) {
     logger.info('BullMQ worker disabled; skipping Redis-backed worker startup');
@@ -157,6 +257,7 @@ function startWorker() {
   worker.on('completed', (job) => {
     const ms = job.finishedOn - job.processedOn;
     logger.info(`[gam-sync] Job "${job.name}" completed in ${ms}ms`);
+    scheduleDrainAfterJob(job);
   });
 
   worker.on('failed', (job, err) => {
@@ -164,6 +265,7 @@ function startWorker() {
       logger.warn(`[gam-sync] Job "${job.name}" attempt ${job.attemptsMade} failed, will retry: ${err.message}`);
     } else {
       logger.error(`[gam-sync] Job "${job.name}" permanently failed after ${job.attemptsMade} attempts: ${err.message}`);
+      scheduleDrainAfterJob(job);
     }
   });
 

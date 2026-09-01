@@ -31,13 +31,14 @@ export function startOfMonth(ymd) {
 // { startDate, endDate } for a named preset, anchored on "today" in Singapore.
 export function presetRange(preset) {
   const today = todayInTZ();
+  const yesterday = shiftYMD(today, -1);
   if (preset === 'yesterday') {
-    const y = shiftYMD(today, -1);
-    return { startDate: y, endDate: y };
+    return { startDate: yesterday, endDate: yesterday };
   }
   if (preset === 'today') return { startDate: today, endDate: today };
-  if (preset === 'last7') return { startDate: shiftYMD(today, -6), endDate: today };
-  if (preset === 'last30') return { startDate: shiftYMD(today, -29), endDate: today };
+  // Historical presets end on yesterday — GAM Historical finalizes prior days only.
+  if (preset === 'last7') return { startDate: shiftYMD(yesterday, -6), endDate: yesterday };
+  if (preset === 'last30') return { startDate: shiftYMD(yesterday, -29), endDate: yesterday };
   if (preset === 'lastMonth') {
     const [y, m] = today.split('-').map(Number);
     const lastM = m === 1 ? 12 : m - 1;
@@ -46,8 +47,11 @@ export function presetRange(preset) {
     const end = shiftYMD(`${y}-${String(m).padStart(2, '0')}-01`, -1);
     return { startDate: start, endDate: end };
   }
-  // thisMonth (default)
-  return { startDate: startOfMonth(today), endDate: today };
+  // thisMonth: month start through yesterday (today shown separately when selected)
+  if (preset === 'thisMonth') {
+    return { startDate: startOfMonth(today), endDate: yesterday };
+  }
+  return { startDate: startOfMonth(today), endDate: yesterday };
 }
 
 export function thisMonthRange() {

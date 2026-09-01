@@ -847,6 +847,7 @@ async function deleteThinGrainRows(dates) {
     `DELETE FROM report_grain
      WHERE client_id = $2::uuid
        AND report_date = ANY($1::date[])
+       AND COALESCE(slice_key, '') <> 'network_kpi'
        AND NOT ${RICH_GRAIN_SQL.replace(/g\./g, 'report_grain.')}`,
     [dates, requireClientId()]
   );

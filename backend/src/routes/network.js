@@ -60,6 +60,18 @@ router.get('/info', async (req, res) => {
   // Always surface the API-version deprecation status so the UI can warn early.
   const gamVersion = getVersionStatus();
   const freshness = await loadSyncFreshness();
+  let syncStatus = {};
+  try {
+    const { getReconciliationStatus } = require('../services/gamReconciliationService');
+    syncStatus = await getReconciliationStatus();
+  } catch (e) {
+    logger.warn('Network info sync status failed:', e.message);
+  }
+  const networkMeta = {
+    ...syncStatus,
+    gamLastSyncedAt: freshness.gamLastSyncedAt || syncStatus.gamLastSyncedAt || null,
+    adsLastSyncedAt: freshness.adsLastSyncedAt || null,
+  };
 
   if (isMockClient()) {
     return res.json({
@@ -69,12 +81,12 @@ router.get('/info', async (req, res) => {
       timeZone: 'Asia/Kolkata',
       isMock: true,
       gamVersion,
-      ...freshness,
+      ...networkMeta,
     });
   }
 
   const cached = cache.get(tenantKey('network_info'));
-  if (cached) return res.json({ ...cached, isMock: false, gamVersion, ...freshness });
+  if (cached) return res.json({ ...cached, isMock: false, gamVersion, ...networkMeta });
 
   try {
     const { getGAMClient } = require('../gam/client');
@@ -112,14 +124,14 @@ router.get('/info', async (req, res) => {
       isMock: false,
     };
     cache.set(tenantKey('network_info'), info, 3600);
-    res.json({ ...info, gamVersion, ...freshness });
+    res.json({ ...info, gamVersion, ...networkMeta });
   } catch (err) {
     logger.error('Network info error:', err.message);
     const classified = classifyGoogleAuthError(err);
     if (classified) {
-      return res.status(classified.status).json({ ...classified, gamVersion, ...freshness });
+      return res.status(classified.status).json({ ...classified, gamVersion, ...networkMeta });
     }
-    res.status(500).json({ error: err.message, isMock: false, gamVersion, ...freshness });
+    res.status(500).json({ error: err.message, isMock: false, gamVersion, ...networkMeta });
   }
 });
 
