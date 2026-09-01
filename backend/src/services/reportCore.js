@@ -2489,6 +2489,12 @@ async function handleDashboardOverview(req, res) {
             const impressions = totals.impressions || 0;
             const revenue = totals.revenue || 0;
             const ecpm = impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0;
+            let coverage = null;
+            if (!invFilterActive && typeof svc.getRangeCoverage === 'function') {
+              try {
+                coverage = await svc.getRangeCoverage(filters.startDate, filters.endDate);
+              } catch (_) { /* ignore */ }
+            }
             const summary = {
               totalEarning: revenue,
               totalEarningChange: 0,
@@ -2511,12 +2517,19 @@ async function handleDashboardOverview(req, res) {
               currency,
             };
             logger.info(
-              `Overview from PostgreSQL ${totals.source === 'rollup' ? 'rollups' : 'aggregates'} (${totals.rowCount} rows summed)`
+              `Overview from PostgreSQL ${totals.source || 'aggregates'} (${totals.rowCount} rows summed)`
               + ` ${filters.startDate}..${filters.endDate} revenue=${revenue} impressions=${impressions}`
               + (isScopedUser ? ` user=${req.user.username}` : '')
+              + (coverage ? ` coverage=${coverage.coveredDays}/${coverage.totalDays}` : '')
               + ` in ${Date.now() - t0}ms`
             );
-            return res.json(applyOverviewVisibility({ summary, isMock: false, currency }, req.user));
+            return res.json(applyOverviewVisibility({
+              summary,
+              isMock: false,
+              currency,
+              coverage,
+              status: coverage && !coverage.complete ? 'partial' : 'ready',
+            }, req.user));
           }
         } catch (aggErr) {
           logger.warn('Overview SQL aggregate failed, falling through:', aggErr.message);

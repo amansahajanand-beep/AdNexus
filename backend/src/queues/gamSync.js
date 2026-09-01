@@ -1,11 +1,18 @@
 const { Queue } = require('bullmq');
 const { createBullmqConnection } = require('../redisClient');
+const logger = require('../utils/logger');
 
 function createDisabledQueue(name) {
   return {
     name,
     disabled: true,
-    async add() { return { id: `${name}:disabled`, name }; },
+    async add(jobName, data, opts) {
+      logger.error(
+        `[gam-sync] Queue disabled — job "${jobName}" was NOT enqueued`
+        + ` (REDIS_URL missing, REDIS_DISABLED=true, or SYNC_DISABLED=true)`
+      );
+      return { id: `${name}:disabled`, name, rejected: true };
+    },
     async getJob() { return null; },
     async close() { return undefined; },
   };

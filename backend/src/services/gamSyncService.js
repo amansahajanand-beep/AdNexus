@@ -8,6 +8,7 @@ const {
   UNIFIED_GRAIN_METRICS,
   LEAN_SYNC_DIM_SLICES,
   LEAN_SYNC_METRIC_ATTEMPTS,
+  getMetricAttemptsForSlice,
 } = require('../utils/warehouseGrain');
 const { parseGamMetricValue, gamMoneyToDollars, coerceWarehouseRevenue, pickRowRevenueDollars } = require('../utils/gamReportMetrics');
 
@@ -334,6 +335,12 @@ async function replaceHistoricalRows(rows, syncType = 'sync-day') {
       await rebuildRollupsForDates(dates, syncType);
     } catch (e) {
       logger.warn(`[${syncType}] rollup rebuild skipped:`, e.message);
+    }
+    try {
+      const { rebuildNetworkRollupsFromGrain } = require('./networkRollupStore');
+      await rebuildNetworkRollupsFromGrain(dates, syncType);
+    } catch (e) {
+      logger.warn(`[${syncType}] network rollup rebuild skipped:`, e.message);
     }
   }
   return upserted;
@@ -1394,6 +1401,30 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
     };
   }
 
+  // Network-wide overview (admin, no inventory filters) — rollup_network_daily.
+  if (!hasWeb && !hasApp && siteKind !== 'request') {
+    try {
+      const { fetchNetworkTotalsFromDB } = require('./networkRollupStore');
+      const net = await fetchNetworkTotalsFromDB(startDate, endDate);
+      const impressions = Number(net.impressions) || 0;
+      const revenue = coerceWarehouseRevenue(net.revenue, impressions);
+      const viewableWeight = Number(net.viewable_weight) || 0;
+      const rowCount = Number(net.day_count) || 0;
+      if (rowCount > 0 && (impressions > 0 || revenue > 0)) {
+        const viewability = impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0;
+        return {
+          impressions: Math.round(impressions),
+          revenue,
+          viewability,
+          rowCount,
+          source: 'network_rollup',
+        };
+      }
+    } catch (e) {
+      logger.warn('Overview network rollup read failed, falling back:', e.message);
+    }
+  }
+
   // Prefer typed rollups (fast). Fall back to grain JSONB scan if rollups empty.
   if (siteKind !== 'request') {
     try {
@@ -1528,7 +1559,14 @@ async function backfillAllRollups(syncType = 'rollup-backfill') {
       return 0;
     }
     logger.info(`[${syncType}] Backfilling rollups for ${dates.length} missing day(s)…`);
-    return rebuildRollupsForDates(dates, syncType);
+    const n = await rebuildRollupsForDates(dates, syncType);
+    try {
+      const { rebuildNetworkRollupsFromGrain } = require('./networkRollupStore');
+      await rebuildNetworkRollupsFromGrain(dates, syncType);
+    } catch (e) {
+      logger.warn(`[${syncType}] network rollup backfill skipped:`, e.message);
+    }
+    return n;
   } catch (e) {
     logger.warn(`[${syncType}] backfill skipped:`, e.message);
     return 0;
@@ -3243,7 +3281,8 @@ async function pullLeanSlice(dims, label, token, buildDateXML, startDate, endDat
   const stream = typeof onBatch === 'function';
   const seen = new Set();
   let lastErr;
-  for (const metrics of LEAN_SYNC_METRIC_ATTEMPTS) {
+  const metricAttempts = getMetricAttemptsForSlice(label);
+  for (const metrics of metricAttempts) {
     const key = metricAttemptKey(metrics);
     if (!metrics.length || seen.has(key)) continue;
     seen.add(key);
@@ -3289,7 +3328,7 @@ async function pullLeanSlice(dims, label, token, buildDateXML, startDate, endDat
  * When onBatch is provided, streams each successful slice into the callback.
  * Non-stream mode concatenates rows (for small range-fetch callers).
  */
-async function fetchFromGAM(startDate, endDate, onBatch) {
+async function fetchFromGAM(startDate, endDate, onBatch, opts = {}) {
   const { getToken, buildDateXML } = require('../gam/reportTransport');
   const token = await getToken();
   const stream = typeof onBatch === 'function';
@@ -3297,8 +3336,11 @@ async function fetchFromGAM(startDate, endDate, onBatch) {
   let totalRows = 0;
   const collected = [];
   let lastErr;
+  const slices = Array.isArray(opts.sliceKeys) && opts.sliceKeys.length
+    ? LEAN_SYNC_DIM_SLICES.filter((s) => opts.sliceKeys.includes(s.key))
+    : LEAN_SYNC_DIM_SLICES;
 
-  for (const slice of LEAN_SYNC_DIM_SLICES) {
+  for (const slice of slices) {
     try {
       const sliceOnBatch = stream && onBatch
         ? async (rawChunk) => onBatch(rawChunk, slice.key)
@@ -3330,13 +3372,16 @@ async function fetchFromGAM(startDate, endDate, onBatch) {
 
   if (!okSlices) {
     throw lastErr || new Error(
-      'GAM lean sync failed for all rich dimension slices (country/device/app).'
+      opts.kpiOnly
+        ? 'GAM network_kpi sync failed'
+        : 'GAM lean sync failed for all rich dimension slices (country/device/app).'
     );
   }
 
   logger.info(
-    `GAM lean sync ${startDate}..${endDate}: ${okSlices}/${LEAN_SYNC_DIM_SLICES.length}`
+    `GAM lean sync ${startDate}..${endDate}: ${okSlices}/${slices.length}`
     + ` slices ok, rows≈${totalRows}${stream ? ' (streamed)' : ''}`
+    + (opts.kpiOnly ? ' (network_kpi only)' : '')
   );
 
   if (stream) return { streamed: true, count: totalRows };
@@ -3354,12 +3399,14 @@ function listSyncWindows(startDate, endDate, opts = {}) {
 /**
  * Stream GAM CSV → upsert in batches. Never holds a month of grain rows in heap.
  */
-async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill') {
+async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill', opts = {}) {
   const currency = process.env.GAM_CURRENCY || 'USD';
   const syncStartedAt = new Date();
   let total = 0;
   let grainCount = 0;
   const touchedDates = new Set();
+  const kpiOnly = opts.kpiOnly === true || syncType === 'sync-network-kpi';
+  const fetchOpts = kpiOnly ? { kpiOnly: true, sliceKeys: ['network_kpi'] } : {};
 
   const result = await fetchFromGAM(startDate, endDate, async (rawChunk, sliceKey) => {
     if (!rawChunk?.length) return;
@@ -3371,30 +3418,42 @@ async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill')
       const day = toYmd(row.report_date);
       if (day) touchedDates.add(day);
     }
-  });
+  }, fetchOpts);
 
   const count = Number(result?.count) || total;
   const dates = [...touchedDates];
+  if (kpiOnly && startDate && startDate === endDate && !dates.includes(startDate)) {
+    dates.push(startDate);
+  }
   if (dates.length) {
-    try {
-      await deleteStaleGrain(dates, syncStartedAt);
-    } catch (e) {
-      logger.warn(`[${syncType}] stale grain cleanup skipped:`, e.message);
+    if (!kpiOnly) {
+      try {
+        await deleteStaleGrain(dates, syncStartedAt);
+      } catch (e) {
+        logger.warn(`[${syncType}] stale grain cleanup skipped:`, e.message);
+      }
+      try {
+        await deleteThinGrainRows(dates);
+      } catch (e) {
+        logger.warn(`[${syncType}] thin-row cleanup skipped:`, e.message);
+      }
+      try {
+        await rebuildRollupsForDates(dates, syncType);
+      } catch (e) {
+        logger.warn(`[${syncType}] rollup rebuild skipped:`, e.message);
+      }
     }
     try {
-      await deleteThinGrainRows(dates);
+      const { rebuildNetworkRollupsFromGrain } = require('./networkRollupStore');
+      await rebuildNetworkRollupsFromGrain(dates, syncType);
     } catch (e) {
-      logger.warn(`[${syncType}] thin-row cleanup skipped:`, e.message);
-    }
-    try {
-      await rebuildRollupsForDates(dates, syncType);
-    } catch (e) {
-      logger.warn(`[${syncType}] rollup rebuild skipped:`, e.message);
+      logger.warn(`[${syncType}] network rollup rebuild skipped:`, e.message);
     }
   }
   await invalidateCacheForDate(endDate);
   logger.info(
     `[${syncType}] ${startDate}..${endDate} streamed rows≈${count} → report_grain=${grainCount}`
+    + (kpiOnly ? ' (network_kpi only)' : '')
   );
   return grainCount;
 }
@@ -3437,10 +3496,9 @@ async function presentHasCountryAndDevice() {
   return grainHasRichDimsForDate(today);
 }
 
-/** Days with no KPI-ready grain rows (warehouse gap). */
+/** Days with no verified network KPI rollup (cent-exact completeness). */
 async function listMissingGrainDates(startDate, endDate) {
   const clientId = requireClientId();
-  const { kpiSliceFilterSql } = require('./reportGrainStore');
   const { rows } = await query(
     `WITH days AS (
        SELECT d::date AS d
@@ -3448,13 +3506,13 @@ async function listMissingGrainDates(startDate, endDate) {
      )
      SELECT to_char(days.d, 'YYYY-MM-DD') AS report_date
      FROM days
-     LEFT JOIN LATERAL (
-       SELECT COALESCE(SUM(g.impressions), 0)::bigint AS imps
-       FROM report_grain g
-       WHERE g.client_id = $1::uuid AND g.report_date = days.d
-         AND ${kpiSliceFilterSql('g')}
-     ) k ON true
-     WHERE COALESCE(k.imps, 0) <= 0
+     LEFT JOIN rollup_network_daily n
+       ON n.client_id = $1::uuid AND n.report_date = days.d
+     WHERE n.report_date IS NULL
+        OR (COALESCE(n.impressions, 0) > 0 AND COALESCE(n.revenue, 0) <= 0)
+        OR n.reconciled_at IS NULL
+        OR (n.gam_revenue IS NOT NULL
+            AND ABS(ROUND(n.revenue::numeric, 2) - ROUND(n.gam_revenue::numeric, 2)) >= 0.01)
      ORDER BY 1`,
     [clientId, startDate, endDate]
   );
@@ -3559,38 +3617,23 @@ async function hasCompleteDbCoverage(startDate, endDate) {
  */
 async function getRangeCoverage(startDate, endDate) {
   if (!startDate || !endDate || startDate > endDate) {
-    return { totalDays: 0, coveredDays: 0, missingDays: 0, complete: false };
+    return {
+      totalDays: 0,
+      coveredDays: 0,
+      missingDays: 0,
+      missingDates: [],
+      complete: false,
+      revenueConfidence: 'none',
+    };
   }
+  const { getNetworkRangeCoverage } = require('./gamReconciliationService');
+  const coverage = await getNetworkRangeCoverage(startDate, endDate);
   const today = todayInTZ();
-  let cursor = startDate;
-  let totalDays = 0;
-  while (cursor <= endDate) {
-    totalDays += 1;
-    cursor = shiftDate(cursor, 1);
-  }
-
-  let missing = [];
-  const pastEnd = endDate < today ? endDate : shiftDate(today, -1);
-  if (startDate <= pastEnd) {
-    const [richMissing, grainMissing] = await Promise.all([
-      listDatesMissingRichDims(startDate, pastEnd),
-      listMissingGrainDates(startDate, pastEnd),
-    ]);
-    missing = [...new Set([...richMissing, ...grainMissing])].sort();
-  }
-  let presentMissing = 0;
-  if (startDate <= today && endDate >= today) {
-    const todayGaps = await listMissingGrainDates(today, today);
-    if (todayGaps.length) presentMissing = 1;
-  }
-  const missingDays = missing.length + presentMissing;
-  const coveredDays = Math.max(0, totalDays - missingDays);
   return {
-    totalDays,
-    coveredDays,
-    missingDays,
-    complete: missingDays === 0,
-    newestFilled: missing.length ? null : (endDate < today ? endDate : shiftDate(today, -1)),
+    ...coverage,
+    newestFilled: coverage.complete
+      ? (endDate < today ? endDate : shiftDate(today, -1))
+      : null,
   };
 }
 
@@ -3697,10 +3740,11 @@ async function invalidateCacheForDate(date) {
 
 async function logSync(syncType, status, rowsUpserted = 0, errorMsg = null) {
   try {
+    const rows = Number.isFinite(Number(rowsUpserted)) ? Math.round(Number(rowsUpserted)) : 0;
     await query(
       `INSERT INTO sync_log (client_id, sync_type, finished_at, status, error_msg, rows_upserted)
        VALUES ($1, $2, NOW(), $3, $4, $5)`,
-      [requireClientId(), syncType, status, errorMsg, rowsUpserted]
+      [requireClientId(), syncType, status, errorMsg, rows]
     );
   } catch (e) {
     logger.warn('Failed to write sync_log:', e.message);

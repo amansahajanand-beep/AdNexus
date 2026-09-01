@@ -205,6 +205,32 @@ async function initSchema() {
       PRIMARY KEY (client_id, report_date, dim_kind, dim_value)
     );
 
+    CREATE TABLE IF NOT EXISTS rollup_network_daily (
+      client_id       UUID        NOT NULL REFERENCES gam_clients(id),
+      report_date     DATE        NOT NULL,
+      impressions     BIGINT      NOT NULL DEFAULT 0,
+      revenue         DOUBLE PRECISION NOT NULL DEFAULT 0,
+      ecpm            REAL,
+      viewability     REAL,
+      currency        CHAR(3)     NOT NULL DEFAULT 'USD',
+      gam_revenue     DOUBLE PRECISION,
+      delta_pct       REAL,
+      synced_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      reconciled_at   TIMESTAMPTZ,
+      PRIMARY KEY (client_id, report_date)
+    );
+
+    CREATE TABLE IF NOT EXISTS reconciliation_log (
+      id            BIGSERIAL PRIMARY KEY,
+      client_id     UUID        NOT NULL REFERENCES gam_clients(id),
+      report_date   DATE        NOT NULL,
+      db_revenue    DOUBLE PRECISION NOT NULL DEFAULT 0,
+      gam_revenue   DOUBLE PRECISION NOT NULL DEFAULT 0,
+      delta_pct     REAL,
+      action        TEXT        NOT NULL DEFAULT 'check',
+      checked_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS dim_country (
       id   SMALLINT PRIMARY KEY,
       name TEXT NOT NULL UNIQUE
@@ -401,6 +427,9 @@ async function initSchema() {
     `CREATE INDEX IF NOT EXISTS idx_rollup_inv_kpi_domain ON rollup_inventory_kpi_daily (report_date, LOWER(inv_domain))`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_inv_kpi_site ON rollup_inventory_kpi_daily (report_date, LOWER(inv_site))`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_dim_kind_date ON rollup_dim_daily (dim_kind, report_date DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_rollup_network_date ON rollup_network_daily (client_id, report_date DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_reconciliation_log_client ON reconciliation_log (client_id, checked_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_reconciliation_log_date ON reconciliation_log (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_daily_client_date ON report_daily (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_present_client_date ON report_present (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_client_date ON report_adhoc (client_id, report_date DESC)`,
@@ -437,6 +466,8 @@ const TENANT_TABLES = [
   'rollup_kpi_daily',
   'rollup_inventory_kpi_daily',
   'rollup_dim_daily',
+  'rollup_network_daily',
+  'reconciliation_log',
   'sync_log',
 ];
 

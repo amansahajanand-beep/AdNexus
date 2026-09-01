@@ -44,6 +44,8 @@ async function enqueueLeanToday({ reason } = {}) {
         attempts: 2,
         backoff: { type: 'exponential', delay: 20000 },
       });
+      const { recordCronEnqueue } = require('../services/syncHealthStore');
+      await recordCronEnqueue(reason || 'hourly');
       logger.info(
         `Cron: enqueued lean sync-today for ${today} client=${cid.slice(0, 8)}${tag}`
       );
@@ -146,6 +148,88 @@ async function enqueueMonthCompleteBackfill({ reason } = {}) {
   });
 }
 
+async function enqueueReconcileRecent({ reason } = {}) {
+  const today = todayInTZ();
+  const yesterday = shiftYMD(today, -1);
+  const tag = reason ? ` (${reason})` : '';
+  await eachActiveClient(async (client) => {
+    const cid = client.id;
+    try {
+      await gamSyncQueue.add('reconcile-range', {
+        startDate: yesterday,
+        endDate: today,
+        clientId: cid,
+      }, {
+        jobId: `reconcile-recent-${cid.slice(0, 8)}-${today}-${Math.floor(Date.now() / (30 * 60 * 1000))}`,
+        priority: 2,
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 30000 },
+      });
+      logger.info(`Cron: enqueued reconcile-recent ${yesterday}..${today} client=${cid.slice(0, 8)}${tag}`);
+    } catch (e) {
+      logger.error('Cron: failed to enqueue reconcile-recent:', e.message);
+    }
+  });
+}
+
+async function enqueueReconcileHistorical({ reason } = {}) {
+  const range = historicalRangeForPresets();
+  const tag = reason ? ` (${reason})` : '';
+  await eachActiveClient(async (client) => {
+    const cid = client.id;
+    try {
+      await gamSyncQueue.add('reconcile-range', {
+        startDate: range.startDate,
+        endDate: range.yesterday,
+        clientId: cid,
+        historical: true,
+      }, {
+        jobId: `reconcile-historical-${cid.slice(0, 8)}-${range.yesterday}`,
+        priority: 4,
+        attempts: 2,
+        backoff: { type: 'fixed', delay: 120000 },
+      });
+      logger.info(
+        `Cron: enqueued reconcile-historical ${range.startDate}..${range.yesterday}`
+        + ` client=${cid.slice(0, 8)}${tag}`
+      );
+    } catch (e) {
+      logger.error('Cron: failed to enqueue reconcile-historical:', e.message);
+    }
+  });
+}
+
+/** Re-enqueue sync-today if stale; keep draining historical gaps. */
+async function watchdogStaleSync() {
+  const { query } = require('../db');
+  const { listActiveClients } = require('../models/clientStore');
+  const { runWithClient } = require('../utils/clientContext');
+  const { drainIncompleteHistory } = require('../services/gamReconciliationService');
+  const clients = await listActiveClients();
+  const staleMs = 75 * 60 * 1000;
+  for (const client of clients) {
+    try {
+      const { rows } = await query(
+        `SELECT finished_at FROM sync_log
+         WHERE client_id = $1::uuid AND sync_type = 'sync-today' AND status = 'success'
+         ORDER BY finished_at DESC LIMIT 1`,
+        [client.id]
+      );
+      const last = rows[0]?.finished_at ? new Date(rows[0].finished_at).getTime() : 0;
+      if (Date.now() - last > staleMs) {
+        logger.warn(
+          `Cron watchdog: sync-today stale for client=${client.id.slice(0, 8)}`
+          + ` (last=${rows[0]?.finished_at || 'never'}) — re-enqueue`
+        );
+        await enqueueLeanToday({ reason: 'watchdog' });
+      }
+      await runWithClient(client, () => drainIncompleteHistory());
+    } catch (e) {
+      logger.warn('Cron watchdog check failed:', e.message);
+    }
+  }
+}
+
 async function enqueueHourlyLeanSync({ reason } = {}) {
   await enqueueLeanToday({ reason });
   // On boot, also refresh yesterday + recent gaps + full historical months.
@@ -170,6 +254,21 @@ function startCron() {
   // ── Every 6 hours: yesterday lean ────────────────────────────────────────
   cron.schedule('15 */6 * * *', async () => {
     await enqueueLeanYesterdayAndFullToday({ reason: '6h' });
+  }, { timezone: 'Asia/Singapore' });
+
+  // ── Every hour :30 SGT: reconcile today + yesterday vs live GAM ───────────
+  cron.schedule('30 * * * *', async () => {
+    await enqueueReconcileRecent({ reason: 'hourly-reconcile' });
+  }, { timezone: 'Asia/Singapore' });
+
+  // ── 1 AM daily: full historical reconciliation walk ─────────────────────
+  cron.schedule('0 1 * * *', async () => {
+    await enqueueReconcileHistorical({ reason: '1am-reconcile' });
+  }, { timezone: 'Asia/Singapore' });
+
+  // ── Every 15 min: watchdog if hourly sync stalled ───────────────────────
+  cron.schedule('*/15 * * * *', async () => {
+    await watchdogStaleSync();
   }, { timezone: 'Asia/Singapore' });
 
   // ── 2 AM daily: complete each calendar month (all days 1..end) ───────────
@@ -197,7 +296,8 @@ function startCron() {
   }, { timezone: 'Asia/Singapore' });
 
   logger.info(
-    'Cron jobs started: hourly today, 6h yesterday, 2AM complete-month backfill, 3AM archive, boot kickoff'
+    'Cron jobs started: hourly today, :30 reconcile-recent, 1AM reconcile-historical,'
+    + ' 6h yesterday, 2AM complete-month backfill, 3AM archive, 15m watchdog, boot kickoff'
   );
 
   // Don't wait until the next clock hour — fill today's present now.
@@ -213,4 +313,6 @@ module.exports = {
   enqueueHourlyLeanSync,
   enqueueRecentGapFill,
   enqueueMonthCompleteBackfill,
+  enqueueReconcileRecent,
+  enqueueReconcileHistorical,
 };

@@ -48,6 +48,7 @@ function objectKey(clientId, kind, reportDate) {
   if (kind === 'grain') return `${cid}/grain/${reportDate}.json.gz`;
   if (kind === 'rollup_kpi') return `${cid}/rollups/kpi/${reportDate}.json.gz`;
   if (kind === 'rollup_dim') return `${cid}/rollups/dim/${reportDate}.json.gz`;
+  if (kind === 'rollup_network') return `${cid}/rollups/network/${reportDate}.json.gz`;
   throw new Error(`Unknown archive kind: ${kind}`);
 }
 
@@ -62,6 +63,14 @@ async function fetchRollupKpiForDate(clientId, reportDate) {
 async function fetchRollupDimForDate(clientId, reportDate) {
   const { rows } = await schemaQuery(
     `SELECT * FROM rollup_dim_daily WHERE client_id = $1::uuid AND report_date = $2::date`,
+    [clientId, reportDate]
+  );
+  return rows;
+}
+
+async function fetchRollupNetworkForDate(clientId, reportDate) {
+  const { rows } = await schemaQuery(
+    `SELECT * FROM rollup_network_daily WHERE client_id = $1::uuid AND report_date = $2::date`,
     [clientId, reportDate]
   );
   return rows;
@@ -145,8 +154,9 @@ async function exportDayToArchive(clientId, reportDate) {
   const grain = await fetchGrainRowsForArchive(clientId, reportDate);
   const kpi = await fetchRollupKpiForDate(clientId, reportDate);
   const dim = await fetchRollupDimForDate(clientId, reportDate);
+  const network = await fetchRollupNetworkForDate(clientId, reportDate);
 
-  if (!grain.length && !kpi.length && !dim.length) {
+  if (!grain.length && !kpi.length && !dim.length && !network.length) {
     logger.info(`Archive skip ${reportDate} — no rows`);
     return false;
   }
@@ -154,11 +164,13 @@ async function exportDayToArchive(clientId, reportDate) {
   if (grain.length) await uploadArchive(clientId, 'grain', reportDate, grain);
   if (kpi.length) await uploadArchive(clientId, 'rollup_kpi', reportDate, kpi);
   if (dim.length) await uploadArchive(clientId, 'rollup_dim', reportDate, dim);
+  if (network.length) await uploadArchive(clientId, 'rollup_network', reportDate, network);
 
   const kinds = [];
   if (grain.length) kinds.push('grain');
   if (kpi.length) kinds.push('rollup_kpi');
   if (dim.length) kinds.push('rollup_dim');
+  if (network.length) kinds.push('rollup_network');
 
   for (const kind of kinds) {
     const ok = await verifyArchive(clientId, reportDate, kind);
@@ -178,6 +190,10 @@ async function purgeDayFromPostgres(clientId, reportDate) {
   );
   await schemaQuery(
     `DELETE FROM rollup_dim_daily WHERE client_id = $1::uuid AND report_date = $2::date`,
+    [clientId, reportDate]
+  );
+  await schemaQuery(
+    `DELETE FROM rollup_network_daily WHERE client_id = $1::uuid AND report_date = $2::date`,
     [clientId, reportDate]
   );
 }
@@ -304,6 +320,27 @@ async function fetchArchivedRollupKpi(clientId, startDate, endDate) {
   return all;
 }
 
+async function fetchArchivedNetworkRollup(clientId, startDate, endDate) {
+  if (!isArchiveEnabled()) return [];
+  const { rows } = await schemaQuery(
+    `SELECT report_date FROM report_archive_manifest
+     WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date
+       AND archive_kind = 'rollup_network'`,
+    [clientId, startDate, endDate]
+  );
+  const all = [];
+  for (const r of rows) {
+    const day = String(r.report_date).slice(0, 10);
+    try {
+      const data = await downloadArchive(clientId, day, 'rollup_network');
+      if (Array.isArray(data)) all.push(...data);
+    } catch (e) {
+      logger.warn(`fetchArchivedNetworkRollup ${day}:`, e.message);
+    }
+  }
+  return all;
+}
+
 async function fetchArchivedRollupDim(clientId, startDate, endDate) {
   if (!isArchiveEnabled()) return [];
   const { rows } = await schemaQuery(
@@ -357,6 +394,7 @@ module.exports = {
   fetchArchivedGrain,
   fetchArchivedRollupKpi,
   fetchArchivedRollupDim,
+  fetchArchivedNetworkRollup,
   archivedGrainToLegacy,
   downloadArchive,
 };

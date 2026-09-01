@@ -13,6 +13,13 @@ router.use(requireAuth);
 router.get('/info', async (req, res) => {
   // Always surface the API-version deprecation status so the UI can warn early.
   const gamVersion = getVersionStatus();
+  let syncStatus = {};
+  try {
+    const { getReconciliationStatus } = require('../services/gamReconciliationService');
+    syncStatus = await getReconciliationStatus();
+  } catch (e) {
+    logger.warn('Network info sync status failed:', e.message);
+  }
 
   if (isMockClient()) {
     return res.json({
@@ -21,12 +28,13 @@ router.get('/info', async (req, res) => {
       currencyCode: 'INR',
       timeZone: 'Asia/Kolkata',
       isMock: true,
-      gamVersion
+      gamVersion,
+      ...syncStatus,
     });
   }
 
   const cached = cache.get(tenantKey('network_info'));
-  if (cached) return res.json({ ...cached, isMock: false, gamVersion });
+  if (cached) return res.json({ ...cached, isMock: false, gamVersion, ...syncStatus });
 
   try {
     const { getGAMClient } = require('../gamClient');
@@ -64,7 +72,7 @@ router.get('/info', async (req, res) => {
       isMock: false,
     };
     cache.set(tenantKey('network_info'), info, 3600);
-    res.json({ ...info, gamVersion });
+    res.json({ ...info, gamVersion, ...syncStatus });
   } catch (err) {
     logger.error('Network info error:', err.message);
     const classified = classifyGoogleAuthError(err);

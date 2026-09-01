@@ -28,6 +28,7 @@ import FilterChips from './ui/FilterChips';
 import GamOverviewCard from './ui/GamOverviewCard';
 import InsightsStrip from './ui/InsightsStrip';
 import PageHeader from './ui/PageHeader';
+import DataFreshness from './ui/DataFreshness';
 import ChartHeader from './ui/ChartHeader';
 import ChartExportButton from './ui/ChartExportButton';
 import OnboardingGuide from './ui/OnboardingGuide';
@@ -1845,6 +1846,12 @@ export default function Dashboard() {
           </button>
         )}
       </PageHeader>
+      <DataFreshness
+        coverage={overviewData?.coverage}
+        networkInfo={networkInfo}
+        status={overviewData?.status}
+        className="dash-freshness"
+      />
       {canGenerate && (
         <CompareRangeBar
           mode={compareMode}
