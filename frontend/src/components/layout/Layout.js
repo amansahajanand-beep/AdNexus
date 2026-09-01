@@ -7,8 +7,11 @@ import { NO_DOMAINS_MSG, NO_DOMAINS_TITLE, hasAssignedInventory } from '../../ut
 import BrandLogo from '../ui/BrandLogo';
 import ToastStack from '../ui/ToastStack';
 import CommandPalette from '../ui/CommandPalette';
+import DataFreshness from '../ui/DataFreshness';
+import { ConfirmDialogHost } from '../../hooks/useConfirmDialog';
 import { rememberLastRoute } from '../../utils/lastRoute';
 import { APP_TIMEZONE } from '../../utils/datetime';
+import { buildFreshnessLabel } from '../../utils/dataFreshness';
 
 const FOCUS_KEY = 'adnexus.focusMode';
 
@@ -16,6 +19,7 @@ const NAV_ITEMS = [
   { to: '/dashboard', label: 'Dashboard', short: 'D', page: 'dashboard' },
   { to: '/reporting', label: 'Reporting', short: 'R', page: 'reporting' },
   { to: '/roi', label: 'ROI', short: 'O', page: 'roi' },
+  { to: '/presets', label: 'Presets', short: 'P', page: 'presets' },
   { to: '/admin', label: 'Admin', short: 'A', adminOnly: true },
   { to: '/domain-user', label: 'Domain User', short: 'U', page: 'domain-user' },
 ];
@@ -121,7 +125,7 @@ export default function Layout() {
     navigate('/login', { replace: true, state: { resetKey: Date.now() } });
   };
   const go = (to) => { navigate(to); setUserOpen(false); };
-  const profileRoute = canPage('domain-user') ? '/domain-user' : (isAdmin ? '/admin' : null);
+  const profileRoute = isAdmin ? '/admin' : (canPage('domain-user') ? '/domain-user' : null);
   const goProfile = () => {
     if (profileRoute) go(profileRoute);
   };
@@ -140,6 +144,8 @@ export default function Layout() {
   const liveClass = `live-dot header-live${isMock ? ' is-mock' : ''}${authError ? ' is-auth-error' : ''}`;
   const currencyCode = networkInfo?.currencyCode || 'USD';
   const tzShort = APP_TIMEZONE === 'Asia/Singapore' ? 'SGT' : APP_TIMEZONE;
+  const freshnessTitle = buildFreshnessLabel(networkInfo, { tzLabel: tzShort })
+    || liveText;
 
   const gv = networkInfo?.gamVersion;
   const verStatus = gv?.status;
@@ -235,9 +241,12 @@ export default function Layout() {
               {focusMode ? '»' : '«'}
               <span className="sidebar-focus-label">{focusMode ? 'Expand' : 'Focus'}</span>
             </button>
-            <div className={liveClass} title={liveText}>
+            <div className={liveClass} title={freshnessTitle}>
               <span className="dot-pulse" />
               <span className="live-dot-label">{liveText}</span>
+              {!focusMode && !authError && networkInfo && (networkInfo.gamLastSyncedAt || networkInfo.adsLastSyncedAt) && (
+                <DataFreshness networkInfo={networkInfo} tzLabel={tzShort} compact className="live-dot-fresh" />
+              )}
             </div>
             <div className="user-menu" ref={userRef}>
               <button type="button" className="user-btn" onClick={() => setUserOpen(o => !o)} title={user?.username}>
@@ -312,6 +321,7 @@ export default function Layout() {
             )}
           </main>
           <ToastStack />
+          <ConfirmDialogHost />
           <CommandPalette />
         </div>
       </div>

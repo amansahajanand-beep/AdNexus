@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { cache } = require('../gamClient');
+const { cache } = require('../gam/client');
 const logger = require('../utils/logger');
 const {
   scopeRowsToUser,
@@ -56,7 +56,6 @@ const {
   lookupCatalogAdUnitHost,
   rowMatchesAppFilter,
   inventoryFilterFamilyLabels,
-  hasMixedWebAndAppFilters,
 } = require('../utils/inventoryFilters');
 const { normalizeReportRows, rowsHaveMetrics } = require('../utils/rowNormalize');
 const { kvGet, kvSet } = require('../utils/kvCache');
@@ -1858,6 +1857,11 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
     enqueueSyncOnMiss = false,
     /** When true, miss → enqueue sync; return building if warehouse has coverage, else live GAM. */
     asyncOnMiss = false,
+    /**
+     * When false, never block the request on live GAM (dashboard/overview).
+     * Empty / filtered SQL misses return immediately so the UI can show a banner.
+     */
+    allowLiveGam = true,
     logLabel = 'Report',
   } = opts;
 
@@ -2028,6 +2032,29 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
         };
       }
 
+      if (!allowLiveGam) {
+        logger.info(
+          `${logLabel}: SQL miss ${filters.startDate}..${filters.endDate}`
+          + ` covered=${coverage?.coveredDays || 0}/${coverage?.totalDays || 0}`
+          + ' — empty response (no GAM wait)'
+        );
+        return {
+          rows: [],
+          cacheKey,
+          source: 'building',
+          status: 'building',
+          jobId,
+          coverage,
+          reportWarning: hasInventoryFilters(filters) ? 'incompatible' : null,
+          reportWarningSkipped: hasInventoryFilters(filters)
+            ? inventoryFilterFamilyLabels(filters)
+            : ['Warehouse data still loading for this date range'],
+          reportWarningUsed: [],
+          reportWarningUsedIds: [],
+          reportWarningUsedMetricIds: [],
+        };
+      }
+
       if (!queueLive) {
         logger.warn(`${logLabel}: sync queue disabled — live GAM fallback for ${filters.startDate}..${filters.endDate}`);
       } else {
@@ -2038,6 +2065,25 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
       }
       // Fall through to live GAM below.
     }
+  }
+
+  if (!allowLiveGam) {
+    logger.info(
+      `${logLabel}: SQL miss ${filters.startDate}..${filters.endDate} — empty response (no GAM wait)`
+    );
+    return {
+      rows: [],
+      cacheKey,
+      source: 'empty',
+      status: hasInventoryFilters(filters) ? 'empty' : 'building',
+      reportWarning: hasInventoryFilters(filters) ? 'incompatible' : null,
+      reportWarningSkipped: hasInventoryFilters(filters)
+        ? inventoryFilterFamilyLabels(filters)
+        : ['Warehouse data still loading for this date range'],
+      reportWarningUsed: [],
+      reportWarningUsedIds: [],
+      reportWarningUsedMetricIds: [],
+    };
   }
 
   // 4. GAM last resort (blocking) — also used for asyncOnMiss cold-start /
@@ -2518,6 +2564,15 @@ async function handleDashboardOverview(req, res) {
             );
             return res.json(applyOverviewVisibility({ summary, isMock: false, currency }, req.user));
           }
+          // Filtered overview with no SQL hit → zeros immediately (do not wait on live GAM).
+          if (invFilterActive) {
+            logger.info(
+              `Overview filtered SQL miss ${filters.startDate}..${filters.endDate}`
+              + ` — empty KPIs (no GAM wait) in ${Date.now() - t0}ms`
+            );
+            const summary = deriveScopedOverviewSummary([], currency, false);
+            return res.json(applyOverviewVisibility({ summary, isMock: false, currency }, req.user));
+          }
         } catch (aggErr) {
           logger.warn('Overview SQL aggregate failed, falling through:', aggErr.message);
         }
@@ -2599,6 +2654,7 @@ async function handleDashboardOverview(req, res) {
       persistOnGam: true,
       enqueueSyncOnMiss: true,
       asyncOnMiss: true,
+      allowLiveGam: false,
       logLabel: 'Overview',
     });
     const rawRows = loaded.rows || [];
@@ -2735,7 +2791,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = `report_dashboard_resp_v21_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = `report_dashboard_resp_v22_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -2889,26 +2945,34 @@ async function handleDashboard(req, res) {
         cache.set(dashRespKey, empty, Math.min(60, REPORT_CACHE_TTL));
         return res.json(empty);
       }
-      // Mixed web+app with no compatible subset → Reporting-style empty warning (don't hang on GAM).
-      if (hasMixedWebAndAppFilters({
+      // Any inventory filter with no SQL match → instant empty banner (never live GAM).
+      // Live GAM on empty Site∩Domain∩App combos can take minutes and starve the DB pool
+      // (which previously caused false session logouts).
+      if (hasInventoryFilters({
         domain: domains,
         site: sites,
         domainName: toFilterArray(filters.domainName),
         domainId: apps,
       })) {
+        logger.info(
+          `Dashboard filtered SQL miss ${filters.startDate}..${filters.endDate}`
+          + ` — empty incompatible response (no GAM wait) in ${Date.now() - t0}ms`
+        );
         const empty = applyVisibility(
           emptyDashboardCompatPayload(filters, currency),
           req.user,
           visibilityOpts
         );
+        cache.set(dashRespKey, empty, Math.min(60, REPORT_CACHE_TTL));
         return res.json(empty);
       }
-    }
-  } catch (bundleErr) {
-    logger.warn(`Dashboard lean SQL bundle failed, falling back: ${bundleErr.message}`);
-    if (isScopedChild) {
+      // Unfiltered SQL miss: enqueue sync and return empty immediately (no live GAM).
+      logger.info(
+        `Dashboard SQL miss ${filters.startDate}..${filters.endDate}`
+        + ` — returning empty (no GAM wait) in ${Date.now() - t0}ms`
+      );
       enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
-      return res.json(applyVisibility({
+      const empty = applyVisibility({
         summary: {
           impressions: 0,
           revenue: 0,
@@ -2921,58 +2985,65 @@ async function handleDashboard(req, res) {
         charts: { revenue: [], device: [], country: [], performance: [] },
         isMock: false,
         pagination: { totalRows: 0, truncated: false },
-      }, req.user, visibilityOpts));
+        status: 'building',
+        reportWarning: 'partial',
+        reportWarningSkipped: ['Warehouse data still loading for this date range'],
+      }, req.user, visibilityOpts);
+      cache.set(dashRespKey, empty, Math.min(60, REPORT_CACHE_TTL));
+      return res.json(empty);
+    }
+  } catch (bundleErr) {
+    logger.warn(`Dashboard lean SQL bundle failed, falling back: ${bundleErr.message}`);
+    if (isScopedChild || hasInventoryFilters(filters)) {
+      enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
+      return res.json(applyVisibility(
+        hasInventoryFilters(filters)
+          ? emptyDashboardCompatPayload(filters, currency)
+          : {
+            summary: {
+              impressions: 0,
+              revenue: 0,
+              ecpm: 0,
+              viewability: 0,
+              currency: currency || 'USD',
+            },
+            rows: [],
+            trend: [],
+            charts: { revenue: [], device: [], country: [], performance: [] },
+            isMock: false,
+            pagination: { totalRows: 0, truncated: false },
+          },
+        req.user,
+        visibilityOpts
+      ));
     }
   }
 
-  // memory → Redis → Postgres (present/past for this query) → GAM → persist
-  // Long ranges: never block the UI on live GAM — warehouse sync runs in background.
-  const rangeDays = inclusiveDayCount(filters.startDate, filters.endDate);
-  if (!isScopedChild && rangeDays > 14) {
-    logger.info(
-      `Dashboard SQL miss ${filters.startDate}..${filters.endDate} (${rangeDays}d)`
-      + ' — returning empty (no GAM wait)'
-    );
-    enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
-    const empty = applyVisibility({
-      summary: {
-        impressions: 0,
-        revenue: 0,
-        ecpm: 0,
-        viewability: 0,
-        currency: currency || 'USD',
+  // Final safety: never block the dashboard UI on live GAM.
+  enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
+  return res.json(applyVisibility(
+    hasInventoryFilters(filters)
+      ? emptyDashboardCompatPayload(filters, currency)
+      : {
+        summary: {
+          impressions: 0,
+          revenue: 0,
+          ecpm: 0,
+          viewability: 0,
+          currency: currency || 'USD',
+        },
+        rows: [],
+        trend: [],
+        charts: { revenue: [], device: [], country: [], performance: [] },
+        isMock: false,
+        pagination: { totalRows: 0, truncated: false },
+        status: 'building',
+        reportWarning: 'partial',
+        reportWarningSkipped: ['Warehouse data still loading for this date range'],
       },
-      rows: [],
-      trend: [],
-      charts: { revenue: [], device: [], country: [], performance: [] },
-      isMock: false,
-      pagination: { totalRows: 0, truncated: false },
-      reportWarning: 'partial',
-      reportWarningSkipped: ['Warehouse data still loading for this date range'],
-    }, req.user, visibilityOpts);
-    return res.json(empty);
-  }
-
-  try {
-    const token = await getToken();
-    const loaded = await loadReportRowsCacheAside(filters, token, {
-      cachePrefix: 'report_dashboard_raw_v3',
-      fastMode: true,
-      persistOnGam: true,
-      enqueueSyncOnMiss: true,
-      asyncOnMiss: true,
-      logLabel: 'Dashboard',
-    });
-    const body = buildScoped(loaded.rows || [], currency, false);
-    if (loaded.status === 'building' || loaded.source === 'building') {
-      body.status = 'building';
-      body.coverage = loaded.coverage || null;
-    }
-    return res.json(body);
-  } catch (err) {
-    logger.error('Dashboard report error:', err.message);
-    res.status(500).json({ error: err.message });
-  }
+    req.user,
+    visibilityOpts
+  ));
 }
 
 // GET|POST /api/reports/domain-user — aggregated domain earnings with cursor pagination

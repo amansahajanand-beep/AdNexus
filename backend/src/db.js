@@ -1,12 +1,17 @@
+// Load .env when this module is required outside server.js / worker.js
+// (scripts, one-off requires) so we never fall back to stale hardcoded creds.
+require('dotenv').config();
+
 const { Pool } = require('pg');
 const logger = require('./utils/logger');
 
 const pool = new Pool({
   host:     process.env.PG_HOST     || '127.0.0.1',
   port:     parseInt(process.env.PG_PORT) || 5432,
-  user:     process.env.PG_USER     || 'gam_dashbaord_user',
-  password: process.env.PG_PASSWORD || 'GAM_Mediamonetix',
-  database: process.env.PG_DATABASE || 'gam_dashboard_db',
+  // Defaults match .env.example — always set PG_* in real .env
+  user:     process.env.PG_USER     || 'gam_user',
+  password: process.env.PG_PASSWORD || 'gam_password',
+  database: process.env.PG_DATABASE || 'gam_dashboard',
   ssl:      process.env.PG_SSL === 'true' ? { rejectUnauthorized: false } : false,
   // Sync jobs + API share this pool — keep enough headroom for dashboard reads
   // while hourly backfill is writing.
@@ -382,6 +387,7 @@ async function initSchema() {
       report_date DATE NOT NULL,
       campaign_id TEXT NOT NULL,
       campaign_name TEXT NOT NULL DEFAULT '',
+      app_id TEXT NOT NULL DEFAULT '',
       cost DOUBLE PRECISION NOT NULL DEFAULT 0,
       clicks INT NOT NULL DEFAULT 0,
       impressions BIGINT NOT NULL DEFAULT 0,
@@ -390,6 +396,26 @@ async function initSchema() {
       currency CHAR(3) NOT NULL DEFAULT 'USD',
       synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (client_id, ads_account_id, report_date, campaign_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ads_spend_country_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      campaign_id TEXT NOT NULL,
+      country_code TEXT NOT NULL DEFAULT '',
+      country_name TEXT NOT NULL DEFAULT '',
+      app_id TEXT NOT NULL DEFAULT '',
+      cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks INT NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      conversions DOUBLE PRECISION NOT NULL DEFAULT 0,
+      conversion_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+      currency CHAR(3) NOT NULL DEFAULT 'USD',
+      cost_native DOUBLE PRECISION,
+      native_currency CHAR(3),
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (client_id, ads_account_id, report_date, campaign_id, country_code)
     );
 
     CREATE TABLE IF NOT EXISTS roi_other_expenses (
@@ -431,10 +457,20 @@ async function initSchema() {
   try {
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_accounts_client ON ads_accounts (client_id)`);
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_spend_client_date ON ads_spend_daily (client_id, report_date)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_spend_country_client_date ON ads_spend_country_daily (client_id, report_date)`);
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_campaign_map_client ON ads_campaign_map (client_id)`);
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_roi_expenses_client_date ON roi_other_expenses (client_id, expense_date)`);
   } catch (e) {
     logger.warn('ads ROI indexes:', e.message);
+  }
+
+  try {
+    await schemaQuery(`ALTER TABLE ads_accounts ADD COLUMN IF NOT EXISTS currency_code CHAR(3) NOT NULL DEFAULT 'USD'`);
+    await schemaQuery(`ALTER TABLE ads_spend_daily ADD COLUMN IF NOT EXISTS cost_native DOUBLE PRECISION`);
+    await schemaQuery(`ALTER TABLE ads_spend_daily ADD COLUMN IF NOT EXISTS native_currency CHAR(3)`);
+    await schemaQuery(`ALTER TABLE ads_spend_daily ADD COLUMN IF NOT EXISTS app_id TEXT NOT NULL DEFAULT ''`);
+  } catch (e) {
+    logger.warn('ads currency columns:', e.message);
   }
 
   // Retired warehouse — drop if leftover from older deploys (frees a lot of disk).

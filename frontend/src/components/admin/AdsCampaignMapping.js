@@ -1,8 +1,15 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { adsAPI } from '../../utils/api';
-import Button from '../ui/Button';
 import TableSearchBar from '../ui/TableSearchBar';
+import SearchableSelect from '../ui/SearchableSelect';
+import MultiSelect from '../ui/MultiSelect';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
+import { confirmDialog } from '../../hooks/useConfirmDialog';
+import {
+  ALL_SENTINEL,
+  isAllSelection,
+  toAllSelection,
+} from '../../utils/inventorySelection';
 
 const PAGE_SIZE = 12;
 
@@ -11,9 +18,9 @@ export default function AdsCampaignMapping({ siteHosts = [], appIds = [] }) {
   const [maps, setMaps] = useState([]);
   const [accountId, setAccountId] = useState('');
   const [campaigns, setCampaigns] = useState([]);
+  const [selectedCampaignIds, setSelectedCampaignIds] = useState([]);
+  const [campaignsLoading, setCampaignsLoading] = useState(false);
   const [form, setForm] = useState({
-    campaignId: '',
-    campaignName: '',
     targetType: 'app',
     targetKey: '',
   });
@@ -49,31 +56,67 @@ export default function AdsCampaignMapping({ siteHosts = [], appIds = [] }) {
   useEffect(() => {
     if (!accountId) {
       setCampaigns([]);
+      setSelectedCampaignIds([]);
       return;
     }
     let cancelled = false;
     (async () => {
+      setCampaignsLoading(true);
       try {
         const data = await adsAPI.listCampaigns(accountId);
         if (!cancelled) {
-          setCampaigns(data.campaigns || []);
+          const list = data.campaigns || [];
+          setCampaigns(list);
+          // Default: select all campaigns for this account
+          setSelectedCampaignIds(list.length ? toAllSelection() : []);
           setError(null);
         }
       } catch (err) {
         if (!cancelled) {
           setCampaigns([]);
+          setSelectedCampaignIds([]);
           setError(getUserFacingMessage(err, 'Could not list campaigns (connect account / sync first).'));
         }
+      } finally {
+        if (!cancelled) setCampaignsLoading(false);
       }
     })();
     return () => { cancelled = true; };
   }, [accountId]);
 
+  const accountOptions = useMemo(
+    () => accounts.map((a) => ({
+      value: a.id,
+      id: a.id,
+      label: a.descriptiveName || a.customerId,
+      customerId: a.customerId,
+    })),
+    [accounts]
+  );
+
+  const campaignOptions = useMemo(
+    () => campaigns.map((c) => ({
+      value: c.campaignId,
+      id: c.campaignId,
+      label: c.campaignName || c.campaignId,
+      campaignName: c.campaignName,
+    })),
+    [campaigns]
+  );
+
   const targetOptions = useMemo(() => {
     if (form.targetType === 'site') {
-      return (siteHosts || []).map((h) => ({ id: h, label: h }));
+      return (siteHosts || []).map((h) => ({
+        value: String(h).toLowerCase(),
+        id: String(h).toLowerCase(),
+        label: h,
+      }));
     }
-    return (appIds || []).map((a) => ({ id: a, label: a }));
+    return (appIds || []).map((a) => ({
+      value: String(a).toLowerCase(),
+      id: String(a).toLowerCase(),
+      label: a,
+    }));
   }, [form.targetType, siteHosts, appIds]);
 
   const accountNameById = useMemo(() => {
@@ -103,22 +146,47 @@ export default function AdsCampaignMapping({ siteHosts = [], appIds = [] }) {
   const safePage = Math.min(page, totalPages);
   const pageRows = filteredMaps.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
 
+  const selectedCampaignCount = isAllSelection(selectedCampaignIds)
+    ? campaigns.length
+    : selectedCampaignIds.filter((id) => id !== ALL_SENTINEL).length;
+
   const save = async (e) => {
     e.preventDefault();
+    if (!accountId) {
+      setError('Select an Ads account.');
+      return;
+    }
+    if (!form.targetKey) {
+      setError(form.targetType === 'site' ? 'Select a site host.' : 'Select an app ID / package.');
+      return;
+    }
+    const ids = isAllSelection(selectedCampaignIds)
+      ? campaigns.map((c) => c.campaignId)
+      : selectedCampaignIds.filter((id) => id && id !== ALL_SENTINEL);
+    if (!ids.length) {
+      setError('Select at least one campaign (all are selected by default).');
+      return;
+    }
+
     setBusy(true);
     setError(null);
     setOkMsg(null);
     try {
-      const campaign = campaigns.find((c) => c.campaignId === form.campaignId);
-      await adsAPI.saveCampaignMap({
+      const payloadCampaigns = ids.map((id) => {
+        const c = campaigns.find((x) => String(x.campaignId) === String(id));
+        return {
+          campaignId: id,
+          campaignName: c?.campaignName || '',
+        };
+      });
+      const res = await adsAPI.saveCampaignMapsBulk({
         adsAccountId: accountId,
-        campaignId: form.campaignId,
-        campaignName: campaign?.campaignName || form.campaignName,
         targetType: form.targetType,
         targetKey: form.targetKey,
+        campaigns: payloadCampaigns,
       });
-      setForm((f) => ({ ...f, campaignId: '', campaignName: '', targetKey: '' }));
-      setOkMsg('Mapping saved.');
+      setForm((f) => ({ ...f, targetKey: '' }));
+      setOkMsg(`Saved ${res.saved || payloadCampaigns.length} campaign mapping(s).`);
       setPage(1);
       await load();
     } catch (err) {
@@ -129,7 +197,11 @@ export default function AdsCampaignMapping({ siteHosts = [], appIds = [] }) {
   };
 
   const remove = async (id) => {
-    if (!window.confirm('Remove this campaign mapping?')) return;
+    const ok = await confirmDialog({
+      title: 'Remove mapping?',
+      message: 'Remove this campaign mapping?',
+    });
+    if (!ok) return;
     try {
       await adsAPI.deleteCampaignMap(id);
       await load();
@@ -146,7 +218,7 @@ export default function AdsCampaignMapping({ siteHosts = [], appIds = [] }) {
         <div>
           <h3 className="admin-panel-title">Campaign mapping</h3>
           <p className="reporting-sub" style={{ margin: '4px 0 0' }}>
-            Map each Google Ads campaign to a site host or app package so spend appears on the correct ROI row.
+            Select an Ads account — all campaigns are selected by default. Paste names to refine, pick one app/site, then save.
           </p>
         </div>
       </div>
@@ -158,85 +230,97 @@ export default function AdsCampaignMapping({ siteHosts = [], appIds = [] }) {
         <div className="filter-card-head">
           <span className="filter-card-title">New mapping</span>
           <div className="filter-actions">
-            <Button type="submit" loading={busy} disabled={!accountId}>Save mapping</Button>
+            <button
+              type="submit"
+              className="btn-generate"
+              disabled={busy || !accountId || !selectedCampaignCount}
+            >
+              {busy
+                ? 'Saving…'
+                : `Save mapping${selectedCampaignCount ? ` (${selectedCampaignCount})` : ''}`}
+            </button>
           </div>
         </div>
-        <div className="ads-form-grid ads-map-grid">
-          <label className="ui-field">
-            <span className="ui-label">Ads account</span>
-            <select
-              className="ui-input"
+        <div className="filter-grid ads-map-filter-grid">
+          <div className="filter-field">
+            <label htmlFor="ads-map-account">Ads account</label>
+            <SearchableSelect
+              id="ads-map-account"
+              options={accountOptions}
               value={accountId}
-              onChange={(e) => setAccountId(e.target.value)}
-            >
-              <option value="">Select account</option>
-              {accounts.map((a) => (
-                <option key={a.id} value={a.id}>{a.descriptiveName || a.customerId}</option>
-              ))}
-            </select>
-          </label>
-
-          <label className="ui-field">
-            <span className="ui-label">Campaign</span>
-            <select
-              className="ui-input"
-              value={form.campaignId}
-              onChange={(e) => {
-                const id = e.target.value;
-                const c = campaigns.find((x) => x.campaignId === id);
-                setForm((f) => ({
-                  ...f,
-                  campaignId: id,
-                  campaignName: c?.campaignName || '',
-                }));
+              onChange={(next) => {
+                setAccountId(next);
+                setForm((f) => ({ ...f, targetKey: f.targetKey }));
               }}
-              required
-            >
-              <option value="">Select campaign</option>
-              {campaigns.map((c) => (
-                <option key={c.campaignId} value={c.campaignId}>{c.campaignName || c.campaignId}</option>
-              ))}
-            </select>
-          </label>
+              placeholder="Search or paste account…"
+              fieldKeys={['value', 'label', 'id', 'customerId']}
+            />
+          </div>
 
-          <label className="ui-field">
-            <span className="ui-label">Target type</span>
+          <div className="filter-field">
+            <label>Campaigns</label>
+            <MultiSelect
+              options={campaignOptions}
+              value={selectedCampaignIds}
+              onChange={setSelectedCampaignIds}
+              placeholder="All campaigns selected by default — paste names to refine…"
+              disabled={!accountId}
+              loading={campaignsLoading}
+              searchable
+              showSelectAll
+              selectAllLabel="Select all campaigns"
+            />
+          </div>
+
+          <div className="filter-field">
+            <label htmlFor="ads-map-target-type">Target type</label>
             <select
-              className="ui-input"
+              id="ads-map-target-type"
               value={form.targetType}
               onChange={(e) => setForm((f) => ({ ...f, targetType: e.target.value, targetKey: '' }))}
             >
               <option value="app">App</option>
               <option value="site">Site</option>
             </select>
-          </label>
+          </div>
 
-          <label className="ui-field">
-            <span className="ui-label">{form.targetType === 'site' ? 'Site host' : 'App ID / package'}</span>
+          <div className="filter-field">
+            <label htmlFor="ads-map-target-key">
+              {form.targetType === 'site' ? 'Site host' : 'App ID / package'}
+            </label>
             {targetOptions.length > 0 ? (
-              <select
-                className="ui-input"
+              <SearchableSelect
+                id="ads-map-target-key"
+                options={targetOptions}
                 value={form.targetKey}
-                onChange={(e) => setForm((f) => ({ ...f, targetKey: e.target.value }))}
+                onChange={(next) => setForm((f) => ({ ...f, targetKey: next }))}
+                placeholder={
+                  form.targetType === 'site'
+                    ? 'Search or paste site host…'
+                    : 'Search or paste app ID / package…'
+                }
                 required
-              >
-                <option value="">Select…</option>
-                {targetOptions.map((o) => (
-                  <option key={o.id} value={String(o.id).toLowerCase()}>{o.label}</option>
-                ))}
-              </select>
+                fieldKeys={['value', 'label', 'id']}
+              />
             ) : (
               <input
-                className="ui-input"
+                id="ads-map-target-key"
+                type="text"
                 value={form.targetKey}
                 onChange={(e) => setForm((f) => ({ ...f, targetKey: e.target.value }))}
-                placeholder={form.targetType === 'site' ? 'example.com' : 'com.example.app'}
+                onPaste={(e) => {
+                  const pasted = e.clipboardData?.getData('text') || '';
+                  if (!pasted.trim()) return;
+                  e.preventDefault();
+                  setForm((f) => ({ ...f, targetKey: pasted.trim().toLowerCase() }));
+                }}
+                placeholder={form.targetType === 'site' ? 'Paste example.com' : 'Paste com.example.app'}
                 required
               />
             )}
-          </label>
+          </div>
         </div>
-        {!campaigns.length && accountId && (
+        {!campaigns.length && accountId && !campaignsLoading && (
           <p className="form-note" style={{ marginTop: 10 }}>
             No campaigns listed yet — connect the account and run <strong>Sync spend</strong> on Google Ads accounts.
           </p>

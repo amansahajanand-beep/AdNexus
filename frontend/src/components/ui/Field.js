@@ -114,7 +114,9 @@ export function PasswordField({
  * Labelled select dropdown.
  * options: [{ value, label }]
  */
-export function SelectField({ label, value, onChange, options = [], placeholder, loading = false, ...rest }) {
+export function SelectField({
+  label, value, onChange, options = [], placeholder, loading = false, disabled = false, ...rest
+}) {
   return (
     <label className={`ui-field ${loading ? 'ui-field-loading' : ''}`}>
       {label && <span className="ui-field-label">{label}</span>}
@@ -124,7 +126,7 @@ export function SelectField({ label, value, onChange, options = [], placeholder,
           className="ui-field-input"
           value={value}
           onChange={(e) => onChange?.(e.target.value)}
-          disabled={loading || rest.disabled}
+          disabled={loading || disabled}
           {...rest}
         >
           {loading

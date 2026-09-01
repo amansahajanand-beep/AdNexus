@@ -4,7 +4,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const router = express.Router();
-const { getAdsOAuthClient, ADS_SCOPE, listAccessibleCustomerIds, fetchCustomerInfo, listMccChildAccounts } = require('../adsClient');
+const { getAdsOAuthClient, ADS_SCOPE, listAccessibleCustomerIds, fetchCustomerInfo, listMccChildAccounts } = require('../ads/client');
 const { getAccountById, createAccount, updateAccount, upsertChildUnderMcc } = require('../models/adsAccountStore');
 const { getClientById } = require('../models/clientStore');
 const logger = require('../utils/logger');
@@ -26,6 +26,21 @@ function verifyAdsState(state) {
 function frontendAdminUrl(query = '') {
   const base = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
   return `${base}/admin${query}`;
+}
+
+function isAdsApiDisabledError(err) {
+  const msg = String(err?.message || err || '');
+  return /SERVICE_DISABLED|Google Ads API has not been used|googleads\.googleapis\.com/i.test(msg);
+}
+
+function adsOAuthErrorRedirect(err) {
+  if (isAdsApiDisabledError(err)) {
+    return frontendAdminUrl(
+      '?tab=ads&ads_oauth=error&reason='
+      + encodeURIComponent('Enable Google Ads API in Cloud project, wait a few minutes, then Connect again')
+    );
+  }
+  return frontendAdminUrl(`?tab=ads&ads_oauth=error&reason=${encodeURIComponent(String(err.message || err).slice(0, 80))}`);
 }
 
 function buildAdsAuthUrl(gamClient, statePayload) {
@@ -65,6 +80,14 @@ router.get('/callback', async (req, res) => {
     const refreshToken = tokens.refresh_token;
     const mode = decoded.mode || 'mcc';
 
+    // Persist token early when reconnecting a known account — Ads API may still be disabled.
+    if (decoded.adsAccountId) {
+      const early = await getAccountById(decoded.adsAccountId);
+      if (early && early.clientId === gamClient.id) {
+        await updateAccount(early.id, { refreshToken });
+      }
+    }
+
     if (mode === 'individual' && decoded.adsAccountId) {
       const account = await getAccountById(decoded.adsAccountId);
       if (!account || account.clientId !== gamClient.id) {
@@ -79,6 +102,9 @@ router.get('/callback', async (req, res) => {
         });
       } catch (e) {
         logger.warn('Ads individual customer info:', e.message);
+        if (isAdsApiDisabledError(e)) {
+          return res.redirect(adsOAuthErrorRedirect(e));
+        }
         info = { customerId: account.customerId, descriptiveName: account.descriptiveName };
       }
       await updateAccount(account.id, {
@@ -90,7 +116,13 @@ router.get('/callback', async (req, res) => {
     }
 
     // MCC (or discover manager among accessible customers)
-    const accessible = await listAccessibleCustomerIds(gamClient, refreshToken);
+    let accessible;
+    try {
+      accessible = await listAccessibleCustomerIds(gamClient, refreshToken);
+    } catch (e) {
+      logger.error('Ads listAccessibleCustomers failed:', e.message);
+      return res.redirect(adsOAuthErrorRedirect(e));
+    }
     let mccInfo = null;
     for (const cid of accessible) {
       try {
@@ -192,7 +224,7 @@ router.get('/callback', async (req, res) => {
     return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected'));
   } catch (err) {
     logger.error('Ads OAuth callback error:', err.message);
-    return res.redirect(frontendAdminUrl(`?tab=ads&ads_oauth=error&reason=${encodeURIComponent(err.message.slice(0, 80))}`));
+    return res.redirect(adsOAuthErrorRedirect(err));
   }
 });
 

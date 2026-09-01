@@ -3,8 +3,9 @@ const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const { createClient, getClientByNetworkCode } = require('../models/clientStore');
 const { createUser, getUserByUsername } = require('../models/userStore');
-const { getGAMClient } = require('../gamClient');
+const { getGAMClient } = require('../gam/client');
 const { validatePassword } = require('../utils/passwordPolicy');
+const { validateUsername, validateSavedName } = require('../utils/namePolicy');
 const logger = require('../utils/logger');
 
 const limiter = rateLimit({
@@ -47,6 +48,16 @@ router.post('/', async (req, res) => {
   }
   if (!username || !password) {
     return res.status(400).json({ error: 'Admin username and password are required.' });
+  }
+
+  const publisherCheck = validateSavedName(name, { maxLength: 80, label: 'Publisher name' });
+  if (!publisherCheck.valid) {
+    return res.status(400).json({ error: publisherCheck.errors[0] });
+  }
+
+  const nameCheck = validateUsername(username);
+  if (!nameCheck.valid) {
+    return res.status(400).json({ error: nameCheck.errors[0] });
   }
 
   const pwCheck = validatePassword(password, { username: String(username).trim() });

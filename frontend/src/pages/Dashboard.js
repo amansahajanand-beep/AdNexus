@@ -22,15 +22,17 @@ import {
   isCustomRangeIncomplete,
   committedReportDates,
 } from '../utils/dateRestriction';
-import AccessRestricted from './ui/AccessRestricted';
-import MultiSelect from './ui/MultiSelect';
-import FilterChips from './ui/FilterChips';
-import GamOverviewCard from './ui/GamOverviewCard';
-import InsightsStrip from './ui/InsightsStrip';
-import PageHeader from './ui/PageHeader';
-import ChartHeader from './ui/ChartHeader';
-import ChartExportButton from './ui/ChartExportButton';
-import OnboardingGuide from './ui/OnboardingGuide';
+import AccessRestricted from '../components/ui/AccessRestricted';
+import MultiSelect from '../components/ui/MultiSelect';
+import FilterChips from '../components/ui/FilterChips';
+import GamOverviewCard from '../components/ui/GamOverviewCard';
+import InsightsStrip from '../components/ui/InsightsStrip';
+import PageHeader from '../components/ui/PageHeader';
+import ChartHeader from '../components/ui/ChartHeader';
+import ChartExportButton from '../components/ui/ChartExportButton';
+import OnboardingGuide from '../components/ui/OnboardingGuide';
+import DataFreshness from '../components/ui/DataFreshness';
+import ThresholdAlertBanner from '../components/ui/ThresholdAlertBanner';
 import { useReportHotkeys } from '../hooks/useReportHotkeys';
 import { showToast } from '../hooks/useToast';
 import {
@@ -42,6 +44,8 @@ import {
   resolveCompareRange,
   compareLabelFor,
 } from '../utils/periodCompare';
+import { evaluateRevenueDropThreshold } from '../utils/thresholdAlerts';
+import { getLastPageFilters, saveLastPageFilters, LAST_FILTER_PAGES } from '../utils/lastPageFilters';
 import {
   DASH_CHARTS,
   loadHiddenDashCharts,
@@ -49,8 +53,8 @@ import {
   loadComparePrefs,
   saveComparePrefs,
 } from '../utils/dashCharts';
-import CompareRangeBar from './ui/CompareRangeBar';
-import ChartVisibilityMenu from './ui/ChartVisibilityMenu';
+import CompareRangeBar from '../components/ui/CompareRangeBar';
+import ChartVisibilityMenu from '../components/ui/ChartVisibilityMenu';
 import { encodeReportShare, parseReportShare, copyReportLink } from '../utils/reportShare';
 import { DATE_PRESETS } from '../utils/gamReportCatalog';
 import { buildFilterDropdownOptions } from '../utils/catalogOptions';
@@ -59,7 +63,7 @@ import { normalizeInventorySelections, slimFiltersForPersist, isAllSelection, AL
 import { saveReportPage } from '../store/slices/reportSlice';
 import { isReportCacheFresh } from '../hooks/useReportPageCache';
 import { useMedia } from '../hooks/useMedia';
-import DynamicReportTable from './ui/DynamicReportTable';
+import DynamicReportTable from '../components/ui/DynamicReportTable';
 import {
   formatAxisMoney,
   formatAxisNumber,
@@ -71,7 +75,7 @@ import {
   categoryLabelMaxChars,
   scrollableChartMinWidth,
 } from '../utils/chartAxis';
-import ScrollableChart from './ui/ScrollableChart';
+import ScrollableChart from '../components/ui/ScrollableChart';
 import {
   resolveDashboardTableConfig,
   buildReportColumns,
@@ -91,7 +95,7 @@ import {
   buildScopedDashboardApplied,
 } from '../utils/assignedInventoryFilters';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
-import NoDomainsAssignedNote from './ui/NoDomainsAssignedNote';
+import NoDomainsAssignedNote from '../components/ui/NoDomainsAssignedNote';
 import {
   getRecentFilters,
   saveRecentFilter,
@@ -100,8 +104,10 @@ import {
   clearRecentFilters,
   RECENT_FILTERS_CLEARED_EVENT,
 } from '../utils/recentFilters';
-import SavedFiltersBar from './ui/SavedFiltersBar';
+import SavedFiltersBar from '../components/ui/SavedFiltersBar';
+import SavePresetButton from '../components/ui/SavePresetButton';
 import { SAVED_FILTERS_PAGES, getSavedFilters } from '../utils/savedFilters';
+import { PRESET_PAGES } from '../utils/reportPresets';
 import {
   CHART_COLORS,
   CHART_SERIES,
@@ -542,6 +548,8 @@ export default function Dashboard() {
   const filterPanelRef = useRef(null);
   const skipDetailRef = useRef(cacheFresh && saved?.filterApplied);
   const slowTimerRef = useRef(null);
+  const detailAbortRef = useRef(null);
+  const overviewAbortRef = useRef(null);
   const shareHydratedRef = useRef(false);
   const undoSnapRef = useRef(null);
   const skipPrefsSaveRef = useRef(true);
@@ -592,47 +600,68 @@ export default function Dashboard() {
       }
     }
     const shared = parseReportShare(searchParams);
-    if (!shared) return;
-    if (shared.preset && shared.preset !== 'custom') {
-      const r = clampPresetRange(shared.preset, dateRestriction);
-      setPreset(shared.preset);
-      setStartDate(r.startDate);
-      setEndDate(r.endDate);
-      setApplied((prev) => ({
-        ...prev,
-        startDate: r.startDate,
-        endDate: r.endDate,
-        domain: shared.domain?.length ? shared.domain : prev.domain,
-        site: shared.site?.length ? shared.site : prev.site,
-        domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
-        domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
-      }));
-      if (shared.domain?.length) setDomain(shared.domain);
-      if (shared.site?.length) setSite(shared.site);
-      if (shared.domainName?.length) setDomainName(shared.domainName);
-      if (shared.domainId?.length) setDomainId(shared.domainId);
-      setFilterApplied(true);
+    if (shared) {
+      if (shared.preset && shared.preset !== 'custom') {
+        const r = clampPresetRange(shared.preset, dateRestriction);
+        setPreset(shared.preset);
+        setStartDate(r.startDate);
+        setEndDate(r.endDate);
+        setApplied((prev) => ({
+          ...prev,
+          startDate: r.startDate,
+          endDate: r.endDate,
+          domain: shared.domain?.length ? shared.domain : prev.domain,
+          site: shared.site?.length ? shared.site : prev.site,
+          domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
+          domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
+        }));
+        if (shared.domain?.length) setDomain(shared.domain);
+        if (shared.site?.length) setSite(shared.site);
+        if (shared.domainName?.length) setDomainName(shared.domainName);
+        if (shared.domainId?.length) setDomainId(shared.domainId);
+        setFilterApplied(true);
+        return;
+      }
+      if (shared.startDate && shared.endDate) {
+        const r = clampDateRange(shared.startDate, shared.endDate, dateRestriction);
+        setPreset(shared.preset || 'custom');
+        setStartDate(r.startDate);
+        setEndDate(r.endDate);
+        setApplied((prev) => ({
+          ...prev,
+          ...r,
+          domain: shared.domain?.length ? shared.domain : prev.domain,
+          site: shared.site?.length ? shared.site : prev.site,
+          domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
+          domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
+        }));
+        if (shared.domain?.length) setDomain(shared.domain);
+        if (shared.site?.length) setSite(shared.site);
+        if (shared.domainName?.length) setDomainName(shared.domainName);
+        if (shared.domainId?.length) setDomainId(shared.domainId);
+        setFilterApplied(true);
+      }
       return;
     }
-    if (shared.startDate && shared.endDate) {
-      const r = clampDateRange(shared.startDate, shared.endDate, dateRestriction);
-      setPreset(shared.preset || 'custom');
-      setStartDate(r.startDate);
-      setEndDate(r.endDate);
-      setApplied((prev) => ({
-        ...prev,
-        ...r,
-        domain: shared.domain?.length ? shared.domain : prev.domain,
-        site: shared.site?.length ? shared.site : prev.site,
-        domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
-        domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
-      }));
-      if (shared.domain?.length) setDomain(shared.domain);
-      if (shared.site?.length) setSite(shared.site);
-      if (shared.domainName?.length) setDomainName(shared.domainName);
-      if (shared.domainId?.length) setDomainId(shared.domainId);
-      setFilterApplied(true);
-    }
+    if (viewId) return;
+    const last = getLastPageFilters(LAST_FILTER_PAGES.dashboard, user?.id);
+    if (!last?.startDate || !last?.endDate) return;
+    const r = clampDateRange(last.startDate, last.endDate, dateRestriction);
+    setPreset(last.preset || 'custom');
+    setStartDate(r.startDate);
+    setEndDate(r.endDate);
+    if (last.domain?.length) setDomain(last.domain);
+    if (last.site?.length) setSite(last.site);
+    if (last.domainName?.length) setDomainName(last.domainName);
+    if (last.domainId?.length) setDomainId(last.domainId);
+    setApplied((prev) => ({
+      ...prev,
+      ...r,
+      domain: last.domain?.length ? last.domain : prev.domain,
+      site: last.site?.length ? last.site : prev.site,
+      domainName: last.domainName?.length ? last.domainName : prev.domainName,
+      domainId: last.domainId?.length ? last.domainId : prev.domainId,
+    }));
   }, [searchParams, user?.id, dateRestriction]);
 
   useEffect(() => {
@@ -696,17 +725,22 @@ export default function Dashboard() {
 
   const loadOverview = useCallback(async (filtersOverride, silent = false) => {
     const filters = filtersOverride ?? overviewFilters;
+    if (overviewAbortRef.current) overviewAbortRef.current.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    overviewAbortRef.current = ac;
     if (!silent) setOverviewLoading(true);
     setError(null);
     try {
-      const res = await reportsAPI.getDashboardOverview(filters);
+      const res = await reportsAPI.getDashboardOverview(filters, ac ? { signal: ac.signal } : {});
+      if (ac?.signal?.aborted) return;
       setOverviewData(res);
       setLastUpdated(nowTimeInTZ());
     } catch (err) {
+      if (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError' || ac?.signal?.aborted) return;
       logErrorForDebug(err, 'Dashboard overview');
       setError(getUserFacingMessage(err, 'Could not load overview metrics. Please try again.'));
     } finally {
-      if (!silent) setOverviewLoading(false);
+      if (!silent && overviewAbortRef.current === ac) setOverviewLoading(false);
     }
   }, [overviewFilters]);
 
@@ -715,11 +749,14 @@ export default function Dashboard() {
 
   /** Network + filtered charts — load for current dates; inventory filters refine. */
   const loadDetail = useCallback(async (silent = false) => {
+    if (detailAbortRef.current) detailAbortRef.current.abort();
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    detailAbortRef.current = ac;
     if (!silent) {
       setDetailLoading(true);
       setSlowDetail(false);
       clearTimeout(slowTimerRef.current);
-      slowTimerRef.current = setTimeout(() => setSlowDetail(true), 8000);
+      slowTimerRef.current = setTimeout(() => setSlowDetail(true), 4000);
     }
     setError(null);
     try {
@@ -732,21 +769,34 @@ export default function Dashboard() {
       const res = await reportsAPI.getDashboard({
         ...dates,
         ...normalizeInventorySelections(applied || {}, {}),
-      });
+      }, ac ? { signal: ac.signal } : {});
+      if (ac?.signal?.aborted) return;
       startTransition(() => {
         setDetailData(res);
         setLastUpdated(nowTimeInTZ());
         setFetchedAt(Date.now());
       });
     } catch (err) {
+      if (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError' || ac?.signal?.aborted) return;
       logErrorForDebug(err, 'Dashboard detail');
       const status = err?.status ?? err?.response?.status ?? null;
-      // Auth/permission still surface as errors; filter incompat / empty → warn card like Reporting.
-      if (status === 401 || status === 403) {
-        setError(getUserFacingMessage(err, 'Could not load the chart and breakdown table. Try Apply Filter again or use a shorter date range.'));
-        setDetailData(null);
-      } else if (status === 503) {
-        setError(getUserFacingMessage(err, 'Live metrics unavailable. Check Google OAuth credentials in Admin.'));
+      // Auth/permission / timeout / server errors — show error. Only treat empty
+      // filter combos (2xx with empty body is handled above) as warn card.
+      if (
+        status === 401
+        || status === 403
+        || status === 503
+        || status === 502
+        || status === 504
+        || status === 500
+        || err?.isTimeout
+        || err?.code === 'ECONNABORTED'
+        || err?.code === 'ERR_NETWORK'
+      ) {
+        setError(getUserFacingMessage(
+          err,
+          'Could not load the chart and breakdown table. Try Apply Filter again or use a shorter date range.'
+        ));
         setDetailData(null);
       } else {
         setError(null);
@@ -769,13 +819,19 @@ export default function Dashboard() {
         });
       }
     } finally {
-      if (!silent) {
+      if (!silent && detailAbortRef.current === ac) {
         setDetailLoading(false);
         setSlowDetail(false);
         clearTimeout(slowTimerRef.current);
       }
     }
   }, [applied, startDate, endDate]);
+
+  useEffect(() => () => {
+    detailAbortRef.current?.abort();
+    overviewAbortRef.current?.abort();
+    clearTimeout(slowTimerRef.current);
+  }, []);
 
   useEffect(() => {
     if (filterApplied && hasInventoryFilterSelection(applied)) return;
@@ -1060,6 +1116,18 @@ export default function Dashboard() {
     domainId,
   }), [domain, site, domainName, domainId]);
 
+  const getPresetSnapshot = useCallback(() => ({
+    preset,
+    startDate: applied?.startDate || startDate,
+    endDate: applied?.endDate || endDate,
+    domain: applied?.domain || domain,
+    site: applied?.site || site,
+    domainName: applied?.domainName || domainName,
+    domainId: applied?.domainId || domainId,
+  }), [
+    preset, applied, startDate, endDate, domain, site, domainName, domainId,
+  ]);
+
   const handleApplySavedFilter = useCallback((snapshot) => {
     const nextDomain = snapshot.domain || [];
     const nextSite = snapshot.site || [];
@@ -1101,6 +1169,15 @@ export default function Dashboard() {
     setApplied(nextApplied);
     setFilterApplied(true);
     persistRecentFilter();
+    saveLastPageFilters(LAST_FILTER_PAGES.dashboard, {
+      preset,
+      startDate: dates.startDate,
+      endDate: dates.endDate,
+      domain,
+      site,
+      domainName,
+      domainId,
+    }, user?.id);
     setBreakdownOpen(true);
     setChipsExpanded(false);
     loadCatalog(true);
@@ -1578,6 +1655,22 @@ export default function Dashboard() {
     priorSiteShareSeries,
   ]);
 
+  const [thresholdBanners, setThresholdBanners] = useState([]);
+  const [dismissedAlerts, setDismissedAlerts] = useState(() => new Set());
+
+  useEffect(() => {
+    const items = evaluateRevenueDropThreshold(
+      overviewSummary?.revenueChange,
+      compareLabel
+    );
+    setThresholdBanners(items);
+  }, [overviewSummary?.revenueChange, compareLabel]);
+
+  const visibleThresholdBanners = useMemo(
+    () => thresholdBanners.filter((b) => !dismissedAlerts.has(b.id)),
+    [thresholdBanners, dismissedAlerts]
+  );
+
   const stickyKpis = useMemo(() => ([
     { key: 'imps', label: 'Imps', value: overviewSummary?.impressions, change: overviewSummary?.impressionsChange },
     { key: 'rev', label: 'Rev', value: overviewSummary?.revenue ?? overviewSummary?.selectRange, change: overviewSummary?.revenueChange, money: true },
@@ -1840,9 +1933,17 @@ export default function Dashboard() {
         summary={filterSummary}
       >
         {canFilter && (
-          <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>
-            Copy link
-          </button>
+          <>
+            <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>
+              Copy link
+            </button>
+            <SavePresetButton
+              page={PRESET_PAGES.dashboard}
+              userId={user?.id}
+              getSnapshot={getPresetSnapshot}
+              disabled={!canFilter}
+            />
+          </>
         )}
       </PageHeader>
       {canGenerate && (
@@ -1921,6 +2022,12 @@ export default function Dashboard() {
               Filters{appliedChips.length ? ` (${appliedChips.length})` : ''} {mobileFiltersOpen ? '▴' : '▾'}
             </button>
             <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>Copy link</button>
+            <SavePresetButton
+              page={PRESET_PAGES.dashboard}
+              userId={user?.id}
+              getSnapshot={getPresetSnapshot}
+              disabled={!canFilter}
+            />
           </div>
         )}
 
@@ -2170,6 +2277,12 @@ export default function Dashboard() {
           {!overviewCardLoading && insightItems.length > 0 && (
             <InsightsStrip items={insightItems} compareLabel={compareLabel} />
           )}
+          {visibleThresholdBanners.length > 0 && (
+            <ThresholdAlertBanner
+              items={visibleThresholdBanners}
+              onDismiss={(id) => setDismissedAlerts((prev) => new Set([...prev, id]))}
+            />
+          )}
         </>
       )}
 
@@ -2325,7 +2438,11 @@ export default function Dashboard() {
                 {filterApplied && (
                   <div className="report-live">
                     <span className="dot-pulse" /> {isMock ? 'Mock' : 'Live'}
-                    {lastUpdated && <span className="report-updated">Updated {lastUpdated} SGT</span>}
+                    <DataFreshness
+                      networkInfo={networkInfo}
+                      fetchedAt={lastUpdated}
+                      className="report-updated"
+                    />
                   </div>
                 )}
                 <ChartExportButton filename="revenue-impressions" />

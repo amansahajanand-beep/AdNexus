@@ -15,31 +15,31 @@ import {
   isFixedDateRestriction,
   isCustomRangeIncomplete,
 } from '../utils/dateRestriction';
-import AccessRestricted from './ui/AccessRestricted';
-import MultiSelect from './ui/MultiSelect';
-import FilterChips from './ui/FilterChips';
-import ReportBuilderFilters, {
-  DEFAULT_REPORT_DIMENSIONS,
-  DEFAULT_REPORT_METRICS,
-} from './ui/ReportBuilderFilters';
-import ReportSettingsFilters, { DEFAULT_REPORT_SETTINGS } from './ui/ReportSettingsFilters';
-import PageHeader from './ui/PageHeader';
+import AccessRestricted from '../components/ui/AccessRestricted';
+import MultiSelect from '../components/ui/MultiSelect';
+import FilterChips from '../components/ui/FilterChips';
+import ReportBuilderFilters from '../components/ui/ReportBuilderFilters';
+import ReportSettingsFilters from '../components/ui/ReportSettingsFilters';
+import PageHeader from '../components/ui/PageHeader';
 import {
   dimensionsToChips,
   metricsToChips,
   reportSettingsToChips,
   dimensionLabel,
   metricLabel,
-} from '../utils/gamReportCatalog';
+  DEFAULT_REPORT_DIMENSIONS,
+  DEFAULT_REPORT_METRICS,
+  DEFAULT_REPORT_SETTINGS,
+} from '../utils/report/gamReportCatalog';
 import { buildFilterDropdownOptions } from '../utils/catalogOptions';
 import { normalizeInventorySelections, slimFiltersForPersist, isAllSelection, ALL_SENTINEL } from '../utils/inventorySelection';
 import { buildAppliedFilterChips, removeFilterChip } from '../utils/filterChips';
 import { saveReportPage } from '../store/slices/reportSlice';
 import { isReportCacheFresh } from '../hooks/useReportPageCache';
 import { useMedia } from '../hooks/useMedia';
-import DynamicReportTable from './ui/DynamicReportTable';
-import ReportAutoCharts from './ui/ReportAutoCharts';
-import GamReportControlBar from './ui/GamReportControlBar';
+import DynamicReportTable from '../components/ui/DynamicReportTable';
+import ReportAutoCharts from '../components/ui/ReportAutoCharts';
+import GamReportControlBar from '../components/ui/GamReportControlBar';
 import {
   resolveReportTableConfig,
   buildReportColumns,
@@ -62,10 +62,14 @@ import {
   buildAssignedInventoryFilters,
 } from '../utils/assignedInventoryFilters';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
-import NoDomainsAssignedNote from './ui/NoDomainsAssignedNote';
+import NoDomainsAssignedNote from '../components/ui/NoDomainsAssignedNote';
 import { getRecentFilters, saveRecentFilter, applyRecentFilter, clearRecentFilters, RECENT_FILTERS_CLEARED_EVENT } from '../utils/recentFilters';
-import SavedFiltersBar from './ui/SavedFiltersBar';
+import SavedFiltersBar from '../components/ui/SavedFiltersBar';
+import SavePresetButton from '../components/ui/SavePresetButton';
+import DataFreshness from '../components/ui/DataFreshness';
 import { SAVED_FILTERS_PAGES, getSavedFilters } from '../utils/savedFilters';
+import { PRESET_PAGES } from '../utils/reportPresets';
+import { getLastPageFilters, saveLastPageFilters, LAST_FILTER_PAGES } from '../utils/lastPageFilters';
 import { downloadCsv, downloadExcel, exportCellValue } from '../utils/tableExport';
 
 const PAGE_SIZE = 50;
@@ -289,57 +293,76 @@ export default function Reporting() {
       }
     }
     const shared = parseReportShare(searchParams);
-    if (!shared) return;
-    if (shared.preset && shared.preset !== 'custom') {
-      const r = clampPresetRange(shared.preset, dateRestriction);
-      setPreset(shared.preset);
-      setStartDate(r.startDate);
-      setEndDate(r.endDate);
-      if (shared.reportDimensions?.length) setReportDimensions(shared.reportDimensions);
-      if (shared.reportMetrics?.length) setReportMetrics(shared.reportMetrics);
-      if (shared.domain?.length) setDomain(shared.domain);
-      if (shared.site?.length) setSite(shared.site);
-      if (shared.domainName?.length) setDomainName(shared.domainName);
-      if (shared.domainId?.length) setDomainId(shared.domainId);
-      if (shared.country?.length) setCountry(shared.country);
-      setHasApplied(true);
-      setApplied((prev) => ({
-        ...prev,
-        ...r,
-        domain: shared.domain?.length ? shared.domain : prev.domain,
-        site: shared.site?.length ? shared.site : prev.site,
-        domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
-        domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
-        country: shared.country?.length ? shared.country : prev.country,
-        reportDimensions: shared.reportDimensions?.length ? shared.reportDimensions : prev.reportDimensions,
-        reportMetrics: shared.reportMetrics?.length ? shared.reportMetrics : prev.reportMetrics,
-      }));
+    if (shared) {
+      if (shared.preset && shared.preset !== 'custom') {
+        const r = clampPresetRange(shared.preset, dateRestriction);
+        setPreset(shared.preset);
+        setStartDate(r.startDate);
+        setEndDate(r.endDate);
+        if (shared.reportDimensions?.length) setReportDimensions(shared.reportDimensions);
+        if (shared.reportMetrics?.length) setReportMetrics(shared.reportMetrics);
+        if (shared.domain?.length) setDomain(shared.domain);
+        if (shared.site?.length) setSite(shared.site);
+        if (shared.domainName?.length) setDomainName(shared.domainName);
+        if (shared.domainId?.length) setDomainId(shared.domainId);
+        if (shared.country?.length) setCountry(shared.country);
+        setHasApplied(true);
+        setApplied((prev) => ({
+          ...prev,
+          ...r,
+          domain: shared.domain?.length ? shared.domain : prev.domain,
+          site: shared.site?.length ? shared.site : prev.site,
+          domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
+          domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
+          country: shared.country?.length ? shared.country : prev.country,
+          reportDimensions: shared.reportDimensions?.length ? shared.reportDimensions : prev.reportDimensions,
+          reportMetrics: shared.reportMetrics?.length ? shared.reportMetrics : prev.reportMetrics,
+        }));
+        return;
+      }
+      if (shared.startDate && shared.endDate) {
+        const r = clampDateRange(shared.startDate, shared.endDate, dateRestriction);
+        setPreset(shared.preset || 'custom');
+        setStartDate(r.startDate);
+        setEndDate(r.endDate);
+        if (shared.reportDimensions?.length) setReportDimensions(shared.reportDimensions);
+        if (shared.reportMetrics?.length) setReportMetrics(shared.reportMetrics);
+        if (shared.domain?.length) setDomain(shared.domain);
+        if (shared.site?.length) setSite(shared.site);
+        if (shared.domainName?.length) setDomainName(shared.domainName);
+        if (shared.domainId?.length) setDomainId(shared.domainId);
+        if (shared.country?.length) setCountry(shared.country);
+        setHasApplied(true);
+        setApplied((prev) => ({
+          ...prev,
+          ...r,
+          domain: shared.domain?.length ? shared.domain : prev.domain,
+          site: shared.site?.length ? shared.site : prev.site,
+          domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
+          domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
+          country: shared.country?.length ? shared.country : prev.country,
+          reportDimensions: shared.reportDimensions?.length ? shared.reportDimensions : prev.reportDimensions,
+          reportMetrics: shared.reportMetrics?.length ? shared.reportMetrics : prev.reportMetrics,
+        }));
+      }
       return;
     }
-    if (shared.startDate && shared.endDate) {
-      const r = clampDateRange(shared.startDate, shared.endDate, dateRestriction);
-      setPreset(shared.preset || 'custom');
-      setStartDate(r.startDate);
-      setEndDate(r.endDate);
-      if (shared.reportDimensions?.length) setReportDimensions(shared.reportDimensions);
-      if (shared.reportMetrics?.length) setReportMetrics(shared.reportMetrics);
-      if (shared.domain?.length) setDomain(shared.domain);
-      if (shared.site?.length) setSite(shared.site);
-      if (shared.domainName?.length) setDomainName(shared.domainName);
-      if (shared.domainId?.length) setDomainId(shared.domainId);
-      if (shared.country?.length) setCountry(shared.country);
-      setHasApplied(true);
-      setApplied((prev) => ({
-        ...prev,
-        ...r,
-        domain: shared.domain?.length ? shared.domain : prev.domain,
-        site: shared.site?.length ? shared.site : prev.site,
-        domainName: shared.domainName?.length ? shared.domainName : prev.domainName,
-        domainId: shared.domainId?.length ? shared.domainId : prev.domainId,
-        country: shared.country?.length ? shared.country : prev.country,
-        reportDimensions: shared.reportDimensions?.length ? shared.reportDimensions : prev.reportDimensions,
-        reportMetrics: shared.reportMetrics?.length ? shared.reportMetrics : prev.reportMetrics,
-      }));
+    if (viewId) return;
+    const last = getLastPageFilters(LAST_FILTER_PAGES.reporting, user?.id);
+    if (!last?.startDate || !last?.endDate) return;
+    const r = clampDateRange(last.startDate, last.endDate, dateRestriction);
+    setPreset(last.preset || 'custom');
+    setStartDate(r.startDate);
+    setEndDate(r.endDate);
+    if (last.domain?.length) setDomain(last.domain);
+    if (last.site?.length) setSite(last.site);
+    if (last.domainName?.length) setDomainName(last.domainName);
+    if (last.domainId?.length) setDomainId(last.domainId);
+    if (last.country?.length) setCountry(last.country);
+    if (last.reportDimensions?.length) setReportDimensions(last.reportDimensions);
+    if (last.reportMetrics?.length) setReportMetrics(last.reportMetrics);
+    if (last.reportSettings && Object.keys(last.reportSettings).length) {
+      setReportSettings(last.reportSettings);
     }
   }, [searchParams, user?.id, dateRestriction]);
 
@@ -392,6 +415,22 @@ export default function Reporting() {
     reportMetrics,
     reportSettings,
   }), [country, domain, site, domainName, domainId, reportDimensions, reportMetrics, reportSettings]);
+
+  const getPresetSnapshot = useCallback(() => ({
+    preset,
+    startDate: applied?.startDate || startDate,
+    endDate: applied?.endDate || endDate,
+    country: applied?.country || country,
+    domain: applied?.domain || domain,
+    site: applied?.site || site,
+    domainName: applied?.domainName || domainName,
+    domainId: applied?.domainId || domainId,
+    reportDimensions: applied?.reportDimensions || reportDimensions,
+    reportMetrics: applied?.reportMetrics || reportMetrics,
+  }), [
+    preset, applied, startDate, endDate, country, domain, site,
+    domainName, domainId, reportDimensions, reportMetrics,
+  ]);
 
   const handleApplySavedFilter = useCallback((snapshot) => {
     const nextCountry = normalizeCountry(snapshot.country);
@@ -550,8 +589,18 @@ export default function Reporting() {
       if (loadGen !== loadGenRef.current) return;
       logErrorForDebug(err, 'Reporting load');
       const status = err?.status ?? err?.response?.status ?? null;
-      // Auth/permission still surface as errors; GAM incompat / empty failures → no data found.
-      if (status === 401 || status === 403) {
+      // Auth/permission / timeout / server errors — show error. Do not fake "incompatible".
+      if (
+        status === 401
+        || status === 403
+        || status === 503
+        || status === 502
+        || status === 504
+        || status === 500
+        || err?.isTimeout
+        || err?.code === 'ECONNABORTED'
+        || err?.code === 'ERR_NETWORK'
+      ) {
         setError(getUserFacingMessage(err, 'Could not load the report. Please try again or narrow your filters.'));
         setData(null);
         setProgData(null);
@@ -839,6 +888,19 @@ export default function Reporting() {
       reportSettings,
     });
     persistRecentFilter();
+    saveLastPageFilters(LAST_FILTER_PAGES.reporting, {
+      preset,
+      startDate: dates.startDate,
+      endDate: dates.endDate,
+      country,
+      domain,
+      site,
+      domainName,
+      domainId,
+      reportDimensions,
+      reportMetrics,
+      reportSettings,
+    }, user?.id);
     setFiltersOpen(false);
     setChipsExpanded(false);
     loadCatalog(true);
@@ -1341,9 +1403,17 @@ export default function Reporting() {
         summary={reportFilterSummary}
       >
         {canFilter && (
-          <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>
-            Copy link
-          </button>
+          <>
+            <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>
+              Copy link
+            </button>
+            <SavePresetButton
+              page={PRESET_PAGES.reporting}
+              userId={user?.id}
+              getSnapshot={getPresetSnapshot}
+              disabled={!canFilter}
+            />
+          </>
         )}
       </PageHeader>
       {dateRestriction && (
@@ -1612,7 +1682,11 @@ export default function Reporting() {
         </div>
         <div className="report-live">
           <span className="dot-pulse" /> {data?.isMock ? 'Mock' : 'Live'}
-          {lastUpdated && <span className="report-updated">Updated {lastUpdated} SGT</span>}
+          <DataFreshness
+            networkInfo={networkInfo}
+            fetchedAt={lastUpdated}
+            className="report-updated"
+          />
         </div>
       </div>
       )}

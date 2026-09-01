@@ -16,6 +16,7 @@ function mapPublic(row) {
     descriptiveName: row.descriptive_name || '',
     parentMccId: row.parent_mcc_id || null,
     loginCustomerId: row.login_customer_id || null,
+    currencyCode: row.currency_code || 'USD',
     isActive: row.is_active !== false,
     includeInRoi: row.include_in_roi !== false,
     hasRefreshToken: !!row.google_refresh_token_enc,
@@ -160,6 +161,9 @@ async function updateAccount(id, patch = {}) {
       : current.loginCustomerId,
     isActive: patch.isActive != null ? !!patch.isActive : current.isActive,
     includeInRoi: patch.includeInRoi != null ? !!patch.includeInRoi : current.includeInRoi,
+    currencyCode: patch.currencyCode != null
+      ? String(patch.currencyCode).trim().toUpperCase().slice(0, 3)
+      : (current.currencyCode || 'USD'),
     refreshTokenEnc: current.refreshToken ? encryptSecret(current.refreshToken) : null,
   };
 
@@ -176,6 +180,7 @@ async function updateAccount(id, patch = {}) {
        google_refresh_token_enc = COALESCE($6, google_refresh_token_enc),
        is_active = $7,
        include_in_roi = $8,
+       currency_code = COALESCE($9, currency_code),
        updated_at = now()
      WHERE id = $1
      RETURNING *`,
@@ -188,6 +193,7 @@ async function updateAccount(id, patch = {}) {
       next.refreshTokenEnc,
       next.isActive,
       next.includeInRoi,
+      next.currencyCode || 'USD',
     ]
   );
   return mapPublic(rows[0]);
@@ -290,6 +296,37 @@ async function upsertCampaignMap({
   return rows[0];
 }
 
+/** Upsert many campaign → target maps for one Ads account. */
+async function upsertCampaignMapsBulk({
+  clientId,
+  adsAccountId,
+  targetType,
+  targetKey,
+  campaigns = [],
+}) {
+  const key = String(targetKey || '').trim().toLowerCase();
+  if (!key) throw new Error('targetKey required');
+  if (!['site', 'app'].includes(targetType)) throw new Error('targetType must be site or app');
+  const list = Array.isArray(campaigns) ? campaigns : [];
+  if (!list.length) throw new Error('campaigns required');
+
+  const saved = [];
+  for (const c of list) {
+    const campaignId = String(c.campaignId || c.id || '').trim();
+    if (!campaignId) continue;
+    const row = await upsertCampaignMap({
+      clientId,
+      adsAccountId,
+      campaignId,
+      campaignName: c.campaignName || c.name || '',
+      targetType,
+      targetKey: key,
+    });
+    saved.push(row);
+  }
+  return saved;
+}
+
 async function deleteCampaignMap(id, clientId) {
   await query('DELETE FROM ads_campaign_map WHERE id = $1 AND client_id = $2', [id, clientId]);
 }
@@ -368,18 +405,25 @@ async function upsertSpendRows(clientId, adsAccountId, rows) {
   for (const r of rows) {
     await query(
       `INSERT INTO ads_spend_daily (
-         client_id, ads_account_id, report_date, campaign_id, campaign_name,
-         cost, clicks, impressions, conversions, conversion_value, currency, synced_at
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11, now())
+         client_id, ads_account_id, report_date, campaign_id, campaign_name, app_id,
+         cost, clicks, impressions, conversions, conversion_value, currency,
+         cost_native, native_currency, synced_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now())
        ON CONFLICT (client_id, ads_account_id, report_date, campaign_id)
        DO UPDATE SET
          campaign_name = EXCLUDED.campaign_name,
+         app_id = CASE
+           WHEN NULLIF(TRIM(EXCLUDED.app_id), '') IS NOT NULL THEN EXCLUDED.app_id
+           ELSE ads_spend_daily.app_id
+         END,
          cost = EXCLUDED.cost,
          clicks = EXCLUDED.clicks,
          impressions = EXCLUDED.impressions,
          conversions = EXCLUDED.conversions,
          conversion_value = EXCLUDED.conversion_value,
          currency = EXCLUDED.currency,
+         cost_native = EXCLUDED.cost_native,
+         native_currency = EXCLUDED.native_currency,
          synced_at = now()`,
       [
         clientId,
@@ -387,15 +431,90 @@ async function upsertSpendRows(clientId, adsAccountId, rows) {
         r.reportDate,
         String(r.campaignId),
         r.campaignName || '',
+        String(r.appId || '').trim(),
         Number(r.cost) || 0,
         Number(r.clicks) || 0,
         Number(r.impressions) || 0,
         Number(r.conversions) || 0,
         Number(r.conversionValue) || 0,
         r.currency || 'USD',
+        r.costNative != null ? Number(r.costNative) : null,
+        r.nativeCurrency || r.accountCurrency || null,
       ]
     );
     n += 1;
+  }
+  return n;
+}
+
+async function upsertCountrySpendRows(clientId, adsAccountId, rows) {
+  if (!rows?.length) return 0;
+  let n = 0;
+  for (const r of rows) {
+    const countryCode = String(r.countryCode || '').trim().toUpperCase();
+    if (!countryCode) continue;
+    await query(
+      `INSERT INTO ads_spend_country_daily (
+         client_id, ads_account_id, report_date, campaign_id, country_code, country_name, app_id,
+         cost, clicks, impressions, conversions, conversion_value, currency,
+         cost_native, native_currency, synced_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, now())
+       ON CONFLICT (client_id, ads_account_id, report_date, campaign_id, country_code)
+       DO UPDATE SET
+         country_name = EXCLUDED.country_name,
+         app_id = CASE
+           WHEN NULLIF(TRIM(EXCLUDED.app_id), '') IS NOT NULL THEN EXCLUDED.app_id
+           ELSE ads_spend_country_daily.app_id
+         END,
+         cost = EXCLUDED.cost,
+         clicks = EXCLUDED.clicks,
+         impressions = EXCLUDED.impressions,
+         conversions = EXCLUDED.conversions,
+         conversion_value = EXCLUDED.conversion_value,
+         currency = EXCLUDED.currency,
+         cost_native = EXCLUDED.cost_native,
+         native_currency = EXCLUDED.native_currency,
+         synced_at = now()`,
+      [
+        clientId,
+        adsAccountId,
+        r.reportDate,
+        String(r.campaignId),
+        countryCode,
+        r.countryName || countryCode,
+        String(r.appId || '').trim(),
+        Number(r.cost) || 0,
+        Number(r.clicks) || 0,
+        Number(r.impressions) || 0,
+        Number(r.conversions) || 0,
+        Number(r.conversionValue) || 0,
+        r.currency || 'USD',
+        r.costNative != null ? Number(r.costNative) : null,
+        r.nativeCurrency || r.accountCurrency || null,
+      ]
+    );
+    n += 1;
+  }
+  return n;
+}
+
+/** Backfill app_id on existing spend rows for an account (from Ads App Campaign settings). */
+async function applyCampaignAppIds(clientId, adsAccountId, campaignApps = []) {
+  let n = 0;
+  for (const c of campaignApps) {
+    const campaignId = String(c.campaignId || '').trim();
+    const appId = String(c.appId || '').trim();
+    if (!campaignId || !appId) continue;
+    const { rowCount } = await query(
+      `UPDATE ads_spend_daily
+       SET app_id = $4, synced_at = now()
+       WHERE client_id = $1
+         AND ads_account_id = $2
+         AND campaign_id = $3
+         AND (app_id IS NULL OR TRIM(app_id) = '' OR app_id <> $4)`,
+      [clientId, adsAccountId, campaignId, appId]
+    );
+    n += rowCount || 0;
   }
   return n;
 }
@@ -415,11 +534,14 @@ module.exports = {
   deleteAccount,
   listCampaignMaps,
   upsertCampaignMap,
+  upsertCampaignMapsBulk,
   deleteCampaignMap,
   listOtherExpenses,
   createOtherExpense,
   deleteOtherExpense,
   upsertSpendRows,
+  upsertCountrySpendRows,
+  applyCampaignAppIds,
   mapPublic,
   mapRuntime,
 };

@@ -8,6 +8,7 @@ import {
   hasSavableFilters,
   summaryFor,
 } from '../../utils/savedFilters';
+import { validateSavedName, SAVED_NAME_RULES_HINT } from '../../utils/namePolicy';
 
 /**
  * Save current filters with a name + browse / apply / edit / delete saved sets.
@@ -108,12 +109,12 @@ export default function SavedFiltersBar({
   const confirmForm = (e) => {
     e?.preventDefault?.();
     const trimmed = name.trim();
-    if (!trimmed) {
-      setError('Enter a name for this filter.');
-      return;
-    }
-    if (trimmed.length > FILTER_NAME_MAX) {
-      setError(`Name must be ${FILTER_NAME_MAX} characters or fewer.`);
+    const nameCheck = validateSavedName(trimmed, {
+      maxLength: FILTER_NAME_MAX,
+      label: 'Filter name',
+    });
+    if (!nameCheck.valid) {
+      setError(nameCheck.errors[0]);
       return;
     }
 
@@ -167,7 +168,7 @@ export default function SavedFiltersBar({
         className="btn-saved-filter"
         onClick={openCreate}
         disabled={disabled}
-        title="Save current filters as a new named set (dates are not saved)"
+        title="Save inventory/country filters only — dates are not saved (unlike Save preset)"
       >
         💾 Save filter
       </button>
@@ -179,7 +180,7 @@ export default function SavedFiltersBar({
           closeForm();
         }}
         disabled={disabled}
-        title="View, apply, or edit saved filters"
+        title="Named filters without dates — different from Presets (which include dates)"
         aria-expanded={panelOpen}
       >
         ★ Saved filters{list.length ? ` (${list.length})` : ''}
@@ -191,7 +192,7 @@ export default function SavedFiltersBar({
           <p className="saved-filters-popover-hint">
             {isEdit
               ? 'Rename this set. Optionally replace its filters with what you have selected now (dates stay unsaved).'
-              : 'Name this filter set. Date range is not saved — you choose dates when you use it. Each save adds another filter.'}
+              : 'Saves inventory/country filters only — not the date range. For dates + filters together, use Save preset (Presets page).'}
           </p>
           <form onSubmit={confirmForm}>
             <input
@@ -209,6 +210,7 @@ export default function SavedFiltersBar({
             <div className="saved-filters-name-meta">
               {name.trim().length}/{FILTER_NAME_MAX} characters
             </div>
+            <p className="form-note saved-filters-name-rules">{SAVED_NAME_RULES_HINT}</p>
             {isEdit && (
               <label className="saved-filters-update-toggle">
                 <input

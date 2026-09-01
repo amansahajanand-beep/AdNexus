@@ -5,7 +5,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const router = express.Router();
-const { getOAuthClient, getGAMClient } = require('../gamClient');
+const { getOAuthClient, getGAMClient } = require('../gam/client');
 const { getClientById, ensureBootstrapFromEnv, updateClientCredentials } = require('../models/clientStore');
 const logger = require('../utils/logger');
 

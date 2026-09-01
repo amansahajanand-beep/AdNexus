@@ -13,8 +13,43 @@ import {
 import { PermissionSaveSummary, UserEditChangeSummary } from './PermissionChangeSummary';
 import SuccessModal from '../ui/SuccessModal';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
+import { generatePassword } from '../../utils/passwordPolicy';
+import { confirmDialog } from '../../hooks/useConfirmDialog';
+import { showToast } from '../../hooks/useToast';
 
-function DomainUserPasswordCell({ user }) {
+function IconEye({ crossed = false }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path
+        d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinejoin="round"
+      />
+      <circle cx="12" cy="12" r="3" stroke="currentColor" strokeWidth="1.75" />
+      {crossed && (
+        <path d="M4 4l16 16" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
+      )}
+    </svg>
+  );
+}
+
+function IconCopy() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <rect x="9" y="9" width="11" height="11" rx="2" stroke="currentColor" strokeWidth="1.75" />
+      <path
+        d="M5 15V5a2 2 0 0 1 2-2h10"
+        stroke="currentColor"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function DomainUserPasswordCell({ user, onResetPassword, resetting }) {
   const [visible, setVisible] = useState(false);
   if (user.role === 'admin') {
     return <span className="admin-password-muted">—</span>;
@@ -22,9 +57,15 @@ function DomainUserPasswordCell({ user }) {
   const pwd = user.password;
   if (!pwd) {
     return (
-      <span className="admin-password-muted" title="Edit user and set a password to store a viewable copy">
-        Reset to view
-      </span>
+      <button
+        type="button"
+        className="link-action admin-password-reset"
+        disabled={resetting}
+        title="Set a new password and show it here (old password cannot be recovered)"
+        onClick={() => onResetPassword?.(user)}
+      >
+        {resetting ? 'Resetting…' : 'Reset to view'}
+      </button>
     );
   }
   return (
@@ -32,23 +73,25 @@ function DomainUserPasswordCell({ user }) {
       <code className="admin-password-value">{visible ? pwd : '••••••••'}</code>
       <button
         type="button"
-        className="link-action"
+        className="admin-password-icon-btn"
         onClick={() => setVisible((v) => !v)}
         title={visible ? 'Hide password' : 'Show password'}
+        aria-label={visible ? 'Hide password' : 'Show password'}
       >
-        {visible ? 'Hide' : 'Show'}
+        <IconEye crossed={visible} />
       </button>
       <button
         type="button"
-        className="link-action"
+        className="admin-password-icon-btn"
         onClick={() => {
           try {
             navigator.clipboard?.writeText(pwd);
           } catch (_) { /* ignore */ }
         }}
         title="Copy password"
+        aria-label="Copy password"
       >
-        Copy
+        <IconCopy />
       </button>
     </div>
   );
@@ -78,8 +121,35 @@ export default function UserManagement({
   const [formError, setFormError] = useState(null);
   const [search, setSearch] = useState('');
   const [successMsg, setSuccessMsg] = useState(null);
+  const [resettingUserId, setResettingUserId] = useState(null);
 
   const showSuccess = (msg) => setSuccessMsg(msg);
+
+  const handleResetPassword = async (u) => {
+    if (!u?.id || u.role === 'admin') return;
+    const ok = await confirmDialog({
+      title: 'Reset password?',
+      message:
+        `Set a new password for “${u.username}” and show it in the list?\n\n`
+        + 'The current password cannot be recovered from the database — only a new one can be stored for viewing.',
+    });
+    if (!ok) return;
+    const nextPassword = generatePassword(u.username);
+    setResettingUserId(u.id);
+    try {
+      await onUpdate(u.id, { password: nextPassword });
+      showSuccess({
+        type: 'password',
+        username: u.username,
+        password: nextPassword,
+      });
+    } catch (err) {
+      logErrorForDebug(err, 'UserManagement reset password');
+      window.alert(getUserFacingMessage(err, 'Could not reset password. Please try again.'));
+    } finally {
+      setResettingUserId(null);
+    }
+  };
 
   const filteredUsers = useMemo(
     () => filterRowsBySearch(users, search, (u) => [
@@ -131,7 +201,14 @@ export default function UserManagement({
         await onUpdate(editingUser.id, payload);
         setFormOpen(false);
         setEditingUser(null);
-        showSuccess({ type: 'edit', ...buildUserEditSummary(oldUser, payload) });
+        const summary = buildUserEditSummary(oldUser, payload);
+        if (payload.password && oldUser.role !== 'admin' && payload.role !== 'admin') {
+          summary.changes = [
+            { type: 'added', text: `Password: ${payload.password}` },
+            ...(summary.changes || []),
+          ];
+        }
+        showSuccess({ type: 'edit', ...summary });
       } else {
         await onCreate(payload);
         setFormOpen(false);
@@ -168,12 +245,15 @@ export default function UserManagement({
   };
 
   const handleDelete = async (u) => {
-    if (!window.confirm(`Delete user "${u.username}"?`)) return;
     try {
       await onDelete(u.id);
+      showToast({ message: `User “${u.username}” deleted` });
     } catch (err) {
       logErrorForDebug(err, 'UserManagement delete');
-      window.alert(getUserFacingMessage(err, 'Could not delete user. Please try again.'));
+      showToast({
+        message: getUserFacingMessage(err, 'Could not delete user. Please try again.'),
+        timeout: 6000,
+      });
     }
   };
 
@@ -185,6 +265,7 @@ export default function UserManagement({
         title={
           successMsg?.type === 'add' ? 'User Created' :
           successMsg?.type === 'edit' ? 'User Updated' :
+          successMsg?.type === 'password' ? 'Password Reset' :
           'Permissions Updated'
         }
         onClose={() => setSuccessMsg(null)}
@@ -200,6 +281,30 @@ export default function UserManagement({
             username={successMsg.username}
             changes={successMsg.changes}
           />
+        )}
+        {successMsg?.type === 'password' && (
+          <div className="admin-password-reveal">
+            <p>
+              New password for <strong>{successMsg.username}</strong>:
+            </p>
+            <code className="admin-password-value admin-password-value-lg">{successMsg.password}</code>
+            <div style={{ marginTop: 12 }}>
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => {
+                  try {
+                    navigator.clipboard?.writeText(successMsg.password);
+                  } catch (_) { /* ignore */ }
+                }}
+              >
+                Copy password
+              </button>
+            </div>
+            <p className="form-note" style={{ marginTop: 12 }}>
+              It is also visible in the Password column (Show / Copy).
+            </p>
+          </div>
         )}
         {!successMsg?.type && (
           <PermissionSaveSummary
@@ -257,7 +362,11 @@ export default function UserManagement({
                   </span>
                 </td>
                 <td data-label="Password">
-                  <DomainUserPasswordCell user={u} />
+                  <DomainUserPasswordCell
+                    user={u}
+                    onResetPassword={handleResetPassword}
+                    resetting={resettingUserId === u.id}
+                  />
                 </td>
                 <td data-label="Permissions">
                   <div className="perm-badge-row">

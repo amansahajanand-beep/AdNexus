@@ -4,19 +4,17 @@ import { usersAPI, domainsAPI, reportsAPI } from '../utils/api';
 import { useAuth } from '../store/useAuth';
 import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions, normalizeDomainPickerOptions } from '../utils/domainCatalog';
 import { isLikelyAppPackage } from '../utils/appPackage';
-import UserManagement from './admin/UserManagement';
-import ClientSettings from './admin/ClientSettings';
-import AdsAccountsAdmin from './admin/AdsAccountsAdmin';
-import AdsCampaignMapping from './admin/AdsCampaignMapping';
-import DomainPermissions from './admin/DomainPermissions';
-import PageHeader from './ui/PageHeader';
+import UserManagement from '../components/admin/UserManagement';
+import ClientSettings from '../components/admin/ClientSettings';
+import AdsAccountsAdmin from '../components/admin/AdsAccountsAdmin';
+import DomainPermissions from '../components/admin/DomainPermissions';
+import PageHeader from '../components/ui/PageHeader';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
 const TABS = [
   { id: 'user', label: 'Users' },
   { id: 'domains', label: 'Assign Permissions' },
   { id: 'client', label: 'GAM credentials' },
   { id: 'ads', label: 'Google Ads accounts' },
-  { id: 'ads-map', label: 'Campaign mapping' },
 ];
 
 export default function Admin() {
@@ -156,8 +154,7 @@ export default function Admin() {
             : tab === 'domains' ? 'Assign inventory access'
               : tab === 'client' ? 'Client OAuth settings'
                 : tab === 'ads' ? 'Google Ads MCC & accounts'
-                  : tab === 'ads-map' ? 'Campaign → site/app mapping'
-                    : ''
+                  : ''
         }
       />
 
@@ -198,13 +195,6 @@ export default function Admin() {
       {tab === 'client' && <ClientSettings />}
 
       {tab === 'ads' && <AdsAccountsAdmin />}
-
-      {tab === 'ads-map' && (
-        <AdsCampaignMapping
-          siteHosts={catalogLists.siteHosts || []}
-          appIds={catalogLists.appIds || []}
-        />
-      )}
 
       {tab === 'domains' && (
         <DomainPermissions

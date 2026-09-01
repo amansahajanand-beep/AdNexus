@@ -1,10 +1,10 @@
 import axios from 'axios';
-import { TOKEN_KEY } from './authConstants';
-import { clearSessionSuperseded, isIntentionalLogout } from './crossTabAuth';
-import { getUserFacingMessage, logErrorForDebug } from './userFacingError';
-import { clearRecentFilters } from './recentFilters';
+import { TOKEN_KEY } from './auth/authConstants';
+import { clearSessionSuperseded, isIntentionalLogout } from './auth/crossTabAuth';
+import { getUserFacingMessage, logErrorForDebug } from './auth/userFacingError';
+import { clearRecentFilters } from './filters/recentFilters';
 
-export { TOKEN_KEY } from './authConstants';
+export { TOKEN_KEY } from './auth/authConstants';
 
 function readStoredToken() {
   const fromLocal = localStorage.getItem(TOKEN_KEY);
@@ -93,7 +93,9 @@ function handleApiError(err) {
       clearAuthStorage();
     } else {
       const code = String(data.code || '');
-      // Only force logout on explicit session invalidation — not every opaque 401.
+      // Only force logout on explicit session invalidation codes from auth middleware.
+      // Do not match free-text (e.g. "token" in unrelated errors) — that caused false logouts
+      // when report APIs hung and auth lookups failed under DB pressure.
       if (
         code === 'SESSION_REPLACED'
         || code === 'SESSION_INVALID'
@@ -102,9 +104,8 @@ function handleApiError(err) {
         || code === 'NOT_AUTHENTICATED'
         || code === 'NO_TOKEN'
         || code === 'USER_INACTIVE'
-        || /session|token|expired|unauthorized|not authenticated/i.test(String(data.error || data.message || ''))
       ) {
-        dispatchAuthFailure(code || data.code);
+        dispatchAuthFailure(code);
       }
     }
   }
@@ -146,10 +147,15 @@ function buildFilterQuery(filters = {}) {
 
 /** GET when small; POST body when filter list would exceed URL limits (proxy/nginx). */
 const MAX_REPORT_GET_QUERY_LEN = 1800;
+/** Dashboard must fail fast — empty filters must not wait on live GAM (up to 5 min). */
+const DASHBOARD_REQUEST_TIMEOUT_MS = 60000;
 
-function reportRequest(path, filters = {}) {
+function reportRequest(path, filters = {}, axiosConfig = {}) {
   const qs = buildFilterQuery(filters);
-  const noCache = { headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' } };
+  const noCache = {
+    headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
+    ...axiosConfig,
+  };
   if (qs.length <= MAX_REPORT_GET_QUERY_LEN) {
     return API.get(`${path}?${qs}`, noCache);
   }
@@ -173,14 +179,20 @@ export const reportsAPI = {
   getDetailed: (filters = {}) =>
     reportRequest('/reports/detailed', filters),
 
-  getDashboard: (filters = {}) =>
-    reportRequest('/reports/dashboard', filters),
+  getDashboard: (filters = {}, axiosConfig = {}) =>
+    reportRequest('/reports/dashboard', filters, {
+      timeout: DASHBOARD_REQUEST_TIMEOUT_MS,
+      ...axiosConfig,
+    }),
 
   getDomainUserReport: (filters = {}) =>
     reportRequest('/reports/domain-user', filters),
 
-  getDashboardOverview: (filters = {}) =>
-    reportRequest('/reports/dashboard/overview', filters),
+  getDashboardOverview: (filters = {}, axiosConfig = {}) =>
+    reportRequest('/reports/dashboard/overview', filters, {
+      timeout: DASHBOARD_REQUEST_TIMEOUT_MS,
+      ...axiosConfig,
+    }),
 
   getCountries: () => FAST_API.get('/reports/countries'),
 
@@ -245,8 +257,13 @@ export const adsAPI = {
   deleteAccount: (id) => FAST_API.delete(`/ads/accounts/${id}`),
   refreshChildren: (id) => FAST_API.post(`/ads/accounts/${id}/refresh-children`),
   listCampaigns: (id) => FAST_API.get(`/ads/accounts/${id}/campaigns`),
+  listRoiCampaigns: (params) => FAST_API.get('/ads/roi-campaigns', { params }),
+  listRoiAccounts: (params) => FAST_API.get('/ads/roi-accounts', { params }),
+  listRoiRelatedTargets: (params) => FAST_API.get('/ads/roi-related-targets', { params }),
+  listRoiCountries: (params) => FAST_API.get('/ads/roi-countries', { params }),
   listCampaignMaps: () => FAST_API.get('/ads/campaign-maps'),
   saveCampaignMap: (payload) => FAST_API.put('/ads/campaign-maps', payload),
+  saveCampaignMapsBulk: (payload) => FAST_API.put('/ads/campaign-maps/bulk', payload),
   deleteCampaignMap: (id) => FAST_API.delete(`/ads/campaign-maps/${id}`),
   syncAll: (payload) => FAST_API.post('/ads/sync', payload || {}),
   syncAccount: (id, payload) => FAST_API.post(`/ads/accounts/${id}/sync`, payload || {}),

@@ -8,7 +8,7 @@ const readline = require('readline');
 const logger = require('../utils/logger');
 const { GAM_API_VERSION: API_VER } = require('../utils/gamVersion');
 const { getClient, getClientId } = require('../utils/clientContext');
-const { cache } = require('../gamClient');
+const { cache } = require('./client');
 
 // Cache OAuth access token for 55 min (tokens expire after 60 min).
 const _tokenCache = new Map();
@@ -26,7 +26,7 @@ async function getToken() {
     return hit.token;
   }
   const t0 = Date.now();
-  const { getGAMClient } = require('../gamClient');
+  const { getGAMClient } = require('./client');
   const auth = await getGAMClient();
   const t = await auth.getAccessToken();
   _tokenCache.set(cacheId, { token: t.token, expiry: now + 55 * 60 * 1000 });

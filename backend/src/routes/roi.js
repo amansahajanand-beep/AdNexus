@@ -18,8 +18,38 @@ router.get('/summary', async (req, res) => {
       ? req.query.targetType
       : 'all';
 
-    const data = await getRoiSummary(clientId, { start, end, targetType });
-    res.json({ start, end, targetType, ...data });
+    const parseCsv = (v) => String(v || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const accountIds = parseCsv(req.query.accountIds);
+    const campaignIds = parseCsv(req.query.campaignIds);
+    const appKeys = parseCsv(req.query.appKeys);
+    const siteKeys = parseCsv(req.query.siteKeys);
+    const countryCodes = parseCsv(req.query.countryCodes);
+
+    const data = await getRoiSummary(clientId, {
+      start,
+      end,
+      targetType,
+      accountIds: accountIds.length ? accountIds : null,
+      campaignIds: campaignIds.length ? campaignIds : null,
+      appKeys: appKeys.length ? appKeys : null,
+      siteKeys: siteKeys.length ? siteKeys : null,
+      countryCodes: countryCodes.length ? countryCodes : null,
+    });
+    res.json({
+      start,
+      end,
+      targetType,
+      accountIds: accountIds.length ? accountIds : null,
+      campaignIds: campaignIds.length ? campaignIds : null,
+      appKeys: appKeys.length ? appKeys : null,
+      siteKeys: siteKeys.length ? siteKeys : null,
+      countryCodes: countryCodes.length ? countryCodes : null,
+      ...data,
+    });
   } catch (err) {
     logger.error('ROI summary:', err.message);
     res.status(500).json({ error: err.message });

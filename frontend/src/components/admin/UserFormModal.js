@@ -4,6 +4,7 @@ import Button from '../ui/Button';
 import { TextField, SelectField } from '../ui/Field';
 import PermissionsPanel from './PermissionsPanel';
 import { validatePassword, PASSWORD_RULES_HINT } from '../../utils/passwordPolicy';
+import { validateUsername, USERNAME_RULES_HINT } from '../../utils/namePolicy';
 import { readDateRestrictionFromUser, dateRestrictionPayload } from '../../utils/adminDateRestriction';
 import { PERMISSION_SECTIONS } from '../../utils/permissions';
 
@@ -11,6 +12,14 @@ const ROLE_OPTIONS = [
   { value: 'admin', label: 'Admin' },
   { value: 'child', label: 'Domain User' },
 ];
+
+function isAdminRole(user) {
+  if (!user) return false;
+  const role = String(user.role || '').toLowerCase();
+  if (role === 'admin') return true;
+  if (role === 'child') return false;
+  return user.permissions == null;
+}
 
 const ALL_FLAG_KEYS = [
   ...PERMISSION_SECTIONS.pages,
@@ -38,6 +47,7 @@ export default function UserFormModal({
   domains = [], domainsLoading, catalogLoading = false, catalogRows = [], catalogLists = {},
 }) {
   const isEdit = !!user;
+  const editingAdmin = isEdit && isAdminRole(user);
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -61,7 +71,7 @@ export default function UserFormModal({
     setConfirmPassword('');
     setLocalError(null);
     setSuccessMsg(null);
-    setRole(user?.role || 'child');
+    setRole(isAdminRole(user) ? 'admin' : (user?.role || 'child'));
     setFlags(flagsFromUser(user));
     setAllowedDomains(user?.permissions?.allowedDomains || []);
     setAllowedSites(user?.permissions?.allowedSites || []);
@@ -89,8 +99,9 @@ export default function UserFormModal({
   const submit = () => {
     setLocalError(null);
     const name = username.trim();
-    if (!name) {
-      setLocalError('Username is required.');
+    const nameCheck = validateUsername(name);
+    if (!nameCheck.valid) {
+      setLocalError(nameCheck.errors[0]);
       scrollToError();
       return;
     }
@@ -113,14 +124,16 @@ export default function UserFormModal({
       }
     }
 
+    const effectiveRole = editingAdmin ? 'admin' : role;
+
     const payload = {
       username: name,
       email: email.trim() || `${name}@local`,
       password: password || undefined,
-      role,
+      role: effectiveRole,
     };
 
-    if (role !== 'admin') {
+    if (effectiveRole !== 'admin') {
       if (dateRestrictionStart && dateRestrictionEnd && dateRestrictionStart > dateRestrictionEnd) {
         setLocalError('Allowed date range: start date must be on or before end date.');
         scrollToError();
@@ -159,6 +172,7 @@ export default function UserFormModal({
       {displayError && <div ref={errorRef} className="login-error">{displayError}</div>}
 
       <TextField label="Username" value={username} onChange={setUsername} placeholder="Enter username" autoFocus />
+      <p className="form-note" style={{ marginTop: -8 }}>{USERNAME_RULES_HINT}</p>
       <TextField label="Email" type="email" value={email} onChange={setEmail} placeholder="user@example.com" />
       <TextField
         label="Password"
@@ -177,7 +191,14 @@ export default function UserFormModal({
         autoComplete="new-password"
       />
       <p className="form-note" style={{ marginTop: -8 }}>{PASSWORD_RULES_HINT}</p>
-      <SelectField label="Role" value={role} onChange={setRole} options={ROLE_OPTIONS} />
+      {editingAdmin ? (
+        <>
+          <TextField label="Role" value="Admin" readOnly />
+          <div className="form-note">Admin role cannot be changed to Domain User.</div>
+        </>
+      ) : (
+        <SelectField label="Role" value={role} onChange={setRole} options={ROLE_OPTIONS} />
+      )}
 
       {role === 'admin' ? (
         <div className="form-note">Admin users have full access to all pages, reports, and user management.</div>

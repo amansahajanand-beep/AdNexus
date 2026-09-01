@@ -535,6 +535,7 @@ function canAccessPage(user, page) {
     'domain-user': 'canAccessDomainUser',
     admin: null,
   };
+  if (page === 'domain-user' && isAdmin(user)) return false;
   if (isAdmin(user)) return true;
   const key = map[page];
   if (!key) return false;
@@ -544,7 +545,7 @@ function canAccessPage(user, page) {
 function buildVisibility(user) {
   if (isAdmin(user)) {
     return {
-      pages: { dashboard: true, reporting: true, roi: true, domainUser: true },
+      pages: { dashboard: true, reporting: true, roi: true, domainUser: false },
       revenue: true, impressions: true, ctr: true, ecpm: true, programmatic: true,
       generate: true, download: true, filters: true, reportBuilder: true,
       orders: true, inventory: true,

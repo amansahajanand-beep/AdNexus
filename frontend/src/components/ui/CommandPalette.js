@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../../store/useAuth';
 import { usePermissions } from '../../hooks/usePermissions';
 import { getSavedFilters, SAVED_FILTERS_PAGES } from '../../utils/savedFilters';
+import { getReportPresets, PRESET_PAGES, hrefForPreset } from '../../utils/reportPresets';
 import { encodeReportShare } from '../../utils/reportShare';
 
 export default function CommandPalette() {
@@ -50,23 +51,52 @@ export default function CommandPalette() {
     if (canPage('roi')) {
       list.push({ id: 'roi', label: 'ROI', hint: 'Spend vs earn', to: '/roi' });
     }
+    if (canPage('presets')) {
+      list.push({ id: 'presets', label: 'Presets', hint: 'Saved presets', to: '/presets' });
+    }
     if (canPage('dashboard')) {
-      getSavedFilters(SAVED_FILTERS_PAGES.dashboard, user?.id).slice(0, 6).forEach((f) => {
+      getReportPresets(PRESET_PAGES.dashboard, user?.id).slice(0, 4).forEach((f) => {
+        list.push({
+          id: `rp-d-${f.id}`,
+          label: f.name,
+          hint: 'Preset · Dashboard',
+          to: hrefForPreset(PRESET_PAGES.dashboard, f.snapshot),
+        });
+      });
+      getSavedFilters(SAVED_FILTERS_PAGES.dashboard, user?.id).slice(0, 3).forEach((f) => {
         list.push({
           id: `sd-${f.id}`,
           label: f.name,
-          hint: 'Saved · Dashboard',
+          hint: 'Saved filter · Dashboard',
           to: `/dashboard?view=${encodeURIComponent(f.id)}`,
         });
       });
     }
     if (canPage('reporting')) {
-      getSavedFilters(SAVED_FILTERS_PAGES.reporting, user?.id).slice(0, 6).forEach((f) => {
+      getReportPresets(PRESET_PAGES.reporting, user?.id).slice(0, 4).forEach((f) => {
+        list.push({
+          id: `rp-r-${f.id}`,
+          label: f.name,
+          hint: 'Preset · Reporting',
+          to: hrefForPreset(PRESET_PAGES.reporting, f.snapshot),
+        });
+      });
+      getSavedFilters(SAVED_FILTERS_PAGES.reporting, user?.id).slice(0, 3).forEach((f) => {
         list.push({
           id: `sr-${f.id}`,
           label: f.name,
-          hint: 'Saved · Reporting',
+          hint: 'Saved filter · Reporting',
           to: `/reporting?view=${encodeURIComponent(f.id)}`,
+        });
+      });
+    }
+    if (canPage('roi')) {
+      getReportPresets(PRESET_PAGES.roi, user?.id).slice(0, 4).forEach((f) => {
+        list.push({
+          id: `rp-roi-${f.id}`,
+          label: f.name,
+          hint: 'Preset · ROI',
+          to: hrefForPreset(PRESET_PAGES.roi, f.snapshot),
         });
       });
     }

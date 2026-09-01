@@ -1,74 +1,86 @@
-import React from 'react';
-import Modal from './Modal';
-import Button from './Button';
+import React, { useEffect } from 'react';
 
 /**
- * Centered confirm/alert dialog replacing window.confirm and window.alert.
- *
- * Props:
- *   open        – boolean
- *   title       – heading text
- *   message     – body text
- *   type        – 'confirm' (default) | 'alert' | 'danger'
- *   confirmLabel – button label (default: 'Confirm')
- *   cancelLabel  – button label (default: 'Cancel')
- *   onConfirm   – called when user clicks confirm
- *   onCancel    – called when user clicks cancel / closes (not shown for type='alert')
- *   icon        – optional emoji/icon string
+ * Yes / No confirm dialog — green check + red cross.
+ * Use via confirmDialog() from hooks/useConfirmDialog, or render directly.
  */
 export default function ConfirmDialog({
   open,
-  title,
+  title = 'Are you sure?',
   message,
-  type = 'confirm',
-  confirmLabel,
-  cancelLabel = 'Cancel',
-  onConfirm,
-  onCancel,
-  icon,
+  yesLabel = 'Yes',
+  noLabel = 'No',
+  onYes,
+  onNo,
 }) {
-  const isAlert = type === 'alert';
-  const isDanger = type === 'danger';
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => {
+      if (e.key === 'Escape') onNo?.();
+      if (e.key === 'Enter') onYes?.();
+    };
+    document.addEventListener('keydown', onKey);
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      document.body.style.overflow = '';
+    };
+  }, [open, onYes, onNo]);
 
-  const defaultIcon = isDanger ? '🗑' : isAlert ? 'ℹ️' : '❓';
-  const displayIcon = icon || defaultIcon;
-  const displayConfirmLabel = confirmLabel || (isDanger ? 'Delete' : isAlert ? 'OK' : 'Confirm');
-
-  const footer = (
-    <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
-      {!isAlert && (
-        <Button variant="secondary" onClick={onCancel}>{cancelLabel}</Button>
-      )}
-      <Button
-        variant={isDanger ? 'danger' : 'primary'}
-        onClick={onConfirm}
-      >
-        {displayConfirmLabel}
-      </Button>
-    </div>
-  );
+  if (!open) return null;
 
   return (
-    <Modal
-      open={open}
-      title={null}
-      onClose={isAlert ? onConfirm : onCancel}
-      footer={footer}
-      width={400}
+    <div
+      className="confirm-dialog-overlay"
+      onMouseDown={onNo}
+      role="presentation"
     >
-      <div style={{ textAlign: 'center', padding: '8px 0 4px' }}>
-        <div style={{ fontSize: 44, marginBottom: 14, lineHeight: 1 }}>{displayIcon}</div>
-        {title && (
-          <div style={{ fontWeight: 700, fontSize: 17, color: isDanger ? '#c62828' : '#202124', marginBottom: 10 }}>
+      <div
+        className="confirm-dialog"
+        onMouseDown={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-dialog-title"
+      >
+        <button
+          type="button"
+          className="confirm-dialog-close"
+          onClick={onNo}
+          aria-label="Close"
+        >
+          ×
+        </button>
+        <div className="confirm-dialog-icon" aria-hidden>
+          ?
+        </div>
+        {title ? (
+          <div className="confirm-dialog-title" id="confirm-dialog-title">
             {title}
           </div>
-        )}
-        {message && (
-          <div style={{ color: '#3c4043', fontSize: 14, lineHeight: 1.6 }}>
-            {message}
-          </div>
-        )}
+        ) : null}
+        {message ? (
+          <div className="confirm-dialog-message">{message}</div>
+        ) : null}
+        <div className="confirm-dialog-actions">
+          <button
+            type="button"
+            className="confirm-dialog-btn confirm-dialog-btn--no"
+            onClick={onNo}
+          >
+            <span className="confirm-dialog-btn-icon" aria-hidden>✕</span>
+            {noLabel}
+          </button>
+          <button
+            type="button"
+            className="confirm-dialog-btn confirm-dialog-btn--yes"
+            onClick={onYes}
+            autoFocus
+          >
+            <span className="confirm-dialog-btn-icon" aria-hidden>✓</span>
+            {yesLabel}
+          </button>
+        </div>
       </div>
-    </Modal>
+    </div>
   );
 }

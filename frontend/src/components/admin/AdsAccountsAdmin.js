@@ -4,6 +4,7 @@ import { TextField } from '../ui/Field';
 import Button from '../ui/Button';
 import TableSearchBar from '../ui/TableSearchBar';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
+import { confirmDialog } from '../../hooks/useConfirmDialog';
 
 const PAGE_SIZE = 10;
 
@@ -192,6 +193,26 @@ export default function AdsAccountsAdmin() {
     }
   };
 
+  const setChildrenIncludeInRoi = async (childAccounts, includeInRoi) => {
+    if (!childAccounts?.length) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const toUpdate = childAccounts.filter((c) => !!c.includeInRoi !== includeInRoi);
+      await Promise.all(toUpdate.map((c) => adsAPI.updateAccount(c.id, { includeInRoi })));
+      setOkMsg(
+        includeInRoi
+          ? `Included ${childAccounts.length} child account(s) in ROI.`
+          : `Excluded ${childAccounts.length} child account(s) from ROI.`
+      );
+      await load();
+    } catch (err) {
+      setError(getUserFacingMessage(err, 'Could not update Include in ROI.'));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const connectAccount = async (id) => {
     setBusy(true);
     try {
@@ -204,7 +225,11 @@ export default function AdsAccountsAdmin() {
   };
 
   const removeAccount = async (id) => {
-    if (!window.confirm('Remove this Google Ads account link?')) return;
+    const ok = await confirmDialog({
+      title: 'Remove account?',
+      message: 'Remove this Google Ads account link?',
+    });
+    if (!ok) return;
     try {
       await adsAPI.deleteAccount(id);
       await load();
@@ -218,7 +243,15 @@ export default function AdsAccountsAdmin() {
     setError(null);
     try {
       const result = await adsAPI.syncAll();
-      setOkMsg(`Synced ${result.total || 0} spend row(s) across ${result.accounts || 0} account(s).`);
+      const syncErrors = Array.isArray(result?.errors) ? result.errors : [];
+      if (syncErrors.length) {
+        setError(syncErrors.map((e) => e.error || e.message).filter(Boolean).join(' · ') || 'Ads sync failed for one or more accounts.');
+      }
+      if (result?.queued) {
+        setOkMsg(result.message || `Spend sync queued for ${result.accounts || 0} account(s). This can take several minutes.`);
+      } else {
+        setOkMsg(`Synced ${result.total || 0} spend row(s) across ${result.accounts || 0} account(s).`);
+      }
       await load();
     } catch (err) {
       setError(getUserFacingMessage(err, 'Ads sync failed.'));
@@ -414,38 +447,85 @@ export default function AdsAccountsAdmin() {
                 </div>
               </div>
               {children.length > 0 && (
-                <div className="table-wrap ads-nested-table">
-                  <table className="data-table report-table report-table--compact">
-                    <thead>
-                      <tr>
-                        <th>Child account</th>
-                        <th>Customer ID</th>
-                        <th>In ROI</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {children.map((child) => (
-                        <tr key={child.id}>
-                          <td data-label="Child">{child.descriptiveName || formatCustomerId(child.customerId)}</td>
-                          <td className="td-mono" data-label="Customer ID">{formatCustomerId(child.customerId)}</td>
-                          <td data-label="In ROI">
-                            <label className="ads-check">
+                <>
+                  <div className="ads-children-toolbar">
+                    <span className="muted">
+                      {children.filter((c) => c.includeInRoi).length} of {children.length} in ROI
+                    </span>
+                    <div className="row-actions">
+                      <button
+                        type="button"
+                        className="link-action"
+                        disabled={busy || children.every((c) => c.includeInRoi)}
+                        onClick={() => setChildrenIncludeInRoi(children, true)}
+                      >
+                        Select all
+                      </button>
+                      <button
+                        type="button"
+                        className="link-action"
+                        disabled={busy || children.every((c) => !c.includeInRoi)}
+                        onClick={() => setChildrenIncludeInRoi(children, false)}
+                      >
+                        Clear all
+                      </button>
+                    </div>
+                  </div>
+                  <div className="table-wrap ads-nested-table">
+                    <table className="data-table report-table report-table--compact">
+                      <thead>
+                        <tr>
+                          <th>Child account</th>
+                          <th>Customer ID</th>
+                          <th>
+                            <label className="ads-check ads-check-header">
                               <input
                                 type="checkbox"
-                                checked={!!child.includeInRoi}
-                                onChange={(e) => patchAccount(child.id, { includeInRoi: e.target.checked })}
+                                checked={children.length > 0 && children.every((c) => c.includeInRoi)}
+                                ref={(el) => {
+                                  if (el) {
+                                    const n = children.filter((c) => c.includeInRoi).length;
+                                    el.indeterminate = n > 0 && n < children.length;
+                                  }
+                                }}
+                                disabled={busy}
+                                onChange={(e) => setChildrenIncludeInRoi(children, e.target.checked)}
+                                title="Select all for ROI"
                               />
-                              <span>{child.includeInRoi ? 'Yes' : 'No'}</span>
+                              <span>In ROI</span>
                             </label>
-                          </td>
+                          </th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                      </thead>
+                      <tbody>
+                        {children.map((child) => (
+                          <tr key={child.id}>
+                            <td data-label="Child">{child.descriptiveName || formatCustomerId(child.customerId)}</td>
+                            <td className="td-mono" data-label="Customer ID">{formatCustomerId(child.customerId)}</td>
+                            <td data-label="In ROI">
+                              <label className="ads-check">
+                                <input
+                                  type="checkbox"
+                                  checked={!!child.includeInRoi}
+                                  disabled={busy}
+                                  onChange={(e) => patchAccount(child.id, { includeInRoi: e.target.checked })}
+                                />
+                                <span>{child.includeInRoi ? 'Yes' : 'No'}</span>
+                              </label>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
               )}
               {!children.length && (
-                <p className="muted ads-mcc-hint">No children yet — click Refresh children after connecting.</p>
+                <p className="muted ads-mcc-hint">
+                  {mcc.hasRefreshToken
+                    ? 'No children yet — click Refresh children. If it fails, your developer token may still be Test-only (need Basic/Standard access).'
+                    : 'No children yet — Connect with Google first, then Refresh children.'}
+                </p>
               )}
             </div>
           );

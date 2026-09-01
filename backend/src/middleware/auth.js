@@ -62,7 +62,11 @@ async function requireAuth(req, res, next) {
   try {
     user = await Promise.resolve(getUserById(decoded.id));
   } catch (e) {
-    return sendAuthError(res, 401, 'User lookup failed', AUTH_CODES.USER_INACTIVE);
+    // Transient DB/pool errors must not clear the client session (false logout).
+    return res.status(503).json({
+      error: 'Temporarily unable to verify session. Please try again.',
+      code: 'AUTH_LOOKUP_UNAVAILABLE',
+    });
   }
 
   if (!user || !user.isActive) {
@@ -85,7 +89,10 @@ async function requireAuth(req, res, next) {
   try {
     client = await resolveClientForUser(user);
   } catch (e) {
-    return sendAuthError(res, 401, 'Client lookup failed', AUTH_CODES.USER_INACTIVE);
+    return res.status(503).json({
+      error: 'Temporarily unable to resolve account. Please try again.',
+      code: 'AUTH_LOOKUP_UNAVAILABLE',
+    });
   }
   if (!client) {
     return sendAuthError(res, 403, 'No GAM client is linked to this account', AUTH_CODES.USER_INACTIVE);

@@ -306,7 +306,7 @@ async function startServer() {
     // Pre-warm durable caches (filter-catalog from Postgres survives restart without Redis).
     setImmediate(async () => {
       try {
-        const { cache } = require('./gamClient');
+        const { cache } = require('./gam/client');
         const { kvGet } = require('./utils/kvCache');
         const { CATALOG_CACHE_KEY } = require('./utils/inventoryCatalog');
         const hit = await kvGet(CATALOG_CACHE_KEY);
@@ -325,7 +325,7 @@ async function startServer() {
     // real user request is served from cache instead of waiting for GAM.
     setImmediate(async () => {
         try {
-          const { cache } = require('./gamClient');
+          const { cache } = require('./gam/client');
           // Check if cache already has today's data (e.g. after a hot reload).
           const todayKey = cache.keys().find(k => k.startsWith('report_dashboard_full_') || k.startsWith('report_detailed_full_'));
           if (todayKey) {

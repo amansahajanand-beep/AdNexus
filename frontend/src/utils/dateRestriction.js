@@ -1,5 +1,5 @@
 import { presetRange, shiftYMD, todayInTZ } from './datetime';
-import { isAdmin } from './permissions';
+import { isAdmin } from './auth/permissions';
 
 const YMD_RE = /^\d{4}-\d{2}-\d{2}$/;
 

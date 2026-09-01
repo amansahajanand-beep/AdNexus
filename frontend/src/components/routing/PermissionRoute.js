@@ -5,7 +5,7 @@ import AccessRestricted from '../ui/AccessRestricted';
 
 /**
  * Page-level permission guard for domain users.
- * Admins always pass. Missing page access shows AccessRestricted or redirects home.
+ * Admins pass all pages except Domain User. Missing page access shows AccessRestricted or redirects home.
  */
 export default function PermissionRoute({ page, children }) {
   const { canPage, homeRoute, hasAnyPage } = usePermissions();

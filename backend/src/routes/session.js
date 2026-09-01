@@ -12,6 +12,7 @@ const { resolveClientForUser } = require('../models/clientStore');
 const { generateTokens, requireAuth } = require('../middleware/auth');
 const { rotateUserSession, clearUserSession, stripSessionFields } = require('../utils/sessionManager');
 const { validatePassword } = require('../utils/passwordPolicy');
+const { validateUsername } = require('../utils/namePolicy');
 const logger = require('../utils/logger');
 
 router.post('/login', async (req, res) => {
@@ -81,8 +82,9 @@ async function handleUpdateProfile(req, res) {
 
   if (username != null && String(username).trim() !== existing.username) {
     const trimmed = String(username).trim();
-    if (!trimmed) {
-      return res.status(400).json({ error: 'Username is required.' });
+    const nameCheck = validateUsername(trimmed);
+    if (!nameCheck.valid) {
+      return res.status(400).json({ error: nameCheck.errors[0] });
     }
     const taken = await Promise.resolve(getUserByUsername(trimmed));
     if (taken && taken.id !== existing.id) {

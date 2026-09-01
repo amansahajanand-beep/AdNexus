@@ -9,7 +9,7 @@
  */
 const express = require('express');
 const router = express.Router();
-const { cache } = require('../gamClient');
+const { cache } = require('../gam/client');
 const { requireAuth } = require('../middleware/auth');
 const logger = require('../utils/logger');
 const { findCachedInventoryRows, rowsToDomainOptions, isLegacyAdUnitCatalog } = require('../utils/inventoryCatalog');

@@ -4,11 +4,12 @@ import SuccessModal from './components/ui/SuccessModal';
 import Layout from './components/layout/Layout';
 import Login from './pages/Login';
 import Onboard from './pages/Onboard';
-import Dashboard from './components/Dashboard';
-import Reporting from './components/Reporting';
-import Roi from './components/Roi';
-import Admin from './components/Admin';
-import DomainUser from './components/DomainUser';
+import Dashboard from './pages/Dashboard';
+import Reporting from './pages/Reporting';
+import Roi from './pages/Roi';
+import Presets from './pages/Presets';
+import Admin from './pages/Admin';
+import DomainUser from './pages/DomainUser';
 import ProtectedRoute from './components/routing/ProtectedRoute';
 import AdminRoute from './components/routing/AdminRoute';
 import PermissionRoute from './components/routing/PermissionRoute';
@@ -109,6 +110,7 @@ function AppRoutes() {
         <Route path="/dashboard" element={<PermissionRoute page="dashboard"><Dashboard /></PermissionRoute>} />
         <Route path="/reporting" element={<PermissionRoute page="reporting"><Reporting /></PermissionRoute>} />
         <Route path="/roi" element={<PermissionRoute page="roi"><Roi /></PermissionRoute>} />
+        <Route path="/presets" element={<PermissionRoute page="presets"><Presets /></PermissionRoute>} />
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
       </Route>
