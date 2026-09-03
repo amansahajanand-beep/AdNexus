@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useLocation } from 'react-router-dom';
-import { usersAPI, domainsAPI, reportsAPI } from '../utils/api';
+import { usersAPI, domainsAPI, reportsAPI, adsAPI } from '../utils/api';
 import { useAuth } from '../store/useAuth';
 import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions, normalizeDomainPickerOptions } from '../utils/domainCatalog';
 import { isLikelyAppPackage } from '../utils/appPackage';
@@ -16,6 +16,20 @@ const TABS = [
   { id: 'client', label: 'GAM credentials' },
   { id: 'ads', label: 'Google Ads accounts' },
 ];
+
+function buildAdsAccountPickerOptions(accounts = []) {
+  return (accounts || [])
+    .filter((a) => a && a.accountType === 'client' && a.isActive !== false)
+    .map((a) => {
+      const name = a.descriptiveName || a.customerId || a.id;
+      const cid = a.customerId ? String(a.customerId) : '';
+      return {
+        id: String(a.id),
+        label: cid && name !== cid ? `${name} (${cid})` : String(name),
+      };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
 
 export default function Admin() {
   const { user } = useAuth();
@@ -41,6 +55,8 @@ export default function Admin() {
   const [catalogLists, setCatalogLists] = useState({ siteHosts: [], appIds: [], sitesByDomain: {}, adUnitsByHost: {} });
   const [domainsLoading, setDomainsLoading] = useState(true);
   const [catalogLoading, setCatalogLoading] = useState(true);
+  const [adsAccountOptions, setAdsAccountOptions] = useState([]);
+  const [adsAccountsLoading, setAdsAccountsLoading] = useState(true);
 
   const [permSaving, setPermSaving] = useState(false);
   const [permError, setPermError] = useState(null);
@@ -55,6 +71,19 @@ export default function Admin() {
       setUsersError(getUserFacingMessage(err, 'Could not load users. Please refresh the page.'));
     } finally {
       setUsersLoading(false);
+    }
+  }, []);
+
+  const loadAdsAccounts = useCallback(async () => {
+    setAdsAccountsLoading(true);
+    try {
+      const list = await adsAPI.listAccounts();
+      setAdsAccountOptions(buildAdsAccountPickerOptions(Array.isArray(list) ? list : list?.accounts || []));
+    } catch (err) {
+      logErrorForDebug(err, 'Admin ads accounts picker');
+      setAdsAccountOptions([]);
+    } finally {
+      setAdsAccountsLoading(false);
     }
   }, []);
 
@@ -113,7 +142,11 @@ export default function Admin() {
       setDomainsLoading(false);
     }
   }, []);
-  useEffect(() => { loadUsers(); loadDomains(); }, [loadUsers, loadDomains]);
+  useEffect(() => { loadUsers(); loadDomains(); loadAdsAccounts(); }, [loadUsers, loadDomains, loadAdsAccounts]);
+
+  useEffect(() => {
+    if (tab === 'user' || tab === 'domains') loadAdsAccounts();
+  }, [tab, loadAdsAccounts]);
 
   // ─── Action handlers ──────────────────────────────────────────────────────
   const onCreate = async (payload) => {
@@ -183,6 +216,8 @@ export default function Admin() {
           catalogLoading={catalogLoading}
           catalogRows={catalogRows}
           catalogLists={catalogLists}
+          adsAccountOptions={adsAccountOptions}
+          adsAccountsLoading={adsAccountsLoading}
           onCreate={onCreate}
           onUpdate={onUpdate}
           onSavePermissions={onSavePermissions}
@@ -205,6 +240,8 @@ export default function Admin() {
           catalogLoading={catalogLoading}
           catalogRows={catalogRows}
           catalogLists={catalogLists}
+          adsAccountOptions={adsAccountOptions}
+          adsAccountsLoading={adsAccountsLoading}
           onSave={onSaveDomainTab}
           saving={permSaving}
           error={permError}

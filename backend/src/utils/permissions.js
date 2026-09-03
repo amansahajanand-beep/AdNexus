@@ -497,10 +497,58 @@ const FLAG_KEYS = [
   'canSeeOrders', 'canSeeInventory',
 ];
 
-const INVENTORY_SCOPE_KEYS = ['allowedDomains', 'allowedSites', 'allowedAppIds'];
+const INVENTORY_SCOPE_KEYS = [
+  'allowedDomains',
+  'allowedSites',
+  'allowedAppIds',
+  'allowedAdsAccountIds',
+];
+
+/** Never-matching UUID — forces Ads SQL filters to return no rows when scope is empty. */
+const NO_ADS_ACCOUNT_SCOPE_ID = '00000000-0000-0000-0000-000000000000';
 
 function isAdmin(user) {
   return user?.role === 'admin';
+}
+
+/**
+ * Ads account IDs a domain user may access.
+ * - admin → null (unrestricted)
+ * - child without the field (legacy) → null (unrestricted until admin assigns)
+ * - child with assignments → string[] of ads_accounts.id
+ * - child with explicit empty list → [] (no Ads access)
+ */
+function getAllowedAdsAccountIds(user) {
+  if (isAdmin(user)) return null;
+  const perms = user?.permissions || {};
+  if (!Object.prototype.hasOwnProperty.call(perms, 'allowedAdsAccountIds')) {
+    return null;
+  }
+  const raw = perms.allowedAdsAccountIds;
+  if (!Array.isArray(raw)) return [];
+  return raw.map((id) => String(id || '').trim()).filter(Boolean);
+}
+
+/**
+ * Intersect request accountIds with the user's Ads scope.
+ * Returns null = no account filter; [] or ids = must filter (empty → deny-all via sentinel).
+ */
+function resolveAdsAccountIdsForUser(user, requestedIds = []) {
+  const allowed = getAllowedAdsAccountIds(user);
+  const requested = (Array.isArray(requestedIds) ? requestedIds : [])
+    .map((id) => String(id || '').trim())
+    .filter(Boolean);
+
+  if (allowed === null) {
+    return requested.length ? requested : null;
+  }
+  if (!allowed.length) {
+    return [NO_ADS_ACCOUNT_SCOPE_ID];
+  }
+  if (!requested.length) return allowed;
+  const set = new Set(allowed);
+  const hit = requested.filter((id) => set.has(id));
+  return hit.length ? hit : [NO_ADS_ACCOUNT_SCOPE_ID];
 }
 
 function normalizePermissions(role, input = {}) {
@@ -513,6 +561,11 @@ function normalizePermissions(role, input = {}) {
   if (Array.isArray(input.allowedDomains)) base.allowedDomains = input.allowedDomains;
   if (Array.isArray(input.allowedSites)) base.allowedSites = input.allowedSites;
   if (Array.isArray(input.allowedAppIds)) base.allowedAppIds = input.allowedAppIds;
+  if (Array.isArray(input.allowedAdsAccountIds)) {
+    base.allowedAdsAccountIds = input.allowedAdsAccountIds
+      .map((id) => String(id || '').trim())
+      .filter(Boolean);
+  }
   if (Array.isArray(input.allowedAdUnits)) base.allowedAdUnits = [];
   if (input.dateRestriction != null) {
     base.dateRestriction = resolveDateRestriction(input.dateRestriction)
@@ -586,12 +639,15 @@ module.exports = {
   DEFAULT_CHILD_PERMISSIONS,
   FLAG_KEYS,
   INVENTORY_SCOPE_KEYS,
+  NO_ADS_ACCOUNT_SCOPE_ID,
   normalizePermissions,
   hasFlag,
   canAccessPage,
   buildVisibility,
   getDefaultHomePage,
   isAdmin,
+  getAllowedAdsAccountIds,
+  resolveAdsAccountIdsForUser,
   scopeRowsToUser,
   applyScopedOverviewSiteTightening,
   scopeCatalogOptionsForUser,

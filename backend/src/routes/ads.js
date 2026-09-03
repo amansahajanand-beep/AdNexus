@@ -18,9 +18,38 @@ const {
   deleteOtherExpense,
 } = require('../models/adsAccountStore');
 const { listCampaigns, isAdsOAuthConfigured, resolveOAuthApp, adsRedirectUri } = require('../ads/client');
-const { resolveRefreshForAccount, syncAllAccountsForClient, syncAccountSpend } = require('../services/adsSyncService');
+const { resolveRefreshForAccount, syncAllAccountsForClient, syncAccountSpend, enqueueAdsSyncAccounts } = require('../services/adsSyncService');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
+const { resolveAdsAccountIdsForUser, getAllowedAdsAccountIds } = require('../utils/permissions');
 const logger = require('../utils/logger');
+const { cache } = require('../gam/client');
+
+function parseAccountIdsQuery(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Apply domain-user Ads account scope; always returns an array usable with ANY(uuid[]). */
+function scopedAccountIds(req, requested = []) {
+  const resolved = resolveAdsAccountIdsForUser(req.user, requested);
+  return resolved && resolved.length ? resolved : null;
+}
+
+const ROI_FILTER_CACHE_TTL = Math.max(
+  15,
+  parseInt(process.env.ROI_FILTER_CACHE_TTL || '60', 10) || 60
+);
+
+function roiFilterCacheKey(route, clientId, payload) {
+  return `roi_filter_v1_${route}_${clientId}_${JSON.stringify(payload)}`;
+}
+
+function sendCachedJson(res, cacheKey, payload, ttl = ROI_FILTER_CACHE_TTL) {
+  cache.set(cacheKey, payload, ttl);
+  res.json(payload);
+}
 
 router.use(requireAuth);
 
@@ -415,10 +444,7 @@ router.get('/roi-campaigns', async (req, res) => {
     if (!clientId) return res.status(400).json({ error: 'No client context' });
     const end = req.query.end || todayInTZ();
     const start = req.query.start || end;
-    const accountIds = String(req.query.accountIds || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const accountIds = scopedAccountIds(req, parseAccountIdsQuery(req.query.accountIds)) || [];
 
     const { query } = require('../db');
     const { shiftYMD } = require('../utils/datetime');
@@ -463,37 +489,54 @@ router.get('/roi-campaigns', async (req, res) => {
       accountName: r.account_name || '',
       spend: Number(r.spend) || 0,
     }));
-    res.json({ start, end, campaigns, fallbackUsed });
+    const payload = { start, end, campaigns, fallbackUsed };
+    const cacheKey = roiFilterCacheKey('campaigns', clientId, { start, end, accountIds });
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+    return sendCachedJson(res, cacheKey, payload);
   } catch (err) {
     logger.error('ROI campaigns list:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-/** Ads client accounts for ROI filter — all active clients; spend in range for sorting (0 allowed). */
+/** Ads client accounts for ROI filter — only accounts with spend in the selected range. */
 router.get('/roi-accounts', async (req, res) => {
   try {
     const clientId = req.client?.id || req.user?.clientId;
     if (!clientId) return res.status(400).json({ error: 'No client context' });
     const end = req.query.end || todayInTZ();
     const start = req.query.start || end;
+    const allowed = getAllowedAdsAccountIds(req.user);
+    // Domain user with no Ads accounts assigned → empty list (same idea as empty inventory).
+    if (allowed !== null && allowed.length === 0) {
+      return res.json({ start, end, accounts: [] });
+    }
     const { query } = require('../db');
+    const params = [clientId, start, end];
+    let scopeClause = '';
+    if (allowed !== null) {
+      params.push(allowed);
+      scopeClause = ` AND a.id = ANY($${params.length}::uuid[])`;
+    }
     const { rows } = await query(
       `SELECT a.id, a.customer_id, a.descriptive_name,
               COALESCE(SUM(s.cost), 0)::float8 AS spend
        FROM ads_accounts a
-       LEFT JOIN ads_spend_daily s
+       INNER JOIN ads_spend_daily s
          ON s.ads_account_id = a.id
         AND s.client_id = a.client_id
         AND s.report_date BETWEEN $2::date AND $3::date
        WHERE a.client_id = $1
          AND a.account_type = 'client'
          AND a.is_active = true
+         ${scopeClause}
        GROUP BY a.id
+       HAVING COALESCE(SUM(s.cost), 0) > 0
        ORDER BY spend DESC, a.descriptive_name ASC`,
-      [clientId, start, end]
+      params
     );
-    res.json({
+    const payload = {
       start,
       end,
       accounts: (rows || []).map((r) => ({
@@ -502,9 +545,47 @@ router.get('/roi-accounts', async (req, res) => {
         descriptiveName: r.descriptive_name || r.customer_id || r.id,
         spend: Number(r.spend) || 0,
       })),
-    });
+    };
+    const scopeKey = allowed === null ? 'all' : [...allowed].sort().join(',');
+    const cacheKey = roiFilterCacheKey('accounts', clientId, { start, end, spendOnly: true, scope: scopeKey });
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+    return sendCachedJson(res, cacheKey, payload);
   } catch (err) {
     logger.error('ROI accounts list:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** GAM site hosts for ROI filter — manual inventory pick, not tied to Ads accounts. */
+router.get('/roi-sites', async (req, res) => {
+  try {
+    const clientId = req.client?.id || req.user?.clientId;
+    if (!clientId) return res.status(400).json({ error: 'No client context' });
+    const { query } = require('../db');
+    const { rows } = await query(
+      `SELECT LOWER(TRIM(ds.name)) AS site_key,
+              MAX(ds.name) AS site_name
+       FROM dim_site ds
+       WHERE ds.client_id = $1::uuid
+         AND ds.id > 0
+         AND NULLIF(TRIM(ds.name), '') IS NOT NULL
+       GROUP BY 1
+       ORDER BY site_name ASC`,
+      [clientId]
+    );
+    const payload = {
+      sites: (rows || []).map((r) => ({
+        id: String(r.site_key || '').toLowerCase(),
+        label: String(r.site_name || r.site_key || '').trim(),
+      })).filter((s) => s.id),
+    };
+    const cacheKey = roiFilterCacheKey('sites', clientId, {});
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+    return sendCachedJson(res, cacheKey, payload, 300);
+  } catch (err) {
+    logger.error('ROI sites list:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -516,10 +597,7 @@ router.get('/roi-countries', async (req, res) => {
     if (!clientId) return res.status(400).json({ error: 'No client context' });
     const end = req.query.end || todayInTZ();
     const start = req.query.start || end;
-    const accountIds = String(req.query.accountIds || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const accountIds = scopedAccountIds(req, parseAccountIdsQuery(req.query.accountIds)) || [];
     const campaignIds = String(req.query.campaignIds || '')
       .split(',')
       .map((s) => s.trim())
@@ -563,7 +641,7 @@ router.get('/roi-countries', async (req, res) => {
       fallbackUsed = rows.length > 0;
     }
 
-    res.json({
+    const payload = {
       start,
       end,
       fallbackUsed,
@@ -572,7 +650,11 @@ router.get('/roi-countries', async (req, res) => {
         name: String(r.country_name || r.country_code || '').trim(),
         spend: Number(r.spend) || 0,
       })),
-    });
+    };
+    const cacheKey = roiFilterCacheKey('countries', clientId, { start, end, accountIds, campaignIds });
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+    return sendCachedJson(res, cacheKey, payload);
   } catch (err) {
     logger.error('ROI countries list:', err.message);
     res.status(500).json({ error: err.message });
@@ -586,20 +668,13 @@ router.get('/roi-related-targets', async (req, res) => {
     if (!clientId) return res.status(400).json({ error: 'No client context' });
     const end = req.query.end || todayInTZ();
     const start = req.query.start || end;
-    const accountIds = String(req.query.accountIds || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const accountIds = scopedAccountIds(req, parseAccountIdsQuery(req.query.accountIds)) || [];
     const campaignIds = String(req.query.campaignIds || '')
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
 
     const { query } = require('../db');
-    const {
-      getAccountById,
-    } = require('../models/adsAccountStore');
-    const { backfillAccountAppIds } = require('../services/adsSyncService');
 
     async function loadAppsFromSpend() {
       const params = [clientId, start, end];
@@ -635,72 +710,7 @@ router.get('/roi-related-targets', async (req, res) => {
 
     let apps = await loadAppsFromSpend();
 
-    // Backfill App Campaign package IDs for every selected account that still
-    // has spend rows without app_id (do not stop after the first account has apps).
-    {
-      const params = [clientId, start, end];
-      let extra = '';
-      let idsToBackfill = accountIds;
-      if (accountIds.length) {
-        params.push(accountIds);
-        extra += ` AND s.ads_account_id = ANY($${params.length}::uuid[])`;
-      }
-      if (campaignIds.length) {
-        params.push(campaignIds);
-        extra += ` AND s.campaign_id = ANY($${params.length}::text[])`;
-      }
-      if (!idsToBackfill.length) {
-        const { rows: accRows } = await query(
-          `SELECT s.ads_account_id::text AS id
-           FROM ads_spend_daily s
-           WHERE s.client_id = $1
-             AND s.report_date BETWEEN $2::date AND $3::date
-             AND NULLIF(TRIM(s.app_id), '') IS NULL
-             ${extra}
-           GROUP BY s.ads_account_id
-           ORDER BY SUM(s.cost) DESC
-           LIMIT 20`,
-          params
-        );
-        idsToBackfill = (accRows || []).map((r) => r.id).filter(Boolean);
-      } else {
-        // Only backfill selected accounts that are still missing app_id on spend.
-        const missParams = [clientId, start, end, accountIds];
-        let missExtra = '';
-        if (campaignIds.length) {
-          missParams.push(campaignIds);
-          missExtra = ` AND s.campaign_id = ANY($${missParams.length}::text[])`;
-        }
-        const { rows: missRows } = await query(
-          `SELECT s.ads_account_id::text AS id
-           FROM ads_spend_daily s
-           WHERE s.client_id = $1
-             AND s.report_date BETWEEN $2::date AND $3::date
-             AND s.ads_account_id = ANY($4::uuid[])
-             AND NULLIF(TRIM(s.app_id), '') IS NULL
-             ${missExtra}
-           GROUP BY s.ads_account_id
-           ORDER BY SUM(s.cost) DESC`,
-          missParams
-        );
-        idsToBackfill = (missRows || []).map((r) => r.id).filter(Boolean);
-      }
-
-      for (const id of idsToBackfill.slice(0, 20)) {
-        try {
-          const account = await getAccountById(id);
-          if (!account || String(account.clientId) !== String(clientId)) continue;
-          await backfillAccountAppIds(account, { gamClient: req.client });
-        } catch (e) {
-          logger.warn(`ROI related-targets backfill ${id}: ${e.message}`);
-        }
-      }
-      if (idsToBackfill.length) {
-        apps = await loadAppsFromSpend();
-      }
-    }
-
-    // Also include map-based apps/sites if any still exist.
+    // App ID backfill runs during Ads sync — never block filter dropdowns on live API calls.
     const mapParams = [clientId];
     let mapExtra = '';
     if (accountIds.length) {
@@ -724,25 +734,19 @@ router.get('/roi-related-targets', async (req, res) => {
     );
 
     const appById = new Map(apps.map((a) => [a.id, a]));
-    const sites = [];
     (mapRows || []).forEach((r) => {
       const key = r.target_key;
       if (!key) return;
-      if (r.target_type === 'app') {
-        if (!appById.has(key)) {
-          appById.set(key, { id: key, label: key, campaignCount: r.map_count, spend: 0 });
-        }
-      } else if (r.target_type === 'site') {
-        sites.push({ id: key, label: key, mapCount: r.map_count });
+      if (r.target_type === 'app' && !appById.has(key)) {
+        appById.set(key, { id: key, label: key, campaignCount: r.map_count, spend: 0 });
       }
     });
 
-    res.json({
-      start,
-      end,
-      apps: [...appById.values()],
-      sites,
-    });
+    const payload = { start, end, apps: [...appById.values()], sites: [] };
+    const cacheKey = roiFilterCacheKey('related-targets', clientId, { start, end, accountIds, campaignIds });
+    const cached = cache.get(cacheKey);
+    if (cached) return res.json(cached);
+    return sendCachedJson(res, cacheKey, payload);
   } catch (err) {
     logger.error('ROI related targets:', err.message);
     res.status(500).json({ error: err.message });
@@ -783,28 +787,24 @@ router.post('/sync', requireAdmin, async (req, res) => {
       });
     }
 
-    // Large account sets: queue in background so the HTTP request does not time out.
+    // Large account sets: queue per-account jobs so one failure does not block the rest.
     const QUEUE_THRESHOLD = 5;
     if (syncable.length >= QUEUE_THRESHOLD) {
       const { adsSyncQueue } = require('../queues/adsSync');
-      const job = await adsSyncQueue.add(
-        'ads-sync-all',
-        { clientId: req.client.id, startDate: start, endDate: end },
-        {
-          jobId: `ads-sync-manual-${req.client.id.slice(0, 8)}-${Date.now()}`,
-          removeOnComplete: { count: 20 },
-        }
-      );
-      logger.info(`Ads sync queued job=${job.id} accounts=${syncable.length} ${start}→${end}`);
+      const { accounts: queued } = await enqueueAdsSyncAccounts(req.client, adsSyncQueue, {
+        startDate: start,
+        endDate: end,
+        jobIdPrefix: `ads-sync-manual-${req.client.id.slice(0, 8)}-${Date.now()}`,
+      });
+      logger.info(`Ads sync queued ${queued} account job(s) ${start}→${end}`);
       return res.json({
         ok: true,
         queued: true,
-        jobId: job.id,
-        accounts: syncable.length,
+        accounts: queued,
         total: 0,
         start,
         end,
-        message: `Spend sync started in the background for ${syncable.length} account(s). Check back in a few minutes, then map campaigns.`,
+        message: `Spend sync started in the background for ${queued} account(s). Check back in a few minutes, then map campaigns.`,
       });
     }
 

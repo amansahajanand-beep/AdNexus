@@ -68,7 +68,7 @@ import SavedFiltersBar from '../components/ui/SavedFiltersBar';
 import SavePresetButton from '../components/ui/SavePresetButton';
 import DataFreshness from '../components/ui/DataFreshness';
 import { SAVED_FILTERS_PAGES, getSavedFilters } from '../utils/savedFilters';
-import { PRESET_PAGES } from '../utils/reportPresets';
+import { PRESET_PAGES, filtersOnlySnapshot } from '../utils/reportPresets';
 import { getLastPageFilters, saveLastPageFilters, LAST_FILTER_PAGES } from '../utils/lastPageFilters';
 import { downloadCsv, downloadExcel, exportCellValue } from '../utils/tableExport';
 
@@ -416,10 +416,7 @@ export default function Reporting() {
     reportSettings,
   }), [country, domain, site, domainName, domainId, reportDimensions, reportMetrics, reportSettings]);
 
-  const getPresetSnapshot = useCallback(() => ({
-    preset,
-    startDate: applied?.startDate || startDate,
-    endDate: applied?.endDate || endDate,
+  const getPresetSnapshot = useCallback(() => filtersOnlySnapshot({
     country: applied?.country || country,
     domain: applied?.domain || domain,
     site: applied?.site || site,
@@ -428,8 +425,7 @@ export default function Reporting() {
     reportDimensions: applied?.reportDimensions || reportDimensions,
     reportMetrics: applied?.reportMetrics || reportMetrics,
   }), [
-    preset, applied, startDate, endDate, country, domain, site,
-    domainName, domainId, reportDimensions, reportMetrics,
+    applied, country, domain, site, domainName, domainId, reportDimensions, reportMetrics,
   ]);
 
   const handleApplySavedFilter = useCallback((snapshot) => {

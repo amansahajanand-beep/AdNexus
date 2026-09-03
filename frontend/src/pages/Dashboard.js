@@ -107,7 +107,7 @@ import {
 import SavedFiltersBar from '../components/ui/SavedFiltersBar';
 import SavePresetButton from '../components/ui/SavePresetButton';
 import { SAVED_FILTERS_PAGES, getSavedFilters } from '../utils/savedFilters';
-import { PRESET_PAGES } from '../utils/reportPresets';
+import { PRESET_PAGES, filtersOnlySnapshot } from '../utils/reportPresets';
 import {
   CHART_COLORS,
   CHART_SERIES,
@@ -1116,16 +1116,13 @@ export default function Dashboard() {
     domainId,
   }), [domain, site, domainName, domainId]);
 
-  const getPresetSnapshot = useCallback(() => ({
-    preset,
-    startDate: applied?.startDate || startDate,
-    endDate: applied?.endDate || endDate,
+  const getPresetSnapshot = useCallback(() => filtersOnlySnapshot({
     domain: applied?.domain || domain,
     site: applied?.site || site,
     domainName: applied?.domainName || domainName,
     domainId: applied?.domainId || domainId,
   }), [
-    preset, applied, startDate, endDate, domain, site, domainName, domainId,
+    applied, domain, site, domainName, domainId,
   ]);
 
   const handleApplySavedFilter = useCallback((snapshot) => {

@@ -5,6 +5,9 @@ import {
   filterCountryTree,
   flattenCountryTreeForExport,
   formatRoiMoney,
+  formatRoiNum,
+  formatRoiPct,
+  formatRoiEcpm,
   roiToneClass,
 } from '../../utils/report/roiView';
 import { showToast } from '../../hooks/useToast';
@@ -14,6 +17,10 @@ const COLS = [
   { id: 'label', label: 'Country / Account / Package', type: 'dimension' },
   { id: 'date', label: 'Date', type: 'dimension' },
   { id: 'adsSpend', label: 'Ads spend', type: 'metric' },
+  { id: 'impressions', label: 'Impressions', type: 'metric' },
+  { id: 'clicks', label: 'Clicks', type: 'metric' },
+  { id: 'ctr', label: 'CTR', type: 'metric' },
+  { id: 'ecpm', label: 'Ads eCPM', type: 'metric' },
   { id: 'earn', label: 'Earn', type: 'metric' },
   { id: 'profitSpend', label: 'Profit (spend)', type: 'metric' },
   { id: 'roiSpendPercent', label: 'ROI spend %', type: 'metric' },
@@ -24,8 +31,7 @@ function money(n) {
 }
 
 function pct(n) {
-  if (n == null || Number.isNaN(Number(n))) return '—';
-  return `${Number(n).toFixed(1)}%`;
+  return formatRoiPct(n);
 }
 
 function SortHeader({ label, active, dir, onClick }) {
@@ -55,6 +61,13 @@ function TreeChevron({ open, hasChildren }) {
 
 function renderMetric(row, colId) {
   if (colId === 'adsSpend') return money(row.adsSpend);
+  if (colId === 'impressions') return formatRoiNum(row.impressions);
+  if (colId === 'clicks') return formatRoiNum(row.clicks);
+  if (colId === 'ctr') return pct(row.ctr);
+  if (colId === 'ecpm') {
+    const v = formatRoiEcpm(row.ecpm);
+    return typeof v === 'string' ? v.replace(/^US\$/, '$') : v;
+  }
   if (colId === 'earn') return money(row.earn);
   if (colId === 'profitSpend') return money(row.profitSpend);
   if (colId === 'roiSpendPercent') return pct(row.roiSpendPercent);
@@ -115,10 +128,14 @@ export default function RoiCountryTreeTable({
 
   const totals = useMemo(() => {
     const adsSpend = filteredTree.reduce((s, r) => s + (Number(r.adsSpend) || 0), 0);
+    const impressions = filteredTree.reduce((s, r) => s + (Number(r.impressions) || 0), 0);
+    const clicks = filteredTree.reduce((s, r) => s + (Number(r.clicks) || 0), 0);
     const earn = filteredTree.reduce((s, r) => s + (Number(r.earn) || 0), 0);
     const profitSpend = earn - adsSpend;
     const roiSpendPercent = adsSpend > 0 ? (profitSpend / adsSpend) * 100 : null;
-    return { adsSpend, earn, profitSpend, roiSpendPercent };
+    const ctr = impressions > 0 ? (clicks / impressions) * 100 : null;
+    const ecpm = impressions > 0 ? (adsSpend / impressions) * 1000 : null;
+    return { adsSpend, impressions, clicks, ctr, ecpm, earn, profitSpend, roiSpendPercent };
   }, [filteredTree]);
 
   const totalPages = Math.max(1, Math.ceil(sortedTree.length / pageSize));

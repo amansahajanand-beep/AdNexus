@@ -79,7 +79,7 @@ export default function SavePresetButton({
 
   const defaultHint = (
     <>
-      Saves the <strong>date range and filters</strong>. Open later from Presets.
+      Saves <strong>filters only</strong> (not dates). Pick dates on the Presets page or on each report page.
       {' '}
       (Saved filters keep inventory only — no dates.)
     </>
@@ -97,7 +97,7 @@ export default function SavePresetButton({
         className={triggerClass}
         onClick={openForm}
         disabled={disabled}
-        title="Save dates + filters as a preset (Presets page)"
+        title="Save filters as a preset (Presets page)"
       >
         Save preset
       </button>

@@ -110,6 +110,7 @@ function DomainUserPasswordCell({ user, onResetPassword, resetting }) {
 export default function UserManagement({
   users = [], loading, error,
   domains = [], domainsLoading, catalogLoading = false, catalogRows = [], catalogLists = {},
+  adsAccountOptions = [], adsAccountsLoading = false,
   onCreate, onUpdate, onSavePermissions, onDelete,
   currentUserId,
   onLoadDomains,
@@ -406,6 +407,8 @@ export default function UserManagement({
         catalogLoading={catalogLoading}
         catalogRows={catalogRows}
         catalogLists={catalogLists}
+        adsAccountOptions={adsAccountOptions}
+        adsAccountsLoading={adsAccountsLoading}
       />
 
       <EditChannelsModal
@@ -420,6 +423,8 @@ export default function UserManagement({
         catalogLoading={catalogLoading}
         catalogRows={catalogRows}
         catalogLists={catalogLists}
+        adsAccountOptions={adsAccountOptions}
+        adsAccountsLoading={adsAccountsLoading}
       />
     </div>
   );

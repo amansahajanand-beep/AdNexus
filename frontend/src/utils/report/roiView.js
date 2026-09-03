@@ -12,6 +12,15 @@ export function formatRoiPct(n) {
   return `${Number(n).toFixed(1)}%`;
 }
 
+export function formatRoiNum(n) {
+  return Math.round(Number(n) || 0).toLocaleString();
+}
+
+export function formatRoiEcpm(n) {
+  if (n == null || Number.isNaN(Number(n))) return '—';
+  return formatRoiMoney(n);
+}
+
 export function roiToneClass(n) {
   if (n == null || Number.isNaN(Number(n))) return '';
   return Number(n) >= 0 ? 'roi-pos' : 'roi-neg';
@@ -70,6 +79,38 @@ export function buildRoiTableColumns(accounts = []) {
       aggregate: 'sum',
     },
     {
+      id: 'impressions',
+      type: 'metric',
+      label: 'Impressions',
+      getValue: (r) => Number(r.impressions) || 0,
+      format: 'number',
+      aggregate: 'sum',
+    },
+    {
+      id: 'clicks',
+      type: 'metric',
+      label: 'Clicks',
+      getValue: (r) => Number(r.clicks) || 0,
+      format: 'number',
+      aggregate: 'sum',
+    },
+    {
+      id: 'ctr',
+      type: 'metric',
+      label: 'CTR',
+      getValue: (r) => (r.ctr == null ? null : Number(r.ctr)),
+      format: 'percent',
+      aggregate: 'none',
+    },
+    {
+      id: 'ecpm',
+      type: 'metric',
+      label: 'Ads eCPM',
+      getValue: (r) => (r.ecpm == null ? null : Number(r.ecpm)),
+      format: 'money',
+      aggregate: 'none',
+    },
+    {
       id: 'otherExpenses',
       type: 'metric',
       label: 'Other',
@@ -123,58 +164,112 @@ export function buildRoiTableColumns(accounts = []) {
   return cols;
 }
 
-export function buildRoiSummaryCards(summary = {}) {
-  return [
-    {
-      key: 'spend',
-      label: 'Ads spend',
-      value: formatRoiMoney(summary.adsSpend),
-      icon: '💸',
-      tone: 'blue',
-    },
-    {
-      key: 'other',
-      label: 'Other expenses',
-      value: formatRoiMoney(summary.otherExpenses),
-      icon: '📄',
-      tone: 'amber',
-    },
+export function buildRoiSummaryGroups(summary = {}) {
+  const hasOther = Number(summary.otherExpenses) > 0;
+  const profitTone = Number(summary.profitSpend) >= 0 ? 'pos' : 'neg';
+  const roiTone = summary.roiSpendPercent == null
+    ? null
+    : (Number(summary.roiSpendPercent) >= 0 ? 'pos' : 'neg');
+
+  const ads = {
+    id: 'ads',
+    title: 'Google Ads',
+    hint: 'From Ads sync',
+    metrics: [
+      {
+        key: 'spend',
+        label: 'Spend',
+        value: formatRoiMoney(summary.adsSpend),
+        emphasis: true,
+      },
+      {
+        key: 'impressions',
+        label: 'Impressions',
+        value: formatRoiNum(summary.impressions),
+      },
+      {
+        key: 'clicks',
+        label: 'Clicks',
+        value: formatRoiNum(summary.clicks),
+      },
+      {
+        key: 'ctr',
+        label: 'CTR',
+        value: formatRoiPct(summary.ctr),
+      },
+      {
+        key: 'ecpm',
+        label: 'eCPM',
+        value: formatRoiEcpm(summary.ecpm),
+      },
+    ],
+  };
+
+  const roiMetrics = [
     {
       key: 'earn',
       label: 'Earn',
       value: formatRoiMoney(summary.earn),
-      icon: '💰',
-      tone: 'green',
+      emphasis: true,
     },
     {
       key: 'pSpend',
-      label: 'Profit (vs spend)',
+      label: 'Profit',
       value: formatRoiMoney(summary.profitSpend),
-      icon: '📈',
-      tone: 'green',
+      valueTone: profitTone,
+      emphasis: true,
     },
     {
       key: 'roiSpend',
-      label: 'ROI on spend',
+      label: 'ROI',
       value: formatRoiPct(summary.roiSpendPercent),
-      icon: '%',
-      tone: 'green',
-    },
-    {
-      key: 'pExp',
-      label: 'Profit (vs expenses)',
-      value: formatRoiMoney(summary.profitExpense),
-      icon: '📈',
-      tone: 'amber',
-    },
-    {
-      key: 'roiExp',
-      label: 'ROI on expenses',
-      value: formatRoiPct(summary.roiExpensePercent),
-      icon: '%',
-      tone: 'green',
+      valueTone: roiTone,
+      emphasis: true,
     },
   ];
+
+  if (hasOther) {
+    roiMetrics.push(
+      {
+        key: 'other',
+        label: 'Other expenses',
+        value: formatRoiMoney(summary.otherExpenses),
+      },
+      {
+        key: 'pExp',
+        label: 'Profit vs expenses',
+        value: formatRoiMoney(summary.profitExpense),
+        valueTone: Number(summary.profitExpense) >= 0 ? 'pos' : 'neg',
+      },
+      {
+        key: 'roiExp',
+        label: 'ROI on expenses',
+        value: formatRoiPct(summary.roiExpensePercent),
+        valueTone: summary.roiExpensePercent == null
+          ? null
+          : (Number(summary.roiExpensePercent) >= 0 ? 'pos' : 'neg'),
+      },
+    );
+  }
+
+  return [
+    ads,
+    {
+      id: 'roi',
+      title: 'ROI outcome',
+      hint: 'Ads-linked apps only',
+      metrics: roiMetrics,
+    },
+  ];
+}
+
+/** Flat card list (legacy / simple consumers). */
+export function buildRoiSummaryCards(summary = {}) {
+  return buildRoiSummaryGroups(summary).flatMap((g) => g.metrics.map((m) => ({
+    ...m,
+    icon: '·',
+    tone: m.valueTone === 'neg' ? 'amber' : 'blue',
+  })));
 }
 
 /** Convert a saved preset snapshot into roiAPI.summary query params. */
@@ -246,6 +341,38 @@ export function buildCountryBreakdownColumns() {
       aggregate: 'sum',
     },
     {
+      id: 'impressions',
+      type: 'metric',
+      label: 'Impressions',
+      getValue: (r) => Number(r.impressions) || 0,
+      format: 'number',
+      aggregate: 'sum',
+    },
+    {
+      id: 'clicks',
+      type: 'metric',
+      label: 'Clicks',
+      getValue: (r) => Number(r.clicks) || 0,
+      format: 'number',
+      aggregate: 'sum',
+    },
+    {
+      id: 'ctr',
+      type: 'metric',
+      label: 'CTR',
+      getValue: (r) => (r.ctr == null ? null : Number(r.ctr)),
+      format: 'percent',
+      aggregate: 'none',
+    },
+    {
+      id: 'ecpm',
+      type: 'metric',
+      label: 'Ads eCPM',
+      getValue: (r) => (r.ecpm == null ? null : Number(r.ecpm)),
+      format: 'money',
+      aggregate: 'none',
+    },
+    {
       id: 'earn',
       type: 'metric',
       label: 'Earn',
@@ -299,9 +426,24 @@ export function buildCountryTargetBreakdownRows(rows = []) {
 function rollupCountryMetrics(items = []) {
   const adsSpend = items.reduce((s, r) => s + (Number(r.adsSpend) || 0), 0);
   const earn = items.reduce((s, r) => s + (Number(r.earn) || 0), 0);
+  const impressions = items.reduce((s, r) => s + (Number(r.impressions) || 0), 0);
+  const clicks = items.reduce((s, r) => s + (Number(r.clicks) || 0), 0);
+  const conversions = items.reduce((s, r) => s + (Number(r.conversions) || 0), 0);
   const profitSpend = earn - adsSpend;
   const roiSpendPercent = adsSpend > 0 ? (profitSpend / adsSpend) * 100 : null;
-  return { adsSpend, earn, profitSpend, roiSpendPercent };
+  const ctr = impressions > 0 ? (clicks / impressions) * 100 : null;
+  const ecpm = impressions > 0 ? (adsSpend / impressions) * 1000 : null;
+  return {
+    adsSpend,
+    earn,
+    profitSpend,
+    roiSpendPercent,
+    impressions,
+    clicks,
+    conversions,
+    ctr,
+    ecpm,
+  };
 }
 
 export function formatRoiDateRange(startDate = '', endDate = '') {
@@ -350,6 +492,11 @@ export function buildCountryTree(
       earn: Number(row.earn) || 0,
       profitSpend: Number(row.profitSpend) || 0,
       roiSpendPercent: row.roiSpendPercent,
+      impressions: Number(row.impressions) || 0,
+      clicks: Number(row.clicks) || 0,
+      conversions: Number(row.conversions) || 0,
+      ctr: row.ctr,
+      ecpm: row.ecpm,
     });
   });
   dailyByPackage.forEach((days, key) => {
@@ -395,6 +542,11 @@ export function buildCountryTree(
         earn: Number(row.earn) || 0,
         profitSpend: Number(row.profitSpend) || 0,
         roiSpendPercent: row.roiSpendPercent,
+        impressions: Number(row.impressions) || 0,
+        clicks: Number(row.clicks) || 0,
+        conversions: Number(row.conversions) || 0,
+        ctr: row.ctr,
+        ecpm: row.ecpm,
       });
     });
 
@@ -416,6 +568,11 @@ export function buildCountryTree(
       earn: Number(c.earn) || 0,
       profitSpend: Number(c.profitSpend) || 0,
       roiSpendPercent: c.roiSpendPercent,
+      impressions: Number(c.impressions) || 0,
+      clicks: Number(c.clicks) || 0,
+      conversions: Number(c.conversions) || 0,
+      ctr: c.ctr,
+      ecpm: c.ecpm,
       accounts,
       accountCount: accounts.length,
     };
@@ -425,46 +582,29 @@ export function buildCountryTree(
 /** Flatten tree for CSV / Excel export (full hierarchy). */
 export function flattenCountryTreeForExport(tree = []) {
   const rows = [];
-  (tree || []).forEach((country) => {
+  const push = (level, name, date, m) => {
     rows.push({
-      level: 'Country',
-      name: country.label,
-      date: country.dateLabel,
-      adsSpend: country.adsSpend,
-      earn: country.earn,
-      profitSpend: country.profitSpend,
-      roiSpendPercent: country.roiSpendPercent,
+      level,
+      name,
+      date,
+      adsSpend: m.adsSpend,
+      impressions: m.impressions,
+      clicks: m.clicks,
+      ctr: m.ctr,
+      ecpm: m.ecpm,
+      earn: m.earn,
+      profitSpend: m.profitSpend,
+      roiSpendPercent: m.roiSpendPercent,
     });
+  };
+  (tree || []).forEach((country) => {
+    push('Country', country.label, country.dateLabel, country);
     (country.accounts || []).forEach((account) => {
-      rows.push({
-        level: 'Ads account',
-        name: account.label,
-        date: account.dateLabel,
-        adsSpend: account.adsSpend,
-        earn: account.earn,
-        profitSpend: account.profitSpend,
-        roiSpendPercent: account.roiSpendPercent,
-      });
+      push('Ads account', account.label, account.dateLabel, account);
       (account.packages || []).forEach((pkg) => {
-        rows.push({
-          level: 'Package',
-          name: pkg.label,
-          date: pkg.dateLabel,
-          adsSpend: pkg.adsSpend,
-          earn: pkg.earn,
-          profitSpend: pkg.profitSpend,
-          roiSpendPercent: pkg.roiSpendPercent,
-        });
+        push('Package', pkg.label, pkg.dateLabel, pkg);
         (pkg.days || []).forEach((day) => {
-          rows.push({
-            level: 'Date',
-            name: pkg.label,
-            date: day.date,
-            adsSpend: day.adsSpend,
-            earn: day.earn,
-            profitSpend: day.profitSpend,
-            roiSpendPercent: day.roiSpendPercent,
-          });
+          push('Date', pkg.label, day.date, day);
         });
       });
     });
@@ -545,4 +685,100 @@ export function buildCountryTargetBreakdownColumns() {
       getCellClass: (r) => roiToneClass(r.roiSpendPercent),
     },
   ];
+}
+
+/**
+ * Merge summaryOnly + breakdownOnly API payloads without clobbering each other.
+ * breakdownOnly returns empty `summary` / `accounts`; a naive `{...prev, ...bd}`
+ * wipe caused overview cards to show $0 while the country table still had data.
+ */
+export function summaryFromCountryBreakdown(countryBreakdown = []) {
+  const rows = Array.isArray(countryBreakdown) ? countryBreakdown : [];
+  if (!rows.length) return null;
+  let adsSpend = 0;
+  let earn = 0;
+  let impressions = 0;
+  let clicks = 0;
+  let conversions = 0;
+  rows.forEach((r) => {
+    adsSpend += Number(r.adsSpend) || 0;
+    earn += Number(r.earn) || 0;
+    impressions += Number(r.impressions) || 0;
+    clicks += Number(r.clicks) || 0;
+    conversions += Number(r.conversions) || 0;
+  });
+  adsSpend = Math.round(adsSpend * 100) / 100;
+  earn = Math.round(earn * 100) / 100;
+  const profitSpend = Math.round((earn - adsSpend) * 100) / 100;
+  const roiSpendPercent = adsSpend > 0
+    ? Math.round(((earn - adsSpend) / adsSpend) * 10000) / 100
+    : null;
+  const ctr = impressions > 0 ? Math.round((clicks / impressions) * 10000) / 100 : null;
+  const ecpm = impressions > 0 ? Math.round((adsSpend / impressions) * 1000 * 100) / 100 : null;
+  return {
+    adsSpend,
+    otherExpenses: 0,
+    totalCost: adsSpend,
+    earn,
+    profitSpend,
+    profitExpense: earn,
+    profit: profitSpend,
+    roiSpendPercent,
+    roiExpensePercent: null,
+    roiPercent: roiSpendPercent,
+    impressions,
+    clicks,
+    conversions,
+    ctr,
+    ecpm,
+    mappedSpend: adsSpend,
+    unmappedSpend: 0,
+    mappedCampaigns: 0,
+    accountsWithSpend: 0,
+    _fromBreakdown: true,
+  };
+}
+
+export function mergeRoiSummaryPayload(prev, summaryPayload) {
+  if (!summaryPayload) return prev;
+  const next = { ...(prev || {}) };
+  if (summaryPayload.summary && typeof summaryPayload.summary === 'object'
+    && Object.keys(summaryPayload.summary).length > 0) {
+    next.summary = summaryPayload.summary;
+  }
+  if (Array.isArray(summaryPayload.accounts) && summaryPayload.accounts.length > 0) {
+    next.accounts = summaryPayload.accounts;
+  } else if (!Array.isArray(next.accounts)) {
+    next.accounts = [];
+  }
+  if (Array.isArray(summaryPayload.rows)) next.rows = summaryPayload.rows;
+  if (Array.isArray(summaryPayload.generalExpenses)) {
+    next.generalExpenses = summaryPayload.generalExpenses;
+  }
+  if (Array.isArray(summaryPayload.expenses)) next.expenses = summaryPayload.expenses;
+  return next;
+}
+
+export function mergeRoiBreakdownPayload(prev, breakdownPayload) {
+  if (!breakdownPayload) return prev;
+  const next = {
+    ...(prev || {}),
+    countryBreakdown: Array.isArray(breakdownPayload.countryBreakdown)
+      ? breakdownPayload.countryBreakdown
+      : (prev?.countryBreakdown || []),
+    countryTargetBreakdown: Array.isArray(breakdownPayload.countryTargetBreakdown)
+      ? breakdownPayload.countryTargetBreakdown
+      : (prev?.countryTargetBreakdown || []),
+    countryTargetDailyBreakdown: Array.isArray(breakdownPayload.countryTargetDailyBreakdown)
+      ? breakdownPayload.countryTargetDailyBreakdown
+      : (prev?.countryTargetDailyBreakdown || []),
+  };
+  // Fill overview immediately from the table while summaryOnly is still in flight.
+  const hasSummary = next.summary && Object.keys(next.summary).length > 0
+    && !next.summary._fromBreakdown;
+  if (!hasSummary) {
+    const interim = summaryFromCountryBreakdown(next.countryBreakdown);
+    if (interim) next.summary = interim;
+  }
+  return next;
 }

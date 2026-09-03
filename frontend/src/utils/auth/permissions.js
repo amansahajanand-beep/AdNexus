@@ -27,7 +27,12 @@ export const NO_DOMAINS_TITLE = 'No Inventory Assigned';
 export const NO_DOMAINS_MSG =
   'No domains, sites, or app IDs have been assigned to your account. Please contact your administrator.';
 
-export const INVENTORY_SCOPE_KEYS = ['allowedDomains', 'allowedSites', 'allowedAppIds'];
+export const INVENTORY_SCOPE_KEYS = [
+  'allowedDomains',
+  'allowedSites',
+  'allowedAppIds',
+  'allowedAdsAccountIds',
+];
 
 export function getAssignedDomains(user) {
   if (isAdmin(user)) return null;
@@ -47,12 +52,21 @@ export function getAssignedAppIds(user) {
   return Array.isArray(allowed) ? allowed : [];
 }
 
+export function getAssignedAdsAccountIds(user) {
+  if (isAdmin(user)) return null;
+  const perms = user?.permissions || {};
+  if (!Object.prototype.hasOwnProperty.call(perms, 'allowedAdsAccountIds')) return null;
+  const allowed = perms.allowedAdsAccountIds;
+  return Array.isArray(allowed) ? allowed : [];
+}
+
 export function getAssignedInventoryScope(user) {
   if (isAdmin(user)) return null;
   return {
     allowedDomains: getAssignedDomains(user),
     allowedSites: getAssignedSites(user),
     allowedAppIds: getAssignedAppIds(user),
+    allowedAdsAccountIds: getAssignedAdsAccountIds(user),
   };
 }
 

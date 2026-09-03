@@ -3698,6 +3698,115 @@ select.ui-field-input { border-radius: 10px; cursor: pointer; }
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) auto;
   margin-top: 16px;
 }
+
+/* Grouped ROI KPI boards (Ads + outcome) */
+.roi-kpi-boards {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.roi-kpi-boards-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  min-height: 24px;
+}
+.roi-kpi-boards-meta .report-live {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.roi-kpi-boards-grid {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 14px;
+  align-items: stretch;
+}
+.roi-kpi-board {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-sm);
+  padding: 16px 18px 14px;
+  min-width: 0;
+}
+.roi-kpi-board-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.roi-kpi-board-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 650;
+  color: var(--text);
+  letter-spacing: -0.2px;
+}
+.roi-kpi-board-hint {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 500;
+}
+.roi-kpi-metrics {
+  display: grid;
+  grid-template-columns: repeat(var(--roi-kpi-cols, 3), minmax(0, 1fr));
+  gap: 10px;
+}
+.roi-kpi-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  padding: 12px 12px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.roi-kpi-metric.is-emphasis {
+  background: var(--surface);
+  border-color: var(--accent-soft, #dbeafe);
+}
+.roi-kpi-label {
+  font-size: 11px;
+  color: var(--muted);
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.roi-kpi-value {
+  font-size: 20px;
+  font-weight: 650;
+  color: var(--text);
+  line-height: 1.15;
+  letter-spacing: -0.35px;
+  word-break: break-word;
+}
+.roi-kpi-value.is-pos { color: var(--success, #137333); }
+.roi-kpi-value.is-neg { color: var(--danger, #c5221f); }
+.roi-kpi-spacer { min-height: 16px; }
+.roi-kpi-boards.is-loading .roi-kpi-value {
+  min-height: 24px;
+}
+
+@media (max-width: 1100px) {
+  .roi-kpi-boards-grid { grid-template-columns: 1fr; }
+  .roi-kpi-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 700px) {
+  .roi-kpi-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .roi-kpi-value { font-size: 17px; }
+}
+@media (max-width: 420px) {
+  .roi-kpi-metrics { grid-template-columns: 1fr; }
+}
 .roi-page .report-summary-row ~ .filter-card,
 .roi-page .warn-card ~ .filter-card {
   margin-top: 16px;
@@ -4284,6 +4393,16 @@ a { color: var(--accent); }
   font-size: 13px;
   color: var(--muted);
   line-height: 1.4;
+}
+.presets-date-card {
+  margin: 12px 0 16px;
+  padding: 16px 20px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+}
+.presets-date-card .dash-date-toolbar {
+  padding-bottom: 0;
 }
 @media (max-width: 960px) {
   .presets-master-detail {

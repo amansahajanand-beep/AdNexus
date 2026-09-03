@@ -1,8 +1,11 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import DynamicReportTable from '../ui/DynamicReportTable';
+import PresetDateToolbar from '../presets/PresetDateToolbar';
+import { useAuth } from '../../store/useAuth';
+import { usePresetDateRange } from '../../hooks/usePresetDateRange';
 import { reportsAPI } from '../../utils/api';
-import { hrefForPreset, summaryForPreset } from '../../utils/reportPresets';
+import { hrefForPreset, mergePresetWithDates, summaryForPreset } from '../../utils/reportPresets';
 import {
   snapshotToReportingParams,
   formatReportingMoney,
@@ -21,8 +24,34 @@ export default function ReportingPresetDetail({
   onDelete,
 }) {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const isNarrow = useMedia('(max-width: 768px)');
   const snapshot = presetItem?.snapshot || {};
+
+  const {
+    preset,
+    startDate,
+    endDate,
+    applied,
+    dateRestriction,
+    dateFilterLocked,
+    presetOptions,
+    presetLabel,
+    customDatesIncomplete,
+    onPreset,
+    applyDates,
+    setStartDate,
+    setEndDate,
+  } = usePresetDateRange(user, presetItem?.id);
+
+  const activeSnapshot = useMemo(
+    () => mergePresetWithDates(snapshot, {
+      startDate: applied.startDate,
+      endDate: applied.endDate,
+      preset,
+    }),
+    [snapshot, applied.startDate, applied.endDate, preset]
+  );
 
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -31,17 +60,17 @@ export default function ReportingPresetDetail({
   const [search, setSearch] = useState('');
 
   const resolved = useMemo(
-    () => snapshotToReportingParams(snapshot),
+    () => snapshotToReportingParams(activeSnapshot),
     [
-      snapshot.startDate,
-      snapshot.endDate,
-      JSON.stringify(snapshot.country || []),
-      JSON.stringify(snapshot.domain || []),
-      JSON.stringify(snapshot.site || []),
-      JSON.stringify(snapshot.domainName || []),
-      JSON.stringify(snapshot.domainId || []),
-      JSON.stringify(snapshot.reportDimensions || []),
-      JSON.stringify(snapshot.reportMetrics || []),
+      activeSnapshot.startDate,
+      activeSnapshot.endDate,
+      JSON.stringify(activeSnapshot.country || []),
+      JSON.stringify(activeSnapshot.domain || []),
+      JSON.stringify(activeSnapshot.site || []),
+      JSON.stringify(activeSnapshot.domainName || []),
+      JSON.stringify(activeSnapshot.domainId || []),
+      JSON.stringify(activeSnapshot.reportDimensions || []),
+      JSON.stringify(activeSnapshot.reportMetrics || []),
     ]
   );
 
@@ -54,7 +83,7 @@ export default function ReportingPresetDetail({
     if (!resolved) {
       setData(null);
       setError(presetItem
-        ? 'This preset is missing a date range or report selection.'
+        ? 'Select a date range and click Apply dates, or fix the report selection in this preset.'
         : null);
       return undefined;
     }
@@ -121,7 +150,7 @@ export default function ReportingPresetDetail({
           <button
             type="button"
             className="btn-generate"
-            onClick={() => navigate(hrefForPreset('reporting', snapshot))}
+            onClick={() => navigate(hrefForPreset('reporting', activeSnapshot))}
           >
             Open in Reporting
           </button>
@@ -142,6 +171,21 @@ export default function ReportingPresetDetail({
           ) : null}
         </div>
       </div>
+
+      <PresetDateToolbar
+        preset={preset}
+        startDate={startDate}
+        endDate={endDate}
+        presetLabel={presetLabel}
+        presetOptions={presetOptions}
+        customDatesIncomplete={customDatesIncomplete}
+        dateFilterLocked={dateFilterLocked}
+        dateRestriction={dateRestriction}
+        onPreset={onPreset}
+        onStartDateChange={setStartDate}
+        onEndDateChange={setEndDate}
+        onApply={applyDates}
+      />
 
       {error ? <div className="login-error" style={{ marginTop: 12 }}>{error}</div> : null}
 
@@ -204,7 +248,7 @@ export default function ReportingPresetDetail({
           emptyMessage="No Reporting rows for this preset"
           columnStorageKey={`reporting-preset-${presetItem.id}`}
           canDownload
-          exportName={`reporting_preset_${snapshot.startDate || 'x'}_${snapshot.endDate || 'y'}`}
+          exportName={`reporting_preset_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
         />
       </div>
     </div>

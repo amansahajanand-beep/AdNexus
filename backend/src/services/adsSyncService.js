@@ -173,6 +173,47 @@ async function syncAllAccountsForClient(gamClient, { startDate, endDate } = {}) 
   return { total, accounts: accounts.length, errors };
 }
 
+/** Enqueue one BullMQ job per Ads account so a slow/failed account cannot block the rest. */
+async function enqueueAdsSyncAccounts(gamClient, adsSyncQueue, {
+  startDate,
+  endDate,
+  jobName = 'ads-sync-account',
+  jobIdPrefix = null,
+  priority = 3,
+} = {}) {
+  if (!gamClient?.id || !adsSyncQueue) {
+    throw new Error('enqueueAdsSyncAccounts requires client and adsSyncQueue');
+  }
+  const accounts = await listSyncableClientAccounts(gamClient.id);
+  const end = endDate || todayInTZ();
+  const lookback = parseInt(process.env.GOOGLE_ADS_SYNC_LOOKBACK_DAYS || '30', 10) || 30;
+  const start = startDate || shiftYMD(end, -(lookback - 1));
+  const prefix = jobIdPrefix || `ads-sync-${gamClient.id.slice(0, 8)}-${end}`;
+  let queued = 0;
+  for (const acc of accounts) {
+    await adsSyncQueue.add(
+      jobName,
+      {
+        clientId: gamClient.id,
+        adsAccountId: acc.id,
+        startDate: start,
+        endDate: end,
+      },
+      {
+        jobId: `${prefix}-${acc.id.slice(0, 8)}`,
+        priority,
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 30000 },
+        removeOnComplete: { count: 30 },
+        removeOnFail: { count: 50 },
+      }
+    );
+    queued += 1;
+  }
+  logger.info(`Ads sync enqueued ${queued} account job(s) client=${gamClient.id.slice(0, 8)} ${start}→${end}`);
+  return { accounts: queued, start, end };
+}
+
 /** Fetch App Campaign package IDs from Google Ads and stamp onto spend rows. */
 async function backfillAccountAppIds(adsAccount, { gamClient } = {}) {
   const client = gamClient || getClient();
@@ -191,6 +232,7 @@ async function backfillAccountAppIds(adsAccount, { gamClient } = {}) {
 module.exports = {
   syncAccountSpend,
   syncAllAccountsForClient,
+  enqueueAdsSyncAccounts,
   backfillAccountAppIds,
   resolveRefreshForAccount,
   formatAdsSyncError,

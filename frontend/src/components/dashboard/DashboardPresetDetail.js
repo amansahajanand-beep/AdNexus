@@ -2,8 +2,11 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import DynamicReportTable from '../ui/DynamicReportTable';
 import GamOverviewCard from '../ui/GamOverviewCard';
+import PresetDateToolbar from '../presets/PresetDateToolbar';
+import { useAuth } from '../../store/useAuth';
+import { usePresetDateRange } from '../../hooks/usePresetDateRange';
 import { reportsAPI } from '../../utils/api';
-import { hrefForPreset, summaryForPreset } from '../../utils/reportPresets';
+import { hrefForPreset, mergePresetWithDates, summaryForPreset } from '../../utils/reportPresets';
 import { snapshotToDashboardParams } from '../../utils/report/dashboardView';
 import {
   resolveDashboardTableConfig,
@@ -22,8 +25,34 @@ export default function DashboardPresetDetail({
   onDelete,
 }) {
   const navigate = useNavigate();
+  const { user } = useAuth();
   const isNarrow = useMedia('(max-width: 768px)');
   const snapshot = presetItem?.snapshot || {};
+
+  const {
+    preset,
+    startDate,
+    endDate,
+    applied,
+    dateRestriction,
+    dateFilterLocked,
+    presetOptions,
+    presetLabel,
+    customDatesIncomplete,
+    onPreset,
+    applyDates,
+    setStartDate,
+    setEndDate,
+  } = usePresetDateRange(user, presetItem?.id);
+
+  const activeSnapshot = useMemo(
+    () => mergePresetWithDates(snapshot, {
+      startDate: applied.startDate,
+      endDate: applied.endDate,
+      preset,
+    }),
+    [snapshot, applied.startDate, applied.endDate, preset]
+  );
 
   const [overview, setOverview] = useState(null);
   const [detail, setDetail] = useState(null);
@@ -38,11 +67,11 @@ export default function DashboardPresetDetail({
   }, [presetItem?.id]);
 
   useEffect(() => {
-    const params = snapshotToDashboardParams(snapshot);
+    const params = snapshotToDashboardParams(activeSnapshot);
     if (!params) {
       setOverview(null);
       setDetail(null);
-      setError('This preset is missing a date range.');
+      setError('Select a date range and click Apply dates.');
       return undefined;
     }
     let cancelled = false;
@@ -71,22 +100,25 @@ export default function DashboardPresetDetail({
     return () => { cancelled = true; };
   }, [
     presetItem?.id,
-    snapshot.startDate,
-    snapshot.endDate,
-    JSON.stringify(snapshot.domain || []),
-    JSON.stringify(snapshot.site || []),
-    JSON.stringify(snapshot.domainName || []),
-    JSON.stringify(snapshot.domainId || []),
+    activeSnapshot.startDate,
+    activeSnapshot.endDate,
+    JSON.stringify(activeSnapshot.domain || []),
+    JSON.stringify(activeSnapshot.site || []),
+    JSON.stringify(activeSnapshot.domainName || []),
+    JSON.stringify(activeSnapshot.domainId || []),
   ]);
 
-  const dashParams = useMemo(() => snapshotToDashboardParams(snapshot), [
-    snapshot.startDate,
-    snapshot.endDate,
-    JSON.stringify(snapshot.domain || []),
-    JSON.stringify(snapshot.site || []),
-    JSON.stringify(snapshot.domainName || []),
-    JSON.stringify(snapshot.domainId || []),
-  ]);
+  const dashParams = useMemo(
+    () => snapshotToDashboardParams(activeSnapshot),
+    [
+      activeSnapshot.startDate,
+      activeSnapshot.endDate,
+      JSON.stringify(activeSnapshot.domain || []),
+      JSON.stringify(activeSnapshot.site || []),
+      JSON.stringify(activeSnapshot.domainName || []),
+      JSON.stringify(activeSnapshot.domainId || []),
+    ]
+  );
 
   const tableConfig = useMemo(
     () => resolveDashboardTableConfig(dashParams?.applied || {}, Boolean(dashParams?.filterApplied)),
@@ -133,7 +165,7 @@ export default function DashboardPresetDetail({
           <button
             type="button"
             className="btn-generate"
-            onClick={() => navigate(hrefForPreset('dashboard', snapshot))}
+            onClick={() => navigate(hrefForPreset('dashboard', activeSnapshot))}
           >
             Open in Dashboard
           </button>
@@ -154,6 +186,21 @@ export default function DashboardPresetDetail({
           ) : null}
         </div>
       </div>
+
+      <PresetDateToolbar
+        preset={preset}
+        startDate={startDate}
+        endDate={endDate}
+        presetLabel={presetLabel}
+        presetOptions={presetOptions}
+        customDatesIncomplete={customDatesIncomplete}
+        dateFilterLocked={dateFilterLocked}
+        dateRestriction={dateRestriction}
+        onPreset={onPreset}
+        onStartDateChange={setStartDate}
+        onEndDateChange={setEndDate}
+        onApply={applyDates}
+      />
 
       {error ? <div className="login-error" style={{ marginTop: 12 }}>{error}</div> : null}
 
@@ -189,7 +236,7 @@ export default function DashboardPresetDetail({
           emptyMessage="No Dashboard rows for this preset"
           columnStorageKey={`dash-preset-${presetItem.id}`}
           canDownload
-          exportName={`dashboard_preset_${snapshot.startDate || 'x'}_${snapshot.endDate || 'y'}`}
+          exportName={`dashboard_preset_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
         />
       </div>
     </div>

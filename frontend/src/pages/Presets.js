@@ -239,7 +239,7 @@ export default function Presets() {
     <div className="dashboard-page presets-page">
       <PageHeader
         title="Presets"
-        subtitle="Saved date + filter combos. Select one to preview live overview and table."
+        subtitle="Saved filter combos — pick a date range on the right to preview data."
         summary={totalCount
           ? `${totalCount} saved${pinnedCount ? ` · ${pinnedCount} pinned` : ''}`
           : null}
@@ -247,9 +247,9 @@ export default function Presets() {
 
       <div className="filter-card presets-clarify-card">
         <p className="form-note" style={{ margin: 0 }}>
-          Use <strong>Save preset</strong> on Dashboard, Reporting, or ROI.
-          Click a preset here to see the same overview cards and results table without leaving this page.
-          <strong> Open in …</strong> still opens the full page with filters applied.
+          Use <strong>Save preset</strong> on Dashboard, Reporting, or ROI to save filters only.
+          Click a preset here, change the date range (same as Dashboard), and preview overview + table.
+          <strong> Open in …</strong> opens the full page with your current dates and filters applied.
         </p>
       </div>
 

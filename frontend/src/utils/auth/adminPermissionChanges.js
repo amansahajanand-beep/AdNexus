@@ -17,11 +17,12 @@ function diffLists(oldArr = [], newArr = []) {
   };
 }
 
-/** Summary after saving permissions (flags + domains + sites + app IDs + date limit). */
-export function buildPermissionSaveSummary(username, oldUser, newPayload = {}) {
+/** Summary after saving permissions (flags + domains + sites + app IDs + ads accounts + date limit). */
+export function buildPermissionSaveSummary(username, oldUser, newPayload = {}, opts = {}) {
   const oldPerms = oldUser?.permissions || {};
   const added = [];
   const removed = [];
+  const adsLabel = (id) => (opts.adsAccountLabelById && opts.adsAccountLabelById[id]) || id;
 
   const { added: domAdd, removed: domRem } = diffLists(
     oldPerms.allowedDomains,
@@ -43,6 +44,13 @@ export function buildPermissionSaveSummary(username, oldUser, newPayload = {}) {
   );
   appAdd.forEach((a) => added.push(`App ID: ${a}`));
   appRem.forEach((a) => removed.push(`App ID: ${a}`));
+
+  const { added: adsAdd, removed: adsRem } = diffLists(
+    oldPerms.allowedAdsAccountIds,
+    newPayload.allowedAdsAccountIds
+  );
+  adsAdd.forEach((a) => added.push(`Ads account: ${adsLabel(a)}`));
+  adsRem.forEach((a) => removed.push(`Ads account: ${adsLabel(a)}`));
 
   ALL_PERM_ITEMS.forEach((p) => {
     const wasTrue = typeof oldPerms[p.key] === 'boolean'
@@ -104,6 +112,7 @@ export function buildNewUserInventorySummary(payload = {}) {
   (payload.allowedDomains || []).forEach((d) => changes.push({ type: 'added', text: `Domain: ${d}` }));
   (payload.allowedSites || []).forEach((s) => changes.push({ type: 'added', text: `Site: ${s}` }));
   (payload.allowedAppIds || []).forEach((a) => changes.push({ type: 'added', text: `App ID: ${a}` }));
+  (payload.allowedAdsAccountIds || []).forEach((a) => changes.push({ type: 'added', text: `Ads account: ${a}` }));
   const drLabel = formatDateRestrictionForSummary({
     startDate: payload.dateRestrictionStart,
     endDate: payload.dateRestrictionEnd,

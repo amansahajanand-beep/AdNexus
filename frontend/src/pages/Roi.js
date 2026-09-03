@@ -2,9 +2,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useOutletContext, useSearchParams } from 'react-router-dom';
 import PageHeader from '../components/ui/PageHeader';
 import RoiCountryTreeTable from '../components/roi/RoiCountryTreeTable';
+import RoiSummaryBoards from '../components/roi/RoiSummaryBoards';
 import CompareRangeBar from '../components/ui/CompareRangeBar';
 import SavePresetButton from '../components/ui/SavePresetButton';
-import DataFreshness from '../components/ui/DataFreshness';
 import ThresholdAlertBanner from '../components/ui/ThresholdAlertBanner';
 import { adsAPI, roiAPI, usersAPI } from '../utils/api';
 import MultiSelect from '../components/ui/MultiSelect';
@@ -35,7 +35,7 @@ import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError
 import { useMedia } from '../hooks/useMedia';
 import { showToast } from '../hooks/useToast';
 import { parseReportShare, copyReportLink } from '../utils/reportShare';
-import { PRESET_PAGES } from '../utils/reportPresets';
+import { PRESET_PAGES, filtersOnlySnapshot } from '../utils/reportPresets';
 import { getLastPageFilters, saveLastPageFilters, LAST_FILTER_PAGES } from '../utils/lastPageFilters';
 import { loadComparePrefs, saveComparePrefs } from '../utils/dashCharts';
 import {
@@ -47,11 +47,12 @@ import {
 } from '../utils/periodCompare';
 import { evaluateRoiThresholds } from '../utils/thresholdAlerts';
 import {
-  buildRoiSummaryCards,
   buildCountryTree,
   formatRoiMoney,
   formatRoiPct,
   labelsForSelection,
+  mergeRoiBreakdownPayload,
+  mergeRoiSummaryPayload,
   roiToneClass,
 } from '../utils/report/roiView';
 
@@ -77,26 +78,6 @@ function emptyExpenseSlot() {
     targetKey: '',
     notes: '',
   };
-}
-
-function DeltaLine({ change, compareLabel, loading }) {
-  if (loading || change === undefined || change === null) return null;
-  const n = Number(change);
-  if (!Number.isFinite(n) || Math.abs(n) < 0.05) {
-    return (
-      <span className="gam-overview-delta is-flat">
-        No change
-        {compareLabel ? <span className="gam-overview-delta-vs"> {compareLabel}</span> : null}
-      </span>
-    );
-  }
-  const isDown = n < 0;
-  return (
-    <span className={`gam-overview-delta ${isDown ? 'down' : 'up'}`}>
-      {isDown ? '▼' : '▲'} {Math.abs(n).toFixed(1)}%
-      {compareLabel ? <span className="gam-overview-delta-vs"> {compareLabel}</span> : null}
-    </span>
-  );
 }
 
 export default function Roi() {
@@ -143,6 +124,8 @@ export default function Roi() {
   const [roiCampaignOptions, setRoiCampaignOptions] = useState([]);
   const [roiAppOptions, setRoiAppOptions] = useState([]);
   const [roiCountryOptions, setRoiCountryOptions] = useState([]);
+  const [roiSiteOptions, setRoiSiteOptions] = useState([]);
+  const [roiSitesLoading, setRoiSitesLoading] = useState(false);
   const [roiCampaignsLoading, setRoiCampaignsLoading] = useState(false);
   const [roiCampaignsFallback, setRoiCampaignsFallback] = useState(false);
   const [roiAppsLoading, setRoiAppsLoading] = useState(false);
@@ -150,6 +133,7 @@ export default function Roi() {
   const [roiCountriesFallback, setRoiCountriesFallback] = useState(false);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [breakdownLoading, setBreakdownLoading] = useState(false);
   const [error, setError] = useState(null);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [filtersOpen, setFiltersOpen] = useState(true);
@@ -189,6 +173,8 @@ export default function Roi() {
   const shareHydratedRef = useRef(false);
   const pendingShareFiltersRef = useRef(null);
   const skipPrefsSaveRef = useRef(true);
+  const loadAbortRef = useRef(null);
+  const breakdownAbortRef = useRef(null);
 
   useEffect(() => {
     try {
@@ -290,10 +276,20 @@ export default function Roi() {
     [preset]
   );
 
-  const siteOptions = useMemo(
-    () => (siteHosts || []).map((h) => ({ value: String(h).toLowerCase(), label: String(h) })),
-    [siteHosts]
-  );
+  const siteOptions = useMemo(() => {
+    const seen = new Set();
+    const opts = [];
+    const add = (value, label) => {
+      const id = String(value || '').trim().toLowerCase();
+      if (!id || seen.has(id)) return;
+      seen.add(id);
+      opts.push({ value: id, label: String(label || value).trim() || id });
+    };
+    (roiSiteOptions || []).forEach((o) => add(o.value, o.label));
+    (siteHosts || []).forEach((h) => add(h, h));
+    opts.sort((a, b) => a.label.localeCompare(b.label));
+    return opts;
+  }, [roiSiteOptions, siteHosts]);
 
   const roiAccountsWithSpendInRange = useMemo(
     () => roiAccountOptions.filter((o) => Number(o.spend) > 0).length,
@@ -349,12 +345,10 @@ export default function Roi() {
     const accountIds = collapseFullSelection(accountSel, accountOpts);
     const campaignIds = collapseFullSelection(campaignSel, campaignOpts);
     const countryCodes = collapseFullSelection(countrySel, countryOpts);
-    // Apps: expand "all" to concrete related IDs so site-only maps stay out when sites aren't picked.
-    const appKeys = isAllSelection(appSel)
-      ? optionValues(appOpts)
-      : (Array.isArray(appSel) ? appSel.filter((v) => v && v !== ALL_SENTINEL) : []);
+    const appKeys = collapseFullSelection(appSel, appOpts);
+    // Sites: manual GAM inventory — only send explicit picks (never auto-expand to all sites).
     const siteKeys = isAllSelection(siteSel)
-      ? optionValues(siteOpts)
+      ? []
       : (Array.isArray(siteSel) ? siteSel.filter((v) => v && v !== ALL_SENTINEL) : []);
     let targetType = 'all';
     if (appKeys.length && siteKeys.length) targetType = 'all';
@@ -370,36 +364,142 @@ export default function Roi() {
     };
   }, []);
 
+  const loadKey = useMemo(() => JSON.stringify({
+    startDate: applied?.startDate || null,
+    endDate: applied?.endDate || null,
+    targetType: applied?.targetType || 'all',
+    accountIds: applied?.accountIds || null,
+    campaignIds: applied?.campaignIds || null,
+    appKeys: applied?.appKeys || null,
+    siteKeys: applied?.siteKeys || null,
+    countryCodes: applied?.countryCodes || null,
+    userId: user?.id || null,
+  }), [
+    applied?.startDate,
+    applied?.endDate,
+    applied?.targetType,
+    applied?.accountIds,
+    applied?.campaignIds,
+    applied?.appKeys,
+    applied?.siteKeys,
+    applied?.countryCodes,
+    user?.id,
+  ]);
+
   const load = useCallback(async (range = applied) => {
     if (!range?.startDate || !range?.endDate) return;
+    if (loadAbortRef.current) loadAbortRef.current.abort();
+    if (breakdownAbortRef.current) breakdownAbortRef.current.abort();
+
+    const controller = new AbortController();
+    const bdController = new AbortController();
+    loadAbortRef.current = controller;
+    breakdownAbortRef.current = bdController;
+
     setLoading(true);
+    setBreakdownLoading(true);
     setError(null);
-    try {
+
+    const buildParams = (extra = {}) => {
       const params = {
         start: range.startDate,
         end: range.endDate,
         targetType: range.targetType || 'all',
+        ...extra,
       };
       if (range.accountIds?.length) params.accountIds = range.accountIds.join(',');
       if (range.campaignIds?.length) params.campaignIds = range.campaignIds.join(',');
       if (range.appKeys?.length) params.appKeys = range.appKeys.join(',');
       if (range.siteKeys?.length) params.siteKeys = range.siteKeys.join(',');
       if (range.countryCodes?.length) params.countryCodes = range.countryCodes.join(',');
-      const summary = await roiAPI.summary(params);
-      setData(summary);
-      setLastUpdated(nowTimeInTZ());
-      setThresholdBanners(evaluateRoiThresholds(summary?.summary || summary || {}));
-    } catch (err) {
-      logErrorForDebug(err, 'ROI summary');
-      setError(getUserFacingMessage(err, 'Could not load ROI summary.'));
-      setData(null);
-      setThresholdBanners([]);
+      return params;
+    };
+
+    const summaryParams = buildParams({ summaryOnly: '1' });
+    const breakdownParams = buildParams({ breakdownOnly: '1' });
+
+    let summaryOk = false;
+    let breakdownOk = false;
+    let summaryErr = null;
+    let breakdownErr = null;
+
+    const summaryPromise = roiAPI.summary(summaryParams, { signal: controller.signal })
+      .then((fast) => {
+        if (controller.signal.aborted) return null;
+        summaryOk = true;
+        setData((prev) => mergeRoiSummaryPayload(prev, fast));
+        setLastUpdated(nowTimeInTZ());
+        setThresholdBanners(evaluateRoiThresholds(fast?.summary || fast || {}));
+        setLoading(false);
+        return fast;
+      })
+      .catch((err) => {
+        if (controller.signal.aborted || err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') {
+          return null;
+        }
+        summaryErr = err;
+        logErrorForDebug(err, 'ROI summary');
+        setLoading(false);
+        return null;
+      });
+
+    const breakdownPromise = roiAPI.summary(breakdownParams, { signal: bdController.signal })
+      .then((breakdown) => {
+        if (bdController.signal.aborted) return null;
+        breakdownOk = true;
+        setData((prev) => mergeRoiBreakdownPayload(prev, breakdown));
+        setBreakdownLoading(false);
+        // Overview can paint from table totals immediately.
+        setLoading(false);
+        return breakdown;
+      })
+      .catch((err) => {
+        if (bdController.signal.aborted || err?.name === 'CanceledError' || err?.code === 'ERR_CANCELED') {
+          return null;
+        }
+        breakdownErr = err;
+        logErrorForDebug(err, 'ROI breakdown');
+        setBreakdownLoading(false);
+        return null;
+      });
+
+    try {
+      await Promise.all([summaryPromise, breakdownPromise]);
+      if (controller.signal.aborted && bdController.signal.aborted) return;
+      if (!summaryOk && !breakdownOk) {
+        setError(getUserFacingMessage(
+          summaryErr || breakdownErr,
+          'Could not load ROI summary.'
+        ));
+        setData(null);
+        setThresholdBanners([]);
+      } else if (!summaryOk && summaryErr) {
+        setError(getUserFacingMessage(summaryErr, 'Could not load ROI overview cards.'));
+      } else {
+        setError(null);
+      }
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) setLoading(false);
+      if (!bdController.signal.aborted) setBreakdownLoading(false);
     }
   }, [applied]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => { load(); }, [loadKey, load]);
+
+  // Clear ROI payload when switching users so stale overview/table never linger.
+  useEffect(() => {
+    setData(null);
+    setPriorSummary(null);
+    setRoiAccountOptions([]);
+    setRoiCampaignOptions([]);
+    setRoiAppOptions([]);
+    setRoiCountryOptions([]);
+    setRoiSiteOptions([]);
+    setError(null);
+    setThresholdBanners([]);
+    setLoading(false);
+    setBreakdownLoading(false);
+  }, [user?.id]);
 
   useEffect(() => {
     setCountryPage(1);
@@ -414,17 +514,19 @@ export default function Roi() {
     applied?.countryCodes,
   ]);
 
-  // Load Ads accounts for filter (by current date selection)
+  // Load Ads accounts for filter as soon as dates are applied (do not wait on summary).
   useEffect(() => {
-    const start = startDate || applied?.startDate;
-    const end = endDate || applied?.endDate;
+    const start = applied?.startDate;
+    const end = applied?.endDate;
     if (!start || !end) return undefined;
     let cancelled = false;
     (async () => {
       try {
         const res = await adsAPI.listRoiAccounts({ start, end });
         if (cancelled) return;
-        const opts = (res.accounts || []).map((a) => ({
+        const opts = (res.accounts || [])
+          .filter((a) => (Number(a.spend) || 0) > 0)
+          .map((a) => ({
           value: a.id,
           label: a.descriptiveName || a.customerId || a.id,
           spend: Number(a.spend) || 0,
@@ -438,6 +540,7 @@ export default function Roi() {
             pendingShareFiltersRef.current = { ...pending, accountIds: [] };
             if (kept.length) return kept;
           }
+          if (!opts.length) return [];
           if (isAllSelection(prev) || !prev?.length) return toAllSelection();
           const allowed = new Set(opts.map((o) => o.value));
           const kept = prev.filter((id) => id !== ALL_SENTINEL && allowed.has(id));
@@ -449,12 +552,12 @@ export default function Roi() {
       }
     })();
     return () => { cancelled = true; };
-  }, [startDate, endDate, applied?.startDate, applied?.endDate]);
+  }, [applied?.startDate, applied?.endDate]);
 
   // Load campaigns for selected accounts
   useEffect(() => {
-    const start = startDate || applied?.startDate;
-    const end = endDate || applied?.endDate;
+    const start = applied?.startDate;
+    const end = applied?.endDate;
     if (!start || !end) return undefined;
     let cancelled = false;
     (async () => {
@@ -498,12 +601,12 @@ export default function Roi() {
       }
     })();
     return () => { cancelled = true; };
-  }, [startDate, endDate, applied?.startDate, applied?.endDate, filterAccountIds, roiAccountOptions]);
+  }, [applied?.startDate, applied?.endDate, filterAccountIds, roiAccountOptions]);
 
   // App IDs from Google Ads for the selected accounts/campaigns (App Campaign settings).
   useEffect(() => {
-    const start = startDate || applied?.startDate;
-    const end = endDate || applied?.endDate;
+    const start = applied?.startDate;
+    const end = applied?.endDate;
     if (!start || !end) return undefined;
     // Wait until campaigns for the current accounts have loaded so we do not
     // request apps with a stale campaign filter from a previous selection.
@@ -549,8 +652,6 @@ export default function Roi() {
     })();
     return () => { cancelled = true; };
   }, [
-    startDate,
-    endDate,
     applied?.startDate,
     applied?.endDate,
     filterAccountIds,
@@ -562,8 +663,8 @@ export default function Roi() {
 
   // Countries with Ads spend for selected accounts/campaigns.
   useEffect(() => {
-    const start = startDate || applied?.startDate;
-    const end = endDate || applied?.endDate;
+    const start = applied?.startDate;
+    const end = applied?.endDate;
     if (!start || !end) return undefined;
     if (roiCampaignsLoading) return undefined;
     let cancelled = false;
@@ -609,8 +710,6 @@ export default function Roi() {
     })();
     return () => { cancelled = true; };
   }, [
-    startDate,
-    endDate,
     applied?.startDate,
     applied?.endDate,
     filterAccountIds,
@@ -626,6 +725,7 @@ export default function Roi() {
       setPriorSummary(null);
       return undefined;
     }
+    if (loading) return undefined;
     let cancelled = false;
     setPriorSummary(null);
     (async () => {
@@ -634,6 +734,7 @@ export default function Roi() {
           start: prior.startDate,
           end: prior.endDate,
           targetType: applied?.targetType || 'all',
+          summaryOnly: '1',
         };
         if (applied?.accountIds?.length) params.accountIds = applied.accountIds.join(',');
         if (applied?.campaignIds?.length) params.campaignIds = applied.campaignIds.join(',');
@@ -658,8 +759,47 @@ export default function Roi() {
     applied?.campaignIds,
     applied?.appKeys,
     applied?.siteKeys,
+    applied?.countryCodes,
     dateRestriction,
+    loading,
   ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setRoiSitesLoading(true);
+      try {
+        const res = await adsAPI.listRoiSites();
+        if (cancelled) return;
+        const opts = (res.sites || []).map((s) => ({
+          value: String(s.id || '').toLowerCase(),
+          label: s.label || s.id,
+        })).filter((o) => o.value);
+        setRoiSiteOptions(opts);
+        setFilterSiteKeys((prev) => {
+          const pending = pendingShareFiltersRef.current;
+          if (pending?.siteKeys?.length) {
+            const allowed = new Set(opts.map((o) => o.value));
+            const kept = pending.siteKeys
+              .map((k) => String(k).toLowerCase())
+              .filter((id) => allowed.has(id));
+            pendingShareFiltersRef.current = { ...pending, siteKeys: [] };
+            if (kept.length) return kept;
+          }
+          if (!prev?.length) return [];
+          const allowed = new Set(opts.map((o) => o.value));
+          const kept = prev.filter((id) => id === ALL_SENTINEL || allowed.has(id));
+          return kept.length ? kept : [];
+        });
+      } catch (err) {
+        logErrorForDebug(err, 'ROI sites filter');
+        if (!cancelled) setRoiSiteOptions([]);
+      } finally {
+        if (!cancelled) setRoiSitesLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -693,33 +833,20 @@ export default function Roi() {
     return () => { cancelled = true; };
   }, []);
 
-  const getPresetSnapshot = useCallback(() => {
-    const accountSel = filterAccountIds?.length ? filterAccountIds : toAllSelection();
-    const campaignSel = filterCampaignIds?.length ? filterCampaignIds : toAllSelection();
-    const appSel = filterAppKeys?.length ? filterAppKeys : [];
-    const siteSel = filterSiteKeys?.length ? filterSiteKeys : [];
-    const countrySel = filterCountryCodes?.length ? filterCountryCodes : toAllSelection();
-    return {
-      preset,
-      startDate: applied?.startDate || startDate,
-      endDate: applied?.endDate || endDate,
-      targetType: applied?.targetType || 'all',
-      accountIds: accountSel,
-      campaignIds: campaignSel,
-      appKeys: appSel,
-      siteKeys: siteSel,
-      countryCodes: countrySel,
-      accountLabels: labelsForSelection(accountSel, roiAccountOptions),
-      campaignLabels: labelsForSelection(campaignSel, roiCampaignOptions),
-      appLabels: labelsForSelection(appSel, roiAppOptions),
-      siteLabels: labelsForSelection(siteSel, siteOptions),
-      countryLabels: labelsForSelection(countrySel, roiCountryOptions),
-    };
-  }, [
-    preset,
-    applied,
-    startDate,
-    endDate,
+  const getPresetSnapshot = useCallback(() => filtersOnlySnapshot({
+    targetType: applied?.targetType || 'all',
+    accountIds: filterAccountIds?.length ? filterAccountIds : toAllSelection(),
+    campaignIds: filterCampaignIds?.length ? filterCampaignIds : toAllSelection(),
+    appKeys: filterAppKeys?.length ? filterAppKeys : [],
+    siteKeys: filterSiteKeys?.length ? filterSiteKeys : [],
+    countryCodes: filterCountryCodes?.length ? filterCountryCodes : toAllSelection(),
+    accountLabels: labelsForSelection(filterAccountIds?.length ? filterAccountIds : toAllSelection(), roiAccountOptions),
+    campaignLabels: labelsForSelection(filterCampaignIds?.length ? filterCampaignIds : toAllSelection(), roiCampaignOptions),
+    appLabels: labelsForSelection(filterAppKeys, roiAppOptions),
+    siteLabels: labelsForSelection(filterSiteKeys, siteOptions),
+    countryLabels: labelsForSelection(filterCountryCodes?.length ? filterCountryCodes : toAllSelection(), roiCountryOptions),
+  }), [
+    applied?.targetType,
     filterAccountIds,
     filterCampaignIds,
     filterAppKeys,
@@ -733,8 +860,12 @@ export default function Roi() {
   ]);
 
   const handleCopyLink = async () => {
-    const snap = getPresetSnapshot();
-    await copyReportLink(snap);
+    await copyReportLink({
+      ...getPresetSnapshot(),
+      preset,
+      startDate: applied?.startDate || startDate,
+      endDate: applied?.endDate || endDate,
+    });
     showToast({ message: 'Link copied — opens this exact ROI view' });
   };
 
@@ -888,14 +1019,10 @@ export default function Roi() {
     };
     if (type === 'site') {
       (siteHosts || []).forEach(add);
-      (data?.rows || []).forEach((r) => {
-        if (r.targetType === 'site') add(r.targetKey);
-      });
+      (siteOptions || []).forEach((o) => add(o.value));
     } else if (type === 'app') {
       (appIds || []).forEach(add);
-      (data?.rows || []).forEach((r) => {
-        if (r.targetType === 'app') add(r.targetKey);
-      });
+      (roiAppOptions || []).forEach((o) => add(o.value));
     }
     options.sort((a, b) => a.label.localeCompare(b.label));
     return options;
@@ -1026,8 +1153,8 @@ export default function Roi() {
     );
   };
 
-  const accounts = data?.accounts || [];
   const summary = data?.summary || {};
+  const overviewReady = Boolean(summary && Object.keys(summary).length > 0);
 
   const cardDeltas = useMemo(() => {
     if (!priorSummary) return {};
@@ -1059,16 +1186,6 @@ export default function Roi() {
     ]
   );
 
-  const summaryCards = useMemo(() => {
-    const base = buildRoiSummaryCards(summary);
-    return base.map((card) => {
-      if (card.key === 'spend') return { ...card, delta: cardDeltas.adsSpend };
-      if (card.key === 'earn') return { ...card, delta: cardDeltas.earn };
-      if (card.key === 'roiSpend') return { ...card, delta: cardDeltas.roiSpendPercent };
-      return card;
-    });
-  }, [summary, cardDeltas]);
-
   return (
     <div className="dashboard-page reporting-page roi-page">
       <PageHeader
@@ -1087,7 +1204,7 @@ export default function Roi() {
           userId={user?.id}
           getSnapshot={getPresetSnapshot}
           variant="primary"
-          hint="Saves accounts, campaigns, app IDs, sites, countries, and date range."
+          hint="Saves accounts, campaigns, app IDs, sites, and countries (not the date range)."
         />
       </PageHeader>
 
@@ -1211,18 +1328,22 @@ export default function Roi() {
             </RoiFilterSection>
 
             <RoiFilterSection
-              title="Ads and inventory"
-              subtitle="Choose the accounts, campaigns, apps, and sites to include in your ROI."
+              title="Google Ads"
+              subtitle="Accounts, campaigns, and apps from synced Ads spend in the selected date range."
             >
               <RoiFilterRow icon="accounts" label="Ads accounts">
                 <MultiSelect
                   options={roiAccountOptions}
                   value={filterAccountIds}
                   onChange={setFilterAccountIds}
-                  placeholder="Select ads accounts…"
+                  placeholder={
+                    roiAccountOptions.length
+                      ? 'Accounts with spend in this period…'
+                      : 'No Ads spend in this period — try another date or run Ads sync'
+                  }
                   searchable
                   showSelectAll
-                  selectAllLabel="Select all accounts"
+                  selectAllLabel="Select all accounts with spend"
                 />
               </RoiFilterRow>
               <RoiFilterRow icon="campaigns" label="Campaigns">
@@ -1257,19 +1378,6 @@ export default function Roi() {
                   selectAllLabel="Select all related apps"
                 />
               </RoiFilterRow>
-              <RoiFilterRow icon="sites" label="Sites">
-                <MultiSelect
-                  options={siteOptions}
-                  value={filterSiteKeys}
-                  onChange={setFilterSiteKeys}
-                  placeholder="Select sites…"
-                  disabled={!siteOptions.length && !inventoryLoading}
-                  loading={inventoryLoading}
-                  searchable
-                  showSelectAll
-                  selectAllLabel="Select all sites"
-                />
-              </RoiFilterRow>
               <RoiFilterRow icon="countries" label="Countries">
                 <MultiSelect
                   options={roiCountryOptions}
@@ -1287,6 +1395,31 @@ export default function Roi() {
                   searchable
                   showSelectAll
                   selectAllLabel="Select all countries"
+                />
+              </RoiFilterRow>
+            </RoiFilterSection>
+
+            <RoiFilterSection
+              title="GAM sites"
+              subtitle="Pick site hosts manually for GAM earn — independent of Ads account selection."
+            >
+              <RoiFilterRow icon="sites" label="Sites">
+                <MultiSelect
+                  options={siteOptions}
+                  value={filterSiteKeys}
+                  onChange={setFilterSiteKeys}
+                  placeholder={
+                    roiSitesLoading
+                      ? 'Loading GAM sites…'
+                      : (siteOptions.length
+                        ? 'Select site hosts (optional)…'
+                        : 'No GAM sites in inventory yet')
+                  }
+                  disabled={!siteOptions.length && !roiSitesLoading}
+                  loading={roiSitesLoading}
+                  searchable
+                  showSelectAll
+                  selectAllLabel="Select all sites"
                 />
               </RoiFilterRow>
             </RoiFilterSection>
@@ -1351,26 +1484,14 @@ export default function Roi() {
         </form>
       )}
 
-      <div className={`report-summary-row roi-summary-grid${loading ? ' is-loading' : ''}`}>
-        {summaryCards.map((card) => (
-          <div key={card.key} className={`report-sum-card${loading ? ' is-loading' : ''}`}>
-            <span className={`rsc-icon ${card.tone}`}>{card.icon}</span>
-            <div>
-              <div className="rsc-label">{card.label}</div>
-              <div className="rsc-value">
-                {loading ? <span className="card-spinner card-spinner-lg" aria-label="Loading" /> : card.value}
-              </div>
-              {'delta' in card ? (
-                <DeltaLine change={card.delta} compareLabel={compareLabel} loading={loading} />
-              ) : null}
-            </div>
-          </div>
-        ))}
-        <div className="report-live">
-          <span className="dot-pulse" /> Live
-          <DataFreshness networkInfo={networkInfo} fetchedAt={lastUpdated} compact />
-        </div>
-      </div>
+      <RoiSummaryBoards
+        summary={summary}
+        deltas={cardDeltas}
+        compareLabel={compareLabel}
+        loading={loading && !overviewReady}
+        networkInfo={networkInfo}
+        fetchedAt={lastUpdated}
+      />
 
       {summary.unmappedSpend > 0 && (
         <div className="warn-card warn-card-partial" role="status" style={{ marginTop: 12 }}>
@@ -1393,7 +1514,10 @@ export default function Roi() {
         </div>
       )}
 
-      {!accounts.length && !loading && (
+      {!loading && !breakdownLoading
+        && !roiAccountOptions.length
+        && !(Number(summary.adsSpend) > 0)
+        && !(countryTargetBreakdown?.length || countryBreakdown?.length) && (
         <div className="warn-card" role="status" style={{ marginTop: 12 }}>
           <div className="warn-card-main">
             <div className="warn-card-left">
@@ -1411,7 +1535,7 @@ export default function Roi() {
 
       <RoiCountryTreeTable
         tree={countryTree}
-        loading={loading}
+        loading={breakdownLoading}
         search={countrySearch}
         onSearchChange={setCountrySearch}
         onPageReset={() => setCountryPage(1)}

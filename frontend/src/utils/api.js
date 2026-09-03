@@ -259,6 +259,7 @@ export const adsAPI = {
   listCampaigns: (id) => FAST_API.get(`/ads/accounts/${id}/campaigns`),
   listRoiCampaigns: (params) => FAST_API.get('/ads/roi-campaigns', { params }),
   listRoiAccounts: (params) => FAST_API.get('/ads/roi-accounts', { params }),
+  listRoiSites: () => FAST_API.get('/ads/roi-sites'),
   listRoiRelatedTargets: (params) => FAST_API.get('/ads/roi-related-targets', { params }),
   listRoiCountries: (params) => FAST_API.get('/ads/roi-countries', { params }),
   listCampaignMaps: () => FAST_API.get('/ads/campaign-maps'),
@@ -273,7 +274,7 @@ export const adsAPI = {
 };
 
 export const roiAPI = {
-  summary: (params) => FAST_API.get('/roi/summary', { params }),
+  summary: (params, config) => FAST_API.get('/roi/summary', { params, ...config }),
 };
 
 export const usersAPI = {

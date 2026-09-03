@@ -1,6 +1,6 @@
 /**
- * Named report presets — full snapshot including dates (unlike savedFilters).
- * Persisted to localStorage per user + page. Shown only on the Presets page.
+ * Named report presets — filter snapshot only (no dates).
+ * Dates are chosen on the Presets page, same as switching dates on Dashboard.
  *
  * Storage key: reportPresets_v1:<page>:<userId>
  * Item shape: { id, name, snapshot, summary, when, pinned, pinnedAt }
@@ -41,7 +41,7 @@ function toArray(v) {
   return Array.isArray(v) ? v.filter(Boolean) : (v ? [v] : []);
 }
 
-/** Full snapshot — includes date range (same shape as copy-link payload). */
+/** Full snapshot shape (dates optional — legacy presets may still have them). */
 export function normalizePresetSnapshot(f = {}) {
   return {
     preset: f.preset || null,
@@ -69,6 +69,27 @@ export function normalizePresetSnapshot(f = {}) {
   };
 }
 
+/** Strip dates from a snapshot before persisting a preset. */
+export function filtersOnlySnapshot(f = {}) {
+  const snap = normalizePresetSnapshot(f);
+  const {
+    preset,
+    startDate,
+    endDate,
+    ...filters
+  } = snap;
+  return filters;
+}
+
+/** Merge saved filter preset with active date range (Presets page / open in …). */
+export function mergePresetWithDates(filterSnapshot = {}, { startDate, endDate, preset } = {}) {
+  return {
+    ...filtersOnlySnapshot(filterSnapshot),
+    ...(startDate && endDate ? { startDate, endDate } : {}),
+    ...(preset ? { preset } : {}),
+  };
+}
+
 function makeId() {
   try {
     if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
@@ -81,12 +102,6 @@ function makeId() {
 export function summaryForPreset(snapshot) {
   const p = normalizePresetSnapshot(snapshot);
   const parts = [];
-
-  if (p.startDate && p.endDate) {
-    parts.push(p.startDate === p.endDate ? p.startDate : `${p.startDate} → ${p.endDate}`);
-  } else if (p.preset) {
-    parts.push(String(p.preset));
-  }
 
   if (p.targetType && p.targetType !== 'all') {
     parts.push(p.targetType === 'site' ? 'Sites' : 'Apps');
@@ -140,12 +155,10 @@ export function summaryForPreset(snapshot) {
 }
 
 function defaultNameFromSnapshot(snapshot) {
-  const p = normalizePresetSnapshot(snapshot);
-  if (p.startDate && p.endDate) {
-    return (p.startDate === p.endDate ? p.startDate : `${p.startDate} → ${p.endDate}`)
-      .slice(0, PRESET_NAME_MAX);
+  const summary = summaryForPreset(snapshot);
+  if (summary && summary !== 'Default filters') {
+    return summary.slice(0, PRESET_NAME_MAX);
   }
-  if (p.preset) return String(p.preset).slice(0, PRESET_NAME_MAX);
   return 'Untitled preset';
 }
 
@@ -210,7 +223,7 @@ export function getReportPresets(page, userId) {
 }
 
 export function saveReportPreset(page, name, filter, userId) {
-  const snap = normalizePresetSnapshot(filter);
+  const snap = filtersOnlySnapshot(filter);
   let trimmed;
   try {
     trimmed = assertValidSavedName(
@@ -296,7 +309,7 @@ export function removeReportPreset(page, id, userId) {
   }
 }
 
-/** Build path+query to open this preset. */
+/** Build path+query to open this preset (include dates in snapshot when opening a page). */
 export function hrefForPreset(page, snapshot) {
   const path = page === PRESET_PAGES.reporting
     ? '/reporting'
@@ -315,6 +328,8 @@ export default {
   removeReportPreset,
   summaryForPreset,
   normalizePresetSnapshot,
+  filtersOnlySnapshot,
+  mergePresetWithDates,
   hrefForPreset,
   PRESET_PAGES,
   PRESET_NAME_MAX,

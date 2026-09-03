@@ -45,6 +45,7 @@ function flagsFromUser(user) {
 export default function UserFormModal({
   open, onClose, onSave, saving, error, user,
   domains = [], domainsLoading, catalogLoading = false, catalogRows = [], catalogLists = {},
+  adsAccountOptions = [], adsAccountsLoading = false,
 }) {
   const isEdit = !!user;
   const editingAdmin = isEdit && isAdminRole(user);
@@ -57,6 +58,7 @@ export default function UserFormModal({
   const [allowedDomains, setAllowedDomains] = useState([]);
   const [allowedSites, setAllowedSites] = useState([]);
   const [allowedAppIds, setAllowedAppIds] = useState([]);
+  const [allowedAdsAccountIds, setAllowedAdsAccountIds] = useState([]);
   const [dateRestrictionStart, setDateRestrictionStart] = useState('');
   const [dateRestrictionEnd, setDateRestrictionEnd] = useState('');
   const [localError, setLocalError] = useState(null);
@@ -76,6 +78,7 @@ export default function UserFormModal({
     setAllowedDomains(user?.permissions?.allowedDomains || []);
     setAllowedSites(user?.permissions?.allowedSites || []);
     setAllowedAppIds(user?.permissions?.allowedAppIds || []);
+    setAllowedAdsAccountIds(user?.permissions?.allowedAdsAccountIds || []);
     const dr = readDateRestrictionFromUser(user);
     setDateRestrictionStart(dr.start);
     setDateRestrictionEnd(dr.end);
@@ -143,6 +146,7 @@ export default function UserFormModal({
         allowedDomains,
         allowedSites,
         allowedAppIds,
+        allowedAdsAccountIds,
         ...dateRestrictionPayload(dateRestrictionStart, dateRestrictionEnd),
       });
     }
@@ -212,6 +216,8 @@ export default function UserFormModal({
           onSitesChange={setAllowedSites}
           allowedAppIds={allowedAppIds}
           onAppIdsChange={setAllowedAppIds}
+          allowedAdsAccountIds={allowedAdsAccountIds}
+          onAdsAccountsChange={setAllowedAdsAccountIds}
           dateRestrictionStart={dateRestrictionStart}
           dateRestrictionEnd={dateRestrictionEnd}
           onDateRestrictionChange={handleDateRestrictionChange}
@@ -220,6 +226,8 @@ export default function UserFormModal({
           catalogLoading={catalogLoading}
           catalogRows={catalogRows}
           catalogLists={catalogLists}
+          adsAccountOptions={adsAccountOptions}
+          adsAccountsLoading={adsAccountsLoading}
         />
       )}
       </div>

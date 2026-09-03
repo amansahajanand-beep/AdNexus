@@ -1,7 +1,7 @@
 /**
  * BullMQ worker — Google Ads spend sync jobs.
  */
-const { Worker } = require('bullmq');
+const { Worker, DelayedError } = require('bullmq');
 const { createBullmqConnection, isTransientRedisError } = require('../redisClient');
 const logger = require('../utils/logger');
 const { runWithClient } = require('../utils/clientContext');
@@ -10,6 +10,24 @@ const { syncAllAccountsForClient, syncAccountSpend } = require('../services/adsS
 const { getAccountById } = require('../models/adsAccountStore');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { isSyncQueueEnabled } = require('../queues/gamSync');
+const {
+  isTodayPriorityActive,
+  isAdsJobAllowedDuringTodayPriority,
+  DEFER_MS,
+} = require('../services/syncPriorityGate');
+
+async function deferForTodayPriority(job) {
+  logger.info(
+    `[ads-sync] Deferring job ${job.id} for ${Math.round(DEFER_MS / 1000)}s (today-priority)`
+  );
+  if (job.token) {
+    await job.moveToDelayed(Date.now() + DEFER_MS, job.token);
+    throw new DelayedError();
+  }
+  const err = new Error('Deferred for today-priority');
+  err.yieldToToday = true;
+  throw err;
+}
 
 async function processJob(job) {
   const clientId = job.data?.clientId;
@@ -17,6 +35,11 @@ async function processJob(job) {
     logger.warn('[ads-sync] missing clientId');
     return;
   }
+
+  if (await isTodayPriorityActive() && !isAdsJobAllowedDuringTodayPriority(job)) {
+    await deferForTodayPriority(job);
+  }
+
   const client = await getClientById(clientId);
   if (!client) {
     logger.warn(`[ads-sync] unknown client ${clientId}`);
