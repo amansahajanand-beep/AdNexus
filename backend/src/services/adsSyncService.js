@@ -156,10 +156,21 @@ async function syncAccountSpend(adsAccount, { startDate, endDate, gamClient } = 
   return n;
 }
 
-async function syncAllAccountsForClient(gamClient, { startDate, endDate } = {}) {
-  const accounts = await listSyncableClientAccounts(gamClient.id);
+function adsSyncRoiOnly() {
+  const raw = String(process.env.ADS_SYNC_ROI_ONLY || 'true').trim().toLowerCase();
+  return raw !== 'false' && raw !== '0' && raw !== 'no';
+}
+
+async function syncAllAccountsForClient(gamClient, { startDate, endDate, roiOnly = adsSyncRoiOnly() } = {}) {
+  const accounts = await listSyncableClientAccounts(gamClient.id, { roiOnly });
   let total = 0;
   const errors = [];
+  // Warm FX once for the whole client batch (avoid per-account live FX HTTP spam).
+  try {
+    const { refreshFxRates } = require('../utils/adsCurrency');
+    await refreshFxRates();
+  } catch (_) { /* ignore */ }
+
   for (const acc of accounts) {
     try {
       total += await syncAccountSpend(acc, { startDate, endDate, gamClient });
@@ -173,45 +184,105 @@ async function syncAllAccountsForClient(gamClient, { startDate, endDate } = {}) 
   return { total, accounts: accounts.length, errors };
 }
 
-/** Enqueue one BullMQ job per Ads account so a slow/failed account cannot block the rest. */
+/**
+ * Enqueue Ads sync — one BullMQ job per GAM client (GAM-lean style).
+ * Avoids N× Redis commands from per-account Queue.add fan-out.
+ * Set fanOutAccounts=true only for debugging a single bad account path.
+ */
 async function enqueueAdsSyncAccounts(gamClient, adsSyncQueue, {
   startDate,
   endDate,
-  jobName = 'ads-sync-account',
+  jobName = 'ads-sync-client',
   jobIdPrefix = null,
   priority = 3,
+  fanOutAccounts = false,
+  roiOnly = adsSyncRoiOnly(),
+  skipIfTodayPriority = false,
 } = {}) {
   if (!gamClient?.id || !adsSyncQueue) {
     throw new Error('enqueueAdsSyncAccounts requires client and adsSyncQueue');
   }
-  const accounts = await listSyncableClientAccounts(gamClient.id);
+
+  if (skipIfTodayPriority) {
+    try {
+      const { isTodayPriorityActive } = require('./syncPriorityGate');
+      if (await isTodayPriorityActive()) {
+        logger.info(
+          `Ads sync enqueue skipped (today-priority) client=${gamClient.id.slice(0, 8)}`
+        );
+        return { accounts: 0, jobs: 0, skipped: true, start: startDate, end: endDate };
+      }
+    } catch (_) { /* gate optional */ }
+  }
+
+  const accounts = await listSyncableClientAccounts(gamClient.id, { roiOnly });
   const end = endDate || todayInTZ();
   const lookback = parseInt(process.env.GOOGLE_ADS_SYNC_LOOKBACK_DAYS || '30', 10) || 30;
   const start = startDate || shiftYMD(end, -(lookback - 1));
   const prefix = jobIdPrefix || `ads-sync-${gamClient.id.slice(0, 8)}-${end}`;
-  let queued = 0;
-  for (const acc of accounts) {
-    await adsSyncQueue.add(
-      jobName,
-      {
+
+  if (!accounts.length) {
+    logger.info(`Ads sync: no syncable accounts client=${gamClient.id.slice(0, 8)} roiOnly=${roiOnly}`);
+    return { accounts: 0, jobs: 0, start, end };
+  }
+
+  if (fanOutAccounts) {
+    let queued = 0;
+    const bulk = accounts.map((acc) => ({
+      name: 'ads-sync-account',
+      data: {
         clientId: gamClient.id,
         adsAccountId: acc.id,
         startDate: start,
         endDate: end,
       },
-      {
+      opts: {
         jobId: `${prefix}-${acc.id.slice(0, 8)}`,
         priority,
         attempts: 2,
         backoff: { type: 'exponential', delay: 30000 },
-        removeOnComplete: { count: 30 },
-        removeOnFail: { count: 50 },
+        removeOnComplete: { count: 20 },
+        removeOnFail: { count: 30 },
+      },
+    }));
+    if (typeof adsSyncQueue.addBulk === 'function') {
+      await adsSyncQueue.addBulk(bulk);
+      queued = bulk.length;
+    } else {
+      for (const item of bulk) {
+        await adsSyncQueue.add(item.name, item.data, item.opts);
+        queued += 1;
       }
+    }
+    logger.info(
+      `Ads sync enqueued ${queued} account job(s) client=${gamClient.id.slice(0, 8)} ${start}→${end}`
     );
-    queued += 1;
+    return { accounts: queued, jobs: queued, start, end };
   }
-  logger.info(`Ads sync enqueued ${queued} account job(s) client=${gamClient.id.slice(0, 8)} ${start}→${end}`);
-  return { accounts: queued, start, end };
+
+  // One job per client — syncs all ROI accounts inside the worker.
+  await adsSyncQueue.add(
+    jobName,
+    {
+      clientId: gamClient.id,
+      startDate: start,
+      endDate: end,
+      roiOnly,
+    },
+    {
+      jobId: prefix,
+      priority,
+      attempts: 2,
+      backoff: { type: 'exponential', delay: 30000 },
+      removeOnComplete: { count: 20 },
+      removeOnFail: { count: 30 },
+    }
+  );
+  logger.info(
+    `Ads sync enqueued 1 client job (${accounts.length} account(s)) `
+    + `client=${gamClient.id.slice(0, 8)} ${start}→${end}`
+  );
+  return { accounts: accounts.length, jobs: 1, start, end };
 }
 
 /** Fetch App Campaign package IDs from Google Ads and stamp onto spend rows. */

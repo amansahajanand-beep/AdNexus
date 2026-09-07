@@ -2,9 +2,49 @@
  * Shared ROI table / summary helpers for Roi page and Presets live preview.
  */
 
-export function formatRoiMoney(n) {
+export function formatRoiMoney(n, currency = 'USD') {
   const v = Number(n) || 0;
+  const cur = String(currency || 'USD').trim().toUpperCase();
+  if (cur === 'INR') {
+    return `₹${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
+  if (cur && cur !== 'USD') {
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: 'currency',
+        currency: cur,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      }).format(v);
+    } catch {
+      return `${cur} ${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+    }
+  }
   return `US$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** Compact money for KPI cards — e.g. ₹44.6k. Hover shows full via title. */
+export function formatRoiMoneyCompact(n, currency = 'USD') {
+  const v = Number(n) || 0;
+  const abs = Math.abs(v);
+  if (abs < 1000) return formatRoiMoney(n, currency);
+
+  const cur = String(currency || 'USD').trim().toUpperCase();
+  const sign = v < 0 ? '-' : '';
+  const prefix = cur === 'INR' ? '₹' : (cur && cur !== 'USD' ? `${cur} ` : 'US$');
+
+  let scaled;
+  let suffix;
+  if (abs >= 1_000_000) {
+    scaled = abs / 1_000_000;
+    suffix = 'M';
+  } else {
+    scaled = abs / 1000;
+    suffix = 'k';
+  }
+  const digits = scaled >= 100 ? 0 : 1;
+  const body = scaled.toFixed(digits).replace(/\.0$/, '');
+  return `${sign}${prefix}${body}${suffix}`;
 }
 
 export function formatRoiPct(n) {
@@ -16,9 +56,33 @@ export function formatRoiNum(n) {
   return Math.round(Number(n) || 0).toLocaleString();
 }
 
-export function formatRoiEcpm(n) {
+export function formatRoiEcpm(n, currency = 'USD') {
   if (n == null || Number.isNaN(Number(n))) return '—';
-  return formatRoiMoney(n);
+  return formatRoiMoney(n, currency);
+}
+
+export function formatRoiEcpmCompact(n, currency = 'USD') {
+  if (n == null || Number.isNaN(Number(n))) return '—';
+  return formatRoiMoneyCompact(n, currency);
+}
+
+/** Sum App vs Site earn from country×target breakdown (display currency). */
+export function sumInventoryEarnFromBreakdown(countryTargetBreakdown = []) {
+  let appEarn = 0;
+  let siteEarn = 0;
+  for (const r of countryTargetBreakdown || []) {
+    const earn = Number(r.earn) || 0;
+    if (!(earn > 0) && earn !== 0) continue;
+    if (r.targetType === 'site' || r.earnOnly) siteEarn += earn;
+    else appEarn += earn;
+  }
+  appEarn = Math.round(appEarn * 100) / 100;
+  siteEarn = Math.round(siteEarn * 100) / 100;
+  return {
+    appEarn,
+    siteEarn,
+    totalEarn: Math.round((appEarn + siteEarn) * 100) / 100,
+  };
 }
 
 export function roiToneClass(n) {
@@ -170,18 +234,22 @@ export function buildRoiSummaryGroups(summary = {}) {
   const roiTone = summary.roiSpendPercent == null
     ? null
     : (Number(summary.roiSpendPercent) >= 0 ? 'pos' : 'neg');
+  const spendCur = summary.adsSpendCurrency || summary.spendCurrency || 'USD';
+
+  const moneyMetric = (key, label, amount, extra = {}) => ({
+    key,
+    label,
+    value: formatRoiMoneyCompact(amount, spendCur),
+    title: formatRoiMoney(amount, spendCur),
+    ...extra,
+  });
 
   const ads = {
     id: 'ads',
     title: 'Google Ads',
-    hint: 'From Ads sync',
+    hint: spendCur === 'INR' ? 'Account currency (matches Ads UI)' : 'From Ads sync',
     metrics: [
-      {
-        key: 'spend',
-        label: 'Spend',
-        value: formatRoiMoney(summary.adsSpend),
-        emphasis: true,
-      },
+      moneyMetric('spend', 'Spend', summary.adsSpend, { emphasis: true }),
       {
         key: 'impressions',
         label: 'Impressions',
@@ -200,25 +268,18 @@ export function buildRoiSummaryGroups(summary = {}) {
       {
         key: 'ecpm',
         label: 'eCPM',
-        value: formatRoiEcpm(summary.ecpm),
+        value: formatRoiEcpmCompact(summary.ecpm, spendCur),
+        title: summary.ecpm == null ? undefined : formatRoiEcpm(summary.ecpm, spendCur),
       },
     ],
   };
 
   const roiMetrics = [
-    {
-      key: 'earn',
-      label: 'Earn',
-      value: formatRoiMoney(summary.earn),
-      emphasis: true,
-    },
-    {
-      key: 'pSpend',
-      label: 'Profit',
-      value: formatRoiMoney(summary.profitSpend),
+    moneyMetric('earn', 'Earn', summary.earn, { emphasis: true }),
+    moneyMetric('pSpend', 'Profit', summary.profitSpend, {
       valueTone: profitTone,
       emphasis: true,
-    },
+    }),
     {
       key: 'roiSpend',
       label: 'ROI',
@@ -230,17 +291,10 @@ export function buildRoiSummaryGroups(summary = {}) {
 
   if (hasOther) {
     roiMetrics.push(
-      {
-        key: 'other',
-        label: 'Other expenses',
-        value: formatRoiMoney(summary.otherExpenses),
-      },
-      {
-        key: 'pExp',
-        label: 'Profit vs expenses',
-        value: formatRoiMoney(summary.profitExpense),
+      moneyMetric('other', 'Other expenses', summary.otherExpenses),
+      moneyMetric('pExp', 'Profit vs expenses', summary.profitExpense, {
         valueTone: Number(summary.profitExpense) >= 0 ? 'pos' : 'neg',
-      },
+      }),
       {
         key: 'roiExp',
         label: 'ROI on expenses',
@@ -302,10 +356,9 @@ export function snapshotToRoiSummaryParams(snapshot = {}) {
   const countryCodes = stripAll(snapshot.countryCodes);
   if (countryCodes?.length) params.countryCodes = countryCodes.join(',');
 
-  // Derive targetType when apps/sites present (same as ROI apply).
-  if (appKeys?.length && siteKeys?.length) params.targetType = 'all';
-  else if (appKeys?.length) params.targetType = 'app';
-  else if (siteKeys?.length) params.targetType = 'site';
+  // App + site filters are a union — never send site-only / app-only targetType
+  // (that hid Ads packages and zeroed earn when sites were selected alone).
+  if (appKeys?.length || siteKeys?.length) params.targetType = 'all';
 
   return params;
 }
@@ -426,18 +479,24 @@ export function buildCountryTargetBreakdownRows(rows = []) {
 function rollupCountryMetrics(items = []) {
   const adsSpend = items.reduce((s, r) => s + (Number(r.adsSpend) || 0), 0);
   const earn = items.reduce((s, r) => s + (Number(r.earn) || 0), 0);
+  const otherExpenses = items.reduce((s, r) => s + (Number(r.otherExpenses) || 0), 0);
   const impressions = items.reduce((s, r) => s + (Number(r.impressions) || 0), 0);
   const clicks = items.reduce((s, r) => s + (Number(r.clicks) || 0), 0);
   const conversions = items.reduce((s, r) => s + (Number(r.conversions) || 0), 0);
   const profitSpend = earn - adsSpend;
+  const profitExpense = earn - otherExpenses;
   const roiSpendPercent = adsSpend > 0 ? (profitSpend / adsSpend) * 100 : null;
+  const roiExpensePercent = otherExpenses > 0 ? (profitExpense / otherExpenses) * 100 : null;
   const ctr = impressions > 0 ? (clicks / impressions) * 100 : null;
   const ecpm = impressions > 0 ? (adsSpend / impressions) * 1000 : null;
   return {
     adsSpend,
     earn,
+    otherExpenses,
     profitSpend,
+    profitExpense,
     roiSpendPercent,
+    roiExpensePercent,
     impressions,
     clicks,
     conversions,
@@ -462,14 +521,49 @@ function packageKey(row) {
   ].join('|');
 }
 
+function sortPackages(packages = []) {
+  return [...packages].sort((a, b) => {
+    const aSite = a.targetType === 'site' || a.earnOnly ? 1 : 0;
+    const bSite = b.targetType === 'site' || b.earnOnly ? 1 : 0;
+    if (aSite !== bSite) return aSite - bSite;
+    if (aSite) return b.earn - a.earn || a.label.localeCompare(b.label);
+    return b.adsSpend - a.adsSpend || a.label.localeCompare(b.label);
+  });
+}
+
+function finalizeAccount(acc) {
+  const sortedPackages = sortPackages(acc.packages || []);
+  const rolled = rollupCountryMetrics(sortedPackages);
+  const appEarn = sortedPackages
+    .filter((p) => p.targetType !== 'site' && !p.earnOnly)
+    .reduce((s, p) => s + (Number(p.earn) || 0), 0);
+  const siteEarn = sortedPackages
+    .filter((p) => p.targetType === 'site' || p.earnOnly)
+    .reduce((s, p) => s + (Number(p.earn) || 0), 0);
+  return {
+    ...acc,
+    ...rolled,
+    appEarn,
+    siteEarn,
+    packages: sortedPackages,
+  };
+}
+
+function isGamSitesBucket(acc) {
+  return acc?.adsAccountId === 'gam-sites'
+    || String(acc?.label || '').toLowerCase() === 'gam sites';
+}
+
 /**
- * Country → Ads account → Package → Date tree for the ROI country table.
+ * Country → (optional Ads account) → Package / Site tree.
+ * - singleAccountMode: Country → Package + Site (no account / GAM sites wrapper)
+ * - multi: Country → Ads account → Package + Site (sites folded into ads accounts)
  */
 export function buildCountryTree(
   countryBreakdown = [],
   countryTargetBreakdown = [],
   countryTargetDailyBreakdown = [],
-  { startDate = '', endDate = '' } = {},
+  { startDate = '', endDate = '', singleAccountMode = false } = {},
 ) {
   const rangeLabel = formatRoiDateRange(startDate, endDate);
   const targetsByCountry = new Map();
@@ -488,15 +582,20 @@ export function buildCountryTree(
       level: 'date',
       date: row.date,
       label: row.date,
-      adsSpend: Number(row.adsSpend) || 0,
+      targetType: row.targetType,
+      earnOnly: row.targetType === 'site' || Boolean(row.earnOnly),
+      adsSpend: row.targetType === 'site' ? 0 : (Number(row.adsSpend) || 0),
       earn: Number(row.earn) || 0,
+      otherExpenses: Number(row.otherExpenses) || 0,
       profitSpend: Number(row.profitSpend) || 0,
-      roiSpendPercent: row.roiSpendPercent,
-      impressions: Number(row.impressions) || 0,
-      clicks: Number(row.clicks) || 0,
-      conversions: Number(row.conversions) || 0,
-      ctr: row.ctr,
-      ecpm: row.ecpm,
+      profitExpense: Number(row.profitExpense) || 0,
+      roiSpendPercent: row.targetType === 'site' ? null : row.roiSpendPercent,
+      roiExpensePercent: row.roiExpensePercent,
+      impressions: row.targetType === 'site' ? 0 : (Number(row.impressions) || 0),
+      clicks: row.targetType === 'site' ? 0 : (Number(row.clicks) || 0),
+      conversions: row.targetType === 'site' ? 0 : (Number(row.conversions) || 0),
+      ctr: row.targetType === 'site' ? null : row.ctr,
+      ecpm: row.targetType === 'site' ? null : row.ecpm,
     });
   });
   dailyByPackage.forEach((days, key) => {
@@ -513,6 +612,7 @@ export function buildCountryTree(
     const accountsMap = new Map();
 
     targetRows.forEach((row) => {
+      const isSite = row.targetType === 'site' || Boolean(row.earnOnly);
       const accId = String(row.adsAccountId || row.accountName || 'unknown');
       if (!accountsMap.has(accId)) {
         accountsMap.set(accId, {
@@ -529,33 +629,91 @@ export function buildCountryTree(
       const days = dailyByPackage.get(pKey) || [];
       const dayLabel = days.length === 1
         ? days[0].date
-        : (days.length > 1 ? rangeLabel : rangeLabel);
+        : rangeLabel;
+      const earn = Number(row.earn) || 0;
+      const adsSpend = isSite ? 0 : (Number(row.adsSpend) || 0);
       acc.packages.push({
         id: `pkg:${code}:${accId}:${row.targetType || 'x'}:${row.targetKey || 'x'}`,
-        level: 'package',
+        level: isSite ? 'site' : 'package',
         label: row.targetKey || '—',
         targetType: row.targetType,
         targetKey: row.targetKey,
+        earnOnly: isSite,
         dateLabel: dayLabel,
         days,
-        adsSpend: Number(row.adsSpend) || 0,
-        earn: Number(row.earn) || 0,
+        adsSpend,
+        earn,
+        otherExpenses: Number(row.otherExpenses) || 0,
         profitSpend: Number(row.profitSpend) || 0,
-        roiSpendPercent: row.roiSpendPercent,
-        impressions: Number(row.impressions) || 0,
-        clicks: Number(row.clicks) || 0,
-        conversions: Number(row.conversions) || 0,
-        ctr: row.ctr,
-        ecpm: row.ecpm,
+        profitExpense: Number(row.profitExpense) || 0,
+        roiSpendPercent: isSite ? null : row.roiSpendPercent,
+        roiExpensePercent: row.roiExpensePercent,
+        impressions: isSite ? 0 : (Number(row.impressions) || 0),
+        clicks: isSite ? 0 : (Number(row.clicks) || 0),
+        conversions: isSite ? 0 : (Number(row.conversions) || 0),
+        ctr: isSite ? null : row.ctr,
+        ecpm: isSite ? null : row.ecpm,
       });
     });
 
-    const accounts = Array.from(accountsMap.values())
-      .map((acc) => {
-        const sortedPackages = acc.packages.sort((a, b) => b.adsSpend - a.adsSpend || a.label.localeCompare(b.label));
-        return { ...acc, ...rollupCountryMetrics(sortedPackages), packages: sortedPackages };
-      })
+    let accounts = Array.from(accountsMap.values()).map(finalizeAccount);
+
+    // Fold "GAM sites" bucket into Ads accounts — no separate GAM sites wrapper.
+    const gamBucket = accounts.find(isGamSitesBucket);
+    const adsAccounts = accounts
+      .filter((a) => !isGamSitesBucket(a))
       .sort((a, b) => b.adsSpend - a.adsSpend || a.label.localeCompare(b.label));
+    if (gamBucket?.packages?.length && adsAccounts.length) {
+      // Fold sites into Ads accounts (no "GAM sites" wrapper).
+      // Attach under the top-spend account in this country so site earn isn't duplicated.
+      const host = adsAccounts[0];
+      gamBucket.packages.forEach((pkg) => {
+        host.packages.push({
+          ...pkg,
+          id: `${pkg.id}::under:${host.adsAccountId || host.id}`,
+        });
+      });
+      accounts = adsAccounts.map(finalizeAccount);
+    } else if (gamBucket?.packages?.length && !adsAccounts.length) {
+      accounts = [];
+    } else {
+      accounts = adsAccounts.length ? adsAccounts : accounts.filter((a) => !isGamSitesBucket(a));
+    }
+    accounts = accounts.sort((a, b) => b.adsSpend - a.adsSpend || a.label.localeCompare(b.label));
+
+    const orphanSitePackages = (!adsAccounts.length && gamBucket?.packages) ? gamBucket.packages : [];
+    const allPackages = sortPackages(
+      accounts.length
+        ? accounts.flatMap((a) => a.packages || [])
+        : orphanSitePackages
+    );
+
+    // Deduplicate packages/sites (same site may appear under multiple accounts).
+    const dedupePackages = (list) => {
+      const seen = new Set();
+      const out = [];
+      for (const pkg of list || []) {
+        const key = `${pkg.targetType || ''}:${String(pkg.targetKey || pkg.label || '').toLowerCase()}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(pkg);
+      }
+      return sortPackages(out);
+    };
+
+    const uniquePackages = dedupePackages(allPackages);
+    const useFlat = Boolean(singleAccountMode || accounts.length <= 1);
+    const flatPackages = useFlat ? uniquePackages : [];
+    const countryExpense = Number(c.otherExpenses);
+    const countryProfitExpense = Number(c.profitExpense);
+    const rolled = rollupCountryMetrics(useFlat ? flatPackages : accounts);
+    // Country earn split always from unique packages (sites are not double-counted).
+    const appEarn = uniquePackages
+      .filter((p) => p.targetType !== 'site' && !p.earnOnly)
+      .reduce((s, p) => s + (Number(p.earn) || 0), 0);
+    const siteEarn = uniquePackages
+      .filter((p) => p.targetType === 'site' || p.earnOnly)
+      .reduce((s, p) => s + (Number(p.earn) || 0), 0);
 
     return {
       id: `country:${code}`,
@@ -566,15 +724,23 @@ export function buildCountryTree(
       dateLabel: rangeLabel,
       adsSpend: Number(c.adsSpend) || 0,
       earn: Number(c.earn) || 0,
+      appEarn,
+      siteEarn,
+      otherExpenses: Number.isFinite(countryExpense) ? countryExpense : rolled.otherExpenses,
       profitSpend: Number(c.profitSpend) || 0,
+      profitExpense: Number.isFinite(countryProfitExpense) ? countryProfitExpense : rolled.profitExpense,
       roiSpendPercent: c.roiSpendPercent,
+      roiExpensePercent: c.roiExpensePercent != null ? c.roiExpensePercent : rolled.roiExpensePercent,
       impressions: Number(c.impressions) || 0,
       clicks: Number(c.clicks) || 0,
       conversions: Number(c.conversions) || 0,
       ctr: c.ctr,
       ecpm: c.ecpm,
-      accounts,
-      accountCount: accounts.length,
+      flatMode: useFlat,
+      packages: useFlat ? flatPackages : [],
+      accounts: useFlat ? [] : accounts,
+      accountCount: useFlat ? 0 : accounts.length,
+      childCount: useFlat ? (flatPackages?.length || 0) : accounts.length,
     };
   }).sort((a, b) => b.adsSpend - a.adsSpend || a.label.localeCompare(b.label));
 }
@@ -593,16 +759,28 @@ export function flattenCountryTreeForExport(tree = []) {
       ctr: m.ctr,
       ecpm: m.ecpm,
       earn: m.earn,
+      otherExpenses: m.otherExpenses,
       profitSpend: m.profitSpend,
+      profitExpense: m.profitExpense,
       roiSpendPercent: m.roiSpendPercent,
+      roiExpensePercent: m.roiExpensePercent,
     });
   };
   (tree || []).forEach((country) => {
     push('Country', country.label, country.dateLabel, country);
+    if (country.flatMode && (country.packages || []).length) {
+      (country.packages || []).forEach((pkg) => {
+        push(pkg.targetType === 'site' || pkg.earnOnly ? 'Site' : 'Package', pkg.label, pkg.dateLabel, pkg);
+        (pkg.days || []).forEach((day) => {
+          push('Date', pkg.label, day.date, day);
+        });
+      });
+      return;
+    }
     (country.accounts || []).forEach((account) => {
       push('Ads account', account.label, account.dateLabel, account);
       (account.packages || []).forEach((pkg) => {
-        push('Package', pkg.label, pkg.dateLabel, pkg);
+        push(pkg.targetType === 'site' || pkg.earnOnly ? 'Site' : 'Package', pkg.label, pkg.dateLabel, pkg);
         (pkg.days || []).forEach((day) => {
           push('Date', pkg.label, day.date, day);
         });
@@ -618,6 +796,10 @@ export function filterCountryTree(tree = [], query = '') {
   return (tree || []).filter((country) => {
     if (country.label.toLowerCase().includes(q)) return true;
     if (String(country.dateLabel || '').toLowerCase().includes(q)) return true;
+    if ((country.packages || []).some((pkg) => {
+      if (pkg.label.toLowerCase().includes(q)) return true;
+      return (pkg.days || []).some((day) => String(day.date || '').includes(q));
+    })) return true;
     return (country.accounts || []).some((account) => {
       if (account.label.toLowerCase().includes(q)) return true;
       return (account.packages || []).some((pkg) => {
@@ -756,6 +938,10 @@ export function mergeRoiSummaryPayload(prev, summaryPayload) {
     next.generalExpenses = summaryPayload.generalExpenses;
   }
   if (Array.isArray(summaryPayload.expenses)) next.expenses = summaryPayload.expenses;
+  if (summaryPayload.spendCurrency) next.spendCurrency = summaryPayload.spendCurrency;
+  if (next.summary && summaryPayload.spendCurrency && !next.summary.adsSpendCurrency) {
+    next.summary = { ...next.summary, adsSpendCurrency: summaryPayload.spendCurrency };
+  }
   return next;
 }
 

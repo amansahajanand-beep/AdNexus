@@ -1,7 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { requireAuth, requireAdmin } = require('../middleware/auth');
-const { buildAdsAuthUrl } = require('./authAds');
+const {
+  buildAdsAuthUrl,
+  commitMccSelection,
+  commitIndividualSelection,
+} = require('./authAds');
 const {
   listAccounts,
   createAccount,
@@ -17,6 +21,7 @@ const {
   createOtherExpense,
   deleteOtherExpense,
 } = require('../models/adsAccountStore');
+const { getPendingSessionPublic, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const { listCampaigns, isAdsOAuthConfigured, resolveOAuthApp, adsRedirectUri } = require('../ads/client');
 const { resolveRefreshForAccount, syncAllAccountsForClient, syncAccountSpend, enqueueAdsSyncAccounts } = require('../services/adsSyncService');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
@@ -92,6 +97,78 @@ router.post('/accounts/mcc/oauth-url', requireAdmin, async (req, res) => {
     res.json({ url });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+/** Pending Ads OAuth session after Connect with Google (manager / account picker). */
+router.get('/oauth/pending/:id', requireAdmin, async (req, res) => {
+  try {
+    const session = await getPendingSessionPublic(req.params.id);
+    if (!session || session.product !== 'ads') {
+      return res.status(404).json({ error: 'OAuth session expired or not found. Connect with Google again.' });
+    }
+    if (session.clientId && session.clientId !== req.client.id) {
+      return res.status(403).json({ error: 'OAuth session belongs to another client.' });
+    }
+    const managers = (session.candidates || []).filter((c) => c.kind === 'mcc' || c.isManager);
+    const individuals = (session.candidates || []).filter((c) => c.kind === 'client' || (!c.isManager && c.kind !== 'mcc'));
+    res.json({
+      sessionId: session.id,
+      managers,
+      individuals,
+      expiresAt: session.expiresAt,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/oauth/pending/:id/select', requireAdmin, async (req, res) => {
+  try {
+    const session = await getPendingSession(req.params.id);
+    if (!session || session.product !== 'ads') {
+      return res.status(404).json({ error: 'OAuth session expired or not found. Connect with Google again.' });
+    }
+    if (session.clientId && session.clientId !== req.client.id) {
+      return res.status(403).json({ error: 'OAuth session belongs to another client.' });
+    }
+    const customerId = normalizeCustomerId(req.body?.customerId);
+    if (!customerId || !/^\d{10}$/.test(customerId)) {
+      return res.status(400).json({ error: 'customerId is required.' });
+    }
+    const candidate = (session.candidates || []).find(
+      (c) => String(c.customerId || '').replace(/-/g, '') === customerId
+    );
+    if (!candidate) {
+      return res.status(400).json({ error: 'Selected account is not in this OAuth session.' });
+    }
+
+    const isMcc = candidate.kind === 'mcc' || candidate.isManager;
+    if (isMcc) {
+      const { mccAccount, childrenCount } = await commitMccSelection(req.client, {
+        customerId,
+        descriptiveName: candidate.descriptiveName,
+        refreshToken: session.refreshToken,
+      });
+      await deletePendingSession(session.id);
+      return res.json({
+        ok: true,
+        accountType: 'mcc',
+        account: mccAccount,
+        childrenCount,
+      });
+    }
+
+    const account = await commitIndividualSelection(req.client, {
+      customerId,
+      descriptiveName: candidate.descriptiveName,
+      refreshToken: session.refreshToken,
+    });
+    await deletePendingSession(session.id);
+    return res.json({ ok: true, accountType: 'client', account });
+  } catch (err) {
+    logger.error('Ads OAuth select failed:', err.message);
+    res.status(500).json({ error: err.message || 'Could not select Ads account' });
   }
 });
 
@@ -300,8 +377,23 @@ router.delete('/accounts/:id', requireAdmin, async (req, res) => {
     if (!account || account.clientId !== req.client.id) {
       return res.status(404).json({ error: 'Account not found' });
     }
-    await deleteAccount(account.id);
-    res.json({ ok: true });
+    const result = await deleteAccount(account.id);
+    res.json({
+      ok: true,
+      accountType: result.accountType,
+      childrenDeleted: result.childrenDeleted || 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Admin: wipe all Ads accounts for this GAM client (MCC + children + linked spend). */
+router.delete('/accounts', requireAdmin, async (req, res) => {
+  try {
+    const { deleteAllAccountsForClient } = require('../models/adsAccountStore');
+    const deleted = await deleteAllAccountsForClient(req.client.id);
+    res.json({ ok: true, deleted });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -557,30 +649,37 @@ router.get('/roi-accounts', async (req, res) => {
   }
 });
 
-/** GAM site hosts for ROI filter — manual inventory pick, not tied to Ads accounts. */
+/** GAM subdomain hosts for ROI filter (finance2.x.com, quiz1.x.com — not apex domains). */
 router.get('/roi-sites', async (req, res) => {
   try {
     const clientId = req.client?.id || req.user?.clientId;
     if (!clientId) return res.status(400).json({ error: 'No client context' });
     const { query } = require('../db');
+    // Subdomains only: host must have at least two dots (a.b.tld). Exclude apex (b.tld).
     const { rows } = await query(
-      `SELECT LOWER(TRIM(ds.name)) AS site_key,
-              MAX(ds.name) AS site_name
-       FROM dim_site ds
-       WHERE ds.client_id = $1::uuid
-         AND ds.id > 0
-         AND NULLIF(TRIM(ds.name), '') IS NOT NULL
-       GROUP BY 1
+      `SELECT site_key, MAX(site_name) AS site_name
+       FROM (
+         SELECT LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) AS site_key,
+                MAX(ds.name) AS site_name
+         FROM dim_site ds
+         WHERE ds.client_id = $1::uuid
+           AND ds.id > 0
+           AND NULLIF(TRIM(ds.name), '') IS NOT NULL
+         GROUP BY 1
+       ) x
+       WHERE (LENGTH(site_key) - LENGTH(REPLACE(site_key, '.', ''))) >= 2
+         AND site_key ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
+       GROUP BY site_key
        ORDER BY site_name ASC`,
       [clientId]
     );
     const payload = {
       sites: (rows || []).map((r) => ({
         id: String(r.site_key || '').toLowerCase(),
-        label: String(r.site_name || r.site_key || '').trim(),
+        label: String(r.site_name || r.site_key || '').trim().replace(/^www\./i, ''),
       })).filter((s) => s.id),
     };
-    const cacheKey = roiFilterCacheKey('sites', clientId, {});
+    const cacheKey = roiFilterCacheKey('sites', clientId, { source: 'dim_site_subdomains_v1' });
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
     return sendCachedJson(res, cacheKey, payload, 300);
@@ -734,15 +833,29 @@ router.get('/roi-related-targets', async (req, res) => {
     );
 
     const appById = new Map(apps.map((a) => [a.id, a]));
+    const siteById = new Map();
     (mapRows || []).forEach((r) => {
       const key = r.target_key;
       if (!key) return;
       if (r.target_type === 'app' && !appById.has(key)) {
         appById.set(key, { id: key, label: key, campaignCount: r.map_count, spend: 0 });
       }
+      if (r.target_type === 'site' && !siteById.has(key)) {
+        siteById.set(key, {
+          id: key,
+          label: key,
+          campaignCount: r.map_count,
+          mapCount: r.map_count,
+        });
+      }
     });
 
-    const payload = { start, end, apps: [...appById.values()], sites: [] };
+    const payload = {
+      start,
+      end,
+      apps: [...appById.values()],
+      sites: [...siteById.values()],
+    };
     const cacheKey = roiFilterCacheKey('related-targets', clientId, { start, end, accountIds, campaignIds });
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
@@ -776,10 +889,10 @@ router.post('/sync', requireAdmin, async (req, res) => {
     const end = req.body?.endDate || todayInTZ();
     const start = req.body?.startDate || shiftYMD(end, -(lookback - 1));
     const { listSyncableClientAccounts } = require('../models/adsAccountStore');
-    const syncable = await listSyncableClientAccounts(req.client.id);
+    const syncable = await listSyncableClientAccounts(req.client.id, { roiOnly: true });
     if (!syncable.length) {
       return res.status(400).json({
-        error: 'No syncable Google Ads client accounts. Save an individual account (or refresh MCC children) with a refresh token, and enable Include in ROI.',
+        error: 'No syncable Google Ads client accounts with Include in ROI. Enable Include in ROI on partner accounts, then Sync again.',
         total: 0,
         accounts: 0,
         start,
@@ -787,24 +900,26 @@ router.post('/sync', requireAdmin, async (req, res) => {
       });
     }
 
-    // Large account sets: queue per-account jobs so one failure does not block the rest.
-    const QUEUE_THRESHOLD = 5;
+    // Queue one client job (not N account jobs) — cuts BullMQ/Upstash command volume.
+    const QUEUE_THRESHOLD = 2;
     if (syncable.length >= QUEUE_THRESHOLD) {
       const { adsSyncQueue } = require('../queues/adsSync');
-      const { accounts: queued } = await enqueueAdsSyncAccounts(req.client, adsSyncQueue, {
+      const { accounts: accountCount, jobs } = await enqueueAdsSyncAccounts(req.client, adsSyncQueue, {
         startDate: start,
         endDate: end,
         jobIdPrefix: `ads-sync-manual-${req.client.id.slice(0, 8)}-${Date.now()}`,
+        fanOutAccounts: false,
       });
-      logger.info(`Ads sync queued ${queued} account job(s) ${start}→${end}`);
+      logger.info(`Ads sync queued ${jobs} job(s) for ${accountCount} account(s) ${start}→${end}`);
       return res.json({
         ok: true,
         queued: true,
-        accounts: queued,
+        accounts: accountCount,
+        jobs,
         total: 0,
         start,
         end,
-        message: `Spend sync started in the background for ${queued} account(s). Check back in a few minutes, then map campaigns.`,
+        message: `Spend sync started in the background for ${accountCount} account(s). Check back in a few minutes, then map campaigns.`,
       });
     }
 
@@ -864,6 +979,10 @@ router.post('/expenses', async (req, res) => {
       notes,
       createdBy: req.user.id,
     });
+    try {
+      const { invalidateRoiSummaryCache } = require('../services/roiService');
+      invalidateRoiSummaryCache(clientId);
+    } catch (_) { /* optional */ }
     res.status(201).json({ expense });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -874,6 +993,10 @@ router.delete('/expenses/:id', async (req, res) => {
   try {
     const clientId = req.client?.id || req.user.clientId;
     await deleteOtherExpense(req.params.id, clientId);
+    try {
+      const { invalidateRoiSummaryCache } = require('../services/roiService');
+      invalidateRoiSummaryCache(clientId);
+    } catch (_) { /* optional */ }
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });

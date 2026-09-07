@@ -13,15 +13,16 @@ const { isSyncQueueEnabled } = require('../queues/gamSync');
 const {
   isTodayPriorityActive,
   isAdsJobAllowedDuringTodayPriority,
-  DEFER_MS,
+  getTodayPriorityDeferMs,
 } = require('../services/syncPriorityGate');
 
 async function deferForTodayPriority(job) {
+  const delayMs = await getTodayPriorityDeferMs();
   logger.info(
-    `[ads-sync] Deferring job ${job.id} for ${Math.round(DEFER_MS / 1000)}s (today-priority)`
+    `[ads-sync] Deferring job ${job.id} for ${Math.round(delayMs / 1000)}s (today-priority)`
   );
   if (job.token) {
-    await job.moveToDelayed(Date.now() + DEFER_MS, job.token);
+    await job.moveToDelayed(Date.now() + delayMs, job.token);
     throw new DelayedError();
   }
   const err = new Error('Deferred for today-priority');
@@ -50,6 +51,7 @@ async function processJob(job) {
     const lookback = parseInt(process.env.GOOGLE_ADS_SYNC_LOOKBACK_DAYS || '30', 10) || 30;
     const end = job.data?.endDate || todayInTZ();
     const start = job.data?.startDate || shiftYMD(end, -(lookback - 1));
+    const roiOnly = job.data?.roiOnly !== false;
 
     if (job.name === 'ads-sync-account' && job.data?.adsAccountId) {
       const account = await getAccountById(job.data.adsAccountId);
@@ -59,8 +61,16 @@ async function processJob(job) {
       return { rows: n };
     }
 
-    const result = await syncAllAccountsForClient(client, { startDate: start, endDate: end });
-    logger.info(`[ads-sync] client=${clientId.slice(0, 8)} total=${result.total} errors=${result.errors.length}`);
+    // Default: one job syncs all ROI-enabled client accounts for this GAM tenant.
+    const result = await syncAllAccountsForClient(client, {
+      startDate: start,
+      endDate: end,
+      roiOnly,
+    });
+    logger.info(
+      `[ads-sync] client=${clientId.slice(0, 8)} accounts=${result.accounts} `
+      + `total=${result.total} errors=${result.errors.length}`
+    );
     return result;
   });
 }

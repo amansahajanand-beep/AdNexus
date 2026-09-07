@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import PageHeader from '../components/ui/PageHeader';
 import RoiPresetDetail from '../components/roi/RoiPresetDetail';
@@ -12,6 +12,7 @@ import {
   PRESETS_CHANGED_EVENT,
   getReportPresets,
   updateReportPreset,
+  duplicateReportPreset,
   toggleReportPresetPin,
   removeReportPreset,
   summaryForPreset,
@@ -19,6 +20,29 @@ import {
 import { confirmDialog } from '../hooks/useConfirmDialog';
 import { validateSavedName, SAVED_NAME_RULES_HINT } from '../utils/namePolicy';
 
+const SPLIT_WIDTH_KEY = 'adnexus.presets.splitWidth';
+const SPLIT_DEFAULT_PX = 280;
+const SPLIT_MIN_PX = 200;
+const SPLIT_HANDLE_PX = 6;
+
+function readStoredSplitWidth() {
+  try {
+    const raw = localStorage.getItem(SPLIT_WIDTH_KEY);
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= SPLIT_MIN_PX) return Math.round(n);
+  } catch {
+    /* ignore */
+  }
+  return SPLIT_DEFAULT_PX;
+}
+
+function clampSplitWidth(px, containerWidth) {
+  const max = Math.max(
+    SPLIT_MIN_PX,
+    Math.floor((Number(containerWidth) || 800) * 0.5)
+  );
+  return Math.min(max, Math.max(SPLIT_MIN_PX, Math.round(px)));
+}
 const SECTIONS = [
   {
     page: PRESET_PAGES.dashboard,
@@ -68,6 +92,12 @@ export default function Presets() {
   const [search, setSearch] = useState('');
   const [editing, setEditing] = useState(null);
   const [renameError, setRenameError] = useState('');
+  const [actionError, setActionError] = useState('');
+  const [compareMode, setCompareMode] = useState(false);
+  const [compareId, setCompareId] = useState(null);
+  const [listWidthPx, setListWidthPx] = useState(readStoredSplitWidth);
+  const [isResizing, setIsResizing] = useState(false);
+  const splitContainerRef = useRef(null);
 
   const availableSections = useMemo(
     () => SECTIONS.filter((s) => canPage(s.access)),
@@ -149,6 +179,26 @@ export default function Presets() {
     [items, selectedId]
   );
 
+  const compareItem = useMemo(() => {
+    if (!compareMode || !compareId || activeSection?.page !== PRESET_PAGES.roi) return null;
+    return items.find((i) => i.id === compareId) || null;
+  }, [compareMode, compareId, items, activeSection?.page]);
+
+  // Leaving ROI (or losing B) clears compare mode.
+  useEffect(() => {
+    if (activeSection?.page !== PRESET_PAGES.roi) {
+      setCompareMode(false);
+      setCompareId(null);
+    }
+  }, [activeSection?.page]);
+
+  useEffect(() => {
+    if (!compareMode) return;
+    if (compareId && !items.some((i) => i.id === compareId)) {
+      setCompareId(null);
+    }
+  }, [compareMode, compareId, items]);
+
   const totalCount = useMemo(
     () => availableSections.reduce((n, s) => n + getReportPresets(s.page, userId).length, 0),
     [availableSections, userId, tick]
@@ -161,8 +211,42 @@ export default function Presets() {
     [availableSections, userId, tick]
   );
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(SPLIT_WIDTH_KEY, String(listWidthPx));
+    } catch {
+      /* ignore */
+    }
+  }, [listWidthPx]);
+
+  const onSplitPointerDown = useCallback((e) => {
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault();
+    const container = splitContainerRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    setIsResizing(true);
+
+    const onMove = (ev) => {
+      const next = clampSplitWidth(ev.clientX - rect.left, rect.width);
+      setListWidthPx(next);
+    };
+    const onUp = () => {
+      setIsResizing(false);
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onUp);
+    };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
+  }, []);
+
   const selectPage = (page) => {
     setSelectedPage(page);
+    setCompareMode(false);
+    setCompareId(null);
+    setActionError('');
     const first = getReportPresets(page, userId)[0];
     const id = first?.id || null;
     setSelectedId(id);
@@ -172,8 +256,54 @@ export default function Presets() {
 
   const selectPreset = (item) => {
     if (!activeSection) return;
+    if (
+      compareMode
+      && activeSection.page === PRESET_PAGES.roi
+      && selectedId
+      && item.id !== selectedId
+    ) {
+      setCompareId(item.id);
+      setActionError('');
+      return;
+    }
     setSelectedId(item.id);
+    if (compareMode && item.id === selectedId) {
+      /* keep A */
+    } else if (compareMode) {
+      setCompareId(null);
+    }
     setSearchParams({ page: activeSection.page, id: item.id }, { replace: true });
+  };
+
+  const exitCompare = () => {
+    setCompareMode(false);
+    setCompareId(null);
+  };
+
+  const startCompare = () => {
+    if (activeSection?.page !== PRESET_PAGES.roi || !selectedItem) return;
+    setCompareMode(true);
+    setCompareId(null);
+    setActionError('');
+  };
+
+  const duplicatePreset = (item) => {
+    if (!activeSection || !item) return;
+    setActionError('');
+    const result = duplicateReportPreset(activeSection.page, item.id, userId);
+    if (!result.ok) {
+      setActionError(result.error || 'Could not duplicate preset.');
+      return;
+    }
+    reload();
+    const created = result.preset;
+    if (created?.id) {
+      setSelectedId(created.id);
+      setSearchParams({ page: activeSection.page, id: created.id }, { replace: true });
+      if (compareMode) {
+        setCompareId(null);
+      }
+    }
   };
 
   const startRename = (item) => {
@@ -219,8 +349,11 @@ export default function Presets() {
     if (!ok) return;
     removeReportPreset(activeSection.page, item.id, userId);
     if (editing?.id === item.id) cancelRename();
+    if (compareId === item.id) setCompareId(null);
     if (selectedId === item.id) {
       setSelectedId(null);
+      setCompareMode(false);
+      setCompareId(null);
       setSearchParams({ page: activeSection.page }, { replace: true });
     }
     reload();
@@ -229,9 +362,13 @@ export default function Presets() {
   const detailProps = selectedItem
     ? {
       presetItem: selectedItem,
+      compareItem,
+      compareMode: compareMode && activeSection?.page === PRESET_PAGES.roi,
       onPin: () => togglePin(selectedItem),
       onRename: () => startRename(selectedItem),
       onDelete: () => deletePreset(selectedItem),
+      onDuplicate: () => duplicatePreset(selectedItem),
+      onExitCompare: exitCompare,
     }
     : { presetItem: null };
 
@@ -281,7 +418,14 @@ export default function Presets() {
           </div>
         </div>
       ) : (
-        <div className="presets-master-detail filter-card">
+        <div
+          ref={splitContainerRef}
+          className={`presets-master-detail filter-card${isResizing ? ' is-resizing' : ''}`}
+          style={{
+            '--presets-list-width': `${listWidthPx}px`,
+            '--presets-split-handle': `${SPLIT_HANDLE_PX}px`,
+          }}
+        >
           <div className="presets-master-list">
             <div className="presets-page-tabs" role="tablist" aria-label="Preset pages">
               {availableSections.map((s) => (
@@ -307,6 +451,37 @@ export default function Presets() {
               </span>
             </div>
 
+            {activeSection?.page === PRESET_PAGES.roi && items.length > 0 ? (
+              <div className="presets-compare-toolbar">
+                {compareMode ? (
+                  <>
+                    <span className="form-note" style={{ margin: 0 }}>
+                      {compareId
+                        ? 'Comparing A vs B — click another preset to change B.'
+                        : 'Click another preset to set B.'}
+                    </span>
+                    <button type="button" className="btn-reset" onClick={exitCompare}>
+                      Exit compare
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    className="btn-reset"
+                    disabled={!selectedItem || items.length < 2}
+                    title={items.length < 2 ? 'Need at least two ROI presets to compare' : 'Compare two presets'}
+                    onClick={startCompare}
+                  >
+                    Compare
+                  </button>
+                )}
+              </div>
+            ) : null}
+
+            {actionError ? (
+              <div className="login-error" style={{ marginTop: 8 }} role="alert">{actionError}</div>
+            ) : null}
+
             {items.length === 0 ? (
               <p className="form-note" style={{ marginTop: 8 }}>
                 On {activeSection?.label}, click <strong>Save preset</strong>.
@@ -318,10 +493,14 @@ export default function Presets() {
                 {items.map((item) => {
                   const isEditing = editing?.page === activeSection.page && editing?.id === item.id;
                   const isSelected = item.id === selectedId;
+                  const isCompareB = compareMode && item.id === compareId;
+                  const roleBadge = isSelected && compareMode
+                    ? 'A'
+                    : (isCompareB ? 'B' : null);
                   return (
                     <li
                       key={item.id}
-                      className={`presets-item${item.pinned ? ' is-pinned' : ''}${isSelected ? ' is-selected' : ''}`}
+                      className={`presets-item${item.pinned ? ' is-pinned' : ''}${isSelected ? ' is-selected' : ''}${isCompareB ? ' is-compare-b' : ''}`}
                     >
                       {isEditing ? (
                         <form className="presets-item-edit" onSubmit={confirmRename}>
@@ -357,6 +536,11 @@ export default function Presets() {
                             onClick={() => selectPreset(item)}
                           >
                             <div className="presets-item-name">
+                              {roleBadge ? (
+                                <span className={`presets-compare-badge${roleBadge === 'B' ? ' is-b' : ''}`}>
+                                  {roleBadge}
+                                </span>
+                              ) : null}
                               {item.pinned ? <span className="presets-pin-badge" title="Pinned">★</span> : null}
                               {item.name}
                             </div>
@@ -373,7 +557,7 @@ export default function Presets() {
                               className="btn-generate"
                               onClick={() => selectPreset(item)}
                             >
-                              View
+                              {compareMode && item.id !== selectedId ? 'Set as B' : 'View'}
                             </button>
                             <button
                               type="button"
@@ -382,6 +566,13 @@ export default function Presets() {
                               title={item.pinned ? 'Unpin' : 'Pin favorite'}
                             >
                               {item.pinned ? 'Unpin' : 'Pin'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn-reset"
+                              onClick={() => duplicatePreset(item)}
+                            >
+                              Duplicate
                             </button>
                             <button
                               type="button"
@@ -405,6 +596,26 @@ export default function Presets() {
                 })}
               </ul>
             )}
+          </div>
+
+          <div
+            className="presets-split-handle"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize presets list"
+            aria-valuenow={listWidthPx}
+            tabIndex={0}
+            onPointerDown={onSplitPointerDown}
+            onKeyDown={(e) => {
+              if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+              e.preventDefault();
+              const container = splitContainerRef.current;
+              const width = container?.getBoundingClientRect().width || 800;
+              const delta = e.key === 'ArrowLeft' ? -16 : 16;
+              setListWidthPx((prev) => clampSplitWidth(prev + delta, width));
+            }}
+          >
+            <span className="presets-split-handle-grip" aria-hidden />
           </div>
 
           <div className="presets-master-detail-pane">

@@ -12,9 +12,10 @@ import {
 } from '../../utils/report/roiView';
 import { showToast } from '../../hooks/useToast';
 import { downloadCsv, downloadExcel } from '../../utils/tableExport';
+import RoiTreeEntityIcon from './RoiTreeEntityIcon';
 
 const COLS = [
-  { id: 'label', label: 'Country / Account / Package', type: 'dimension' },
+  { id: 'label', label: 'Country / Account / Package / Site', type: 'dimension' },
   { id: 'date', label: 'Date', type: 'dimension' },
   { id: 'adsSpend', label: 'Ads spend', type: 'metric' },
   { id: 'impressions', label: 'Impressions', type: 'metric' },
@@ -22,12 +23,17 @@ const COLS = [
   { id: 'ctr', label: 'CTR', type: 'metric' },
   { id: 'ecpm', label: 'Ads eCPM', type: 'metric' },
   { id: 'earn', label: 'Earn', type: 'metric' },
+  { id: 'otherExpenses', label: 'Expenses', type: 'metric' },
   { id: 'profitSpend', label: 'Profit (spend)', type: 'metric' },
+  { id: 'profitExpense', label: 'Profit (expenses)', type: 'metric' },
   { id: 'roiSpendPercent', label: 'ROI spend %', type: 'metric' },
+  { id: 'roiExpensePercent', label: 'ROI expenses %', type: 'metric' },
 ];
 
-function money(n) {
-  return formatRoiMoney(n).replace(/^US\$/, '$');
+function money(n, currency = 'USD') {
+  const formatted = formatRoiMoney(n, currency);
+  if (currency === 'USD' || !currency) return formatted.replace(/^US\$/, '$');
+  return formatted;
 }
 
 function pct(n) {
@@ -40,12 +46,72 @@ function SortHeader({ label, active, dir, onClick }) {
       type="button"
       className={`th-sort-btn${active ? ` is-sorted-${dir}` : ''}`}
       onClick={onClick}
-      title={onClick ? `Sort by ${label}` : label}
+      title={`Sort by ${label}`}
     >
       <span>{label}</span>
       <span className="th-sort-icon" aria-hidden>{active ? (dir === 'asc' ? '▲' : '▼') : '⇅'}</span>
     </button>
   );
+}
+
+function sortValueFor(row, colId) {
+  if (colId === 'label') return row.label ?? '';
+  if (colId === 'date') return row.date || row.dateLabel || '';
+  const n = Number(row[colId]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function compareRows(a, b, colId, dir) {
+  const av = sortValueFor(a, colId);
+  const bv = sortValueFor(b, colId);
+  const emptyA = av == null || av === '';
+  const emptyB = bv == null || bv === '';
+  if (emptyA && emptyB) return 0;
+  if (emptyA) return 1;
+  if (emptyB) return -1;
+
+  let diff;
+  if (typeof av === 'number' && typeof bv === 'number') {
+    diff = av - bv;
+  } else {
+    diff = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+  }
+  if (diff === 0 && colId !== 'label') {
+    diff = String(a.label || '').localeCompare(String(b.label || ''), undefined, {
+      numeric: true,
+      sensitivity: 'base',
+    });
+  }
+  return dir === 'asc' ? diff : -diff;
+}
+
+/** Sort country → account → package → date by the active column (dashboard-style). */
+function sortCountryTree(tree, colId, dir) {
+  return [...tree]
+    .map((country) => {
+      if (country.flatMode) {
+        const packages = (country.packages || [])
+          .map((pkg) => {
+            const days = [...(pkg.days || [])].sort((a, b) => compareRows(a, b, colId, dir));
+            return { ...pkg, days };
+          })
+          .sort((a, b) => compareRows(a, b, colId, dir));
+        return { ...country, packages, accounts: [] };
+      }
+      const accounts = (country.accounts || [])
+        .map((account) => {
+          const packages = (account.packages || [])
+            .map((pkg) => {
+              const days = [...(pkg.days || [])].sort((a, b) => compareRows(a, b, colId, dir));
+              return { ...pkg, days };
+            })
+            .sort((a, b) => compareRows(a, b, colId, dir));
+          return { ...account, packages };
+        })
+        .sort((a, b) => compareRows(a, b, colId, dir));
+      return { ...country, accounts };
+    })
+    .sort((a, b) => compareRows(a, b, colId, dir));
 }
 
 function TreeChevron({ open, hasChildren }) {
@@ -59,24 +125,34 @@ function TreeChevron({ open, hasChildren }) {
   );
 }
 
-function renderMetric(row, colId) {
-  if (colId === 'adsSpend') return money(row.adsSpend);
+function renderMetric(row, colId, currency = 'USD') {
+  const earnOnly = row.targetType === 'site' || row.earnOnly || row.level === 'site';
+  // Sites show revenue only — Ads engagement columns are blank.
+  if (earnOnly && ['adsSpend', 'impressions', 'clicks', 'ctr', 'ecpm', 'roiSpendPercent'].includes(colId)) {
+    return '—';
+  }
+  if (colId === 'adsSpend') return money(row.adsSpend, currency);
   if (colId === 'impressions') return formatRoiNum(row.impressions);
   if (colId === 'clicks') return formatRoiNum(row.clicks);
   if (colId === 'ctr') return pct(row.ctr);
   if (colId === 'ecpm') {
-    const v = formatRoiEcpm(row.ecpm);
-    return typeof v === 'string' ? v.replace(/^US\$/, '$') : v;
+    const v = formatRoiEcpm(row.ecpm, currency);
+    return typeof v === 'string' && currency === 'USD' ? v.replace(/^US\$/, '$') : v;
   }
-  if (colId === 'earn') return money(row.earn);
-  if (colId === 'profitSpend') return money(row.profitSpend);
+  if (colId === 'earn') return money(row.earn, currency);
+  if (colId === 'otherExpenses') return money(row.otherExpenses, currency);
+  if (colId === 'profitSpend') return money(row.profitSpend, currency);
+  if (colId === 'profitExpense') return money(row.profitExpense, currency);
   if (colId === 'roiSpendPercent') return pct(row.roiSpendPercent);
+  if (colId === 'roiExpensePercent') return pct(row.roiExpensePercent);
   return '—';
 }
 
 function metricCellClass(row, colId) {
   if (colId === 'profitSpend') return roiToneClass(row.profitSpend);
+  if (colId === 'profitExpense') return roiToneClass(row.profitExpense);
   if (colId === 'roiSpendPercent') return roiToneClass(row.roiSpendPercent);
+  if (colId === 'roiExpensePercent') return roiToneClass(row.roiExpensePercent);
   return '';
 }
 
@@ -105,11 +181,13 @@ export default function RoiCountryTreeTable({
   canDownload = true,
   showPagination = true,
   showTotals = true,
+  spendCurrency = 'USD',
 }) {
   const isMobile = useMedia('(max-width: 640px)');
   const [expandedCountries, setExpandedCountries] = useState(() => new Set());
   const [expandedAccounts, setExpandedAccounts] = useState(() => new Set());
   const [expandedPackages, setExpandedPackages] = useState(() => new Set());
+  const [sortColumn, setSortColumn] = useState('adsSpend');
   const [sortDir, setSortDir] = useState('desc');
 
   const filteredTree = useMemo(
@@ -117,25 +195,36 @@ export default function RoiCountryTreeTable({
     [tree, search]
   );
 
-  const sortedTree = useMemo(() => {
-    const list = [...filteredTree];
-    list.sort((a, b) => {
-      const diff = (Number(a.adsSpend) || 0) - (Number(b.adsSpend) || 0);
-      return sortDir === 'asc' ? diff : -diff;
-    });
-    return list;
-  }, [filteredTree, sortDir]);
+  const sortedTree = useMemo(
+    () => sortCountryTree(filteredTree, sortColumn, sortDir),
+    [filteredTree, sortColumn, sortDir]
+  );
 
   const totals = useMemo(() => {
     const adsSpend = filteredTree.reduce((s, r) => s + (Number(r.adsSpend) || 0), 0);
     const impressions = filteredTree.reduce((s, r) => s + (Number(r.impressions) || 0), 0);
     const clicks = filteredTree.reduce((s, r) => s + (Number(r.clicks) || 0), 0);
     const earn = filteredTree.reduce((s, r) => s + (Number(r.earn) || 0), 0);
+    const otherExpenses = filteredTree.reduce((s, r) => s + (Number(r.otherExpenses) || 0), 0);
     const profitSpend = earn - adsSpend;
+    const profitExpense = earn - otherExpenses;
     const roiSpendPercent = adsSpend > 0 ? (profitSpend / adsSpend) * 100 : null;
+    const roiExpensePercent = otherExpenses > 0 ? (profitExpense / otherExpenses) * 100 : null;
     const ctr = impressions > 0 ? (clicks / impressions) * 100 : null;
     const ecpm = impressions > 0 ? (adsSpend / impressions) * 1000 : null;
-    return { adsSpend, impressions, clicks, ctr, ecpm, earn, profitSpend, roiSpendPercent };
+    return {
+      adsSpend,
+      impressions,
+      clicks,
+      ctr,
+      ecpm,
+      earn,
+      otherExpenses,
+      profitSpend,
+      profitExpense,
+      roiSpendPercent,
+      roiExpensePercent,
+    };
   }, [filteredTree]);
 
   const totalPages = Math.max(1, Math.ceil(sortedTree.length / pageSize));
@@ -172,8 +261,13 @@ export default function RoiCountryTreeTable({
     });
   };
 
-  const toggleSort = () => {
-    setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+  const handleSort = (colId) => {
+    if (sortColumn === colId) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortColumn(colId);
+      setSortDir(colId === 'label' || colId === 'date' ? 'asc' : 'desc');
+    }
     onPageChange?.(1);
   };
 
@@ -188,15 +282,21 @@ export default function RoiCountryTreeTable({
 
   const exportRows = () => {
     const flat = flattenCountryTreeForExport(filteredTree);
-    const headers = ['Level', 'Name', 'Date', 'Ads spend', 'Earn', 'Profit (spend)', 'ROI spend %'];
+    const headers = [
+      'Level', 'Name', 'Date', 'Ads spend', 'Earn', 'Expenses',
+      'Profit (spend)', 'Profit (expenses)', 'ROI spend %', 'ROI expenses %',
+    ];
     const body = flat.map((r) => [
       r.level,
       r.name,
       r.date || '',
       Number(r.adsSpend) || 0,
       Number(r.earn) || 0,
+      Number(r.otherExpenses) || 0,
       Number(r.profitSpend) || 0,
+      Number(r.profitExpense) || 0,
       r.roiSpendPercent == null ? '' : Number(r.roiSpendPercent),
+      r.roiExpensePercent == null ? '' : Number(r.roiExpensePercent),
     ]);
     return { headers, body };
   };
@@ -241,7 +341,78 @@ export default function RoiCountryTreeTable({
 
   const renderTreeRows = () => pageCountries.map((country) => {
     const countryOpen = expandedCountries.has(country.id);
-    const hasAccounts = country.accountCount > 0;
+    const flatMode = Boolean(country.flatMode);
+    const childCount = flatMode
+      ? (country.packages || []).length
+      : (country.accountCount || (country.accounts || []).length);
+    const hasChildren = childCount > 0;
+    const childBadge = flatMode
+      ? `${childCount} item${childCount === 1 ? '' : 's'}`
+      : `${childCount} account${childCount === 1 ? '' : 's'}`;
+
+    const renderPackageRows = (packages) => (packages || []).map((pkg) => {
+      const pkgOpen = expandedPackages.has(pkg.id);
+      const hasDays = (pkg.days || []).length > 1;
+      return (
+        <React.Fragment key={pkg.id}>
+          <tr className={`roi-tree-row roi-tree-row--package${pkg.earnOnly || pkg.targetType === 'site' ? ' roi-tree-row--site' : ''}`}>
+            <td className="roi-tree-label" data-label={COLS[0].label}>
+              <button
+                type="button"
+                className={flatMode
+                  ? 'roi-tree-toggle roi-tree-toggle--account'
+                  : 'roi-tree-toggle roi-tree-toggle--package'}
+                onClick={() => hasDays && togglePackage(pkg.id)}
+                disabled={!hasDays}
+                aria-expanded={hasDays ? pkgOpen : undefined}
+              >
+                <TreeChevron open={pkgOpen} hasChildren={hasDays} />
+                <span className="roi-tree-label-main">
+                  <RoiTreeEntityIcon
+                    kind={pkg.targetType === 'site' || pkg.earnOnly ? 'site' : 'app'}
+                    label={pkg.label}
+                  />
+                  <span className="roi-tree-label-text">{pkg.label}</span>
+                </span>
+                <span className="roi-tree-kind">
+                  {pkg.targetType === 'site' || pkg.earnOnly ? 'Site' : 'Package'}
+                </span>
+                {hasDays ? (
+                  <span className="roi-tree-badge">{pkg.days.length} days</span>
+                ) : null}
+              </button>
+            </td>
+            <td data-label={COLS[1].label}>{pkg.dateLabel || '—'}</td>
+            {COLS.slice(2).map((col) => (
+              <td key={col.id} data-label={col.label} className={metricCellClass(pkg, col.id) || undefined}>
+                {renderMetric(pkg, col.id, spendCurrency)}
+              </td>
+            ))}
+          </tr>
+
+          {pkgOpen && (pkg.days || []).map((day) => (
+            <tr key={day.id} className="roi-tree-row roi-tree-row--date">
+              <td className="roi-tree-label" data-label={COLS[0].label}>
+                <div className={flatMode
+                  ? 'roi-tree-toggle roi-tree-toggle--package'
+                  : 'roi-tree-toggle roi-tree-toggle--date'}
+                >
+                  <TreeChevron open={false} hasChildren={false} />
+                  <span className="roi-tree-label-text">{day.date}</span>
+                </div>
+              </td>
+              <td data-label={COLS[1].label}>{day.date || '—'}</td>
+              {COLS.slice(2).map((col) => (
+                <td key={col.id} data-label={col.label} className={metricCellClass(day, col.id) || undefined}>
+                  {renderMetric(day, col.id, spendCurrency)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </React.Fragment>
+      );
+    });
+
     return (
       <React.Fragment key={country.id}>
         <tr className="roi-tree-row roi-tree-row--country">
@@ -249,26 +420,42 @@ export default function RoiCountryTreeTable({
             <button
               type="button"
               className="roi-tree-toggle"
-              onClick={() => hasAccounts && toggleCountry(country.id)}
-              disabled={!hasAccounts}
-              aria-expanded={hasAccounts ? countryOpen : undefined}
+              onClick={() => hasChildren && toggleCountry(country.id)}
+              disabled={!hasChildren}
+              aria-expanded={hasChildren ? countryOpen : undefined}
             >
-              <TreeChevron open={countryOpen} hasChildren={hasAccounts} />
-              <span className="roi-tree-label-text">{country.label}</span>
-              {hasAccounts ? (
-                <span className="roi-tree-badge">{country.accountCount} account{country.accountCount === 1 ? '' : 's'}</span>
+              <TreeChevron open={countryOpen} hasChildren={hasChildren} />
+              <span className="roi-tree-label-main">
+                <RoiTreeEntityIcon
+                  kind="country"
+                  code={country.countryCode}
+                  label={country.label}
+                />
+                <span className="roi-tree-label-text">{country.label}</span>
+              </span>
+              {hasChildren ? (
+                <span className="roi-tree-badge">{childBadge}</span>
+              ) : null}
+              {(Number(country.appEarn) > 0 || Number(country.siteEarn) > 0) ? (
+                <span className="roi-tree-earn-split" title="App earn + Site earn = total Earn">
+                  App {money(country.appEarn, spendCurrency)}
+                  {' · '}
+                  Site {money(country.siteEarn, spendCurrency)}
+                </span>
               ) : null}
             </button>
           </td>
           <td data-label={COLS[1].label}>{country.dateLabel || '—'}</td>
           {COLS.slice(2).map((col) => (
             <td key={col.id} data-label={col.label} className={metricCellClass(country, col.id) || undefined}>
-              {renderMetric(country, col.id)}
+              {renderMetric(country, col.id, spendCurrency)}
             </td>
           ))}
         </tr>
 
-        {countryOpen && (country.accounts || []).map((account) => {
+        {countryOpen && flatMode && renderPackageRows(country.packages)}
+
+        {countryOpen && !flatMode && (country.accounts || []).map((account) => {
           const accountOpen = expandedAccounts.has(account.id);
           const hasPackages = (account.packages || []).length > 0;
           return (
@@ -290,60 +477,12 @@ export default function RoiCountryTreeTable({
                 <td data-label={COLS[1].label}>{account.dateLabel || '—'}</td>
                 {COLS.slice(2).map((col) => (
                   <td key={col.id} data-label={col.label} className={metricCellClass(account, col.id) || undefined}>
-                    {renderMetric(account, col.id)}
+                    {renderMetric(account, col.id, spendCurrency)}
                   </td>
                 ))}
               </tr>
 
-              {accountOpen && (account.packages || []).map((pkg) => {
-                const pkgOpen = expandedPackages.has(pkg.id);
-                const hasDays = (pkg.days || []).length > 1;
-                return (
-                  <React.Fragment key={pkg.id}>
-                    <tr className="roi-tree-row roi-tree-row--package">
-                      <td className="roi-tree-label" data-label={COLS[0].label}>
-                        <button
-                          type="button"
-                          className="roi-tree-toggle roi-tree-toggle--package"
-                          onClick={() => hasDays && togglePackage(pkg.id)}
-                          disabled={!hasDays}
-                          aria-expanded={hasDays ? pkgOpen : undefined}
-                        >
-                          <TreeChevron open={pkgOpen} hasChildren={hasDays} />
-                          <span className="roi-tree-label-text">{pkg.label}</span>
-                          <span className="roi-tree-kind">Package</span>
-                          {hasDays ? (
-                            <span className="roi-tree-badge">{pkg.days.length} days</span>
-                          ) : null}
-                        </button>
-                      </td>
-                      <td data-label={COLS[1].label}>{pkg.dateLabel || '—'}</td>
-                      {COLS.slice(2).map((col) => (
-                        <td key={col.id} data-label={col.label} className={metricCellClass(pkg, col.id) || undefined}>
-                          {renderMetric(pkg, col.id)}
-                        </td>
-                      ))}
-                    </tr>
-
-                    {pkgOpen && (pkg.days || []).map((day) => (
-                      <tr key={day.id} className="roi-tree-row roi-tree-row--date">
-                        <td className="roi-tree-label" data-label={COLS[0].label}>
-                          <div className="roi-tree-toggle roi-tree-toggle--date">
-                            <TreeChevron open={false} hasChildren={false} />
-                            <span className="roi-tree-label-text">{day.date}</span>
-                          </div>
-                        </td>
-                        <td data-label={COLS[1].label}>{day.date || '—'}</td>
-                        {COLS.slice(2).map((col) => (
-                          <td key={col.id} data-label={col.label} className={metricCellClass(day, col.id) || undefined}>
-                            {renderMetric(day, col.id)}
-                          </td>
-                        ))}
-                      </tr>
-                    ))}
-                  </React.Fragment>
-                );
-              })}
+              {accountOpen && renderPackageRows(account.packages)}
             </React.Fragment>
           );
         })}
@@ -361,7 +500,7 @@ export default function RoiCountryTreeTable({
               value={search}
               onChange={onSearchChange}
               onPageReset={onPageReset}
-              placeholder="Search country / account / package / date…"
+              placeholder="Search country / account / package / site…"
             />
           )}
           {headerExtra}
@@ -405,7 +544,14 @@ export default function RoiCountryTreeTable({
             {pageCountries.map((country) => (
               <article key={country.id} className="report-mobile-item">
                 <div className="report-mobile-item-head">
-                  <p className="report-mobile-title">{country.label}</p>
+                  <p className="report-mobile-title report-mobile-title--with-icon">
+                    <RoiTreeEntityIcon
+                      kind="country"
+                      code={country.countryCode}
+                      label={country.label}
+                    />
+                    <span>{country.label}</span>
+                  </p>
                   <p className="report-mobile-sub">{country.dateLabel}</p>
                 </div>
                 <dl className="report-mobile-metrics">
@@ -413,7 +559,7 @@ export default function RoiCountryTreeTable({
                     <div key={col.id} className="report-mobile-metric">
                       <dt>{col.label}</dt>
                       <dd className={metricCellClass(country, col.id) || undefined}>
-                        {renderMetric(country, col.id)}
+                        {renderMetric(country, col.id, spendCurrency)}
                       </dd>
                     </div>
                   ))}
@@ -427,16 +573,12 @@ export default function RoiCountryTreeTable({
               <tr>
                 {COLS.map((col) => (
                   <th key={col.id}>
-                    {col.id === 'adsSpend' ? (
-                      <SortHeader
-                        label={col.label}
-                        active
-                        dir={sortDir}
-                        onClick={toggleSort}
-                      />
-                    ) : (
-                      <SortHeader label={col.label} />
-                    )}
+                    <SortHeader
+                      label={col.label}
+                      active={sortColumn === col.id}
+                      dir={sortDir}
+                      onClick={() => handleSort(col.id)}
+                    />
                   </th>
                 ))}
               </tr>
@@ -463,7 +605,7 @@ export default function RoiCountryTreeTable({
                   <td>—</td>
                   {COLS.slice(2).map((col) => (
                     <td key={col.id} className={metricCellClass(totals, col.id) || undefined}>
-                      {renderMetric(totals, col.id)}
+                      {renderMetric(totals, col.id, spendCurrency)}
                     </td>
                   ))}
                 </tr>

@@ -12,6 +12,7 @@ import { ConfirmDialogHost } from '../../hooks/useConfirmDialog';
 import { rememberLastRoute } from '../../utils/lastRoute';
 import { APP_TIMEZONE } from '../../utils/datetime';
 import { buildFreshnessLabel } from '../../utils/dataFreshness';
+import { applyTheme, isDarkTheme, readStoredTheme } from '../../utils/theme';
 
 const FOCUS_KEY = 'adnexus.focusMode';
 
@@ -49,6 +50,7 @@ export default function Layout() {
   const [userOpen, setUserOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [focusMode, setFocusMode] = useState(readFocusMode);
+  const [darkMode, setDarkMode] = useState(() => readStoredTheme() === 'dark');
   const userRef = useRef(null);
 
   const toggleFocusMode = useCallback(() => {
@@ -61,6 +63,11 @@ export default function Layout() {
       }
       return next;
     });
+  }, []);
+
+  const toggleDarkMode = useCallback(() => {
+    const next = applyTheme(isDarkTheme() ? 'light' : 'dark');
+    setDarkMode(next === 'dark');
   }, []);
 
   useEffect(() => {
@@ -234,6 +241,16 @@ export default function Layout() {
             <button
               type="button"
               className="sidebar-focus-toggle"
+              onClick={toggleDarkMode}
+              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-pressed={darkMode}
+            >
+              <span aria-hidden>{darkMode ? '☀' : '☾'}</span>
+              <span className="sidebar-focus-label">{darkMode ? 'Light' : 'Dark'}</span>
+            </button>
+            <button
+              type="button"
+              className="sidebar-focus-toggle"
               onClick={toggleFocusMode}
               title={focusMode ? 'Expand sidebar ([)' : 'Focus mode — more chart width ([)'}
               aria-pressed={focusMode}
@@ -294,6 +311,16 @@ export default function Layout() {
               {menuOpen ? '✕' : '☰'}
             </button>
             <BrandLogo />
+            <button
+              type="button"
+              className="theme-toggle-mobile"
+              onClick={toggleDarkMode}
+              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-pressed={darkMode}
+            >
+              {darkMode ? '☀' : '☾'}
+            </button>
             <span className="context-chip" title={`Currency ${currencyCode} · ${APP_TIMEZONE}`}>
               {currencyCode} · {tzShort}
             </span>
@@ -317,7 +344,7 @@ export default function Layout() {
                 </div>
               </div>
             ) : (
-              <Outlet context={{ networkInfo, isMock }} />
+              <Outlet key={darkMode ? 'dark' : 'light'} context={{ networkInfo, isMock }} />
             )}
           </main>
           <ToastStack />

@@ -13,7 +13,7 @@ import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError
 const TABS = [
   { id: 'user', label: 'Users' },
   { id: 'domains', label: 'Assign Permissions' },
-  { id: 'client', label: 'GAM credentials' },
+  { id: 'client', label: 'GAM connection' },
   { id: 'ads', label: 'Google Ads accounts' },
 ];
 

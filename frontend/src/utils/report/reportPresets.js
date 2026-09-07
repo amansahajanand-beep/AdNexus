@@ -280,6 +280,75 @@ export function updateReportPreset(page, id, { name } = {}, userId) {
   }
 }
 
+/** Build a unique "Name (copy)" / "Name (copy 2)" within max length. */
+function uniqueCopyName(baseName, existingNames) {
+  const taken = new Set(
+    [...(existingNames || [])].map((n) => String(n || '').trim().toLowerCase()).filter(Boolean)
+  );
+  const root = String(baseName || 'Untitled preset')
+    .replace(/\s*\(copy(?:\s+\d+)?\)\s*$/i, '')
+    .trim() || 'Untitled preset';
+
+  const build = (suffix) => {
+    const maxBase = Math.max(1, PRESET_NAME_MAX - suffix.length);
+    return `${root.slice(0, maxBase)}${suffix}`.slice(0, PRESET_NAME_MAX);
+  };
+
+  let candidate = build(' (copy)');
+  if (!taken.has(candidate.toLowerCase())) return candidate;
+  for (let n = 2; n < 100; n += 1) {
+    candidate = build(` (copy ${n})`);
+    if (!taken.has(candidate.toLowerCase())) return candidate;
+  }
+  return build(` (copy ${Date.now() % 1000})`);
+}
+
+/**
+ * Clone a preset (same filters). Returns { ok, preset?, error?, list }.
+ */
+export function duplicateReportPreset(page, id, userId) {
+  const list = getReportPresets(page, userId);
+  if (!id) return { ok: false, error: 'Preset not found.', list };
+  const source = list.find((item) => item.id === id);
+  if (!source) return { ok: false, error: 'Preset not found.', list };
+  if (list.length >= MAX) {
+    return {
+      ok: false,
+      error: `You can save at most ${MAX} presets per page. Delete one before duplicating.`,
+      list,
+    };
+  }
+
+  const snap = filtersOnlySnapshot(source.snapshot);
+  let name;
+  try {
+    name = assertValidSavedName(
+      uniqueCopyName(source.name, list.map((item) => item.name)),
+      { maxLength: PRESET_NAME_MAX, label: 'Preset name' },
+    );
+  } catch (err) {
+    return { ok: false, error: err?.message || 'Invalid preset name.', list };
+  }
+
+  const preset = {
+    id: makeId(),
+    name,
+    snapshot: snap,
+    summary: summaryForPreset(snap),
+    when: Date.now(),
+    pinned: false,
+    pinnedAt: null,
+  };
+
+  try {
+    const next = writeList(page, userId, [preset, ...list]);
+    const created = next.find((item) => item.id === preset.id) || preset;
+    return { ok: true, preset: created, list: next };
+  } catch {
+    return { ok: false, error: 'Could not duplicate preset.', list: getReportPresets(page, userId) };
+  }
+}
+
 export function toggleReportPresetPin(page, id, userId) {
   if (!id) return getReportPresets(page, userId);
   try {
@@ -324,6 +393,7 @@ export default {
   getReportPresets,
   saveReportPreset,
   updateReportPreset,
+  duplicateReportPreset,
   toggleReportPresetPin,
   removeReportPreset,
   summaryForPreset,

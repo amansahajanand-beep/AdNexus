@@ -3,6 +3,7 @@ import { useOutletContext, useSearchParams } from 'react-router-dom';
 import PageHeader from '../components/ui/PageHeader';
 import RoiCountryTreeTable from '../components/roi/RoiCountryTreeTable';
 import RoiSummaryBoards from '../components/roi/RoiSummaryBoards';
+import RoiInventoryEarnOverview from '../components/roi/RoiInventoryEarnOverview';
 import CompareRangeBar from '../components/ui/CompareRangeBar';
 import SavePresetButton from '../components/ui/SavePresetButton';
 import ThresholdAlertBanner from '../components/ui/ThresholdAlertBanner';
@@ -54,12 +55,13 @@ import {
   mergeRoiBreakdownPayload,
   mergeRoiSummaryPayload,
   roiToneClass,
+  sumInventoryEarnFromBreakdown,
 } from '../utils/report/roiView';
 
 const ROI_TIP_KEY = 'adnexus.guide.roi.v1';
 
-function money(n) {
-  return formatRoiMoney(n);
+function money(n, currency = 'USD') {
+  return formatRoiMoney(n, currency);
 }
 
 function pct(n) {
@@ -279,12 +281,19 @@ export default function Roi() {
   const siteOptions = useMemo(() => {
     const seen = new Set();
     const opts = [];
-    const add = (value, label) => {
-      const id = String(value || '').trim().toLowerCase();
-      if (!id || seen.has(id)) return;
-      seen.add(id);
-      opts.push({ value: id, label: String(label || value).trim() || id });
+    const isSubdomainHost = (raw) => {
+      const host = String(raw || '').trim().toLowerCase().replace(/^www\./, '');
+      if (!host || !host.includes('.')) return false;
+      // Apex = one dot (arenapro6.com). Subdomain = two+ (finance2.arenapro6.com).
+      return (host.match(/\./g) || []).length >= 2;
     };
+    const add = (value, label) => {
+      const id = String(value || '').trim().toLowerCase().replace(/^www\./, '');
+      if (!id || seen.has(id) || !isSubdomainHost(id)) return;
+      seen.add(id);
+      opts.push({ value: id, label: String(label || value).trim().replace(/^www\./i, '') || id });
+    };
+    // Prefer GAM subdomains from /roi-sites + inventory picker (never apex domains).
     (roiSiteOptions || []).forEach((o) => add(o.value, o.label));
     (siteHosts || []).forEach((h) => add(h, h));
     opts.sort((a, b) => a.label.localeCompare(b.label));
@@ -305,7 +314,7 @@ export default function Roi() {
     if (applied.accountIds?.length) bits.push(`${applied.accountIds.length} account(s)`);
     if (applied.campaignIds?.length) bits.push(`${applied.campaignIds.length} campaign(s)`);
     if (applied.appKeys?.length) bits.push(`${applied.appKeys.length} app(s)`);
-    if (applied.siteKeys?.length) bits.push(`${applied.siteKeys.length} site(s)`);
+    if (applied.siteKeys?.length) bits.push(`${applied.siteKeys.length} subdomain(s)`);
     if (applied.countryCodes?.length) bits.push(`${applied.countryCodes.length} countr${applied.countryCodes.length === 1 ? 'y' : 'ies'}`);
     return bits.join(' · ');
   }, [applied]);
@@ -350,10 +359,9 @@ export default function Roi() {
     const siteKeys = isAllSelection(siteSel)
       ? []
       : (Array.isArray(siteSel) ? siteSel.filter((v) => v && v !== ALL_SENTINEL) : []);
-    let targetType = 'all';
-    if (appKeys.length && siteKeys.length) targetType = 'all';
-    else if (appKeys.length) targetType = 'app';
-    else if (siteKeys.length) targetType = 'site';
+    // Always use targetType=all when filtering — app + site are a union (selecting
+    // sites must not hide Ads app packages / earn).
+    const targetType = 'all';
     return {
       accountIds: accountIds.length ? accountIds : null,
       campaignIds: campaignIds.length ? campaignIds : null,
@@ -810,16 +818,6 @@ export default function Roi() {
         if (cancelled) return;
         setSiteHosts(Array.isArray(picker?.siteHosts) ? picker.siteHosts : []);
         setAppIds(Array.isArray(picker?.appIds) ? picker.appIds : []);
-        const pending = pendingShareFiltersRef.current;
-        if (pending?.siteKeys?.length) {
-          const hosts = Array.isArray(picker?.siteHosts) ? picker.siteHosts : [];
-          const allowed = new Set(hosts.map((h) => String(h).toLowerCase()));
-          const kept = pending.siteKeys
-            .map((k) => String(k).toLowerCase())
-            .filter((id) => allowed.has(id));
-          pendingShareFiltersRef.current = { ...pending, siteKeys: [] };
-          if (kept.length) setFilterSiteKeys(kept);
-        }
       } catch (err) {
         logErrorForDebug(err, 'ROI inventory picker');
         if (!cancelled) {
@@ -1069,11 +1067,46 @@ export default function Roi() {
   };
 
   const deleteExpense = async (id) => {
+    const removed = (data?.expenses || data?.generalExpenses || []).find((e) => e.id === id);
+    // Optimistic UI — remove immediately so the row does not linger until reload/cache.
+    setData((prev) => {
+      if (!prev) return prev;
+      const expenses = (prev.expenses || []).filter((e) => e.id !== id);
+      const generalExpenses = (prev.generalExpenses || []).filter((e) => e.id !== id);
+      let summary = prev.summary;
+      if (summary && removed && (removed.targetType === 'general' || !removed.targetType)) {
+        const otherExpenses = Math.max(
+          0,
+          Math.round(((Number(summary.otherExpenses) || 0) - (Number(removed.amount) || 0)) * 100) / 100
+        );
+        const earn = Number(summary.earn) || 0;
+        const adsSpend = Number(summary.adsSpend) || 0;
+        const profitExpense = Math.round((earn - otherExpenses) * 100) / 100;
+        const totalCost = Math.round((adsSpend + otherExpenses) * 100) / 100;
+        const roiExpensePercent = otherExpenses > 0
+          ? Math.round(((earn - otherExpenses) / otherExpenses) * 10000) / 100
+          : null;
+        const roiPercent = totalCost > 0
+          ? Math.round(((earn - totalCost) / totalCost) * 10000) / 100
+          : null;
+        summary = {
+          ...summary,
+          otherExpenses,
+          profitExpense,
+          totalCost,
+          profit: Math.round((earn - totalCost) * 100) / 100,
+          roiExpensePercent,
+          roiPercent,
+        };
+      }
+      return { ...prev, expenses, generalExpenses, summary };
+    });
     try {
       await adsAPI.deleteExpense(id);
       await load();
     } catch (err) {
       setError(getUserFacingMessage(err, 'Could not delete expense.'));
+      await load();
     }
   };
 
@@ -1154,6 +1187,7 @@ export default function Roi() {
   };
 
   const summary = data?.summary || {};
+  const spendCurrency = summary.adsSpendCurrency || data?.spendCurrency || 'USD';
   const overviewReady = Boolean(summary && Object.keys(summary).length > 0);
 
   const cardDeltas = useMemo(() => {
@@ -1168,12 +1202,17 @@ export default function Roi() {
   const countryTargetBreakdown = data?.countryTargetBreakdown || [];
   const countryBreakdown = data?.countryBreakdown || [];
   const countryTargetDailyBreakdown = data?.countryTargetDailyBreakdown || [];
+  const singleAccountMode = (applied?.accountIds || []).length === 1;
   const countryTree = useMemo(
     () => buildCountryTree(
       countryBreakdown,
       countryTargetBreakdown,
       countryTargetDailyBreakdown,
-      { startDate: applied?.startDate || startDate, endDate: applied?.endDate || endDate },
+      {
+        startDate: applied?.startDate || startDate,
+        endDate: applied?.endDate || endDate,
+        singleAccountMode,
+      },
     ),
     [
       countryBreakdown,
@@ -1183,7 +1222,12 @@ export default function Roi() {
       applied?.endDate,
       startDate,
       endDate,
+      singleAccountMode,
     ]
+  );
+  const inventoryEarn = useMemo(
+    () => sumInventoryEarnFromBreakdown(countryTargetBreakdown),
+    [countryTargetBreakdown]
   );
 
   return (
@@ -1274,33 +1318,33 @@ export default function Roi() {
               subtitle="Same presets as Dashboard and Reporting"
             >
               <RoiFilterRow icon="calendar" label="Period">
-                <div className="dash-date-display" style={{ padding: '4px 0' }}>
-                  <span className="dash-date-label">{presetLabel}</span>
-                  <span className="dash-date-range">
-                    {customDatesIncomplete
-                      ? 'Select start & end dates'
-                      : (startDate && endDate
-                        ? (startDate !== endDate ? `${startDate} → ${endDate}` : startDate)
-                        : '…')}
-                  </span>
+                <div className="roi-filter-date-toolbar">
+                  <div className="dash-date-display">
+                    <span className="dash-date-label">{presetLabel}</span>
+                    <span className="dash-date-range">
+                      {customDatesIncomplete
+                        ? 'Select start & end dates'
+                        : (startDate && endDate
+                          ? (startDate !== endDate ? `${startDate} → ${endDate}` : startDate)
+                          : '…')}
+                    </span>
+                  </div>
+                  {!dateFilterLocked && presetOptions.length > 0 && (
+                    <div className="preset-pills roi-filter-date-pills">
+                      {presetOptions.map((p) => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          className={`preset-pill ${preset === p.id ? 'active' : ''}`}
+                          onClick={() => onPreset(p.id)}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </RoiFilterRow>
-              {!dateFilterLocked && presetOptions.length > 0 && (
-                <div className="roi-filter-date-pills">
-                  <div className="preset-pills dash-preset-row">
-                    {presetOptions.map((p) => (
-                      <button
-                        key={p.id}
-                        type="button"
-                        className={`preset-pill ${preset === p.id ? 'active' : ''}`}
-                        onClick={() => onPreset(p.id)}
-                      >
-                        {p.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
               {!dateFilterLocked && preset === 'custom' && (
                 <div className="roi-filter-date-custom">
                   <div className="filter-field">
@@ -1328,8 +1372,8 @@ export default function Roi() {
             </RoiFilterSection>
 
             <RoiFilterSection
-              title="Google Ads"
-              subtitle="Accounts, campaigns, and apps from synced Ads spend in the selected date range."
+              title="Google Ads & inventory"
+              subtitle="Accounts/campaigns/apps from Ads; Subdomains are independent — pick GAM subdomains to add site revenue (INR)."
             >
               <RoiFilterRow icon="accounts" label="Ads accounts">
                 <MultiSelect
@@ -1378,6 +1422,25 @@ export default function Roi() {
                   selectAllLabel="Select all related apps"
                 />
               </RoiFilterRow>
+              <RoiFilterRow icon="sites" label="Subdomains">
+                <MultiSelect
+                  options={siteOptions}
+                  value={filterSiteKeys}
+                  onChange={setFilterSiteKeys}
+                  placeholder={
+                    roiSitesLoading
+                      ? 'Loading GAM subdomains…'
+                      : (siteOptions.length
+                        ? 'Pick subdomains → Apply Filter to load their revenue (₹)…'
+                        : 'No GAM subdomains in inventory yet')
+                  }
+                  disabled={!siteOptions.length && !roiSitesLoading}
+                  loading={roiSitesLoading}
+                  searchable
+                  showSelectAll
+                  selectAllLabel="Select all subdomains"
+                />
+              </RoiFilterRow>
               <RoiFilterRow icon="countries" label="Countries">
                 <MultiSelect
                   options={roiCountryOptions}
@@ -1395,31 +1458,6 @@ export default function Roi() {
                   searchable
                   showSelectAll
                   selectAllLabel="Select all countries"
-                />
-              </RoiFilterRow>
-            </RoiFilterSection>
-
-            <RoiFilterSection
-              title="GAM sites"
-              subtitle="Pick site hosts manually for GAM earn — independent of Ads account selection."
-            >
-              <RoiFilterRow icon="sites" label="Sites">
-                <MultiSelect
-                  options={siteOptions}
-                  value={filterSiteKeys}
-                  onChange={setFilterSiteKeys}
-                  placeholder={
-                    roiSitesLoading
-                      ? 'Loading GAM sites…'
-                      : (siteOptions.length
-                        ? 'Select site hosts (optional)…'
-                        : 'No GAM sites in inventory yet')
-                  }
-                  disabled={!siteOptions.length && !roiSitesLoading}
-                  loading={roiSitesLoading}
-                  searchable
-                  showSelectAll
-                  selectAllLabel="Select all sites"
                 />
               </RoiFilterRow>
             </RoiFilterSection>
@@ -1493,6 +1531,16 @@ export default function Roi() {
         fetchedAt={lastUpdated}
       />
 
+      {singleAccountMode ? (
+        <RoiInventoryEarnOverview
+          appEarn={inventoryEarn.appEarn}
+          siteEarn={inventoryEarn.siteEarn}
+          totalEarn={inventoryEarn.totalEarn}
+          currency={spendCurrency}
+          loading={(loading || breakdownLoading) && !countryTargetBreakdown.length}
+        />
+      ) : null}
+
       {summary.unmappedSpend > 0 && (
         <div className="warn-card warn-card-partial" role="status" style={{ marginTop: 12 }}>
           <div className="warn-card-main">
@@ -1501,9 +1549,9 @@ export default function Roi() {
               <div className="warn-card-body">
                 <div className="warn-card-title">Unmapped Ads spend</div>
                 <div className="warn-card-desc">
-                  {money(summary.unmappedSpend)} in this range is not mapped to a site/app
+                  {money(summary.unmappedSpend, spendCurrency)} in this range is not mapped to a site/app
                   {summary.mappedSpend != null
-                    ? ` (${money(summary.mappedSpend)} is in the table)`
+                    ? ` (${money(summary.mappedSpend, spendCurrency)} is in the table)`
                     : ''}.
                   {' '}Unmapped spend is hidden from the table and from Ads spend / ROI cards.
                   Map campaigns in Admin → Campaign mapping to include them.
@@ -1544,6 +1592,7 @@ export default function Roi() {
         onPageChange={setCountryPage}
         density={tableDensity}
         freezeFirst
+        spendCurrency={spendCurrency}
         exportName={`roi_countries_${applied?.startDate || startDate}_${applied?.endDate || endDate}`}
         className="reporting-table"
         emptyMessage="No country spend for the selected filters"
@@ -1610,7 +1659,7 @@ export default function Roi() {
                     </td>
                     <td>{e.targetType === 'general' ? '—' : (e.targetKey || '—')}</td>
                     <td>{e.label || 'Expense'}</td>
-                    <td>{money(e.amount)}</td>
+                    <td>{money(e.amount, spendCurrency)}</td>
                     <td>
                       <button type="button" className="btn-reset" onClick={() => deleteExpense(e.id)}>
                         Delete

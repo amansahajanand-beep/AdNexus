@@ -5,8 +5,19 @@ const {
   listCampaignMaps,
 } = require('../models/adsAccountStore');
 const { coerceWarehouseRevenue } = require('../utils/gamReportMetrics');
+const { adsSpendSql, adsSpendDisplayCurrency, usdToSpendCurrency } = require('../utils/adsCurrency');
 const { kpiSliceFilterSql } = require('./reportGrainStore');
 const { cache } = require('../gam/client');
+
+/** Prefer cost_native (Google Ads account currency) so totals match the Ads UI. */
+const SPEND = (alias = 's') => adsSpendSql(alias);
+
+/** Convert GAM USD earn → Ads display currency (INR when ADS_FORCE_CURRENCY=INR). */
+async function earnInSpendCurrency(earnUsd, endDate = null) {
+  const cur = adsSpendDisplayCurrency();
+  if (cur === 'USD') return round2(earnUsd);
+  return round2(await usdToSpendCurrency(earnUsd, endDate));
+}
 
 const ROI_SUMMARY_CACHE_TTL = Math.max(
   15,
@@ -19,6 +30,75 @@ const ROI_BREAKDOWN_CACHE_TTL = Math.max(
 
 function round2(n) {
   return Math.round((Number(n) || 0) * 100) / 100;
+}
+
+function targetExpenseKey(type, key) {
+  return `${type}:${String(key || '').trim().toLowerCase()}`;
+}
+
+/** Site/app expenses keyed by target and by date+target (general excluded). */
+function buildSiteAppExpenseMaps(expenses, {
+  includeSite = true,
+  includeApp = true,
+  allowTarget = null,
+} = {}) {
+  const byTarget = new Map();
+  const byTargetDate = new Map();
+  for (const e of expenses || []) {
+    if (!e || e.targetType === 'general') continue;
+    if (e.targetType === 'site' && !includeSite) continue;
+    if (e.targetType === 'app' && !includeApp) continue;
+    const tk = targetExpenseKey(e.targetType, e.targetKey);
+    if (typeof allowTarget === 'function' && !allowTarget(e.targetType, e.targetKey)) continue;
+    byTarget.set(tk, round2((byTarget.get(tk) || 0) + (Number(e.amount) || 0)));
+    const day = ymd(e.expenseDate);
+    if (day) {
+      const dk = `${day}:${tk}`;
+      byTargetDate.set(dk, round2((byTargetDate.get(dk) || 0) + (Number(e.amount) || 0)));
+    }
+  }
+  return { byTarget, byTargetDate };
+}
+
+function sumAdsSpendByTarget(rows = []) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = targetExpenseKey(r.targetType, r.targetKey);
+    m.set(k, round2((m.get(k) || 0) + (Number(r.adsSpend) || 0)));
+  }
+  return m;
+}
+
+function sumAdsSpendByTargetDate(rows = []) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = `${ymd(r.date)}:${targetExpenseKey(r.targetType, r.targetKey)}`;
+    m.set(k, round2((m.get(k) || 0) + (Number(r.adsSpend) || 0)));
+  }
+  return m;
+}
+
+/** Split a target's expense across country/account rows by Ads spend share. */
+function allocateTargetExpense(expenseTotal, rowSpend, targetSpendTotal) {
+  const exp = Number(expenseTotal) || 0;
+  const spend = Number(rowSpend) || 0;
+  const total = Number(targetSpendTotal) || 0;
+  if (!(exp > 0) || !(spend > 0) || !(total > 0)) return 0;
+  return round2(exp * (spend / total));
+}
+
+function expenseMetricsFromConvertedEarn(earnConverted, adsSpend, otherExpenses) {
+  const e = Number(earnConverted) || 0;
+  const other = Number(otherExpenses) || 0;
+  const spend = Number(adsSpend) || 0;
+  return {
+    otherExpenses: round2(other),
+    profitExpense: round2(e - other),
+    roiExpensePercent: other > 0 ? round2(((e - other) / other) * 100) : null,
+    totalCost: round2(spend + other),
+    profit: round2(e - spend - other),
+    roiPercent: (spend + other) > 0 ? round2(((e - spend - other) / (spend + other)) * 100) : null,
+  };
 }
 
 function ymd(d) {
@@ -59,8 +139,9 @@ function adsEngagementMetrics({
   };
 }
 
-function metricsFor(earn, adsSpend, otherExpenses, engagement = {}) {
-  const e = Number(earn) || 0;
+async function metricsFor(earn, adsSpend, otherExpenses, engagement = {}, { endDate = null } = {}) {
+  // GAM earn is USD in warehouse; Ads spend may be native INR — convert earn for ROI math/UI.
+  const e = await earnInSpendCurrency(earn, endDate);
   const spend = Number(adsSpend) || 0;
   const other = Number(otherExpenses) || 0;
   const profitSpend = round2(e - spend);
@@ -343,6 +424,91 @@ async function loadGamEarnByTargetAggregated(clientId, start, end, { countryName
   return { sites, apps };
 }
 
+/** Scoped site/app earn — avoids full report_grain scans when inventory filters are set. */
+async function loadGamEarnByTargetAggregatedScoped(clientId, start, end, {
+  appKeys = [],
+  siteKeys = [],
+  countryNames = null,
+} = {}) {
+  const apps = [...new Set((appKeys || []).map((k) => String(k).trim().toLowerCase()).filter(Boolean))];
+  const sites = [...new Set((siteKeys || []).map((k) => String(k).trim().toLowerCase()).filter(Boolean))];
+  if (!apps.length && !sites.length) return { sites: [], apps: [] };
+
+  const countryFilter = Array.isArray(countryNames) && countryNames.length
+    ? countryNames.map((n) => String(n).trim().toLowerCase()).filter(Boolean)
+    : null;
+
+  const outSites = [];
+  const outApps = [];
+
+  if (sites.length) {
+    const exactSites = [...new Set(sites.map((k) => normSiteHost(k)).filter(Boolean))];
+    const params = [clientId, start, end, exactSites];
+    let countryClause = '';
+    if (countryFilter?.length) {
+      params.push(countryFilter);
+      countryClause = ` AND EXISTS (
+         SELECT 1 FROM dim_country dc
+         WHERE dc.id = g.country_id
+           AND LOWER(TRIM(dc.name)) = ANY($${params.length}::text[])
+       )`;
+    }
+    const { rows } = await query(
+      `SELECT LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) AS target_key,
+              COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+              COALESCE(SUM(g.impressions), 0)::float8 AS impressions
+       FROM report_grain g
+       JOIN dim_site ds ON ds.id = g.site_id AND ds.client_id = g.client_id
+       WHERE g.client_id = $1
+         AND g.report_date BETWEEN $2 AND $3
+         AND g.site_id > 0
+         AND g.slice_key = 'inventory_core'
+         AND LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) = ANY($4::text[])
+         ${countryClause}
+       GROUP BY 1`,
+      params
+    );
+    rows.forEach((r) => {
+      if (!r.target_key) return;
+      outSites.push({
+        targetKey: normSiteHost(r.target_key),
+        earn: coerceWarehouseRevenue(r.revenue, Number(r.impressions) || 0),
+      });
+    });
+  }
+
+  if (apps.length) {
+    const params = [clientId, start, end, apps];
+    let countryClause = '';
+    if (countryFilter?.length) {
+      params.push(countryFilter);
+      countryClause = ` AND EXISTS (
+         SELECT 1 FROM dim_country dc
+         WHERE dc.id = g.country_id
+           AND LOWER(TRIM(dc.name)) = ANY($${params.length}::text[])
+       )`;
+    }
+    const { rows } = await query(
+      `SELECT LOWER(TRIM(COALESCE(NULLIF(g.app_id, ''), g.app_name))) AS target_key,
+              COALESCE(SUM(g.revenue), 0)::float8 AS earn
+       FROM report_grain g
+       WHERE g.client_id = $1
+         AND g.report_date BETWEEN $2 AND $3
+         AND g.slice_key = 'app_id'
+         AND LOWER(TRIM(COALESCE(NULLIF(g.app_id, ''), g.app_name))) = ANY($4::text[])
+         ${countryClause}
+       GROUP BY 1`,
+      params
+    );
+    rows.forEach((r) => {
+      if (!r.target_key) return;
+      outApps.push({ targetKey: r.target_key, earn: Number(r.earn) || 0 });
+    });
+  }
+
+  return { sites: outSites, apps: outApps };
+}
+
 async function resolveCountryNames(clientId, countryCodes = []) {
   const codes = [...new Set(
     (countryCodes || []).map((c) => String(c).trim().toUpperCase()).filter(Boolean)
@@ -432,7 +598,7 @@ async function loadCountrySpendBreakdown(clientId, start, end, {
   const { rows } = await query(
     `SELECT UPPER(TRIM(s.country_code)) AS country_code,
             MAX(s.country_name) AS country_name,
-            COALESCE(SUM(s.cost), 0)::float8 AS ads_spend,
+            COALESCE(SUM(${SPEND('s')}), 0)::float8 AS ads_spend,
             COALESCE(SUM(s.clicks), 0)::bigint AS clicks,
             COALESCE(SUM(s.impressions), 0)::bigint AS impressions,
             COALESCE(SUM(s.conversions), 0)::float8 AS conversions
@@ -493,7 +659,7 @@ async function loadCountrySpendByTarget(clientId, start, end, {
               LOWER(TRIM(s.app_id)) AS target_key,
               UPPER(TRIM(s.country_code)) AS country_code,
               s.country_name,
-              s.cost,
+              ${SPEND('s')} AS cost,
               s.clicks,
               s.impressions,
               s.conversions
@@ -509,7 +675,7 @@ async function loadCountrySpendByTarget(clientId, start, end, {
               LOWER(TRIM(m.target_key)) AS target_key,
               UPPER(TRIM(s.country_code)) AS country_code,
               s.country_name,
-              s.cost,
+              ${SPEND('s')} AS cost,
               s.clicks,
               s.impressions,
               s.conversions
@@ -585,7 +751,7 @@ async function loadCountrySpendByTargetDaily(clientId, start, end, {
               LOWER(TRIM(s.app_id)) AS target_key,
               UPPER(TRIM(s.country_code)) AS country_code,
               s.country_name,
-              s.cost,
+              ${SPEND('s')} AS cost,
               s.clicks,
               s.impressions,
               s.conversions
@@ -602,7 +768,7 @@ async function loadCountrySpendByTargetDaily(clientId, start, end, {
               LOWER(TRIM(m.target_key)) AS target_key,
               UPPER(TRIM(s.country_code)) AS country_code,
               s.country_name,
-              s.cost,
+              ${SPEND('s')} AS cost,
               s.clicks,
               s.impressions,
               s.conversions
@@ -723,7 +889,7 @@ async function loadFilterAttributedCountrySpend(
             MAX(a.customer_id) AS customer_id,
             UPPER(TRIM(s.country_code)) AS country_code,
             MAX(s.country_name) AS country_name,
-            COALESCE(SUM(s.cost), 0)::float8 AS ads_spend
+            COALESCE(SUM(${SPEND('s')}), 0)::float8 AS ads_spend
      FROM ads_spend_country_daily s
      JOIN ads_accounts a ON a.id = s.ads_account_id
      WHERE s.client_id = $1
@@ -765,6 +931,7 @@ function buildTargetCountryEarnScope(countryTargetRows, {
     const tk = String(row.targetKey || '').trim().toLowerCase();
     if (!tk) continue;
     addCountry(row.countryName);
+    if (row.countryCode) addCountry(row.countryCode);
     if (row.targetType === 'app') appKeys.add(tk);
     else if (row.targetType === 'site') siteKeys.add(tk);
   }
@@ -773,14 +940,18 @@ function buildTargetCountryEarnScope(countryTargetRows, {
     countryNames.forEach(addCountry);
   }
 
-  let apps = appKeys.size ? [...appKeys] : (appKeyFilter?.size ? [...appKeyFilter] : []);
-  let sites = siteKeys.size ? [...siteKeys] : (siteKeyFilter?.size ? [...siteKeyFilter] : []);
+  // Explicit filters always join the scope (sites selected manually are not Ads packages).
+  if (appKeyFilter?.size) appKeyFilter.forEach((k) => appKeys.add(k));
+  if (siteKeyFilter?.size) siteKeyFilter.forEach((k) => siteKeys.add(normSiteHost(k)));
+
+  let apps = [...appKeys];
+  let sites = [...siteKeys];
 
   if (appKeyFilter?.size) {
     apps = apps.filter((k) => appKeyFilter.has(k));
   }
   if (siteKeyFilter?.size) {
-    sites = sites.filter((k) => siteKeyFilter.has(k));
+    sites = [...new Set([...siteKeyFilter].map(normSiteHost))];
   }
 
   if (countryFilter?.length && !countryKeys.size) {
@@ -793,6 +964,317 @@ function buildTargetCountryEarnScope(countryTargetRows, {
     countryKeys: [...countryKeys],
   };
 }
+
+/** Normalize site host for matching (lowercase, strip leading www.). */
+function normSiteHost(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^www\./, '');
+}
+
+/**
+ * Catalog / Dashboard site host — collapse slot & inventory subdomains to the apex.
+ * Kept for legacy helpers; ROI site filters use exact hosts (see normSiteHost).
+ * d1.arenapro6.com / quiz13.arenapro6.com → arenapro6.com
+ */
+function toCatalogSiteHost(value) {
+  const host = normSiteHost(value);
+  if (!host || !host.includes('.')) return host;
+  const stripped = host.replace(
+    /^(?:d\d+|game\d*|quiz\d*|finance\d*|display|app\d*)\./i,
+    ''
+  );
+  if (stripped && stripped.includes('.') && stripped !== host) return stripped;
+  return host;
+}
+
+/** Exact host match for ROI site filters (www-insensitive). */
+function siteKeyMatchesFilter(siteKey, siteKeyFilter) {
+  if (!siteKeyFilter?.size) return false;
+  const host = normSiteHost(siteKey);
+  if (!host) return false;
+  if (siteKeyFilter.has(host)) return true;
+  for (const k of siteKeyFilter) {
+    if (normSiteHost(k) === host) return true;
+  }
+  return false;
+}
+
+/**
+ * Exact country key equality only.
+ * Never use substring includes — "united states".includes("us") previously dumped
+ * other countries' site earn into the US Ads row.
+ */
+function countryKeysEqual(a, b) {
+  const x = String(a || '').trim().toLowerCase();
+  const y = String(b || '').trim().toLowerCase();
+  if (!x || !y || x === '—' || y === '—') return false;
+  if (x === y) return true;
+  // Allow "united states" ↔ "united-states" / underscores
+  const nx = x.replace(/[^a-z0-9]+/g, '');
+  const ny = y.replace(/[^a-z0-9]+/g, '');
+  return Boolean(nx && ny && nx === ny);
+}
+
+/** Sum GAM site earn for a site, optionally scoped to an Ads/GAM country label/code. */
+function sumSiteEarnFromMap(earnByTargetCountry, siteKey, {
+  countryName = null,
+  countryCode = null,
+  allCountries = false,
+} = {}) {
+  const host = normSiteHost(siteKey);
+  const nameK = String(countryName || '').trim().toLowerCase();
+  const codeK = String(countryCode || '').trim().toLowerCase();
+  let sum = 0;
+  for (const [earnKey, earn] of earnByTargetCountry.entries()) {
+    if (!(Number(earn) > 0)) continue;
+    const parsed = parseTargetCountryEarnKey(earnKey);
+    if (!parsed || parsed.targetType !== 'site') continue;
+    if (normSiteHost(parsed.targetKey) !== host) continue;
+    if (allCountries) {
+      sum += Number(earn) || 0;
+      continue;
+    }
+    const ck = parsed.countryKey;
+    if (!ck) continue;
+    if (countryKeysEqual(ck, nameK)) {
+      sum += Number(earn) || 0;
+      continue;
+    }
+    if (codeK && codeK !== '—' && countryKeysEqual(ck, codeK)) {
+      sum += Number(earn) || 0;
+    }
+  }
+  return round2(sum);
+}
+
+/** Index Ads countries by name and ISO code for nesting GAM site earn. */
+function buildCountryMetaIndex(countrySpendRows = []) {
+  const index = new Map();
+  for (const r of countrySpendRows || []) {
+    const meta = {
+      countryCode: String(r.countryCode || '').toUpperCase() || '—',
+      countryName: String(r.countryName || r.countryCode || '').trim() || '—',
+    };
+    const nameKey = String(meta.countryName || '').trim().toLowerCase();
+    const codeKey = String(meta.countryCode || '').trim().toLowerCase();
+    if (nameKey) index.set(nameKey, meta);
+    if (codeKey && codeKey !== '—') index.set(codeKey, meta);
+    // Normalized form for "United States" ↔ "united_states"
+    const compact = nameKey.replace(/[^a-z0-9]+/g, '');
+    if (compact) index.set(compact, meta);
+  }
+  return index;
+}
+
+/**
+ * Sites rarely appear in Ads country×target spend. Add zero-spend (earn-only) rows from
+ * GAM site revenue so selected sites nest under Country → Ads account → Site.
+ * Prefer campaign-map account; else nest under the Ads account with spend in that country.
+ */
+function buildSiteAccountLookup(maps = [], {
+  accountFilter = null,
+  campaignFilter = null,
+} = {}) {
+  const accountFilterSet = accountFilter?.length
+    ? new Set(accountFilter.map(String))
+    : null;
+  const campaignFilterSet = campaignFilter?.length
+    ? new Set(campaignFilter.map(String))
+    : null;
+  const bySite = new Map();
+  for (const m of maps || []) {
+    const type = m.targetType || m.target_type;
+    if (type !== 'site') continue;
+    const key = String(m.targetKey || m.target_key || '').trim().toLowerCase();
+    if (!key) continue;
+    const adsAccountId = String(m.adsAccountId || m.ads_account_id || '');
+    const campaignId = String(m.campaignId || m.campaign_id || '');
+    if (accountFilterSet && adsAccountId && !accountFilterSet.has(adsAccountId)) continue;
+    if (campaignFilterSet && campaignId && !campaignFilterSet.has(campaignId)) continue;
+    if (bySite.has(key)) continue;
+    bySite.set(key, {
+      adsAccountId: adsAccountId || null,
+      accountName: m.accountName || m.account_name || adsAccountId || 'Ads account',
+      customerId: m.customerId || m.customer_id || null,
+    });
+  }
+  return bySite;
+}
+
+/** Pick Ads account to nest a site under for a given country. */
+function resolveSiteHostAccount({
+  siteKey,
+  countryKey,
+  countryTargetRows = [],
+  siteAccountLookup = null,
+  accountFilter = null,
+}) {
+  const mapped = siteAccountLookup?.get(siteKey);
+  if (mapped?.adsAccountId) return mapped;
+
+  const accountFilterSet = accountFilter?.length
+    ? new Set(accountFilter.map(String))
+    : null;
+  const spendByAccount = new Map();
+  for (const r of countryTargetRows || []) {
+    if (r.targetType === 'site') continue;
+    const cKey = String(r.countryName || '').trim().toLowerCase();
+    if (countryKey && cKey && cKey !== countryKey) continue;
+    const id = String(r.adsAccountId || '');
+    if (!id) continue;
+    if (accountFilterSet && !accountFilterSet.has(id)) continue;
+    const prev = spendByAccount.get(id) || {
+      adsAccountId: id,
+      accountName: r.accountName || id,
+      customerId: r.customerId || null,
+      spend: 0,
+    };
+    prev.spend += Number(r.adsSpend) || 0;
+    if (r.accountName) prev.accountName = r.accountName;
+    spendByAccount.set(id, prev);
+  }
+  const best = [...spendByAccount.values()].sort((a, b) => b.spend - a.spend)[0];
+  if (best) {
+    return {
+      adsAccountId: best.adsAccountId,
+      accountName: best.accountName,
+      customerId: best.customerId,
+    };
+  }
+  if (accountFilter?.length) {
+    const id = String(accountFilter[0]);
+    return { adsAccountId: id, accountName: 'Ads account', customerId: null };
+  }
+  return {
+    adsAccountId: `sites-earn`,
+    accountName: 'Sites (earn only)',
+    customerId: null,
+  };
+}
+
+/**
+ * Selected sites are independent of Ads accounts: earn-only rows under a fixed
+ * "GAM sites" bucket, keyed by GAM country. Revenue is converted to display
+ * currency (INR when ADS_FORCE_CURRENCY=INR) later via metricsFor.
+ */
+function synthesizeSitePackagesFromEarn({
+  countryTargetRows = [],
+  earnByTargetCountry,
+  siteKeyFilter,
+  countrySpendRows = [],
+}) {
+  if (!siteKeyFilter?.size || !earnByTargetCountry?.size) return countryTargetRows;
+
+  const nameToMeta = buildCountryMetaIndex(countrySpendRows);
+  const findMeta = (countryKey) => {
+    const k = String(countryKey || '').trim().toLowerCase();
+    if (!k) return null;
+    if (nameToMeta.has(k)) return nameToMeta.get(k);
+    const compact = k.replace(/[^a-z0-9]+/g, '');
+    if (compact && nameToMeta.has(compact)) return nameToMeta.get(compact);
+    return null;
+  };
+
+  const existing = new Set(
+    (countryTargetRows || [])
+      .filter((r) => r.targetType === 'site')
+      .map((r) => `${normSiteHost(r.targetKey)}|${String(r.gamCountryKey || r.countryName || '').toLowerCase()}`)
+  );
+
+  const added = [];
+  for (const [earnKey, earn] of earnByTargetCountry.entries()) {
+    if (!(Number(earn) > 0)) continue;
+    const parsed = parseTargetCountryEarnKey(earnKey);
+    if (!parsed || parsed.targetType !== 'site') continue;
+    if (!siteKeyMatchesFilter(parsed.targetKey, siteKeyFilter)) continue;
+
+    const exactKey = normSiteHost(parsed.targetKey);
+    const dedupe = `${exactKey}|${parsed.countryKey}`;
+    if (existing.has(dedupe)) continue;
+    existing.add(dedupe);
+
+    const meta = findMeta(parsed.countryKey);
+    const countryName = meta?.countryName
+      || (parsed.countryKey === 'unknown'
+        ? 'Unknown'
+        : String(parsed.countryKey || '').replace(/\b\w/g, (c) => c.toUpperCase()))
+      || '—';
+    // Prefer Ads ISO code when names match; otherwise keep a stable GAM country id
+    // so site revenue still appears country-wise even with no Ads spend in that geo.
+    const countryCode = meta?.countryCode && meta.countryCode !== '—'
+      ? meta.countryCode
+      : String(parsed.countryKey || 'unknown')
+        .toUpperCase()
+        .replace(/[^A-Z0-9]+/g, '_')
+        .replace(/^_|_$/g, '')
+        .slice(0, 24) || 'ZZ';
+
+    added.push({
+      adsAccountId: 'gam-sites',
+      accountName: 'GAM sites',
+      customerId: null,
+      targetType: 'site',
+      targetKey: exactKey,
+      countryCode,
+      countryName,
+      gamCountryKey: parsed.countryKey,
+      adsSpend: 0,
+      impressions: 0,
+      clicks: 0,
+      conversions: 0,
+      earnOnly: true,
+    });
+  }
+
+  return added.length ? [...countryTargetRows, ...added] : countryTargetRows;
+}
+
+/** Ensure countries that only have site earn still appear in the country tree. */
+async function mergeSiteOnlyCountries(countryBreakdown, countryTargetRows, earnByTargetCountry, endDate) {
+  const byCode = new Map(
+    (countryBreakdown || []).map((c) => [String(c.countryCode || '').toUpperCase(), { ...c }])
+  );
+
+  const earnUsdByCode = new Map();
+  const nameByCode = new Map();
+  for (const row of countryTargetRows || []) {
+    if (row.targetType !== 'site') continue;
+    const code = String(row.countryCode || '').toUpperCase() || '—';
+    if (!code || code === '—') continue;
+    nameByCode.set(code, row.countryName || code);
+    const usd = sumSiteEarnFromMap(earnByTargetCountry, row.targetKey, {
+      countryName: row.gamCountryKey || row.countryName,
+      countryCode: row.countryCode,
+    });
+    earnUsdByCode.set(code, round2((earnUsdByCode.get(code) || 0) + usd));
+  }
+
+  for (const [code, earnUsd] of earnUsdByCode.entries()) {
+    if (byCode.has(code)) continue; // Ads country already listed; site packages nest under it
+    const spendMetrics = await metricsFor(earnUsd, 0, 0, {}, { endDate });
+    byCode.set(code, {
+      countryCode: code,
+      countryName: nameByCode.get(code) || code,
+      adsSpend: 0,
+      earn: spendMetrics.earn,
+      profitSpend: spendMetrics.profitSpend,
+      roiSpendPercent: null,
+      impressions: 0,
+      clicks: 0,
+      conversions: 0,
+      ctr: null,
+      ecpm: null,
+    });
+  }
+
+  return [...byCode.values()].sort(
+    (a, b) => (Number(b.adsSpend) || 0) - (Number(a.adsSpend) || 0)
+      || String(a.countryName || '').localeCompare(String(b.countryName || ''))
+  );
+}
+
 
 function mapTargetCountryEarnRows(rows) {
   const map = new Map();
@@ -851,6 +1333,72 @@ async function loadGamEarnByTargetCountryFull(clientId, start, end, { countryKey
   return mapTargetCountryEarnRows(rows);
 }
 
+/**
+ * Expand site hosts for SQL matching — exact selected host + www variant.
+ * Do not collapse finance2/game/quiz subdomains to the apex.
+ */
+function expandSiteHostKeys(siteKeys = []) {
+  const expanded = [];
+  const seen = new Set();
+  const add = (raw) => {
+    const host = normSiteHost(raw);
+    if (!host || seen.has(host)) return;
+    seen.add(host);
+    expanded.push(host);
+    const withWww = `www.${host}`;
+    if (!seen.has(withWww)) {
+      seen.add(withWww);
+      expanded.push(withWww);
+    }
+  };
+  for (const raw of siteKeys) add(raw);
+  return expanded;
+}
+
+/**
+ * Selected GAM sites → earn by country.
+ * Exact host match on inventory_core (finance2.x.com ≠ x.com).
+ */
+async function loadSelectedSitesEarnByCountry(clientId, start, end, siteKeys = []) {
+  const hosts = [...new Set(
+    (siteKeys instanceof Set ? [...siteKeys] : (siteKeys || []))
+      .map((k) => normSiteHost(k))
+      .filter(Boolean)
+  )];
+  if (!hosts.length) return new Map();
+
+  const { rows } = await query(
+    `SELECT LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) AS target_key,
+            LOWER(TRIM(COALESCE(NULLIF(dc.name, ''), 'unknown'))) AS country_key,
+            COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+            COALESCE(SUM(g.impressions), 0)::float8 AS impressions
+     FROM report_grain g
+     JOIN dim_site ds
+       ON ds.id = g.site_id
+      AND ds.client_id = g.client_id
+     LEFT JOIN dim_country dc ON dc.id = g.country_id
+     WHERE g.client_id = $1::uuid
+       AND g.report_date BETWEEN $2::date AND $3::date
+       AND g.site_id > 0
+       AND g.slice_key = 'inventory_core'
+       AND LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) = ANY($4::text[])
+     GROUP BY 1, 2`,
+    [clientId, start, end, hosts]
+  );
+
+  const map = new Map();
+  (rows || []).forEach((r) => {
+    const tKey = normSiteHost(r.target_key);
+    const cKey = String(r.country_key || '').trim().toLowerCase() || 'unknown';
+    if (!tKey) return;
+    const earn = coerceWarehouseRevenue(r.revenue, Number(r.impressions) || 0);
+    if (!(earn > 0)) return;
+    const k = `site:${tKey}:${cKey}`;
+    map.set(k, round2((map.get(k) || 0) + earn));
+  });
+  return map;
+}
+
 /** Scoped target×country earn — limits report_grain to known apps/sites/countries. */
 async function loadGamEarnByTargetCountryScoped(clientId, start, end, scope = {}) {
   const appKeys = [...(scope.appKeys || [])].filter(Boolean);
@@ -871,13 +1419,10 @@ async function loadGamEarnByTargetCountryScoped(clientId, start, end, scope = {}
   const parts = [];
 
   if (siteKeys.length) {
-    params.push(siteKeys);
+    params.push(siteKeys.map(normSiteHost));
     const siteParam = `$${params.length}`;
-    let countryExtra = '';
-    if (countryKeys.length) {
-      params.push(countryKeys);
-      countryExtra = ` AND LOWER(TRIM(dc.name)) = ANY($${params.length}::text[])`;
-    }
+    // Intentionally no Ads-country filter on sites: GAM dim_country names often
+    // differ from Ads country_name/code, which previously returned zero site earn.
     parts.push(`
       SELECT 'site'::text AS target_type,
              LOWER(TRIM(ds.name)) AS target_key,
@@ -890,8 +1435,10 @@ async function loadGamEarnByTargetCountryScoped(clientId, start, end, scope = {}
         AND g.report_date BETWEEN $2 AND $3
         AND g.slice_key = 'inventory_core'
         AND g.site_id > 0
-        AND LOWER(TRIM(ds.name)) = ANY(${siteParam}::text[])
-        ${countryExtra}
+        AND (
+          LOWER(TRIM(ds.name)) = ANY(${siteParam}::text[])
+          OR LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) = ANY(${siteParam}::text[])
+        )
     `);
   }
 
@@ -942,13 +1489,8 @@ async function loadGamEarnByTargetCountryDailyScoped(clientId, start, end, scope
   const parts = [];
 
   if (siteKeys.length) {
-    params.push(siteKeys);
+    params.push(siteKeys.map(normSiteHost));
     const siteParam = `$${params.length}`;
-    let countryExtra = '';
-    if (countryKeys.length) {
-      params.push(countryKeys);
-      countryExtra = ` AND LOWER(TRIM(dc.name)) = ANY($${params.length}::text[])`;
-    }
     parts.push(`
       SELECT g.report_date::text AS report_date,
              'site'::text AS target_type,
@@ -962,8 +1504,10 @@ async function loadGamEarnByTargetCountryDailyScoped(clientId, start, end, scope
         AND g.report_date BETWEEN $2 AND $3
         AND g.slice_key = 'inventory_core'
         AND g.site_id > 0
-        AND LOWER(TRIM(ds.name)) = ANY(${siteParam}::text[])
-        ${countryExtra}
+        AND (
+          LOWER(TRIM(ds.name)) = ANY(${siteParam}::text[])
+          OR LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) = ANY(${siteParam}::text[])
+        )
     `);
   }
 
@@ -1083,10 +1627,11 @@ function buildScopedCountryEarnLookup({
     if (!parsed) continue;
     const { targetType, targetKey, countryKey } = parsed;
 
-    if (effectiveTargetType === 'app' && targetType !== 'app') continue;
-    if (effectiveTargetType === 'site' && targetType !== 'site') continue;
     if (appKeyFilter?.size && targetType === 'app' && !appKeyFilter.has(targetKey)) continue;
-    if (siteKeyFilter?.size && targetType === 'site' && !siteKeyFilter.has(targetKey)) continue;
+    if (siteKeyFilter?.size && targetType === 'site' && !siteKeyMatchesFilter(targetKey, siteKeyFilter)) continue;
+    // Do not drop apps when sites are selected (union model). Only skip sites in
+    // legacy app-only mode when no site filter is present.
+    if (effectiveTargetType === 'app' && targetType === 'site' && !siteKeyFilter?.size) continue;
     if (allowedTargets.size && !allowedTargets.has(`${targetType}:${targetKey}`)) continue;
 
     totals.set(countryKey, round2((totals.get(countryKey) || 0) + (Number(earn) || 0)));
@@ -1104,11 +1649,21 @@ function filterCountryTargetRows(rows, {
   effectiveTargetType = 'all',
 } = {}) {
   return (rows || []).filter((r) => {
-    if (r.targetType === 'site' && effectiveTargetType === 'app') return false;
-    if (r.targetType === 'app' && effectiveTargetType === 'site') return false;
-    if (r.targetType === 'app' && appKeyFilter && !appKeyFilter.has(r.targetKey)) return false;
-    if (r.targetType === 'site' && siteKeyFilter && !siteKeyFilter.has(r.targetKey)) return false;
-    return (Number(r.adsSpend) || 0) > 0;
+    // App + site filters are a union. Selecting sites must never drop Ads app packages.
+    if (r.targetType === 'app') {
+      if (appKeyFilter?.size && !appKeyFilter.has(r.targetKey)) return false;
+      if (effectiveTargetType === 'site' && !siteKeyFilter?.size && appKeyFilter?.size) {
+        return false;
+      }
+    } else if (r.targetType === 'site') {
+      if (effectiveTargetType === 'app' && !siteKeyFilter?.size) return false;
+      if (siteKeyFilter?.size && !siteKeyMatchesFilter(r.targetKey, siteKeyFilter)) return false;
+    }
+    if ((Number(r.adsSpend) || 0) > 0) return true;
+    // Keep selected sites with earn but no Ads spend (synthesized packages).
+    return r.targetType === 'site'
+      && siteKeyFilter?.size
+      && siteKeyMatchesFilter(r.targetKey, siteKeyFilter);
   });
 }
 
@@ -1146,7 +1701,7 @@ async function loadMappedSpendDaily(clientId, start, end, {
               'app'::text AS target_type,
               LOWER(TRIM(s.app_id)) AS target_key,
               s.ads_account_id,
-              s.cost,
+              ${SPEND('s')} AS cost,
               s.clicks,
               s.impressions,
               s.conversions
@@ -1160,7 +1715,7 @@ async function loadMappedSpendDaily(clientId, start, end, {
               m.target_type,
               LOWER(TRIM(m.target_key)) AS target_key,
               s.ads_account_id,
-              s.cost,
+              ${SPEND('s')} AS cost,
               s.clicks,
               s.impressions,
               s.conversions
@@ -1222,7 +1777,7 @@ async function loadMappedSpendAggregated(clientId, start, end, {
        SELECT 'app'::text AS target_type,
               LOWER(TRIM(s.app_id)) AS target_key,
               s.ads_account_id,
-              s.cost,
+              ${SPEND('s')} AS cost,
               s.clicks,
               s.impressions,
               s.conversions
@@ -1235,7 +1790,7 @@ async function loadMappedSpendAggregated(clientId, start, end, {
        SELECT m.target_type,
               LOWER(TRIM(m.target_key)) AS target_key,
               s.ads_account_id,
-              s.cost,
+              ${SPEND('s')} AS cost,
               s.clicks,
               s.impressions,
               s.conversions
@@ -1302,7 +1857,7 @@ async function loadFilterAttributedSpendDaily(
   const { rows } = await query(
     `SELECT s.report_date::text AS report_date,
             s.ads_account_id,
-            COALESCE(SUM(s.cost), 0)::float8 AS cost,
+            COALESCE(SUM(${SPEND('s')}), 0)::float8 AS cost,
             COALESCE(SUM(s.clicks), 0)::bigint AS clicks,
             COALESCE(SUM(s.impressions), 0)::bigint AS impressions,
             COALESCE(SUM(s.conversions), 0)::float8 AS conversions
@@ -1347,7 +1902,7 @@ async function loadUnmappedSpend(clientId, start, end, {
     extra += ` AND UPPER(TRIM(s.country_code)) = ANY($${params.length}::text[])`;
   }
   const { rows } = await query(
-    `SELECT COALESCE(SUM(s.cost), 0)::float8 AS cost
+    `SELECT COALESCE(SUM(${SPEND('s')}), 0)::float8 AS cost
      FROM ${table} s
      LEFT JOIN ads_campaign_map m
        ON m.client_id = s.client_id
@@ -1398,7 +1953,7 @@ async function loadTotalAdsSpend(clientId, start, end, spendOpts = {}) {
   const { extra, params: filterParams } = spendFilterSql(spendOpts, 's', 3);
   const params = [clientId, start, end, ...filterParams];
   const { rows } = await query(
-    `SELECT COALESCE(SUM(s.cost), 0)::float8 AS cost,
+    `SELECT COALESCE(SUM(${SPEND('s')}), 0)::float8 AS cost,
             COALESCE(SUM(s.impressions), 0)::bigint AS impressions,
             COALESCE(SUM(s.clicks), 0)::bigint AS clicks,
             COALESCE(SUM(s.conversions), 0)::float8 AS conversions
@@ -1441,7 +1996,7 @@ async function loadAppScopedAdsSpend(clientId, start, end, spendOpts = {}, appKe
     extra += ` AND UPPER(TRIM(s.country_code)) = ANY($${params.length}::text[])`;
   }
   const { rows } = await query(
-    `SELECT COALESCE(SUM(s.cost), 0)::float8 AS cost,
+    `SELECT COALESCE(SUM(${SPEND('s')}), 0)::float8 AS cost,
             COALESCE(SUM(s.impressions), 0)::bigint AS impressions,
             COALESCE(SUM(s.clicks), 0)::bigint AS clicks,
             COALESCE(SUM(s.conversions), 0)::float8 AS conversions
@@ -1488,7 +2043,7 @@ async function listAccountsWithSpend(clientId, start, end, { accountIds = null }
     extra += ` AND a.id = ANY($${params.length}::uuid[])`;
   }
   const { rows } = await query(
-    `SELECT a.*, COALESCE(SUM(s.cost), 0)::float8 AS spend_cost
+    `SELECT a.*, COALESCE(SUM(${SPEND('s')}), 0)::float8 AS spend_cost
      FROM ads_accounts a
      JOIN ads_spend_daily s
        ON s.ads_account_id = a.id
@@ -1499,7 +2054,7 @@ async function listAccountsWithSpend(clientId, start, end, { accountIds = null }
        AND s.report_date BETWEEN $2 AND $3
        ${extra}
      GROUP BY a.id
-     HAVING COALESCE(SUM(s.cost), 0) > 0
+     HAVING COALESCE(SUM(${SPEND('s')}), 0) > 0
      ORDER BY spend_cost DESC, a.descriptive_name ASC`,
     params
   );
@@ -1559,14 +2114,19 @@ async function buildRoiSummaryCards(clientId, {
       if (e.targetType === 'general') {
         otherExpenses = round2(otherExpenses + (Number(e.amount) || 0));
         generalExpenses.push(e);
+        continue;
+      }
+      // Site/app expenses count toward overview ROI-on-expenses as well.
+      if (e.targetType === 'site' || e.targetType === 'app') {
+        otherExpenses = round2(otherExpenses + (Number(e.amount) || 0));
       }
     }
     const adsSpend = round2(adsTotals.adsSpend || 0);
-    const summaryMetrics = metricsFor(linkedEarn, adsSpend, otherExpenses, {
+    const summaryMetrics = await metricsFor(linkedEarn, adsSpend, otherExpenses, {
       impressions: Number(adsTotals.impressions) || 0,
       clicks: Number(adsTotals.clicks) || 0,
       conversions: Number(adsTotals.conversions) || 0,
-    });
+    }, { endDate: end });
     return {
       accounts: [],
       summary: {
@@ -1575,6 +2135,7 @@ async function buildRoiSummaryCards(clientId, {
         unmappedSpend: 0,
         mappedCampaigns: 0,
         accountsWithSpend: 0,
+        adsSpendCurrency: adsSpendDisplayCurrency(),
       },
       rows: [],
       countryBreakdown: [],
@@ -1582,6 +2143,7 @@ async function buildRoiSummaryCards(clientId, {
       countryTargetDailyBreakdown: [],
       generalExpenses,
       expenses: listedExpenses,
+      spendCurrency: adsSpendDisplayCurrency(),
     };
   }
 
@@ -1591,25 +2153,6 @@ async function buildRoiSummaryCards(clientId, {
     loadUnmappedSpend(clientId, start, end, spendOpts),
     listCampaignMaps(clientId),
     resolveAdsSpendTotals(clientId, start, end, spendOpts, appKeyFilter),
-  ]);
-
-  const needsTargetEarn = !countryFilter && (
-    hasInventoryFilter
-    || maps.length > 0
-    || effectiveTargetType !== 'all'
-  );
-
-  const [earnMaps, canonicalEarn, countrySpendRows, earnByCountry] = await Promise.all([
-    needsTargetEarn
-      ? loadGamEarnByTargetAggregated(clientId, start, end, earnCountryOpts)
-      : Promise.resolve({ sites: [], apps: [] }),
-    Promise.resolve(0),
-    countryFilter?.length
-      ? loadCountrySpendBreakdown(clientId, start, end, spendOpts)
-      : Promise.resolve([]),
-    countryFilter?.length
-      ? loadGamEarnByCountry(clientId, start, end)
-      : Promise.resolve(new Map()),
   ]);
 
   let workingSpendRows = spendRows;
@@ -1633,20 +2176,56 @@ async function buildRoiSummaryCards(clientId, {
     if (accountFilterSet && mapAccountId && !accountFilterSet.has(mapAccountId)) return;
     if (campaignFilterSet && mapCampaignId && !campaignFilterSet.has(mapCampaignId)) return;
     if (type === 'app' && appKeyFilter && !appKeyFilter.has(key)) return;
-    if (type === 'site' && siteKeyFilter && !siteKeyFilter.has(key)) return;
+    if (type === 'site' && siteKeyFilter && !siteKeyMatchesFilter(key, siteKeyFilter)) return;
     if (type && key) mappedKeys.add(`${type}:${key}`);
   });
   workingSpendRows.forEach((s) => {
     if (!s.targetType || !s.targetKey) return;
     if (s.targetType === 'app' && appKeyFilter && !appKeyFilter.has(s.targetKey)) return;
-    if (s.targetType === 'site' && siteKeyFilter && !siteKeyFilter.has(s.targetKey)) return;
+    if (s.targetType === 'site' && siteKeyFilter && !siteKeyMatchesFilter(s.targetKey, siteKeyFilter)) return;
     mappedKeys.add(`${s.targetType}:${s.targetKey}`);
   });
   if (appKeyFilter) appKeyFilter.forEach((k) => mappedKeys.add(`app:${k}`));
   if (siteKeyFilter) siteKeyFilter.forEach((k) => mappedKeys.add(`site:${k}`));
 
-  const includeSite = effectiveTargetType === 'all' || effectiveTargetType === 'site';
-  const includeApp = effectiveTargetType === 'all' || effectiveTargetType === 'app';
+  const scopeApps = [];
+  const scopeSites = [];
+  mappedKeys.forEach((k) => {
+    if (k.startsWith('app:')) scopeApps.push(k.slice(4));
+    else if (k.startsWith('site:')) scopeSites.push(k.slice(5));
+  });
+
+  const needsTargetEarn = !countryFilter && (
+    hasInventoryFilter
+    || maps.length > 0
+    || effectiveTargetType !== 'all'
+    || mappedKeys.size > 0
+  );
+
+  const [earnMaps, canonicalEarn, countrySpendRows, earnByCountry] = await Promise.all([
+    needsTargetEarn
+      ? (
+        (scopeApps.length || scopeSites.length)
+          ? loadGamEarnByTargetAggregatedScoped(clientId, start, end, {
+            appKeys: scopeApps,
+            siteKeys: scopeSites,
+            countryNames: earnCountryOpts?.countryNames || null,
+          })
+          : loadGamEarnByTargetAggregated(clientId, start, end, earnCountryOpts)
+      )
+      : Promise.resolve({ sites: [], apps: [] }),
+    Promise.resolve(0),
+    countryFilter?.length
+      ? loadCountrySpendBreakdown(clientId, start, end, spendOpts)
+      : Promise.resolve([]),
+    countryFilter?.length
+      ? loadGamEarnByCountry(clientId, start, end)
+      : Promise.resolve(new Map()),
+  ]);
+
+  // Sites selected with targetType=all: still include site expenses + app expenses.
+  const includeSite = effectiveTargetType !== 'app' || Boolean(siteKeyFilter?.size);
+  const includeApp = effectiveTargetType !== 'site' || Boolean(appKeyFilter?.size) || scopeApps.length > 0;
 
   function isMappedTarget(type, key) {
     if (!mappedKeys.size) return false;
@@ -1675,7 +2254,7 @@ async function buildRoiSummaryCards(clientId, {
     if (r.targetType === 'site' && !includeSite) return s;
     if (r.targetType === 'app' && !includeApp) return s;
     if (r.targetType === 'app' && appKeyFilter && !appKeyFilter.has(r.targetKey)) return s;
-    if (r.targetType === 'site' && siteKeyFilter && !siteKeyFilter.has(r.targetKey)) return s;
+    if (r.targetType === 'site' && siteKeyFilter && !siteKeyMatchesFilter(r.targetKey, siteKeyFilter)) return s;
     return s + (Number(r.cost) || 0);
   }, 0));
 
@@ -1695,33 +2274,32 @@ async function buildRoiSummaryCards(clientId, {
     : (Number(adsTotals.conversions) || 0);
 
   let earn;
-  if (effectiveTargetType === 'all') {
-    if (mappedKeys.size) {
-      earn = round2(
-        sumEarnList(earnMaps.sites.filter((r) => isMappedTarget('site', r.targetKey)))
-        + sumEarnList(earnMaps.apps.filter((r) => isMappedTarget('app', r.targetKey)))
-      );
-    } else if (countryFilter?.length && countryNames?.length) {
-      earn = round2(
-        countryNames.reduce((s, name) => {
-          const key = String(name).trim().toLowerCase();
-          return s + (earnByCountry.get(key)?.earn || 0);
-        }, 0)
-      );
-    } else {
-      earn = canonicalEarn;
-    }
+  // Inventory filters (app and/or site) are a union — always sum mapped apps + sites.
+  if (mappedKeys.size) {
+    earn = round2(
+      sumEarnList(earnMaps.sites.filter((r) => isMappedTarget('site', r.targetKey)))
+      + sumEarnList(earnMaps.apps.filter((r) => isMappedTarget('app', r.targetKey)))
+    );
+  } else if (countryFilter?.length && countryNames?.length) {
+    earn = round2(
+      countryNames.reduce((s, name) => {
+        const key = String(name).trim().toLowerCase();
+        return s + (earnByCountry.get(key)?.earn || 0);
+      }, 0)
+    );
   } else if (effectiveTargetType === 'site') {
-    earn = sumEarnList(earnMaps.sites.filter((r) => isMappedTarget('site', r.targetKey)));
+    earn = sumEarnList(earnMaps.sites);
+  } else if (effectiveTargetType === 'app') {
+    earn = sumEarnList(earnMaps.apps);
   } else {
-    earn = sumEarnList(earnMaps.apps.filter((r) => isMappedTarget('app', r.targetKey)));
+    earn = canonicalEarn;
   }
 
-  const summaryMetrics = metricsFor(earn, adsSpend, otherExpenses, {
+  const summaryMetrics = await metricsFor(earn, adsSpend, otherExpenses, {
     impressions: adsImpressions,
     clicks: adsClicks,
     conversions: adsConversions,
-  });
+  }, { endDate: end });
 
   return {
     accounts: [],
@@ -1731,6 +2309,7 @@ async function buildRoiSummaryCards(clientId, {
       unmappedSpend: unmapped,
       mappedCampaigns: maps.length,
       accountsWithSpend: 0,
+      adsSpendCurrency: adsSpendDisplayCurrency(),
     },
     rows: [],
     countryBreakdown: [],
@@ -1738,6 +2317,7 @@ async function buildRoiSummaryCards(clientId, {
     countryTargetDailyBreakdown: [],
     generalExpenses,
     expenses: listedExpenses,
+    spendCurrency: adsSpendDisplayCurrency(),
   };
 }
 
@@ -1758,13 +2338,14 @@ async function buildRoiCountryBreakdown(clientId, {
   filterAttrTarget,
   needDaily,
 }) {
-  const [maps, countrySpendRows, countryTargetRowsRaw, countryTargetDailyRowsRaw] = await Promise.all([
+  const [maps, countrySpendRows, countryTargetRowsRaw, countryTargetDailyRowsRaw, expenses] = await Promise.all([
     listCampaignMaps(clientId),
     loadCountrySpendBreakdown(clientId, start, end, spendOpts),
     loadCountrySpendByTarget(clientId, start, end, spendOpts),
     needDaily
       ? loadCountrySpendByTargetDaily(clientId, start, end, spendOpts)
       : Promise.resolve([]),
+    listOtherExpenses(clientId, { start, end }),
   ]);
 
   let countryTargetRows = filterCountryTargetRows(countryTargetRowsRaw, {
@@ -1788,27 +2369,61 @@ async function buildRoiCountryBreakdown(clientId, {
     );
   }
 
+  // Scope app earn from Ads packages; sites load separately (Dashboard-parity).
   const earnScope = buildTargetCountryEarnScope(countryTargetRows, {
     appKeyFilter,
-    siteKeyFilter,
+    siteKeyFilter: null, // sites loaded via loadSelectedSitesEarnByCountry
     countryFilter,
     countryNames,
   });
-  const hasScopeKeys = earnScope.appKeys.length || earnScope.siteKeys.length;
+  const hasScopeKeys = earnScope.appKeys.length > 0;
+  const needsNetworkCountryEarn = !hasScopeKeys
+    && !appKeyFilter?.size
+    && !siteKeyFilter?.size
+    && !(accountFilter?.length || campaignFilter?.length)
+    && !countryTargetRows.some((r) => r.targetType && r.targetKey && (Number(r.adsSpend) || 0) > 0);
 
-  const [earnByCountry, earnByTargetCountry, earnByTargetCountryDaily] = await Promise.all([
-    loadGamEarnByCountry(clientId, start, end),
-    loadGamEarnByTargetCountryScoped(clientId, start, end, {
-      ...earnScope,
-      allowFullScan: !hasScopeKeys && !earnScope.countryKeys.length,
-    }),
-    needDaily
-      ? loadGamEarnByTargetCountryDailyScoped(clientId, start, end, {
-        ...earnScope,
+  const [earnByCountry, earnByTargetCountryApps, earnByTargetCountryDaily, siteEarnByCountry] = await Promise.all([
+    needsNetworkCountryEarn
+      ? loadGamEarnByCountry(clientId, start, end)
+      : Promise.resolve(new Map()),
+    hasScopeKeys || appKeyFilter?.size
+      ? loadGamEarnByTargetCountryScoped(clientId, start, end, {
+        appKeys: earnScope.appKeys,
+        siteKeys: [],
+        countryKeys: earnScope.countryKeys,
         allowFullScan: !hasScopeKeys && !earnScope.countryKeys.length,
       })
       : Promise.resolve(new Map()),
+    needDaily
+      ? loadGamEarnByTargetCountryDailyScoped(clientId, start, end, {
+        appKeys: earnScope.appKeys,
+        siteKeys: [],
+        countryKeys: earnScope.countryKeys,
+        allowFullScan: !hasScopeKeys && !earnScope.countryKeys.length,
+      })
+      : Promise.resolve(new Map()),
+    siteKeyFilter?.size
+      ? loadSelectedSitesEarnByCountry(clientId, start, end, siteKeyFilter)
+      : Promise.resolve(new Map()),
   ]);
+
+  // Merge site×country earn (independent of Ads) into the target earn map.
+  const earnByTargetCountry = new Map(earnByTargetCountryApps);
+  for (const [k, v] of siteEarnByCountry.entries()) {
+    earnByTargetCountry.set(k, round2((earnByTargetCountry.get(k) || 0) + (Number(v) || 0)));
+  }
+
+  countryTargetRows = synthesizeSitePackagesFromEarn({
+    countryTargetRows,
+    earnByTargetCountry: siteEarnByCountry.size ? siteEarnByCountry : earnByTargetCountry,
+    siteKeyFilter,
+    countrySpendRows,
+  });
+  if (needDaily && earnByTargetCountryDaily?.size && siteKeyFilter?.size) {
+    // Daily site packages: reuse range rows (date rows come from Ads); site-only earn
+    // without Ads spend stays on the package rollup from countryTargetRows.
+  }
 
   const mappedKeys = new Set();
   const accountFilterSet = accountFilter ? new Set(accountFilter.map(String)) : null;
@@ -1821,11 +2436,22 @@ async function buildRoiCountryBreakdown(clientId, {
     if (accountFilterSet && mapAccountId && !accountFilterSet.has(mapAccountId)) return;
     if (campaignFilterSet && mapCampaignId && !campaignFilterSet.has(mapCampaignId)) return;
     if (type === 'app' && appKeyFilter && !appKeyFilter.has(key)) return;
-    if (type === 'site' && siteKeyFilter && !siteKeyFilter.has(key)) return;
+    if (type === 'site' && siteKeyFilter && !siteKeyMatchesFilter(key, siteKeyFilter)) return;
     if (type && key) mappedKeys.add(`${type}:${key}`);
   });
   if (appKeyFilter) appKeyFilter.forEach((k) => mappedKeys.add(`app:${k}`));
   if (siteKeyFilter) siteKeyFilter.forEach((k) => mappedKeys.add(`site:${k}`));
+
+  const includeSite = effectiveTargetType !== 'app' || Boolean(siteKeyFilter?.size);
+  const includeApp = effectiveTargetType !== 'site' || Boolean(appKeyFilter?.size)
+    || countryTargetRows.some((r) => r.targetType === 'app');
+  const { byTarget: expenseByTarget, byTargetDate: expenseByTargetDate } = buildSiteAppExpenseMaps(expenses, {
+    includeSite,
+    includeApp,
+    allowTarget: (t, k) => !mappedKeys.size || mappedKeys.has(targetExpenseKey(t, k)),
+  });
+  const spendTotalByTarget = sumAdsSpendByTarget(countryTargetRows);
+  const spendTotalByTargetDate = sumAdsSpendByTargetDate(countryTargetDailyRows);
 
   const accountById = new Map();
   countryTargetRows.forEach((r) => {
@@ -1849,18 +2475,18 @@ async function buildRoiCountryBreakdown(clientId, {
     campaignFilter,
   });
 
-  let countryBreakdown = (countrySpendRows || []).map((row) => {
+  let countryBreakdown = await Promise.all((countrySpendRows || []).map(async (row) => {
     const countryEarn = lookupCountryEarn(row.countryName);
-    const spendMetrics = metricsFor(countryEarn, row.adsSpend, 0, {
+    const spendMetrics = await metricsFor(countryEarn, row.adsSpend, 0, {
       impressions: row.impressions,
       clicks: row.clicks,
       conversions: row.conversions,
-    });
+    }, { endDate: end });
     return {
       countryCode: row.countryCode,
       countryName: row.countryName,
       adsSpend: round2(row.adsSpend),
-      earn: round2(countryEarn),
+      earn: spendMetrics.earn,
       profitSpend: spendMetrics.profitSpend,
       roiSpendPercent: spendMetrics.roiSpendPercent,
       impressions: spendMetrics.impressions,
@@ -1869,7 +2495,7 @@ async function buildRoiCountryBreakdown(clientId, {
       ctr: spendMetrics.ctr,
       ecpm: spendMetrics.ecpm,
     };
-  });
+  }));
 
   if (countryFilter?.length) {
     const byCode = new Map(countryBreakdown.map((r) => [r.countryCode, r]));
@@ -1885,17 +2511,17 @@ async function buildRoiCountryBreakdown(clientId, {
     const nameByCode = new Map(
       (nameRows || []).map((r) => [String(r.country_code).toUpperCase(), String(r.country_name || '').trim()])
     );
-    countryBreakdown = countryFilter.map((code) => {
+    countryBreakdown = await Promise.all(countryFilter.map(async (code) => {
       const existing = byCode.get(code);
       if (existing) return existing;
       const countryName = nameByCode.get(code) || code;
       const countryEarn = lookupCountryEarn(countryName);
-      const spendMetrics = metricsFor(countryEarn, 0, 0);
+      const spendMetrics = await metricsFor(countryEarn, 0, 0, {}, { endDate: end });
       return {
         countryCode: code,
         countryName,
         adsSpend: 0,
-        earn: round2(countryEarn),
+        earn: spendMetrics.earn,
         profitSpend: spendMetrics.profitSpend,
         roiSpendPercent: spendMetrics.roiSpendPercent,
         impressions: 0,
@@ -1904,18 +2530,48 @@ async function buildRoiCountryBreakdown(clientId, {
         ctr: null,
         ecpm: null,
       };
-    }).sort((a, b) => b.adsSpend - a.adsSpend || a.countryName.localeCompare(b.countryName));
+    })).then((list) => list.sort((a, b) => b.adsSpend - a.adsSpend || a.countryName.localeCompare(b.countryName)));
   }
 
-  const countryTargetBreakdown = countryTargetRows.map((row) => {
-    const countryKey = String(row.countryName || '').trim().toLowerCase();
+  if (siteKeyFilter?.size) {
+    countryBreakdown = await mergeSiteOnlyCountries(
+      countryBreakdown,
+      countryTargetRows,
+      earnByTargetCountry,
+      end
+    );
+  }
+
+  const countryTargetBreakdown = await Promise.all(countryTargetRows.map(async (row) => {
+    const countryKey = String(row.gamCountryKey || row.countryName || '').trim().toLowerCase();
     const earnKey = `${row.targetType}:${row.targetKey}:${countryKey}`;
-    const targetEarn = earnByTargetCountry.get(earnKey) || 0;
-    const spendMetrics = metricsFor(targetEarn, row.adsSpend, 0, {
-      impressions: row.impressions,
-      clicks: row.clicks,
-      conversions: row.conversions,
-    });
+    const isSite = row.targetType === 'site';
+    let targetEarn = 0;
+    if (isSite) {
+      targetEarn = sumSiteEarnFromMap(earnByTargetCountry, row.targetKey, {
+        countryName: row.gamCountryKey || row.countryName,
+        countryCode: row.countryCode,
+      });
+      if (!(targetEarn > 0)) {
+        targetEarn = earnByTargetCountry.get(`site:${normSiteHost(row.targetKey)}:${countryKey}`)
+          || earnByTargetCountry.get(earnKey)
+          || 0;
+      }
+    } else {
+      targetEarn = earnByTargetCountry.get(earnKey) || 0;
+    }
+    const rowSpend = isSite ? 0 : (Number(row.adsSpend) || 0);
+    const tk = targetExpenseKey(row.targetType, row.targetKey);
+    const otherExpenses = allocateTargetExpense(
+      expenseByTarget.get(tk) || 0,
+      rowSpend,
+      spendTotalByTarget.get(tk) || 0
+    );
+    const spendMetrics = await metricsFor(targetEarn, rowSpend, otherExpenses, {
+      impressions: isSite ? 0 : row.impressions,
+      clicks: isSite ? 0 : row.clicks,
+      conversions: isSite ? 0 : row.conversions,
+    }, { endDate: end });
     const account = accountById.get(row.adsAccountId);
     return {
       adsAccountId: row.adsAccountId,
@@ -1924,29 +2580,40 @@ async function buildRoiCountryBreakdown(clientId, {
       targetKey: row.targetKey,
       countryCode: row.countryCode,
       countryName: row.countryName,
-      adsSpend: round2(row.adsSpend),
-      earn: round2(targetEarn),
+      adsSpend: round2(rowSpend),
+      earn: spendMetrics.earn,
+      otherExpenses: spendMetrics.otherExpenses,
       profitSpend: spendMetrics.profitSpend,
-      roiSpendPercent: spendMetrics.roiSpendPercent,
-      impressions: spendMetrics.impressions,
-      clicks: spendMetrics.clicks,
-      conversions: spendMetrics.conversions,
-      ctr: spendMetrics.ctr,
-      ecpm: spendMetrics.ecpm,
+      profitExpense: spendMetrics.profitExpense,
+      roiSpendPercent: isSite ? null : spendMetrics.roiSpendPercent,
+      roiExpensePercent: spendMetrics.roiExpensePercent,
+      impressions: isSite ? 0 : spendMetrics.impressions,
+      clicks: isSite ? 0 : spendMetrics.clicks,
+      conversions: isSite ? 0 : spendMetrics.conversions,
+      ctr: isSite ? null : spendMetrics.ctr,
+      ecpm: isSite ? null : spendMetrics.ecpm,
+      earnOnly: isSite,
     };
-  });
+  }));
 
-  const countryTargetDailyBreakdown = (countryTargetDailyRows || [])
+  const countryTargetDailyBreakdown = await Promise.all((countryTargetDailyRows || [])
     .filter((row) => (Number(row.adsSpend) || 0) > 0)
-    .map((row) => {
+    .map(async (row) => {
       const countryKey = String(row.countryName || '').trim().toLowerCase();
       const earnKey = `${row.date}:${row.targetType}:${row.targetKey}:${countryKey}`;
       const targetEarn = earnByTargetCountryDaily.get(earnKey) || 0;
-      const spendMetrics = metricsFor(targetEarn, row.adsSpend, 0, {
+      const tk = targetExpenseKey(row.targetType, row.targetKey);
+      const dayKey = `${ymd(row.date)}:${tk}`;
+      const otherExpenses = allocateTargetExpense(
+        expenseByTargetDate.get(dayKey) || 0,
+        row.adsSpend,
+        spendTotalByTargetDate.get(dayKey) || 0
+      );
+      const spendMetrics = await metricsFor(targetEarn, row.adsSpend, otherExpenses, {
         impressions: row.impressions,
         clicks: row.clicks,
         conversions: row.conversions,
-      });
+      }, { endDate: end });
       const account = accountById.get(row.adsAccountId);
       return {
         date: row.date,
@@ -1957,16 +2624,36 @@ async function buildRoiCountryBreakdown(clientId, {
         countryCode: row.countryCode,
         countryName: row.countryName,
         adsSpend: round2(row.adsSpend),
-        earn: round2(targetEarn),
+        earn: spendMetrics.earn,
+        otherExpenses: spendMetrics.otherExpenses,
         profitSpend: spendMetrics.profitSpend,
+        profitExpense: spendMetrics.profitExpense,
         roiSpendPercent: spendMetrics.roiSpendPercent,
+        roiExpensePercent: spendMetrics.roiExpensePercent,
         impressions: spendMetrics.impressions,
         clicks: spendMetrics.clicks,
         conversions: spendMetrics.conversions,
         ctr: spendMetrics.ctr,
         ecpm: spendMetrics.ecpm,
       };
-    });
+    }));
+
+  // Roll package expenses up onto country rows (already FX-converted earn — do not re-convert).
+  const otherByCountry = new Map();
+  for (const r of countryTargetBreakdown) {
+    const code = r.countryCode;
+    otherByCountry.set(code, round2((otherByCountry.get(code) || 0) + (Number(r.otherExpenses) || 0)));
+  }
+  countryBreakdown = countryBreakdown.map((row) => {
+    const other = otherByCountry.get(row.countryCode) || 0;
+    const em = expenseMetricsFromConvertedEarn(row.earn, row.adsSpend, other);
+    return {
+      ...row,
+      otherExpenses: em.otherExpenses,
+      profitExpense: em.profitExpense,
+      roiExpensePercent: em.roiExpensePercent,
+    };
+  });
 
   return {
     countryBreakdown,
@@ -1994,10 +2681,10 @@ async function getRoiSummary(clientId, {
   includeDaily = null,
 } = {}) {
   const cacheKey = breakdownOnly
-    ? `roi_bd_v8_${clientId}_${JSON.stringify({
+    ? `roi_bd_v16_${clientId}_${JSON.stringify({
       start, end, targetType, accountIds, campaignIds, appKeys, siteKeys, countryCodes, includeDaily,
     })}`
-    : `roi_sum_v8_${clientId}_${JSON.stringify({
+    : `roi_sum_v16_${clientId}_${JSON.stringify({
       start,
       end,
       targetType,
@@ -2024,7 +2711,11 @@ async function getRoiSummary(clientId, {
     ? new Set(appKeys.map((k) => String(k).trim().toLowerCase()).filter(Boolean))
     : null;
   const siteKeyFilter = Array.isArray(siteKeys) && siteKeys.length
-    ? new Set(siteKeys.map((k) => String(k).trim().toLowerCase()).filter(Boolean))
+    ? new Set(
+      siteKeys
+        .map((k) => normSiteHost(k))
+        .filter(Boolean)
+    )
     : null;
   const spendOpts = {
     accountIds: accountFilter,
@@ -2037,12 +2728,12 @@ async function getRoiSummary(clientId, {
     : null;
   const earnCountryOpts = countryNames?.length ? { countryNames } : {};
 
-  // Derive scope from inventory multi-selects when provided.
-  let effectiveTargetType = targetType;
+  // Inventory multi-selects are always a union (Ads apps + GAM sites).
+  // Never force site-only / app-only — that hid packages and zeroed earn when
+  // sites were picked while App IDs stayed "All selected".
+  let effectiveTargetType = targetType || 'all';
   if (appKeyFilter || siteKeyFilter) {
-    if (appKeyFilter && siteKeyFilter) effectiveTargetType = 'all';
-    else if (appKeyFilter) effectiveTargetType = 'app';
-    else effectiveTargetType = 'site';
+    effectiveTargetType = 'all';
   }
 
   const singleAppKey = appKeyFilter && appKeyFilter.size === 1 ? [...appKeyFilter][0] : null;
@@ -2196,6 +2887,13 @@ async function getRoiSummary(clientId, {
     if (spendRows.length) unmappedTotal = 0;
   }
 
+  countryTargetRows = synthesizeSitePackagesFromEarn({
+    countryTargetRows,
+    earnByTargetCountry,
+    siteKeyFilter,
+    countrySpendRows,
+  });
+
   // Targets that have a campaign map (or mapped spend) — table shows only these.
   const mappedKeys = new Set();
   const accountFilterSet = accountFilter ? new Set(accountFilter.map(String)) : null;
@@ -2208,13 +2906,13 @@ async function getRoiSummary(clientId, {
     if (accountFilterSet && mapAccountId && !accountFilterSet.has(mapAccountId)) return;
     if (campaignFilterSet && mapCampaignId && !campaignFilterSet.has(mapCampaignId)) return;
     if (type === 'app' && appKeyFilter && !appKeyFilter.has(key)) return;
-    if (type === 'site' && siteKeyFilter && !siteKeyFilter.has(key)) return;
+    if (type === 'site' && siteKeyFilter && !siteKeyMatchesFilter(key, siteKeyFilter)) return;
     if (type && key) mappedKeys.add(`${type}:${key}`);
   });
   spendRows.forEach((s) => {
     if (!s.targetType || !s.targetKey) return;
     if (s.targetType === 'app' && appKeyFilter && !appKeyFilter.has(s.targetKey)) return;
-    if (s.targetType === 'site' && siteKeyFilter && !siteKeyFilter.has(s.targetKey)) return;
+    if (s.targetType === 'site' && siteKeyFilter && !siteKeyMatchesFilter(s.targetKey, siteKeyFilter)) return;
     mappedKeys.add(`${s.targetType}:${s.targetKey}`);
   });
   // Explicit inventory picks with no maps yet: still allow earn-only rows for those keys.
@@ -2225,8 +2923,9 @@ async function getRoiSummary(clientId, {
     siteKeyFilter.forEach((k) => mappedKeys.add(`site:${k}`));
   }
 
-  const includeSite = effectiveTargetType === 'all' || effectiveTargetType === 'site';
-  const includeApp = effectiveTargetType === 'all' || effectiveTargetType === 'app';
+  const includeSite = effectiveTargetType !== 'app' || Boolean(siteKeyFilter?.size);
+  const includeApp = effectiveTargetType !== 'site' || Boolean(appKeyFilter?.size)
+    || countryTargetRows.some((r) => r.targetType === 'app');
 
   function isMappedTarget(type, key) {
     if (!mappedKeys.size) return false;
@@ -2277,7 +2976,7 @@ async function getRoiSummary(clientId, {
     if (includeSite) {
       earnMaps.sites.forEach((row) => {
         if (!row.date || !isMappedTarget('site', row.targetKey)) return;
-        if (siteKeyFilter && !siteKeyFilter.has(String(row.targetKey || '').trim().toLowerCase())) return;
+        if (siteKeyFilter && !siteKeyMatchesFilter(String(row.targetKey || '').trim().toLowerCase(), siteKeyFilter)) return;
         ensureRow(row.date, 'site', row.targetKey).earn = round2(row.earn);
       });
     }
@@ -2293,7 +2992,7 @@ async function getRoiSummary(clientId, {
       if (s.targetType === 'site' && !includeSite) continue;
       if (s.targetType === 'app' && !includeApp) continue;
       if (s.targetType === 'app' && appKeyFilter && !appKeyFilter.has(s.targetKey)) continue;
-      if (s.targetType === 'site' && siteKeyFilter && !siteKeyFilter.has(s.targetKey)) continue;
+      if (s.targetType === 'site' && siteKeyFilter && !siteKeyMatchesFilter(s.targetKey, siteKeyFilter)) continue;
       if (!s.date) continue;
       const row = ensureRow(s.date, s.targetType, s.targetKey);
       const cost = Number(s.cost) || 0;
@@ -2322,13 +3021,12 @@ async function getRoiSummary(clientId, {
       row.otherExpenses = round2(row.otherExpenses + e.amount);
     }
 
-    rows = [...rowMap.values()]
-      .map((r) => {
-        const m = metricsFor(r.earn, r.adsSpend, r.otherExpenses, {
+    rows = await Promise.all([...rowMap.values()].map(async (r) => {
+        const m = await metricsFor(r.earn, r.adsSpend, r.otherExpenses, {
           impressions: r.impressions,
           clicks: r.clicks,
           conversions: r.conversions,
-        });
+        }, { endDate: end });
         return {
           date: r.date,
           targetType: r.targetType,
@@ -2338,7 +3036,8 @@ async function getRoiSummary(clientId, {
           ),
           ...m,
         };
-      })
+      }));
+    rows = rows
       .filter((r) => r.targetType !== 'unmapped')
       .filter((r) => r.adsSpend > 0 || r.otherExpenses > 0 || r.earn > 0)
       .sort((a, b) => {
@@ -2371,7 +3070,7 @@ async function getRoiSummary(clientId, {
       if (r.targetType === 'site' && !includeSite) return s;
       if (r.targetType === 'app' && !includeApp) return s;
       if (r.targetType === 'app' && appKeyFilter && !appKeyFilter.has(r.targetKey)) return s;
-      if (r.targetType === 'site' && siteKeyFilter && !siteKeyFilter.has(r.targetKey)) return s;
+      if (r.targetType === 'site' && siteKeyFilter && !siteKeyMatchesFilter(r.targetKey, siteKeyFilter)) return s;
       return s + (Number(r.cost) || 0);
     }, 0));
 
@@ -2440,11 +3139,11 @@ async function getRoiSummary(clientId, {
       earn = sumEarnList(earnMaps.apps.filter((r) => isMappedTarget('app', r.targetKey)));
     }
 
-    summaryMetrics = metricsFor(earn, adsSpend, otherExpenses, {
+    summaryMetrics = await metricsFor(earn, adsSpend, otherExpenses, {
       impressions: adsImpressions,
       clicks: adsClicks,
       conversions: adsConversions,
-    });
+    }, { endDate: end });
   }
 
   const lookupCountryEarn = summaryOnly && !breakdownOnly ? null : buildScopedCountryEarnLookup({
@@ -2464,27 +3163,27 @@ async function getRoiSummary(clientId, {
   let countryTargetDailyBreakdown = [];
 
   if (!summaryOnly || breakdownOnly) {
-    countryBreakdown = (countrySpendRows || []).map((row) => {
-    const countryEarn = lookupCountryEarn(row.countryName);
-    const spendMetrics = metricsFor(countryEarn, row.adsSpend, 0, {
-      impressions: row.impressions,
-      clicks: row.clicks,
-      conversions: row.conversions,
-    });
-    return {
-      countryCode: row.countryCode,
-      countryName: row.countryName,
-      adsSpend: round2(row.adsSpend),
-      earn: round2(countryEarn),
-      profitSpend: spendMetrics.profitSpend,
-      roiSpendPercent: spendMetrics.roiSpendPercent,
-      impressions: spendMetrics.impressions,
-      clicks: spendMetrics.clicks,
-      conversions: spendMetrics.conversions,
-      ctr: spendMetrics.ctr,
-      ecpm: spendMetrics.ecpm,
-    };
-  });
+    countryBreakdown = await Promise.all((countrySpendRows || []).map(async (row) => {
+      const countryEarn = lookupCountryEarn(row.countryName);
+      const spendMetrics = await metricsFor(countryEarn, row.adsSpend, 0, {
+        impressions: row.impressions,
+        clicks: row.clicks,
+        conversions: row.conversions,
+      }, { endDate: end });
+      return {
+        countryCode: row.countryCode,
+        countryName: row.countryName,
+        adsSpend: round2(row.adsSpend),
+        earn: spendMetrics.earn,
+        profitSpend: spendMetrics.profitSpend,
+        roiSpendPercent: spendMetrics.roiSpendPercent,
+        impressions: spendMetrics.impressions,
+        clicks: spendMetrics.clicks,
+        conversions: spendMetrics.conversions,
+        ctr: spendMetrics.ctr,
+        ecpm: spendMetrics.ecpm,
+      };
+    }));
 
   // When countries are selected, always list each one (even $0 spend) in the summary table.
   if (countryFilter?.length) {
@@ -2501,17 +3200,17 @@ async function getRoiSummary(clientId, {
     const nameByCode = new Map(
       (nameRows || []).map((r) => [String(r.country_code).toUpperCase(), String(r.country_name || '').trim()])
     );
-    countryBreakdown = countryFilter.map((code) => {
+    countryBreakdown = await Promise.all(countryFilter.map(async (code) => {
       const existing = byCode.get(code);
       if (existing) return existing;
       const countryName = nameByCode.get(code) || code;
       const countryEarn = lookupCountryEarn(countryName);
-      const spendMetrics = metricsFor(countryEarn, 0, 0);
+      const spendMetrics = await metricsFor(countryEarn, 0, 0, {}, { endDate: end });
       return {
         countryCode: code,
         countryName,
         adsSpend: 0,
-        earn: round2(countryEarn),
+        earn: spendMetrics.earn,
         profitSpend: spendMetrics.profitSpend,
         roiSpendPercent: spendMetrics.roiSpendPercent,
         impressions: 0,
@@ -2520,69 +3219,113 @@ async function getRoiSummary(clientId, {
         ctr: null,
         ecpm: null,
       };
-    }).sort((a, b) => b.adsSpend - a.adsSpend || a.countryName.localeCompare(b.countryName));
+    })).then((list) => list.sort((a, b) => b.adsSpend - a.adsSpend || a.countryName.localeCompare(b.countryName)));
   }
 
-    countryTargetBreakdown = countryTargetRows.map((row) => {
-    const countryKey = String(row.countryName || '').trim().toLowerCase();
-    const earnKey = `${row.targetType}:${row.targetKey}:${countryKey}`;
-    const targetEarn = earnByTargetCountry.get(earnKey) || 0;
-    const spendMetrics = metricsFor(targetEarn, row.adsSpend, 0, {
-      impressions: row.impressions,
-      clicks: row.clicks,
-      conversions: row.conversions,
+    const inlineSpendByTarget = sumAdsSpendByTarget(countryTargetRows);
+    const { byTarget: inlineExpenseByTarget, byTargetDate: inlineExpenseByTargetDate } = buildSiteAppExpenseMaps(expenses, {
+      includeSite: effectiveTargetType !== 'app' || Boolean(siteKeyFilter?.size),
+      includeApp: effectiveTargetType !== 'site' || Boolean(appKeyFilter?.size)
+        || countryTargetRows.some((r) => r.targetType === 'app'),
+      allowTarget: (t, k) => !mappedKeys.size || mappedKeys.has(targetExpenseKey(t, k)),
     });
-    const account = accountById.get(row.adsAccountId);
-    return {
-      adsAccountId: row.adsAccountId,
-      accountName: row.accountName || account?.descriptiveName || account?.customerId || row.adsAccountId,
-      targetType: row.targetType,
-      targetKey: row.targetKey,
-      countryCode: row.countryCode,
-      countryName: row.countryName,
-      adsSpend: round2(row.adsSpend),
-      earn: round2(targetEarn),
-      profitSpend: spendMetrics.profitSpend,
-      roiSpendPercent: spendMetrics.roiSpendPercent,
-      impressions: spendMetrics.impressions,
-      clicks: spendMetrics.clicks,
-      conversions: spendMetrics.conversions,
-      ctr: spendMetrics.ctr,
-      ecpm: spendMetrics.ecpm,
-    };
-  });
+    const inlineSpendByTargetDate = sumAdsSpendByTargetDate(countryTargetDailyRows || []);
 
-    countryTargetDailyBreakdown = (countryTargetDailyRows || [])
-    .filter((row) => (Number(row.adsSpend) || 0) > 0)
-    .map((row) => {
-      const countryKey = String(row.countryName || '').trim().toLowerCase();
-      const earnKey = `${row.date}:${row.targetType}:${row.targetKey}:${countryKey}`;
-      const targetEarn = earnByTargetCountryDaily.get(earnKey) || 0;
-      const spendMetrics = metricsFor(targetEarn, row.adsSpend, 0, {
-        impressions: row.impressions,
-        clicks: row.clicks,
-        conversions: row.conversions,
-      });
+    countryTargetBreakdown = await Promise.all(countryTargetRows.map(async (row) => {
+      const countryKey = String(row.gamCountryKey || row.countryName || '').trim().toLowerCase();
+      const earnKey = `${row.targetType}:${row.targetKey}:${countryKey}`;
+      const isSite = row.targetType === 'site';
+      let targetEarn = 0;
+      if (isSite) {
+        targetEarn = sumSiteEarnFromMap(earnByTargetCountry, row.targetKey, {
+          countryName: row.gamCountryKey || row.countryName,
+          countryCode: row.countryCode,
+        });
+        if (!(targetEarn > 0)) {
+          targetEarn = earnByTargetCountry.get(`site:${normSiteHost(row.targetKey)}:${countryKey}`)
+            || earnByTargetCountry.get(earnKey)
+            || 0;
+        }
+      } else {
+        targetEarn = earnByTargetCountry.get(earnKey) || 0;
+      }
+      const rowSpend = isSite ? 0 : (Number(row.adsSpend) || 0);
+      const tk = targetExpenseKey(row.targetType, row.targetKey);
+      const otherExpenses = allocateTargetExpense(
+        inlineExpenseByTarget.get(tk) || 0,
+        rowSpend,
+        inlineSpendByTarget.get(tk) || 0
+      );
+      const spendMetrics = await metricsFor(targetEarn, rowSpend, otherExpenses, {
+        impressions: isSite ? 0 : row.impressions,
+        clicks: isSite ? 0 : row.clicks,
+        conversions: isSite ? 0 : row.conversions,
+      }, { endDate: end });
       const account = accountById.get(row.adsAccountId);
       return {
-        date: row.date,
         adsAccountId: row.adsAccountId,
         accountName: row.accountName || account?.descriptiveName || account?.customerId || row.adsAccountId,
         targetType: row.targetType,
         targetKey: row.targetKey,
         countryCode: row.countryCode,
         countryName: row.countryName,
-        adsSpend: round2(row.adsSpend),
-        earn: round2(targetEarn),
+        adsSpend: round2(rowSpend),
+        earn: spendMetrics.earn,
+        otherExpenses: spendMetrics.otherExpenses,
         profitSpend: spendMetrics.profitSpend,
-        roiSpendPercent: spendMetrics.roiSpendPercent,
-        impressions: spendMetrics.impressions,
-        clicks: spendMetrics.clicks,
-        conversions: spendMetrics.conversions,
-        ctr: spendMetrics.ctr,
-        ecpm: spendMetrics.ecpm,
+        profitExpense: spendMetrics.profitExpense,
+        roiSpendPercent: isSite ? null : spendMetrics.roiSpendPercent,
+        roiExpensePercent: spendMetrics.roiExpensePercent,
+        impressions: isSite ? 0 : spendMetrics.impressions,
+        clicks: isSite ? 0 : spendMetrics.clicks,
+        conversions: isSite ? 0 : spendMetrics.conversions,
+        ctr: isSite ? null : spendMetrics.ctr,
+        ecpm: isSite ? null : spendMetrics.ecpm,
+        earnOnly: isSite,
       };
-    });
+    }));
+
+    countryTargetDailyBreakdown = await Promise.all((countryTargetDailyRows || [])
+      .filter((row) => (Number(row.adsSpend) || 0) > 0)
+      .map(async (row) => {
+        const countryKey = String(row.countryName || '').trim().toLowerCase();
+        const earnKey = `${row.date}:${row.targetType}:${row.targetKey}:${countryKey}`;
+        const targetEarn = earnByTargetCountryDaily.get(earnKey) || 0;
+        const tk = targetExpenseKey(row.targetType, row.targetKey);
+        const dayKey = `${ymd(row.date)}:${tk}`;
+        const otherExpenses = allocateTargetExpense(
+          inlineExpenseByTargetDate.get(dayKey) || 0,
+          row.adsSpend,
+          inlineSpendByTargetDate.get(dayKey) || 0
+        );
+        const spendMetrics = await metricsFor(targetEarn, row.adsSpend, otherExpenses, {
+          impressions: row.impressions,
+          clicks: row.clicks,
+          conversions: row.conversions,
+        }, { endDate: end });
+        const account = accountById.get(row.adsAccountId);
+        return {
+          date: row.date,
+          adsAccountId: row.adsAccountId,
+          accountName: row.accountName || account?.descriptiveName || account?.customerId || row.adsAccountId,
+          targetType: row.targetType,
+          targetKey: row.targetKey,
+          countryCode: row.countryCode,
+          countryName: row.countryName,
+          adsSpend: round2(row.adsSpend),
+          earn: spendMetrics.earn,
+          otherExpenses: spendMetrics.otherExpenses,
+          profitSpend: spendMetrics.profitSpend,
+          profitExpense: spendMetrics.profitExpense,
+          roiSpendPercent: spendMetrics.roiSpendPercent,
+          roiExpensePercent: spendMetrics.roiExpensePercent,
+          impressions: spendMetrics.impressions,
+          clicks: spendMetrics.clicks,
+          conversions: spendMetrics.conversions,
+          ctr: spendMetrics.ctr,
+          ecpm: spendMetrics.ecpm,
+        };
+      }));
   }
 
   const accountsOut = (showAccountColumns ? columnAccounts : []).map((a) => ({
@@ -2593,6 +3336,7 @@ async function getRoiSummary(clientId, {
     parentMccId: a.parentMccId,
   }));
 
+  const spendCurrency = adsSpendDisplayCurrency();
   const result = {
     accounts: accountsOut,
     summary: {
@@ -2601,6 +3345,7 @@ async function getRoiSummary(clientId, {
       unmappedSpend: unmapped,
       mappedCampaigns: maps.length,
       accountsWithSpend: accountById.size,
+      adsSpendCurrency: spendCurrency,
     },
     rows,
     countryBreakdown,
@@ -2608,9 +3353,30 @@ async function getRoiSummary(clientId, {
     countryTargetDailyBreakdown,
     generalExpenses,
     expenses: listedExpenses,
+    spendCurrency,
   };
   cache.set(cacheKey, result, ROI_SUMMARY_CACHE_TTL);
   return result;
+}
+
+/**
+ * Drop cached ROI summaries for a client after expense create/delete
+ * so overview cards reload from DB instead of stale NodeCache.
+ */
+function invalidateRoiSummaryCache(clientId) {
+  if (!clientId || !cache?.keys) return 0;
+  const id = String(clientId);
+  const keys = cache.keys().filter((k) => {
+    const s = String(k);
+    return s.startsWith(`roi_sum_v14_${id}`) || s.startsWith(`roi_bd_v14_${id}`)
+      || s.startsWith(`roi_sum_v13_${id}`) || s.startsWith(`roi_bd_v13_${id}`)
+      || s.startsWith(`roi_sum_v12_${id}`) || s.startsWith(`roi_bd_v12_${id}`)
+      || s.startsWith(`roi_sum_v11_${id}`) || s.startsWith(`roi_bd_v11_${id}`)
+      || s.startsWith(`roi_sum_v10_${id}`) || s.startsWith(`roi_bd_v10_${id}`)
+      || s.startsWith(`roi_sum_v9_${id}`) || s.startsWith(`roi_bd_v9_${id}`);
+  });
+  if (keys.length) cache.del(keys);
+  return keys.length;
 }
 
 module.exports = {
@@ -2619,4 +3385,5 @@ module.exports = {
   metricsFor,
   adsEngagementMetrics,
   loadCanonicalGamEarn,
+  invalidateRoiSummaryCache,
 };

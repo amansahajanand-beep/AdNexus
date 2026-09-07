@@ -23,6 +23,7 @@ export default function DashboardPresetDetail({
   onPin,
   onRename,
   onDelete,
+  onDuplicate,
 }) {
   const navigate = useNavigate();
   const { user } = useAuth();
@@ -177,6 +178,9 @@ export default function DashboardPresetDetail({
             >
               {presetItem.pinned ? 'Unpin' : 'Pin'}
             </button>
+          ) : null}
+          {onDuplicate ? (
+            <button type="button" className="btn-reset" onClick={onDuplicate}>Duplicate</button>
           ) : null}
           {onRename ? (
             <button type="button" className="btn-reset" onClick={onRename}>Rename</button>

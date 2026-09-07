@@ -9,6 +9,16 @@
     <meta name="theme-color" content="#0f172a" />
     <title>AdNexus Live Dashboard</title>
     <meta name="description" content="AdNexus — real-time ad revenue analytics and reporting dashboard" />
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('adnexus.theme');
+          if (t !== 'dark' && t !== 'light') t = 'light';
+          document.documentElement.setAttribute('data-theme', t);
+          document.documentElement.style.colorScheme = t;
+        } catch (e) {}
+      })();
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Figtree:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />

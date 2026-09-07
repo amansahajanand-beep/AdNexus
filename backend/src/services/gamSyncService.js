@@ -3339,8 +3339,15 @@ async function fetchFromGAM(startDate, endDate, onBatch, opts = {}) {
   const slices = Array.isArray(opts.sliceKeys) && opts.sliceKeys.length
     ? LEAN_SYNC_DIM_SLICES.filter((s) => opts.sliceKeys.includes(s.key))
     : LEAN_SYNC_DIM_SLICES;
+  const yieldOnTodayPriority = opts.yieldOnTodayPriority === true;
+  const { assertNotTodayPriority } = yieldOnTodayPriority
+    ? require('./syncPriorityGate')
+    : { assertNotTodayPriority: null };
 
   for (const slice of slices) {
+    if (assertNotTodayPriority) {
+      await assertNotTodayPriority(opts.syncType || 'backfill');
+    }
     try {
       const sliceOnBatch = stream && onBatch
         ? async (rawChunk) => onBatch(rawChunk, slice.key)
@@ -3365,6 +3372,7 @@ async function fetchFromGAM(startDate, endDate, onBatch, opts = {}) {
         totalRows += got.length;
       }
     } catch (err) {
+      if (err?.yieldToToday) throw err;
       lastErr = err;
       logger.warn(`GAM lean slice ${slice.key} error: ${err.message}`);
     }
@@ -3406,7 +3414,15 @@ async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill',
   let grainCount = 0;
   const touchedDates = new Set();
   const kpiOnly = opts.kpiOnly === true || syncType === 'sync-network-kpi';
-  const fetchOpts = kpiOnly ? { kpiOnly: true, sliceKeys: ['network_kpi'] } : {};
+  const today = todayInTZ();
+  // Historical fills must yield mid-run when hourly today-priority turns on.
+  const yieldOnTodayPriority = syncType !== 'sync-today'
+    && !(syncType === 'sync-day' && startDate === today && endDate === today);
+  const fetchOpts = {
+    ...(kpiOnly ? { kpiOnly: true, sliceKeys: ['network_kpi'] } : {}),
+    yieldOnTodayPriority,
+    syncType,
+  };
 
   const result = await fetchFromGAM(startDate, endDate, async (rawChunk, sliceKey) => {
     if (!rawChunk?.length) return;

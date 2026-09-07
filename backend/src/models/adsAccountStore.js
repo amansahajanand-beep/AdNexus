@@ -56,7 +56,8 @@ async function listRoiClientAccounts(clientId) {
   return rows.map(mapPublic);
 }
 
-async function listSyncableClientAccounts(clientId) {
+async function listSyncableClientAccounts(clientId, { roiOnly = false } = {}) {
+  const roiClause = roiOnly ? 'AND a.include_in_roi = true' : '';
   const { rows } = await query(
     `SELECT a.*,
             COALESCE(a.google_refresh_token_enc, m.google_refresh_token_enc) AS google_refresh_token_enc,
@@ -80,7 +81,8 @@ async function listSyncableClientAccounts(clientId) {
        AND a.account_type = 'client'
        AND a.is_active = true
        AND COALESCE(a.google_refresh_token_enc, m.google_refresh_token_enc) IS NOT NULL
-       AND NULLIF(TRIM(a.customer_id), '') IS NOT NULL`,
+       AND NULLIF(TRIM(a.customer_id), '') IS NOT NULL
+       ${roiClause}`,
     [clientId]
   );
   return rows.map((row) => {
@@ -241,8 +243,39 @@ async function upsertChildUnderMcc(clientId, mccId, { customerId, descriptiveNam
   });
 }
 
+/**
+ * Delete an Ads account. Deleting an MCC also deletes all child accounts under it
+ * (FK ON DELETE CASCADE + explicit child delete for clarity/safety).
+ * Children must never be left as orphaned "individual" accounts.
+ */
 async function deleteAccount(id) {
-  await query('DELETE FROM ads_accounts WHERE id = $1', [id]);
+  const account = await getAccountById(id);
+  if (!account) return { deleted: 0, childrenDeleted: 0 };
+
+  let childrenDeleted = 0;
+  if (account.accountType === 'mcc') {
+    const { rowCount } = await query(
+      `DELETE FROM ads_accounts WHERE parent_mcc_id = $1`,
+      [id]
+    );
+    childrenDeleted = rowCount || 0;
+  }
+
+  const { rowCount } = await query('DELETE FROM ads_accounts WHERE id = $1', [id]);
+  return {
+    deleted: rowCount || 0,
+    childrenDeleted,
+    accountType: account.accountType,
+  };
+}
+
+/** Remove every Ads account for a GAM client (MCC + children + spend via FK cascade). */
+async function deleteAllAccountsForClient(clientId) {
+  const { rowCount } = await query(
+    `DELETE FROM ads_accounts WHERE client_id = $1`,
+    [clientId]
+  );
+  return rowCount || 0;
 }
 
 async function listCampaignMaps(clientId) {
@@ -532,6 +565,7 @@ module.exports = {
   setSyncStatus,
   upsertChildUnderMcc,
   deleteAccount,
+  deleteAllAccountsForClient,
   listCampaignMaps,
   upsertCampaignMap,
   upsertCampaignMapsBulk,

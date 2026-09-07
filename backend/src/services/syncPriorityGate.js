@@ -62,14 +62,37 @@ async function endTodayPriority({ reason = 'done' } = {}) {
   logger.info(`[today-priority] OFF reason=${reason}`);
 }
 
-async function isTodayPriorityActive() {
-  if (localPriority && Date.now() < localPriority.until) return true;
+async function getTodayPriorityState() {
+  if (localPriority && Date.now() < localPriority.until) {
+    return { active: true, until: localPriority.until, reason: localPriority.reason };
+  }
   if (localPriority && Date.now() >= localPriority.until) localPriority = null;
   try {
     const v = await redisGet(REDIS_KEY);
-    if (v && v.active && (!v.until || Date.now() < Number(v.until))) return true;
+    if (v && v.active && (!v.until || Date.now() < Number(v.until))) {
+      return {
+        active: true,
+        until: Number(v.until) || (Date.now() + DEFAULT_TTL_SEC * 1000),
+        reason: v.reason || 'redis',
+      };
+    }
   } catch (_) { /* ignore */ }
-  return false;
+  return { active: false, until: 0, reason: null };
+}
+
+async function isTodayPriorityActive() {
+  const state = await getTodayPriorityState();
+  return state.active;
+}
+
+/** Delay so deferred jobs sleep until the priority window ends (avoid 60s wake storms). */
+async function getTodayPriorityDeferMs() {
+  const state = await getTodayPriorityState();
+  if (!state.active) return DEFER_MS;
+  const remaining = Math.max(0, Number(state.until) - Date.now());
+  // Small buffer past TTL so sync-today can finish before historical jobs wake.
+  const untilEnd = remaining + 15_000;
+  return Math.max(DEFER_MS, Math.min(untilEnd, DEFAULT_TTL_SEC * 1000));
 }
 
 async function assertNotTodayPriority(context = 'backfill') {
@@ -93,6 +116,17 @@ function isGamJobAllowedDuringTodayPriority(job) {
   if (name === 'sync-day' && date === today) return true;
   // Single-day range that is today only
   if (start === today && end === today && (name === 'sync-day' || name === 'sync-today')) return true;
+  // Hourly reconcile covers yesterday..today — let it run so "today" stays fresh.
+  if (
+    name === 'reconcile-range'
+    && start
+    && end
+    && start >= yesterday
+    && end <= today
+    && !job?.data?.historical
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -152,12 +186,13 @@ async function runWithTodayPriority(workFn, {
   ttlSec = DEFAULT_TTL_SEC,
   waitMs = DEFAULT_WAIT_MS,
 } = {}) {
-  // Nested cron (e.g. watchdog during hourly wait): do not clear the outer window.
+  // Nested cron (e.g. watchdog during hourly wait): do not clear the outer window
+  // and do not stack another full wait — that starves the worker for 20+ minutes.
   if (await isTodayPriorityActive()) {
-    logger.info(`[today-priority] already ON — nest work reason=${reason}`);
+    logger.info(`[today-priority] already ON — nest enqueue-only reason=${reason}`);
     await workFn({
       startedAt: localPriority?.startedAt || Date.now(),
-      waitMs,
+      waitMs: Math.min(waitMs, 30_000),
       reason,
       nested: true,
     });
@@ -178,6 +213,8 @@ module.exports = {
   beginTodayPriority,
   endTodayPriority,
   isTodayPriorityActive,
+  getTodayPriorityState,
+  getTodayPriorityDeferMs,
   assertNotTodayPriority,
   isGamJobAllowedDuringTodayPriority,
   isAdsJobAllowedDuringTodayPriority,

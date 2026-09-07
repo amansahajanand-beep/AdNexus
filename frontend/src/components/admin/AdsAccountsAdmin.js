@@ -48,12 +48,15 @@ export default function AdsAccountsAdmin() {
   const [error, setError] = useState(null);
   const [okMsg, setOkMsg] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [showIndividual, setShowIndividual] = useState(false);
   const [showMccForm, setShowMccForm] = useState(false);
   const [form, setForm] = useState(EMPTY_INDIVIDUAL);
   const [mccForm, setMccForm] = useState(EMPTY_MCC);
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
+  const [picker, setPicker] = useState(null); // { sessionId, managers, individuals }
+  const [pickingId, setPickingId] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -73,11 +76,37 @@ export default function AdsAccountsAdmin() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    if (params.get('ads_oauth') === 'error') {
+    const status = params.get('ads_oauth');
+    if (status === 'error') {
       setError(`Google Ads OAuth failed${params.get('reason') ? `: ${params.get('reason')}` : ''}`);
-    } else if (params.get('ads_oauth') === 'connected' || params.get('ads_oauth') === 'connected_individual') {
+    } else if (status === 'connected' || status === 'connected_individual') {
       setOkMsg('Google Ads connected successfully.');
       load();
+    } else if (status === 'pick') {
+      const sessionId = params.get('session');
+      if (sessionId) {
+        setBusy(true);
+        adsAPI.oauthPending(sessionId)
+          .then((data) => {
+            setPicker({
+              sessionId: data.sessionId,
+              managers: data.managers || [],
+              individuals: data.individuals || [],
+            });
+            setOkMsg('Select a manager account to continue.');
+          })
+          .catch((err) => {
+            setError(getUserFacingMessage(err, 'Could not load manager accounts from Google.'));
+          })
+          .finally(() => setBusy(false));
+      }
+    }
+    if (status) {
+      params.delete('ads_oauth');
+      params.delete('reason');
+      params.delete('session');
+      const next = params.toString();
+      window.history.replaceState({}, '', `${window.location.pathname}${next ? `?${next}` : ''}${window.location.hash || ''}`);
     }
   }, [load]);
 
@@ -184,6 +213,26 @@ export default function AdsAccountsAdmin() {
     }
   };
 
+  const selectPendingAccount = async (customerId) => {
+    if (!picker?.sessionId) return;
+    setPickingId(customerId);
+    setError(null);
+    try {
+      const result = await adsAPI.oauthSelect(picker.sessionId, { customerId });
+      setPicker(null);
+      setOkMsg(
+        result.accountType === 'mcc'
+          ? `MCC connected. Loaded ${result.childrenCount || 0} partner account(s).`
+          : 'Google Ads account connected.'
+      );
+      await load();
+    } catch (err) {
+      setError(getUserFacingMessage(err, 'Could not select account.'));
+    } finally {
+      setPickingId(null);
+    }
+  };
+
   const patchAccount = async (id, patch) => {
     try {
       await adsAPI.updateAccount(id, patch);
@@ -224,10 +273,14 @@ export default function AdsAccountsAdmin() {
     }
   };
 
-  const removeAccount = async (id) => {
+  const removeAccount = async (id, { isMcc = false, childCount = 0 } = {}) => {
     const ok = await confirmDialog({
-      title: 'Remove account?',
-      message: 'Remove this Google Ads account link?',
+      title: isMcc ? 'Remove MCC manager?' : 'Remove account?',
+      message: isMcc
+        ? (childCount > 0
+          ? `This removes the MCC and all ${childCount} connected child account(s). They will not become individual accounts.`
+          : 'This removes the MCC manager account link.')
+        : 'Remove this Google Ads account link?',
     });
     if (!ok) return;
     try {
@@ -268,13 +321,101 @@ export default function AdsAccountsAdmin() {
         <div>
           <h3 className="admin-panel-title">Google Ads accounts</h3>
           <p className="reporting-sub" style={{ margin: '4px 0 0' }}>
-            Add accounts with customer ID + optional refresh token. Set <code>GOOGLE_ADS_DEVELOPER_TOKEN</code> for spend sync.
+            Connect with Google to list manager accounts for your email, then pick one to load partner accounts.
           </p>
         </div>
         <div className="admin-panel-actions ads-toolbar">
+          <Button type="button" variant="primary" loading={busy} onClick={connectMccOAuth}>
+            Connect with Google
+          </Button>
+          <Button type="button" variant="secondary" loading={busy} onClick={syncAll}>
+            Sync spend
+          </Button>
           <Button
             type="button"
-            variant="primary"
+            variant="ghost"
+            onClick={() => setShowAdvanced((v) => !v)}
+          >
+            {showAdvanced ? 'Hide advanced' : 'Advanced'}
+          </Button>
+        </div>
+      </div>
+
+      {error && <div className="login-error">{error}</div>}
+      {okMsg && <div className="client-settings-ok">{okMsg}</div>}
+
+      {picker && (
+        <div className="filter-card ads-form-card">
+          <div className="filter-card-head">
+            <span className="filter-card-title">Select a manager account</span>
+            <Button type="button" variant="ghost" onClick={() => setPicker(null)}>Cancel</Button>
+          </div>
+          <p className="reporting-sub">
+            These manager (MCC) accounts are linked to the Google account you signed in with.
+          </p>
+          {(picker.managers || []).length === 0 && (picker.individuals || []).length === 0 && (
+            <div className="ads-empty">
+              <p className="ads-empty-title">No accounts found</p>
+            </div>
+          )}
+          <div className="table-wrap">
+            <table className="data-table report-table report-table--comfortable">
+              <thead>
+                <tr>
+                  <th>Account</th>
+                  <th>Customer ID</th>
+                  <th>Type</th>
+                  <th style={{ textAlign: 'right' }}>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(picker.managers || []).map((m) => (
+                  <tr key={`mcc-${m.customerId}`}>
+                    <td>{m.descriptiveName || formatCustomerId(m.customerId)}</td>
+                    <td className="td-mono">{formatCustomerId(m.customerId)}</td>
+                    <td>Manager (MCC)</td>
+                    <td style={{ textAlign: 'right' }}>
+                      <Button
+                        type="button"
+                        variant="primary"
+                        loading={pickingId === m.customerId}
+                        disabled={!!pickingId}
+                        onClick={() => selectPendingAccount(m.customerId)}
+                      >
+                        Select
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+                {(picker.individuals || []).map((m) => (
+                  <tr key={`cli-${m.customerId}`}>
+                    <td>{m.descriptiveName || formatCustomerId(m.customerId)}</td>
+                    <td className="td-mono">{formatCustomerId(m.customerId)}</td>
+                    <td>Client</td>
+                    <td style={{ textAlign: 'right' }}>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        loading={pickingId === m.customerId}
+                        disabled={!!pickingId}
+                        onClick={() => selectPendingAccount(m.customerId)}
+                      >
+                        Select
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {showAdvanced && (
+        <div className="admin-panel-actions ads-toolbar" style={{ marginBottom: 12 }}>
+          <Button
+            type="button"
+            variant="secondary"
             onClick={() => { setShowIndividual(true); setShowMccForm(false); }}
           >
             Add account
@@ -286,19 +427,10 @@ export default function AdsAccountsAdmin() {
           >
             Add MCC
           </Button>
-          <Button type="button" variant="ghost" loading={busy} onClick={connectMccOAuth}>
-            Connect MCC
-          </Button>
-          <Button type="button" variant="secondary" loading={busy} onClick={syncAll}>
-            Sync spend
-          </Button>
         </div>
-      </div>
+      )}
 
-      {error && <div className="login-error">{error}</div>}
-      {okMsg && <div className="client-settings-ok">{okMsg}</div>}
-
-      {showIndividual && (
+      {showAdvanced && showIndividual && (
         <form
           className="filter-card ads-form-card"
           onSubmit={(e) => {
@@ -348,7 +480,7 @@ export default function AdsAccountsAdmin() {
         </form>
       )}
 
-      {showMccForm && (
+      {showAdvanced && showMccForm && (
         <form
           className="filter-card ads-form-card"
           onSubmit={(e) => {
@@ -399,7 +531,7 @@ export default function AdsAccountsAdmin() {
         {!mccs.length && (
           <div className="ads-empty">
             <p className="ads-empty-title">No MCC linked</p>
-            <p className="ads-empty-desc">Add an MCC or connect via Google, then refresh children.</p>
+            <p className="ads-empty-desc">Connect with Google to list manager accounts, then select one.</p>
           </div>
         )}
         {mccs.map((mcc) => {
@@ -441,7 +573,14 @@ export default function AdsAccountsAdmin() {
                   >
                     Refresh children
                   </button>
-                  <button type="button" className="link-action danger" onClick={() => removeAccount(mcc.id)}>
+                  <button
+                    type="button"
+                    className="link-action danger"
+                    onClick={() => removeAccount(mcc.id, {
+                      isMcc: true,
+                      childCount: clients.filter((c) => c.parentMccId === mcc.id).length,
+                    })}
+                  >
                     Remove
                   </button>
                 </div>

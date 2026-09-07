@@ -21,15 +21,15 @@ const {
 const {
   isTodayPriorityActive,
   isGamJobAllowedDuringTodayPriority,
+  getTodayPriorityDeferMs,
   TodayPriorityYieldError,
-  DEFER_MS,
 } = require('../services/syncPriorityGate');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { runWithClient } = require('../utils/clientContext');
 const { getClientById, ensureBootstrapFromEnv } = require('../models/clientStore');
 
 async function deferForTodayPriority(job) {
-  const delayMs = DEFER_MS;
+  const delayMs = await getTodayPriorityDeferMs();
   logger.info(
     `[gam-sync] Deferring "${job.name}" id=${job.id} for ${Math.round(delayMs / 1000)}s (today-priority)`
   );
@@ -211,7 +211,20 @@ async function processJobInner(job) {
 
     if (job.name === 'sync-today') {
       const day = targetDates[targetDates.length - 1];
-      totalUpserted = await streamSyncFromGAM(day, day, job.name);
+      const timeoutMs = Math.max(
+        5 * 60_000,
+        parseInt(process.env.SYNC_TODAY_JOB_TIMEOUT_MS || String(15 * 60_000), 10) || 15 * 60_000
+      );
+      totalUpserted = await Promise.race([
+        streamSyncFromGAM(day, day, job.name),
+        new Promise((_, reject) => {
+          setTimeout(() => {
+            const err = new Error(`sync-today timed out after ${Math.round(timeoutMs / 1000)}s`);
+            err.code = 'SYNC_TODAY_TIMEOUT';
+            reject(err);
+          }, timeoutMs);
+        }),
+      ]);
       await invalidateCacheForDate(day);
     } else if (job.name === 'sync-day') {
       const day = targetDates[0];

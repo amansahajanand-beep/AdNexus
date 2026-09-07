@@ -6,6 +6,9 @@ import { BrowserRouter } from 'react-router-dom';
 import App from './App';
 import store, { persistor } from './store/store';
 import { loadUser } from './store/actions/authActions';
+import { initTheme } from './utils/theme';
+
+initTheme();
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(

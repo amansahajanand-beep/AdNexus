@@ -242,24 +242,32 @@ export const sessionAPI = {
 // ─── User management (admin) ────────────────────────────────────────────────────
 export const clientsAPI = {
   onboard: (payload) => FAST_API.post('/onboard', payload),
+  onboardOauthStart: (payload) => FAST_API.post('/onboard/oauth-start', payload),
+  onboardOauthPending: (id) => FAST_API.get(`/onboard/oauth/pending/${id}`),
+  onboardOauthSelect: (payload) => FAST_API.post('/onboard/oauth/select', payload),
   me: () => FAST_API.get('/clients/me'),
   updateMe: (payload) => FAST_API.put('/clients/me', payload),
   oauthUrl: () => FAST_API.get('/clients/me/oauth-url'),
+  oauthPending: (id) => FAST_API.get(`/clients/oauth/pending/${id}`),
+  oauthSelect: (id, payload) => FAST_API.post(`/clients/oauth/pending/${id}/select`, payload),
 };
 
 export const adsAPI = {
   listAccounts: () => FAST_API.get('/ads/accounts'),
   mccOauthUrl: () => FAST_API.post('/ads/accounts/mcc/oauth-url'),
+  oauthPending: (id) => FAST_API.get(`/ads/oauth/pending/${id}`),
+  oauthSelect: (id, payload) => FAST_API.post(`/ads/oauth/pending/${id}/select`, payload),
   createMcc: (payload) => FAST_API.post('/ads/accounts/mcc', payload),
   createIndividual: (payload) => FAST_API.post('/ads/accounts/individual', payload),
   accountOauthUrl: (id) => FAST_API.get(`/ads/accounts/${id}/oauth-url`),
   updateAccount: (id, payload) => FAST_API.patch(`/ads/accounts/${id}`, payload),
   deleteAccount: (id) => FAST_API.delete(`/ads/accounts/${id}`),
+  deleteAllAccounts: () => FAST_API.delete('/ads/accounts'),
   refreshChildren: (id) => FAST_API.post(`/ads/accounts/${id}/refresh-children`),
   listCampaigns: (id) => FAST_API.get(`/ads/accounts/${id}/campaigns`),
   listRoiCampaigns: (params) => FAST_API.get('/ads/roi-campaigns', { params }),
   listRoiAccounts: (params) => FAST_API.get('/ads/roi-accounts', { params }),
-  listRoiSites: () => FAST_API.get('/ads/roi-sites'),
+  listRoiSites: (params) => FAST_API.get('/ads/roi-sites', { params }),
   listRoiRelatedTargets: (params) => FAST_API.get('/ads/roi-related-targets', { params }),
   listRoiCountries: (params) => FAST_API.get('/ads/roi-countries', { params }),
   listCampaignMaps: () => FAST_API.get('/ads/campaign-maps'),

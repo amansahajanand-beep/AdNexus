@@ -13,9 +13,12 @@ import {
   mergeRoiBreakdownPayload,
   mergeRoiSummaryPayload,
   snapshotToRoiSummaryParams,
+  sumInventoryEarnFromBreakdown,
 } from '../../utils/report/roiView';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 import { useMedia } from '../../hooks/useMedia';
+import RoiInventoryEarnOverview from './RoiInventoryEarnOverview';
+import RoiPresetCompare from './RoiPresetCompare';
 
 const PAGE_SIZE = 50;
 
@@ -24,9 +27,13 @@ const PAGE_SIZE = 50;
  */
 export default function RoiPresetDetail({
   presetItem,
+  compareItem = null,
+  compareMode = false,
   onPin,
   onRename,
   onDelete,
+  onDuplicate,
+  onExitCompare,
 }) {
   const navigate = useNavigate();
   const { user } = useAuth();
@@ -147,15 +154,21 @@ export default function RoiPresetDetail({
   ]);
 
   const summary = data?.summary || {};
+  const spendCurrency = summary.adsSpendCurrency || data?.spendCurrency || 'USD';
   const countryTargetBreakdown = data?.countryTargetBreakdown || [];
   const countryBreakdown = data?.countryBreakdown || [];
   const countryTargetDailyBreakdown = data?.countryTargetDailyBreakdown || [];
+  const singleAccountMode = (activeSnapshot.accountIds || []).length === 1;
   const countryTree = useMemo(
     () => buildCountryTree(
       countryBreakdown,
       countryTargetBreakdown,
       countryTargetDailyBreakdown,
-      { startDate: applied.startDate, endDate: applied.endDate },
+      {
+        startDate: applied.startDate,
+        endDate: applied.endDate,
+        singleAccountMode,
+      },
     ),
     [
       countryBreakdown,
@@ -163,7 +176,13 @@ export default function RoiPresetDetail({
       countryTargetDailyBreakdown,
       applied.startDate,
       applied.endDate,
+      singleAccountMode,
     ]
+  );
+
+  const inventoryEarn = useMemo(
+    () => sumInventoryEarnFromBreakdown(countryTargetBreakdown),
+    [countryTargetBreakdown]
   );
 
   const openInRoi = () => {
@@ -206,11 +225,17 @@ export default function RoiPresetDetail({
               {presetItem.pinned ? 'Unpin' : 'Pin'}
             </button>
           ) : null}
+          {onDuplicate ? (
+            <button type="button" className="btn-reset" onClick={onDuplicate}>Duplicate</button>
+          ) : null}
           {onRename ? (
             <button type="button" className="btn-reset" onClick={onRename}>Rename</button>
           ) : null}
           {onDelete ? (
             <button type="button" className="btn-reset" onClick={onDelete}>Delete</button>
+          ) : null}
+          {compareMode && onExitCompare ? (
+            <button type="button" className="btn-reset" onClick={onExitCompare}>Exit compare</button>
           ) : null}
         </div>
       </div>
@@ -230,6 +255,16 @@ export default function RoiPresetDetail({
         onApply={applyDates}
       />
 
+      {compareMode ? (
+        <RoiPresetCompare
+          presetA={presetItem}
+          presetB={compareItem}
+          startDate={applied.startDate}
+          endDate={applied.endDate}
+          datePreset={preset}
+        />
+      ) : null}
+
       {error ? <div className="login-error" style={{ marginTop: 12 }}>{error}</div> : null}
 
       <RoiSummaryBoards
@@ -238,9 +273,19 @@ export default function RoiPresetDetail({
         showLive={false}
       />
 
+      {singleAccountMode ? (
+        <RoiInventoryEarnOverview
+          appEarn={inventoryEarn.appEarn}
+          siteEarn={inventoryEarn.siteEarn}
+          totalEarn={inventoryEarn.totalEarn}
+          currency={spendCurrency}
+          loading={(loading || breakdownLoading) && !countryTargetBreakdown.length}
+        />
+      ) : null}
+
       {summary.unmappedSpend > 0 && (
         <p className="form-note" style={{ marginTop: 12 }}>
-          Unmapped Ads spend: {formatRoiMoney(summary.unmappedSpend)} (hidden from table / ROI cards).
+          Unmapped Ads spend: {formatRoiMoney(summary.unmappedSpend, spendCurrency)} (hidden from table / ROI cards).
         </p>
       )}
 
@@ -257,6 +302,7 @@ export default function RoiPresetDetail({
             onPageChange={setCountryPage}
             density="comfortable"
             freezeFirst
+            spendCurrency={spendCurrency}
             className="reporting-table"
             exportName={`roi_preset_countries_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
             headerExtra={

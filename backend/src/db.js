@@ -382,7 +382,7 @@ async function initSchema() {
       account_type TEXT NOT NULL CHECK (account_type IN ('mcc', 'client')),
       customer_id TEXT NOT NULL DEFAULT '',
       descriptive_name TEXT NOT NULL DEFAULT '',
-      parent_mcc_id UUID REFERENCES ads_accounts(id) ON DELETE SET NULL,
+      parent_mcc_id UUID REFERENCES ads_accounts(id) ON DELETE CASCADE,
       login_customer_id TEXT,
       google_refresh_token_enc TEXT,
       is_active BOOLEAN DEFAULT true,
@@ -393,6 +393,20 @@ async function initSchema() {
       updated_at TIMESTAMPTZ DEFAULT now(),
       UNIQUE (client_id, customer_id)
     );
+
+    CREATE TABLE IF NOT EXISTS oauth_pending_sessions (
+      id UUID PRIMARY KEY,
+      product TEXT NOT NULL CHECK (product IN ('ads', 'gam')),
+      mode TEXT NOT NULL DEFAULT 'connect',
+      client_id UUID REFERENCES gam_clients(id) ON DELETE CASCADE,
+      refresh_token_enc TEXT,
+      candidates_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      payload_json JSONB,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_oauth_pending_expires
+      ON oauth_pending_sessions (expires_at);
 
     CREATE TABLE IF NOT EXISTS ads_campaign_map (
       id UUID PRIMARY KEY,
@@ -497,6 +511,32 @@ async function initSchema() {
     await schemaQuery(`ALTER TABLE ads_spend_daily ADD COLUMN IF NOT EXISTS app_id TEXT NOT NULL DEFAULT ''`);
   } catch (e) {
     logger.warn('ads currency columns:', e.message);
+  }
+
+  // MCC delete must remove child accounts (not orphan them as "individual").
+  try {
+    const { rows: fkRows } = await schemaQuery(`
+      SELECT c.conname, pg_get_constraintdef(c.oid) AS def
+      FROM pg_constraint c
+      JOIN pg_class t ON t.oid = c.conrelid
+      WHERE t.relname = 'ads_accounts'
+        AND c.contype = 'f'
+        AND pg_get_constraintdef(c.oid) LIKE '%parent_mcc_id%'
+    `);
+    const needsCascade = fkRows.some((r) => !/ON DELETE CASCADE/i.test(String(r.def || '')));
+    if (needsCascade || fkRows.length === 0) {
+      for (const r of fkRows) {
+        await schemaQuery(`ALTER TABLE ads_accounts DROP CONSTRAINT IF EXISTS ${r.conname}`);
+      }
+      await schemaQuery(`
+        ALTER TABLE ads_accounts
+          ADD CONSTRAINT ads_accounts_parent_mcc_id_fkey
+          FOREIGN KEY (parent_mcc_id) REFERENCES ads_accounts(id) ON DELETE CASCADE
+      `);
+      logger.info('ads_accounts.parent_mcc_id FK → ON DELETE CASCADE');
+    }
+  } catch (e) {
+    logger.warn('ads_accounts parent_mcc_id FK cascade migrate:', e.message);
   }
 
   // Retired warehouse — drop if leftover from older deploys (frees a lot of disk).

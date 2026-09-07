@@ -7,7 +7,7 @@ const { GoogleAdsApi, fromMicros } = require('google-ads-api');
 const { Service } = require('google-ads-api/build/src/service');
 const logger = require('../utils/logger');
 const { getClient } = require('../utils/clientContext');
-const { normalizeCurrency, getUnitsPerUsd, refreshFxRates } = require('../utils/adsCurrency');
+const { normalizeCurrency, preloadUnitsPerUsdForDates } = require('../utils/adsCurrency');
 
 // google-ads-api v24: getGoogleAdsError throws when metadata.internalRepr is missing.
 const origGetGoogleAdsError = Service.prototype.getGoogleAdsError;
@@ -183,23 +183,6 @@ async function fetchCampaignSpend(gamClient, {
     }
   }
 
-  let unitsPerUsd = 1;
-  if (accountCurrency !== 'USD') {
-    await refreshFxRates().catch(() => null);
-    unitsPerUsd = await getUnitsPerUsd(accountCurrency);
-  }
-  const toUsdSync = (native) => {
-    const n = Number(native) || 0;
-    if (accountCurrency === 'USD' || !n || !(unitsPerUsd > 0)) {
-      return { usd: n, native: n, nativeCurrency: accountCurrency };
-    }
-    return {
-      usd: Math.round((n / unitsPerUsd) * 1e6) / 1e6,
-      native: n,
-      nativeCurrency: accountCurrency,
-    };
-  };
-
   const rows = await gaqlQuery(customer, `
     SELECT
       campaign.id,
@@ -216,7 +199,28 @@ async function fetchCampaignSpend(gamClient, {
     WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
   `);
 
+  const spendDates = (rows || []).map((r) => r?.segments?.date).filter(Boolean);
+  let rateByDate = new Map();
+  if (accountCurrency !== 'USD') {
+    // Use cached/historical rates — do not force a live FX refresh per account (Upstash-adjacent HTTP spam).
+    rateByDate = await preloadUnitsPerUsdForDates(accountCurrency, spendDates);
+  }
+  const toUsdSync = (native, reportDate) => {
+    const n = Number(native) || 0;
+    const unitsPerUsd = rateByDate.get(String(reportDate)) || 1;
+    if (accountCurrency === 'USD' || !n || !(unitsPerUsd > 0)) {
+      return { usd: n, native: n, nativeCurrency: accountCurrency, rate: 1 };
+    }
+    return {
+      usd: Math.round((n / unitsPerUsd) * 1e6) / 1e6,
+      native: n,
+      nativeCurrency: accountCurrency,
+      rate: unitsPerUsd,
+    };
+  };
+
   const out = [];
+  const ratesUsed = new Set();
   for (const r of rows || []) {
     const campaign = r.campaign || {};
     const segments = r.segments || {};
@@ -225,11 +229,12 @@ async function fetchCampaignSpend(gamClient, {
     const costMicros = Number(metrics.cost_micros) || 0;
     const nativeCost = typeof fromMicros === 'function' ? fromMicros(costMicros) : costMicros / 1e6;
     const nativeConvVal = Number(metrics.conversions_value) || 0;
-    const costFx = toUsdSync(nativeCost);
-    const convFx = toUsdSync(nativeConvVal);
-    const campaignId = String(campaign.id || '');
     const reportDate = segments.date;
+    const costFx = toUsdSync(nativeCost, reportDate);
+    const convFx = toUsdSync(nativeConvVal, reportDate);
+    const campaignId = String(campaign.id || '');
     if (!campaignId || !reportDate) continue;
+    if (costFx.rate && costFx.rate !== 1) ratesUsed.add(`${reportDate}:${costFx.rate}`);
     const rawAppId = String(appSetting.app_id || appSetting.appId || '').trim();
     out.push({
       campaignId,
@@ -247,9 +252,9 @@ async function fetchCampaignSpend(gamClient, {
       accountCurrency,
     });
   }
-  if (accountCurrency !== 'USD') {
+  if (accountCurrency !== 'USD' && ratesUsed.size) {
     logger.info(
-      `Ads spend FX ${customerId}: ${accountCurrency}→USD at ${unitsPerUsd} ${accountCurrency}/USD`
+      `Ads spend FX ${customerId}: ${accountCurrency}→USD by spend-date (${ratesUsed.size} day-rate(s))`
     );
   }
   return out;
@@ -315,23 +320,6 @@ async function fetchCampaignSpendByCountry(gamClient, {
     }
   }
 
-  let unitsPerUsd = 1;
-  if (accountCurrency !== 'USD') {
-    await refreshFxRates().catch(() => null);
-    unitsPerUsd = await getUnitsPerUsd(accountCurrency);
-  }
-  const toUsdSync = (native) => {
-    const n = Number(native) || 0;
-    if (accountCurrency === 'USD' || !n || !(unitsPerUsd > 0)) {
-      return { usd: n, native: n, nativeCurrency: accountCurrency };
-    }
-    return {
-      usd: Math.round((n / unitsPerUsd) * 1e6) / 1e6,
-      native: n,
-      nativeCurrency: accountCurrency,
-    };
-  };
-
   const appByCampaign = new Map(
     (campaignAppIds || []).map((c) => [String(c.campaignId || ''), String(c.appId || '').trim()])
   );
@@ -351,6 +339,26 @@ async function fetchCampaignSpendByCountry(gamClient, {
     WHERE segments.date BETWEEN '${startDate}' AND '${endDate}'
   `);
 
+  const spendDates = (rows || []).map((r) => r?.segments?.date).filter(Boolean);
+  let rateByDate = new Map();
+  if (accountCurrency !== 'USD') {
+    // Use cached/historical rates — do not force a live FX refresh per account (Upstash-adjacent HTTP spam).
+    rateByDate = await preloadUnitsPerUsdForDates(accountCurrency, spendDates);
+  }
+  const toUsdSync = (native, reportDate) => {
+    const n = Number(native) || 0;
+    const unitsPerUsd = rateByDate.get(String(reportDate)) || 1;
+    if (accountCurrency === 'USD' || !n || !(unitsPerUsd > 0)) {
+      return { usd: n, native: n, nativeCurrency: accountCurrency, rate: 1 };
+    }
+    return {
+      usd: Math.round((n / unitsPerUsd) * 1e6) / 1e6,
+      native: n,
+      nativeCurrency: accountCurrency,
+      rate: unitsPerUsd,
+    };
+  };
+
   const criterionIds = (rows || []).map((r) => {
     const ulv = r.user_location_view || r.userLocationView || {};
     return Number(ulv.country_criterion_id || ulv.countryCriterionId);
@@ -358,6 +366,7 @@ async function fetchCampaignSpendByCountry(gamClient, {
   const geoMap = await fetchGeoTargetCountries(customer, criterionIds);
 
   const out = [];
+  const ratesUsed = new Set();
   for (const r of rows || []) {
     const campaign = r.campaign || {};
     const ulv = r.user_location_view || r.userLocationView || {};
@@ -371,11 +380,12 @@ async function fetchCampaignSpendByCountry(gamClient, {
     const costMicros = Number(metrics.cost_micros) || 0;
     const nativeCost = typeof fromMicros === 'function' ? fromMicros(costMicros) : costMicros / 1e6;
     const nativeConvVal = Number(metrics.conversions_value) || 0;
-    const costFx = toUsdSync(nativeCost);
-    const convFx = toUsdSync(nativeConvVal);
-    const campaignId = String(campaign.id || '');
     const reportDate = segments.date;
+    const costFx = toUsdSync(nativeCost, reportDate);
+    const convFx = toUsdSync(nativeConvVal, reportDate);
+    const campaignId = String(campaign.id || '');
     if (!campaignId || !reportDate || !geo.countryCode) continue;
+    if (costFx.rate && costFx.rate !== 1) ratesUsed.add(`${reportDate}:${costFx.rate}`);
     out.push({
       campaignId,
       campaignName: campaign.name || '',
@@ -394,9 +404,9 @@ async function fetchCampaignSpendByCountry(gamClient, {
       accountCurrency,
     });
   }
-  if (accountCurrency !== 'USD' && out.length) {
+  if (accountCurrency !== 'USD' && ratesUsed.size) {
     logger.info(
-      `Ads country spend FX ${customerId}: ${accountCurrency}→USD at ${unitsPerUsd} ${accountCurrency}/USD`
+      `Ads country spend FX ${customerId}: ${accountCurrency}→USD by spend-date (${ratesUsed.size} day-rate(s))`
     );
   }
   return out;

@@ -1,12 +1,14 @@
 /**
  * Google OAuth for Google Ads API (spend / ROI) — separate from GAM /auth/callback.
+ * Connect with Google → list all manager accounts → user picks → fetch partners.
  */
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const router = express.Router();
 const { getAdsOAuthClient, ADS_SCOPE, listAccessibleCustomerIds, fetchCustomerInfo, listMccChildAccounts } = require('../ads/client');
-const { getAccountById, createAccount, updateAccount, upsertChildUnderMcc } = require('../models/adsAccountStore');
+const { getAccountById, createAccount, updateAccount, upsertChildUnderMcc, getAccountByCustomerId } = require('../models/adsAccountStore');
 const { getClientById } = require('../models/clientStore');
+const { createPendingSession, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const logger = require('../utils/logger');
 
 const SECRET = () => process.env.JWT_SECRET || 'change_this_secret';
@@ -53,9 +55,108 @@ function buildAdsAuthUrl(gamClient, statePayload) {
   });
 }
 
+/** Probe accessible customers; return all managers and non-managers. */
+async function discoverAdsCandidates(gamClient, refreshToken) {
+  const accessible = await listAccessibleCustomerIds(gamClient, refreshToken);
+  const managers = [];
+  const individuals = [];
+  for (const cid of accessible) {
+    try {
+      const info = await fetchCustomerInfo(gamClient, { customerId: cid, refreshToken });
+      const row = {
+        customerId: info.customerId,
+        descriptiveName: info.descriptiveName || info.customerId,
+        isManager: !!info.isManager,
+        currency: info.currency || null,
+      };
+      if (row.isManager) managers.push(row);
+      else individuals.push(row);
+    } catch (e) {
+      logger.warn(`Ads probe customer ${cid}:`, e.message);
+    }
+  }
+  return { managers, individuals, accessible };
+}
+
+/** Create/update MCC + upsert level-1 partner accounts. */
+async function commitMccSelection(gamClient, { customerId, descriptiveName, refreshToken }) {
+  const cid = String(customerId || '').replace(/-/g, '');
+  if (!/^\d{10}$/.test(cid)) throw new Error('Invalid MCC customer ID');
+
+  let mccAccount;
+  const existing = await getAccountByCustomerId(gamClient.id, cid);
+  if (existing) {
+    mccAccount = await updateAccount(existing.id, {
+      refreshToken,
+      descriptiveName: descriptiveName || existing.descriptiveName || 'MCC',
+      customerId: cid,
+    });
+    const { query } = require('../db');
+    await query(
+      `UPDATE ads_accounts SET account_type = 'mcc', include_in_roi = false, updated_at = now() WHERE id = $1`,
+      [existing.id]
+    );
+    mccAccount = await getAccountById(existing.id);
+  } else {
+    mccAccount = await createAccount({
+      clientId: gamClient.id,
+      accountType: 'mcc',
+      customerId: cid,
+      descriptiveName: descriptiveName || 'MCC',
+      refreshToken,
+      includeInRoi: false,
+    });
+  }
+
+  let childrenCount = 0;
+  try {
+    const children = await listMccChildAccounts(gamClient, {
+      mccCustomerId: cid,
+      refreshToken,
+    });
+    for (const child of children) {
+      await upsertChildUnderMcc(gamClient.id, mccAccount.id, {
+        customerId: child.customerId,
+        descriptiveName: child.descriptiveName,
+        includeInRoi: false,
+      });
+      childrenCount += 1;
+    }
+    logger.info(`Ads MCC ${cid}: discovered ${childrenCount} child account(s)`);
+  } catch (e) {
+    logger.warn('Ads MCC child discovery failed:', e.message);
+  }
+
+  return { mccAccount, childrenCount };
+}
+
+async function commitIndividualSelection(gamClient, { customerId, descriptiveName, refreshToken }) {
+  const cid = String(customerId || '').replace(/-/g, '');
+  if (!/^\d{10}$/.test(cid)) throw new Error('Invalid customer ID');
+  const existing = await getAccountByCustomerId(gamClient.id, cid);
+  if (existing) {
+    return updateAccount(existing.id, {
+      refreshToken,
+      descriptiveName: descriptiveName || existing.descriptiveName || cid,
+      customerId: cid,
+    });
+  }
+  return createAccount({
+    clientId: gamClient.id,
+    accountType: 'client',
+    customerId: cid,
+    descriptiveName: descriptiveName || cid,
+    refreshToken,
+    includeInRoi: true,
+  });
+}
+
 /** Build OAuth URL for MCC connect or individual account (called from /api/ads). */
 router.buildAdsAuthUrl = buildAdsAuthUrl;
 router.signAdsState = signAdsState;
+router.commitMccSelection = commitMccSelection;
+router.commitIndividualSelection = commitIndividualSelection;
+router.discoverAdsCandidates = discoverAdsCandidates;
 
 router.get('/callback', async (req, res) => {
   const { code, state } = req.query;
@@ -115,113 +216,66 @@ router.get('/callback', async (req, res) => {
       return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected'));
     }
 
-    // MCC (or discover manager among accessible customers)
-    let accessible;
+    // Discover all accessible accounts → pending session → picker (or auto-commit single)
+    let discovered;
     try {
-      accessible = await listAccessibleCustomerIds(gamClient, refreshToken);
+      discovered = await discoverAdsCandidates(gamClient, refreshToken);
     } catch (e) {
       logger.error('Ads listAccessibleCustomers failed:', e.message);
       return res.redirect(adsOAuthErrorRedirect(e));
     }
-    let mccInfo = null;
-    for (const cid of accessible) {
-      try {
-        const info = await fetchCustomerInfo(gamClient, { customerId: cid, refreshToken });
-        if (info.isManager) {
-          mccInfo = info;
-          break;
-        }
-      } catch (e) {
-        logger.warn(`Ads probe customer ${cid}:`, e.message);
-      }
-    }
 
-    if (!mccInfo && accessible[0]) {
-      // Fallback: treat first accessible as the connected account (may be individual)
-      const info = await fetchCustomerInfo(gamClient, {
-        customerId: accessible[0],
-        refreshToken,
-      }).catch(() => ({
-        customerId: accessible[0],
-        descriptiveName: accessible[0],
-        isManager: false,
-      }));
-      if (!info.isManager) {
-        const { getAccountByCustomerId } = require('../models/adsAccountStore');
-        const existingInd = await getAccountByCustomerId(gamClient.id, info.customerId);
-        if (existingInd) {
-          await updateAccount(existingInd.id, {
-            refreshToken,
-            descriptiveName: info.descriptiveName || existingInd.descriptiveName,
-          });
-        } else {
-          await createAccount({
-            clientId: gamClient.id,
-            accountType: 'client',
-            customerId: info.customerId,
-            descriptiveName: info.descriptiveName || info.customerId,
-            refreshToken,
-            includeInRoi: true,
-          });
-        }
-        return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected_individual'));
-      }
-      mccInfo = info;
-    }
+    const { managers, individuals } = discovered;
 
-    if (!mccInfo) {
-      return res.redirect(frontendAdminUrl('?ads_oauth=error&reason=no_accessible_accounts'));
-    }
-
-    let mccAccount = null;
-    const { getAccountByCustomerId } = require('../models/adsAccountStore');
-    const existing = await getAccountByCustomerId(gamClient.id, mccInfo.customerId);
-    if (existing) {
-      mccAccount = await updateAccount(existing.id, {
-        refreshToken,
-        descriptiveName: mccInfo.descriptiveName || existing.descriptiveName,
-        customerId: mccInfo.customerId,
-      });
-      // Ensure type is mcc
-      const { query } = require('../db');
-      await query(
-        `UPDATE ads_accounts SET account_type = 'mcc', updated_at = now() WHERE id = $1`,
-        [existing.id]
-      );
-      mccAccount = await getAccountById(existing.id).then((a) => ({
-        id: a.id,
-        customerId: a.customerId,
-        descriptiveName: a.descriptiveName,
-      }));
-    } else {
-      mccAccount = await createAccount({
-        clientId: gamClient.id,
-        accountType: 'mcc',
-        customerId: mccInfo.customerId,
-        descriptiveName: mccInfo.descriptiveName || 'MCC',
-        refreshToken,
-        includeInRoi: false,
-      });
-    }
-
-    try {
-      const children = await listMccChildAccounts(gamClient, {
-        mccCustomerId: mccInfo.customerId,
-        refreshToken,
-      });
-      for (const child of children) {
-        await upsertChildUnderMcc(gamClient.id, mccAccount.id, {
-          customerId: child.customerId,
-          descriptiveName: child.descriptiveName,
-          includeInRoi: false,
+    // Reconnecting a known MCC: update token + refresh children, skip picker
+    if (decoded.adsAccountId && mode === 'mcc') {
+      const account = await getAccountById(decoded.adsAccountId);
+      if (account && account.clientId === gamClient.id) {
+        await commitMccSelection(gamClient, {
+          customerId: account.customerId,
+          descriptiveName: account.descriptiveName,
+          refreshToken,
         });
+        return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected'));
       }
-      logger.info(`Ads MCC ${mccInfo.customerId}: discovered ${children.length} child account(s)`);
-    } catch (e) {
-      logger.warn('Ads MCC child discovery failed:', e.message);
     }
 
-    return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected'));
+    if (managers.length === 1 && individuals.length === 0) {
+      await commitMccSelection(gamClient, {
+        customerId: managers[0].customerId,
+        descriptiveName: managers[0].descriptiveName,
+        refreshToken,
+      });
+      return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected'));
+    }
+
+    if (managers.length === 0 && individuals.length === 1) {
+      await commitIndividualSelection(gamClient, {
+        customerId: individuals[0].customerId,
+        descriptiveName: individuals[0].descriptiveName,
+        refreshToken,
+      });
+      return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected_individual'));
+    }
+
+    if (managers.length === 0 && individuals.length === 0) {
+      return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=error&reason=no_accessible_accounts'));
+    }
+
+    const session = await createPendingSession({
+      product: 'ads',
+      mode: 'connect',
+      clientId: gamClient.id,
+      refreshToken,
+      candidates: [
+        ...managers.map((m) => ({ ...m, kind: 'mcc' })),
+        ...individuals.map((i) => ({ ...i, kind: 'client' })),
+      ],
+    });
+
+    return res.redirect(
+      frontendAdminUrl(`?tab=ads&ads_oauth=pick&session=${encodeURIComponent(session.id)}`)
+    );
   } catch (err) {
     logger.error('Ads OAuth callback error:', err.message);
     return res.redirect(adsOAuthErrorRedirect(err));
@@ -231,3 +285,8 @@ router.get('/callback', async (req, res) => {
 module.exports = router;
 module.exports.buildAdsAuthUrl = buildAdsAuthUrl;
 module.exports.signAdsState = signAdsState;
+module.exports.commitMccSelection = commitMccSelection;
+module.exports.commitIndividualSelection = commitIndividualSelection;
+module.exports.discoverAdsCandidates = discoverAdsCandidates;
+module.exports.getPendingSession = getPendingSession;
+module.exports.deletePendingSession = deletePendingSession;
