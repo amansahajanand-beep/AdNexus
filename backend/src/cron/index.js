@@ -4,14 +4,16 @@
  * All times are in Asia/Singapore timezone.
  *
  * Tuned for Upstash command budget + heap safety:
- *   - Hourly: lean today only
- *   - Every 6h: lean yesterday
+ *   - Hourly: lean today only (GAM + 1 Ads job per client)
+ *   - Every 6h: lean yesterday (GAM + Ads)
+ *   - Hourly :30: GAM reconcile only (Ads reconcile opt-in via ADS_RECONCILE_CRON)
  *   - 2AM: one job per calendar month until every day has KPI grain
  *   - Boot: today + yesterday + recent gaps + incomplete months
  */
 const cron   = require('node-cron');
 const logger = require('../utils/logger');
 const { gamSyncQueue } = require('../queues/gamSync');
+const { adsSyncQueue } = require('../queues/adsSync');
 const { todayInTZ, historicalRangeForPresets, listCalendarMonthsNewestFirst, shiftYMD } = require('../utils/datetime');
 
 async function eachActiveClient(fn) {
@@ -30,16 +32,34 @@ async function enqueueLeanToday({ reason } = {}) {
   const today = todayInTZ();
   const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
   const tag = reason ? ` (${reason})` : '';
+  // Watchdog / boot: unique suffix so a stuck same-hour jobId cannot block enqueue.
+  const forceSuffix = (reason === 'watchdog' || reason === 'boot')
+    ? `-${Math.floor(Date.now() / 60_000)}`
+    : '';
 
   await eachActiveClient(async (client) => {
     const cid = client.id;
+    const baseId = `sync-today-${cid.slice(0, 8)}-${today}-${hourSlot}`;
+    const jobId = `${baseId}${forceSuffix}`.slice(0, 120);
     try {
+      // Drop completed/failed leftovers with the base id so hourly re-add is reliable.
+      if (!forceSuffix) {
+        try {
+          const existing = await gamSyncQueue.getJob(baseId);
+          if (existing) {
+            const state = await existing.getState();
+            if (state === 'completed' || state === 'failed') {
+              await existing.remove();
+            }
+          }
+        } catch (_) { /* ignore */ }
+      }
       await gamSyncQueue.add('sync-today', {
         date: today,
         includeFull: false,
         clientId: cid,
       }, {
-        jobId: `sync-today-${cid.slice(0, 8)}-${today}-${hourSlot}`,
+        jobId,
         priority: 1,
         attempts: 2,
         backoff: { type: 'exponential', delay: 20000 },
@@ -172,6 +192,99 @@ async function enqueueReconcileRecent({ reason } = {}) {
   });
 }
 
+function isAdsCronEnabled() {
+  return Boolean(String(process.env.GOOGLE_ADS_DEVELOPER_TOKEN || '').trim());
+}
+
+/** Hourly: refresh Google Ads spend for today only (ROI present data). */
+async function enqueueAdsSyncToday({ reason } = {}) {
+  if (!isAdsCronEnabled()) return;
+  const today = todayInTZ();
+  const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
+  const tag = reason ? ` (${reason})` : '';
+  const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
+  await eachActiveClient(async (client) => {
+    const cid = client.id;
+    try {
+      const { accounts, jobs } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
+        startDate: today,
+        endDate: today,
+        jobIdPrefix: `ads-sync-today-${cid.slice(0, 8)}-${today}-${hourSlot}`,
+        priority: 1,
+      });
+      logger.info(
+        `Cron: enqueued ads-sync-today jobs=${jobs} accounts=${accounts} for ${today} `
+        + `client=${cid.slice(0, 8)}${tag}`
+      );
+    } catch (e) {
+      logger.error('Cron: failed to enqueue ads-sync-today:', e.message);
+    }
+  });
+}
+
+/** Every 6h: refresh yesterday's Ads spend (finalize partial snapshots). */
+async function enqueueAdsSyncYesterday({ reason } = {}) {
+  if (!isAdsCronEnabled()) return;
+  const { yesterday } = historicalRangeForPresets();
+  const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
+  const tag = reason ? ` (${reason})` : '';
+  const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
+  await eachActiveClient(async (client) => {
+    const cid = client.id;
+    try {
+      const { accounts, jobs, skipped } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
+        startDate: yesterday,
+        endDate: yesterday,
+        jobIdPrefix: `ads-sync-yesterday-${cid.slice(0, 8)}-${yesterday}-${Math.floor(hourSlot / 6)}`,
+        priority: 2,
+        skipIfTodayPriority: true,
+      });
+      if (skipped) return;
+      logger.info(
+        `Cron: enqueued ads-sync-yesterday jobs=${jobs} accounts=${accounts} for ${yesterday} `
+        + `client=${cid.slice(0, 8)}${tag}`
+      );
+    } catch (e) {
+      logger.error('Cron: failed to enqueue ads-sync-yesterday:', e.message);
+    }
+  });
+}
+
+/**
+ * Optional Ads reconcile (yesterday+today). Disabled by default — overlaps hourly today + 6h yesterday
+ * and burned Upstash via per-account job fan-out. Set ADS_RECONCILE_CRON=true to enable.
+ */
+async function enqueueAdsReconcileRecent({ reason } = {}) {
+  if (!isAdsCronEnabled()) return;
+  const enabled = String(process.env.ADS_RECONCILE_CRON || '').trim().toLowerCase();
+  if (enabled !== 'true' && enabled !== '1' && enabled !== 'yes') {
+    return;
+  }
+  const today = todayInTZ();
+  const yesterday = shiftYMD(today, -1);
+  const tag = reason ? ` (${reason})` : '';
+  const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
+  await eachActiveClient(async (client) => {
+    const cid = client.id;
+    try {
+      const { accounts, jobs, skipped } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
+        startDate: yesterday,
+        endDate: today,
+        jobIdPrefix: `ads-reconcile-recent-${cid.slice(0, 8)}-${today}-${Math.floor(Date.now() / (6 * 60 * 60 * 1000))}`,
+        priority: 2,
+        skipIfTodayPriority: true,
+      });
+      if (skipped) return;
+      logger.info(
+        `Cron: enqueued ads-reconcile-recent jobs=${jobs} accounts=${accounts} `
+        + `${yesterday}..${today} client=${cid.slice(0, 8)}${tag}`
+      );
+    } catch (e) {
+      logger.error('Cron: failed to enqueue ads-reconcile-recent:', e.message);
+    }
+  });
+}
+
 async function enqueueReconcileHistorical({ reason } = {}) {
   const range = historicalRangeForPresets();
   const tag = reason ? ` (${reason})` : '';
@@ -205,6 +318,10 @@ async function watchdogStaleSync() {
   const { listActiveClients } = require('../models/clientStore');
   const { runWithClient } = require('../utils/clientContext');
   const { drainIncompleteHistory } = require('../services/gamReconciliationService');
+  const {
+    runWithTodayPriority,
+    waitForSyncTodaySuccess,
+  } = require('../services/syncPriorityGate');
   const clients = await listActiveClients();
   const staleMs = 75 * 60 * 1000;
   for (const client of clients) {
@@ -219,9 +336,15 @@ async function watchdogStaleSync() {
       if (Date.now() - last > staleMs) {
         logger.warn(
           `Cron watchdog: sync-today stale for client=${client.id.slice(0, 8)}`
-          + ` (last=${rows[0]?.finished_at || 'never'}) — re-enqueue`
+          + ` (last=${rows[0]?.finished_at || 'never'}) — re-enqueue with today-priority`
         );
-        await enqueueLeanToday({ reason: 'watchdog' });
+        await runWithTodayPriority(async ({ startedAt, waitMs }) => {
+          await enqueueLeanToday({ reason: 'watchdog' });
+          await waitForSyncTodaySuccess(client.id, todayInTZ(), {
+            timeoutMs: waitMs,
+            sinceMs: startedAt - 5_000,
+          });
+        }, { reason: 'watchdog' });
       }
       await runWithClient(client, () => drainIncompleteHistory());
     } catch (e) {
@@ -230,14 +353,49 @@ async function watchdogStaleSync() {
   }
 }
 
+/**
+ * Hourly / boot: pause historical work, refresh today, then resume backfill.
+ * Backfill jobs defer while the flag is on; fill loops yield between windows.
+ */
+async function runHourlyTodayPrioritySync({ reason = 'hourly' } = {}) {
+  const {
+    runWithTodayPriority,
+    waitForSyncTodaySuccess,
+  } = require('../services/syncPriorityGate');
+  const { listActiveClients } = require('../models/clientStore');
+  const today = todayInTZ();
+
+  await runWithTodayPriority(async ({ startedAt, waitMs, nested }) => {
+    await enqueueLeanToday({ reason });
+    // Nested (watchdog while hourly already waiting): enqueue only — do not stack another 20m wait.
+    if (nested) {
+      logger.info(`[today-priority] nested ${reason} — skipped wait/ads (outer window owns them)`);
+      return;
+    }
+    const clients = await listActiveClients();
+    for (const client of clients) {
+      await waitForSyncTodaySuccess(client.id, today, {
+        timeoutMs: waitMs,
+        sinceMs: startedAt - 5_000,
+      });
+    }
+    // Ads today while still in priority window (historical ads jobs stay deferred).
+    await enqueueAdsSyncToday({ reason });
+  }, { reason });
+}
+
 async function enqueueHourlyLeanSync({ reason } = {}) {
-  await enqueueLeanToday({ reason });
-  // On boot, also refresh yesterday + recent gaps + full historical months.
   if (reason === 'boot') {
+    // Today first under priority gate, then historical drain. Skip Ads reconcile on boot
+    // (hourly today + 6h yesterday cover the same window without extra BullMQ fan-out).
+    await runHourlyTodayPrioritySync({ reason: 'boot' });
     await enqueueLeanYesterdayAndFullToday({ reason: 'boot' });
+    await enqueueAdsSyncYesterday({ reason: 'boot' });
     await enqueueRecentGapFill({ reason: 'boot', days: 30 });
     await enqueueMonthCompleteBackfill({ reason: 'boot' });
+    return;
   }
+  await runHourlyTodayPrioritySync({ reason: reason || 'hourly' });
 }
 
 function startCron() {
@@ -246,19 +404,21 @@ function startCron() {
     return;
   }
 
-  // ── Every hour: lean today only (dashboard present) ──────────────────────
+  // ── Every hour: today-priority window (pause backfill → sync today → resume) ──
   cron.schedule('0 * * * *', async () => {
-    await enqueueLeanToday({ reason: 'hourly' });
+    await runHourlyTodayPrioritySync({ reason: 'hourly' });
   }, { timezone: 'Asia/Singapore' });
 
-  // ── Every 6 hours: yesterday lean ────────────────────────────────────────
+  // ── Every 6 hours: yesterday lean + Ads spend yesterday ─────────────────
   cron.schedule('15 */6 * * *', async () => {
     await enqueueLeanYesterdayAndFullToday({ reason: '6h' });
+    await enqueueAdsSyncYesterday({ reason: '6h' });
   }, { timezone: 'Asia/Singapore' });
 
-  // ── Every hour :30 SGT: reconcile today + yesterday vs live GAM ───────────
+  // ── Every hour :30 SGT: reconcile today + yesterday vs live GAM + Ads ───
   cron.schedule('30 * * * *', async () => {
     await enqueueReconcileRecent({ reason: 'hourly-reconcile' });
+    await enqueueAdsReconcileRecent({ reason: 'hourly-reconcile' });
   }, { timezone: 'Asia/Singapore' });
 
   // ── 1 AM daily: full historical reconciliation walk ─────────────────────
@@ -295,9 +455,71 @@ function startCron() {
     });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── 4 AM daily: Google Ads spend sync (lookback window) — 1 job per client ──
+  cron.schedule('0 4 * * *', async () => {
+    if (!isAdsCronEnabled()) return;
+    const lookback = parseInt(process.env.GOOGLE_ADS_SYNC_LOOKBACK_DAYS || '30', 10) || 30;
+    const end = todayInTZ();
+    const start = shiftYMD(end, -(lookback - 1));
+    const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
+    await eachActiveClient(async (client) => {
+      const cid = client.id;
+      try {
+        const { accounts, jobs, skipped } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
+          startDate: start,
+          endDate: end,
+          jobIdPrefix: `ads-sync-daily-${cid.slice(0, 8)}-${end}`,
+          priority: 4,
+          skipIfTodayPriority: true,
+        });
+        if (skipped) return;
+        logger.info(
+          `Cron: enqueued ads-sync-daily jobs=${jobs} accounts=${accounts} `
+          + `client=${cid.slice(0, 8)} ${start}→${end}`
+        );
+      } catch (e) {
+        logger.error('Cron: failed to enqueue ads-sync:', e.message);
+      }
+    });
+  }, { timezone: 'Asia/Singapore' });
+
+  // ── Optional every-3h Ads recent catch-up (off by default — overlaps hourly/6h/4AM) ──
+  // Set ADS_RECENT_CRON=true to enable.
+  cron.schedule('45 */3 * * *', async () => {
+    if (!isAdsCronEnabled()) return;
+    const enabled = String(process.env.ADS_RECENT_CRON || '').trim().toLowerCase();
+    if (enabled !== 'true' && enabled !== '1' && enabled !== 'yes') return;
+    const recentDays = parseInt(process.env.GOOGLE_ADS_RECENT_SYNC_DAYS || '3', 10) || 3;
+    const end = todayInTZ();
+    const start = shiftYMD(end, -(Math.max(1, recentDays) - 1));
+    const slot = Math.floor(Date.now() / (3 * 60 * 60 * 1000));
+    const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
+    await eachActiveClient(async (client) => {
+      const cid = client.id;
+      try {
+        const { accounts, jobs, skipped } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
+          startDate: start,
+          endDate: end,
+          jobIdPrefix: `ads-sync-recent-${cid.slice(0, 8)}-${end}-${slot}`,
+          priority: 3,
+          skipIfTodayPriority: true,
+        });
+        if (skipped) return;
+        logger.info(
+          `Cron: enqueued ads-sync-recent jobs=${jobs} accounts=${accounts} `
+          + `client=${cid.slice(0, 8)} ${start}→${end}`
+        );
+      } catch (e) {
+        logger.error('Cron: failed to enqueue ads-sync-recent:', e.message);
+      }
+    });
+  }, { timezone: 'Asia/Singapore' });
+
   logger.info(
-    'Cron jobs started: hourly today, :30 reconcile-recent, 1AM reconcile-historical,'
-    + ' 6h yesterday, 2AM complete-month backfill, 3AM archive, 15m watchdog, boot kickoff'
+    'Cron jobs started: hourly today-priority (+ads 1 job/client), :30 GAM reconcile '
+    + '(Ads reconcile off unless ADS_RECONCILE_CRON=true), 1AM reconcile-historical,'
+    + ' 6h yesterday (+ads), 2AM complete-month, 3AM archive, 4AM ads-full, '
+    + '3h ads-recent off unless ADS_RECENT_CRON=true, 15m watchdog, boot kickoff'
   );
 
   // Don't wait until the next clock hour — fill today's present now.
@@ -311,8 +533,12 @@ function startCron() {
 module.exports = {
   startCron,
   enqueueHourlyLeanSync,
+  runHourlyTodayPrioritySync,
   enqueueRecentGapFill,
   enqueueMonthCompleteBackfill,
   enqueueReconcileRecent,
   enqueueReconcileHistorical,
+  enqueueAdsSyncToday,
+  enqueueAdsSyncYesterday,
+  enqueueAdsReconcileRecent,
 };

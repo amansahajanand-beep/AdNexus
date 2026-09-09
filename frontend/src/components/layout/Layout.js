@@ -7,16 +7,35 @@ import { NO_DOMAINS_MSG, NO_DOMAINS_TITLE, hasAssignedInventory } from '../../ut
 import BrandLogo from '../ui/BrandLogo';
 import ToastStack from '../ui/ToastStack';
 import CommandPalette from '../ui/CommandPalette';
+import DataFreshness from '../ui/DataFreshness';
+import { ConfirmDialogHost } from '../../hooks/useConfirmDialog';
 import { rememberLastRoute } from '../../utils/lastRoute';
 import { APP_TIMEZONE } from '../../utils/datetime';
+import { buildFreshnessLabel } from '../../utils/dataFreshness';
+import { applyTheme, isDarkTheme, readStoredTheme } from '../../utils/theme';
+import {
+  NavIcon,
+  Sun,
+  Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Menu,
+  X,
+  LogOut,
+  Settings,
+  UserRound,
+  ShieldAlert,
+} from '../ui/Icon';
 
 const FOCUS_KEY = 'adnexus.focusMode';
 
 const NAV_ITEMS = [
-  { to: '/dashboard', label: 'Dashboard', short: 'D', page: 'dashboard' },
-  { to: '/reporting', label: 'Reporting', short: 'R', page: 'reporting' },
-  { to: '/admin', label: 'Admin', short: 'A', adminOnly: true },
-  { to: '/domain-user', label: 'Domain User', short: 'U', page: 'domain-user' },
+  { to: '/dashboard', label: 'Dashboard', page: 'dashboard' },
+  { to: '/reporting', label: 'Reporting', page: 'reporting' },
+  { to: '/roi', label: 'ROI', page: 'roi' },
+  { to: '/presets', label: 'Presets', page: 'presets' },
+  { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
+  { to: '/domain-user', label: 'Domain User', page: 'domain-user' },
 ];
 
 function statusLabel(isMock, authError) {
@@ -44,6 +63,7 @@ export default function Layout() {
   const [userOpen, setUserOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [focusMode, setFocusMode] = useState(readFocusMode);
+  const [darkMode, setDarkMode] = useState(() => readStoredTheme() === 'dark');
   const userRef = useRef(null);
 
   const toggleFocusMode = useCallback(() => {
@@ -56,6 +76,11 @@ export default function Layout() {
       }
       return next;
     });
+  }, []);
+
+  const toggleDarkMode = useCallback(() => {
+    const next = applyTheme(isDarkTheme() ? 'light' : 'dark');
+    setDarkMode(next === 'dark');
   }, []);
 
   useEffect(() => {
@@ -120,7 +145,7 @@ export default function Layout() {
     navigate('/login', { replace: true, state: { resetKey: Date.now() } });
   };
   const go = (to) => { navigate(to); setUserOpen(false); };
-  const profileRoute = canPage('domain-user') ? '/domain-user' : (isAdmin ? '/admin' : null);
+  const profileRoute = isAdmin ? '/admin' : (canPage('domain-user') ? '/domain-user' : null);
   const goProfile = () => {
     if (profileRoute) go(profileRoute);
   };
@@ -139,6 +164,8 @@ export default function Layout() {
   const liveClass = `live-dot header-live${isMock ? ' is-mock' : ''}${authError ? ' is-auth-error' : ''}`;
   const currencyCode = networkInfo?.currencyCode || 'USD';
   const tzShort = APP_TIMEZONE === 'Asia/Singapore' ? 'SGT' : APP_TIMEZONE;
+  const freshnessTitle = buildFreshnessLabel(networkInfo, { tzLabel: tzShort })
+    || liveText;
 
   const gv = networkInfo?.gamVersion;
   const verStatus = gv?.status;
@@ -217,7 +244,9 @@ export default function Layout() {
                 className={({ isActive }) => `nav-btn ${isActive ? 'active' : ''}`}
                 onClick={() => setMenuOpen(false)}
               >
-                <span className="nav-btn-short" aria-hidden>{item.short}</span>
+                <span className="nav-btn-icon" aria-hidden>
+                  <NavIcon page={item.page} size={focusMode ? 20 : 18} />
+                </span>
                 <span className="nav-btn-label">{item.label}</span>
               </NavLink>
             ))}
@@ -227,16 +256,35 @@ export default function Layout() {
             <button
               type="button"
               className="sidebar-focus-toggle"
+              onClick={toggleDarkMode}
+              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-pressed={darkMode}
+            >
+              <span className="sidebar-toggle-icon" aria-hidden>
+                {darkMode ? <Sun size={16} strokeWidth={1.75} /> : <Moon size={16} strokeWidth={1.75} />}
+              </span>
+              <span className="sidebar-focus-label">{darkMode ? 'Light' : 'Dark'}</span>
+            </button>
+            <button
+              type="button"
+              className="sidebar-focus-toggle"
               onClick={toggleFocusMode}
               title={focusMode ? 'Expand sidebar ([)' : 'Focus mode — more chart width ([)'}
               aria-pressed={focusMode}
             >
-              {focusMode ? '»' : '«'}
+              <span className="sidebar-toggle-icon" aria-hidden>
+                {focusMode
+                  ? <PanelLeftOpen size={16} strokeWidth={1.75} />
+                  : <PanelLeftClose size={16} strokeWidth={1.75} />}
+              </span>
               <span className="sidebar-focus-label">{focusMode ? 'Expand' : 'Focus'}</span>
             </button>
-            <div className={liveClass} title={liveText}>
+            <div className={liveClass} title={freshnessTitle}>
               <span className="dot-pulse" />
               <span className="live-dot-label">{liveText}</span>
+              {!focusMode && !authError && networkInfo && (networkInfo.gamLastSyncedAt || networkInfo.adsLastSyncedAt) && (
+                <DataFreshness networkInfo={networkInfo} tzLabel={tzShort} compact className="live-dot-fresh" />
+              )}
             </div>
             <div className="user-menu" ref={userRef}>
               <button type="button" className="user-btn" onClick={() => setUserOpen(o => !o)} title={user?.username}>
@@ -260,12 +308,21 @@ export default function Layout() {
                     </div>
                   </button>
                   {isAdmin && (
-                    <button type="button" className="user-dd-item" onClick={() => go('/admin')}>Admin Settings</button>
+                    <button type="button" className="user-dd-item" onClick={() => go('/admin')}>
+                      <Settings size={15} strokeWidth={1.75} aria-hidden />
+                      Admin Settings
+                    </button>
                   )}
                   {canPage('domain-user') && (
-                    <button type="button" className="user-dd-item" onClick={() => go('/domain-user')}>My Profile</button>
+                    <button type="button" className="user-dd-item" onClick={() => go('/domain-user')}>
+                      <UserRound size={15} strokeWidth={1.75} aria-hidden />
+                      My Profile
+                    </button>
                   )}
-                  <button type="button" className="user-dd-item" onClick={handleLogout}>Logout</button>
+                  <button type="button" className="user-dd-item" onClick={handleLogout}>
+                    <LogOut size={15} strokeWidth={1.75} aria-hidden />
+                    Logout
+                  </button>
                 </div>
               )}
             </div>
@@ -281,9 +338,19 @@ export default function Layout() {
               aria-expanded={menuOpen}
               onClick={() => setMenuOpen(o => !o)}
             >
-              {menuOpen ? '✕' : '☰'}
+              {menuOpen ? <X size={18} strokeWidth={1.75} /> : <Menu size={18} strokeWidth={1.75} />}
             </button>
             <BrandLogo />
+            <button
+              type="button"
+              className="theme-toggle-mobile"
+              onClick={toggleDarkMode}
+              title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+              aria-pressed={darkMode}
+            >
+              {darkMode ? <Sun size={16} strokeWidth={1.75} /> : <Moon size={16} strokeWidth={1.75} />}
+            </button>
             <span className="context-chip" title={`Currency ${currencyCode} · ${APP_TIMEZONE}`}>
               {currencyCode} · {tzShort}
             </span>
@@ -297,7 +364,9 @@ export default function Layout() {
             {noAccess ? (
               <div className="no-access-wrap">
                 <div className="no-access-card">
-                  <div className="no-access-icon" aria-hidden>!</div>
+                  <div className="no-access-icon" aria-hidden>
+                    <ShieldAlert size={28} strokeWidth={1.75} />
+                  </div>
                   <h2 className="no-access-title">{noInventoryAssigned ? NO_DOMAINS_TITLE : 'Access Restricted'}</h2>
                   <p className="no-access-msg">
                     {noInventoryAssigned
@@ -307,10 +376,11 @@ export default function Layout() {
                 </div>
               </div>
             ) : (
-              <Outlet context={{ networkInfo, isMock }} />
+              <Outlet key={darkMode ? 'dark' : 'light'} context={{ networkInfo, isMock }} />
             )}
           </main>
           <ToastStack />
+          <ConfirmDialogHost />
           <CommandPalette />
         </div>
       </div>

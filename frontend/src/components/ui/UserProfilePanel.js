@@ -3,6 +3,7 @@ import { useDispatch } from 'react-redux';
 import { TextField, PasswordField } from './Field';
 import Button from './Button';
 import { validatePassword, PASSWORD_RULES_HINT } from '../../utils/passwordPolicy';
+import { validateUsername, USERNAME_RULES_HINT } from '../../utils/namePolicy';
 import { sessionAPI } from '../../utils/api';
 import { authSuccess } from '../../store/actions/authActions';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
@@ -74,8 +75,9 @@ export default function UserProfilePanel({ user, layout = 'card' }) {
       && Boolean(String(newPassword).trim() || String(confirmPassword).trim() || String(currentPassword).trim());
 
     if (usernameChanged) {
-      if (!name) {
-        setError('Username is required.');
+      const nameCheck = validateUsername(name);
+      if (!nameCheck.valid) {
+        setError(nameCheck.errors[0]);
         return;
       }
     }
@@ -223,13 +225,14 @@ export default function UserProfilePanel({ user, layout = 'card' }) {
           <div className="profile-form">
             <div className="profile-form-row">
               <TextField label="Username" value={username} onChange={setUsername} placeholder="Username" />
+              <p className="form-note" style={{ marginTop: -8 }}>{USERNAME_RULES_HINT}</p>
               <TextField label="Email" type="email" value={email} onChange={setEmail} placeholder="you@example.com" />
             </div>
           </div>
         </section>
 
         <section className="profile-panel profile-panel--security">
-          <div className="profile-panel-head">
+          <div className="profile-panel-head profile-panel-head--password">
             <h3 className="profile-panel-title">Change password</h3>
             <label className="profile-pw-change-toggle">
               <input
@@ -240,16 +243,18 @@ export default function UserProfilePanel({ user, layout = 'card' }) {
               <span>I want to change my password</span>
             </label>
           </div>
-          <p className="form-note profile-pw-note">
-            {changePassword
-              ? 'Enter your current password, then choose a new one.'
-              : 'Your password is saved securely and shown as ••••••••.'}
-          </p>
-          <div className="profile-pw-admin-notice" role="note">
-            <span className="profile-pw-admin-notice-icon" aria-hidden>ℹ️</span>
-            <p>
-              If you don&apos;t remember your current password, please contact your admin to change or reset it.
+          <div className="profile-pw-stack">
+            <p className="form-note profile-pw-note">
+              {changePassword
+                ? 'Enter your current password, then choose a new one.'
+                : 'Your password is saved securely and shown as ••••••••.'}
             </p>
+            <div className="profile-pw-admin-notice" role="note">
+              <span className="profile-pw-admin-notice-icon" aria-hidden>ℹ️</span>
+              <p>
+                If you don&apos;t remember your current password, please contact your admin to change or reset it.
+              </p>
+            </div>
           </div>
           {/* Trap browser autofill so saved login password is not injected into these fields */}
           <div className="profile-autofill-trap" aria-hidden="true">

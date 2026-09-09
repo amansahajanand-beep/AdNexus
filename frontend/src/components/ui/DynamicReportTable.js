@@ -11,6 +11,7 @@ import { sortRowsByColumn } from '../../utils/enrichReportRows';
 import { useMedia } from '../../hooks/useMedia';
 import { showToast } from '../../hooks/useToast';
 import { downloadCsv, downloadExcel, exportCellValue } from '../../utils/tableExport';
+import { EmptyIcon } from './Icon';
 
 /**
  * GAM-style table — columns driven by selected dimensions & metrics.
@@ -21,6 +22,8 @@ export default function DynamicReportTable({
   rows = [],
   dimensions = [],
   metrics = [],
+  /** Pre-built columns (e.g. ROI). When set, dimensions/metrics are ignored. */
+  columns: customColumns = null,
   visibility = {},
   currency = 'USD',
   loading = false,
@@ -55,8 +58,10 @@ export default function DynamicReportTable({
 }) {
   const isMobile = useMedia('(max-width: 640px)');
   const allColumns = useMemo(
-    () => buildReportColumns(dimensions, metrics, visibility),
-    [dimensions, metrics, visibility]
+    () => (Array.isArray(customColumns) && customColumns.length
+      ? customColumns
+      : buildReportColumns(dimensions, metrics, visibility)),
+    [customColumns, dimensions, metrics, visibility]
   );
   const [hiddenIds, setHiddenIds] = useState(() => {
     if (!columnStorageKey) return [];
@@ -328,7 +333,7 @@ export default function DynamicReportTable({
       <div className="table-wrap">
         {showEmptyPanel && !loading ? (
           <div className="gam-report-empty">
-            <div className="gam-report-empty-icon" aria-hidden>—</div>
+            <div className="gam-report-empty-icon" aria-hidden><EmptyIcon size={40} /></div>
             <p className="gam-report-empty-title">
               {noReport ? noReportMessage : emptyMessage}
             </p>
@@ -432,15 +437,20 @@ export default function DynamicReportTable({
             ) : (
               pageRows.map((row, i) => (
                 <tr key={i}>
-                  {columns.map((col) => (
-                    <td
-                      key={col.id}
-                      data-label={col.label}
-                      className={col.cellClass || undefined}
-                    >
-                      {renderCell(row, col)}
-                    </td>
-                  ))}
+                  {columns.map((col) => {
+                    const cls = [col.cellClass, typeof col.getCellClass === 'function' ? col.getCellClass(row) : '']
+                      .filter(Boolean)
+                      .join(' ');
+                    return (
+                      <td
+                        key={col.id}
+                        data-label={col.label}
+                        className={cls || undefined}
+                      >
+                        {renderCell(row, col)}
+                      </td>
+                    );
+                  })}
                 </tr>
               ))
             )}

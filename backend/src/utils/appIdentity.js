@@ -229,7 +229,7 @@ function expandAppFilterAliases(apps = [], mapsInput = null) {
 
 function loadCachedAppPackageMaps() {
   try {
-    const { cache } = require('../gamClient');
+    const { cache } = require('../gam/client');
     const catalog = cache.get('filter_catalog_inventory_v25');
     return rehydrateAppPackageMaps(catalog?.appPackageMaps);
   } catch (_) {

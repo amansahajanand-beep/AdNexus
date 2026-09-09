@@ -3339,8 +3339,15 @@ async function fetchFromGAM(startDate, endDate, onBatch, opts = {}) {
   const slices = Array.isArray(opts.sliceKeys) && opts.sliceKeys.length
     ? LEAN_SYNC_DIM_SLICES.filter((s) => opts.sliceKeys.includes(s.key))
     : LEAN_SYNC_DIM_SLICES;
+  const yieldOnTodayPriority = opts.yieldOnTodayPriority === true;
+  const { assertNotTodayPriority } = yieldOnTodayPriority
+    ? require('./syncPriorityGate')
+    : { assertNotTodayPriority: null };
 
   for (const slice of slices) {
+    if (assertNotTodayPriority) {
+      await assertNotTodayPriority(opts.syncType || 'backfill');
+    }
     try {
       const sliceOnBatch = stream && onBatch
         ? async (rawChunk) => onBatch(rawChunk, slice.key)
@@ -3365,6 +3372,7 @@ async function fetchFromGAM(startDate, endDate, onBatch, opts = {}) {
         totalRows += got.length;
       }
     } catch (err) {
+      if (err?.yieldToToday) throw err;
       lastErr = err;
       logger.warn(`GAM lean slice ${slice.key} error: ${err.message}`);
     }
@@ -3406,7 +3414,15 @@ async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill',
   let grainCount = 0;
   const touchedDates = new Set();
   const kpiOnly = opts.kpiOnly === true || syncType === 'sync-network-kpi';
-  const fetchOpts = kpiOnly ? { kpiOnly: true, sliceKeys: ['network_kpi'] } : {};
+  const today = todayInTZ();
+  // Historical fills must yield mid-run when hourly today-priority turns on.
+  const yieldOnTodayPriority = syncType !== 'sync-today'
+    && !(syncType === 'sync-day' && startDate === today && endDate === today);
+  const fetchOpts = {
+    ...(kpiOnly ? { kpiOnly: true, sliceKeys: ['network_kpi'] } : {}),
+    yieldOnTodayPriority,
+    syncType,
+  };
 
   const result = await fetchFromGAM(startDate, endDate, async (rawChunk, sliceKey) => {
     if (!rawChunk?.length) return;
@@ -3552,18 +3568,25 @@ async function fillMissingGrainDates(startDate, endDate, syncType = 'fill-gaps')
   windows.push({ startDate: runStart, endDate: runEnd });
 
   let total = 0;
+  const { assertNotTodayPriority } = require('./syncPriorityGate');
   for (const win of windows) {
+    // Hourly today-priority: stop between windows so sync-today can run; resume later
+    // re-scans missing days (already-written days stay filled).
+    await assertNotTodayPriority(syncType);
     try {
       total += await streamSyncFromGAM(win.startDate, win.endDate, syncType);
     } catch (e) {
+      if (e?.yieldToToday) throw e;
       logger.warn(
         `[${syncType}] Window ${win.startDate}..${win.endDate} failed, falling back day-by-day: ${e.message}`
       );
       let cursor = win.startDate;
       while (cursor <= win.endDate) {
+        await assertNotTodayPriority(syncType);
         try {
           total += await streamSyncFromGAM(cursor, cursor, syncType);
         } catch (dayErr) {
+          if (dayErr?.yieldToToday) throw dayErr;
           logger.warn(`[${syncType}] Failed to sync ${cursor}:`, dayErr.message);
         }
         cursor = shiftDate(cursor, 1);
@@ -3670,6 +3693,8 @@ async function syncCompleteDateRangeFromGAM(startDate, endDate, syncType = 'sync
     + ` (oldest ${missing[0]}, newest ${missing[missing.length - 1]})`
   );
 
+  const { assertNotTodayPriority } = require('./syncPriorityGate');
+  await assertNotTodayPriority(syncType);
   let total = await fillMissingGrainDates(startDate, endDate, syncType);
 
   missing = await listMissingGrainDates(startDate, endDate);
@@ -3680,12 +3705,15 @@ async function syncCompleteDateRangeFromGAM(startDate, endDate, syncType = 'sync
     );
     const windows = listSyncWindows(missing[0], missing[missing.length - 1], { oldestFirst: true });
     for (const win of windows) {
+      await assertNotTodayPriority(syncType);
       try {
         total += await streamSyncFromGAM(win.startDate, win.endDate, syncType);
       } catch (e) {
+        if (e?.yieldToToday) throw e;
         logger.warn(`[${syncType}] Window ${win.startDate}..${win.endDate} failed: ${e.message}`);
       }
     }
+    await assertNotTodayPriority(syncType);
     total += await fillMissingGrainDates(startDate, endDate, `${syncType}:gap-retry`);
     missing = await listMissingGrainDates(startDate, endDate);
   }

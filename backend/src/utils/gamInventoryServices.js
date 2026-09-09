@@ -13,7 +13,7 @@
 
 const axios = require('axios');
 const { GAM_API_VERSION } = require('./gamVersion');
-const { cache } = require('../gamClient');
+const { cache } = require('../gam/client');
 const logger = require('./logger');
 const { isLikelyWebDomain, isLikelyAdUnitName } = require('./adUnit');
 

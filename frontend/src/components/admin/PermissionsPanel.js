@@ -21,6 +21,8 @@ export default function PermissionsPanel({
   onSitesChange,
   allowedAppIds = [],
   onAppIdsChange,
+  allowedAdsAccountIds = [],
+  onAdsAccountsChange,
   dateRestrictionStart = '',
   dateRestrictionEnd = '',
   onDateRestrictionChange,
@@ -29,6 +31,8 @@ export default function PermissionsPanel({
   catalogLoading = false,
   catalogRows = [],
   catalogLists = {},
+  adsAccountOptions = [],
+  adsAccountsLoading = false,
 }) {
   const siteOptions = useMemo(
     () => buildAdminSitePickerOptions({
@@ -111,6 +115,23 @@ export default function PermissionsPanel({
           searchPlaceholder="Search app ID…"
           emptyLabel="No app IDs found"
           itemLabel="app IDs"
+        />
+      </div>
+
+      <div className="ui-field">
+        <span className="ui-field-label">Data scope — assigned Google Ads accounts</span>
+        <p className="form-note">
+          Pick which Ads client accounts this user can see in ROI. Leave empty for no Ads account access.
+        </p>
+        <DomainSelector
+          domains={adsAccountOptions}
+          selected={allowedAdsAccountIds}
+          onChange={onAdsAccountsChange}
+          loading={adsAccountsLoading}
+          selectAllLabel="Select All Ads Accounts"
+          searchPlaceholder="Search Ads account…"
+          emptyLabel="No Ads accounts found — add them under Google Ads accounts"
+          itemLabel="accounts"
         />
       </div>
 

@@ -3,7 +3,7 @@ import {
   REPORT_SETTINGS_OPTIONS,
   DEFAULT_REPORT_SETTINGS,
   DATE_PRESETS,
-} from '../../utils/gamReportCatalog';
+} from '../../utils/report/gamReportCatalog';
 import {
   allowedDatePresets,
   isPresetAllowedForRestriction,

@@ -1,4 +1,4 @@
-import { optionsFor, readDomainName, resolveSiteHost, rootDomainFromHost, validSiteHostsOnly } from './filters';
+import { optionsFor, readDomainName, resolveSiteHost, rootDomainFromHost, validSiteHostsOnly } from './filters/filters';
 import { catalogRowsToAppIdOptions } from './domainCatalog';
 import { isLikelyAppPackage } from './appPackage';
 function hostKeysForLookup(site) {

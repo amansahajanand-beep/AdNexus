@@ -1,29 +1,52 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useLocation } from 'react-router-dom';
-import { usersAPI, domainsAPI, reportsAPI } from '../utils/api';
+import { usersAPI, domainsAPI, reportsAPI, adsAPI } from '../utils/api';
 import { useAuth } from '../store/useAuth';
 import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions, normalizeDomainPickerOptions } from '../utils/domainCatalog';
 import { isLikelyAppPackage } from '../utils/appPackage';
-import UserManagement from './admin/UserManagement';
-import ClientSettings from './admin/ClientSettings';
-import DomainPermissions from './admin/DomainPermissions';
-import PageHeader from './ui/PageHeader';
+import UserManagement from '../components/admin/UserManagement';
+import ClientSettings from '../components/admin/ClientSettings';
+import AdsAccountsAdmin from '../components/admin/AdsAccountsAdmin';
+import DomainPermissions from '../components/admin/DomainPermissions';
+import PageHeader from '../components/ui/PageHeader';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
+import { Users, ShieldAlert, Settings, Megaphone } from '../components/ui/Icon';
+
 const TABS = [
-  { id: 'user', label: 'Users' },
-  { id: 'domains', label: 'Assign Permissions' },
-  { id: 'client', label: 'GAM credentials' },
+  { id: 'user', label: 'Users', Icon: Users },
+  { id: 'domains', label: 'Assign Permissions', Icon: ShieldAlert },
+  { id: 'client', label: 'GAM connection', Icon: Settings },
+  { id: 'ads', label: 'Google Ads accounts', Icon: Megaphone },
 ];
+
+function buildAdsAccountPickerOptions(accounts = []) {
+  return (accounts || [])
+    .filter((a) => a && a.accountType === 'client' && a.isActive !== false)
+    .map((a) => {
+      const name = a.descriptiveName || a.customerId || a.id;
+      const cid = a.customerId ? String(a.customerId) : '';
+      return {
+        id: String(a.id),
+        label: cid && name !== cid ? `${name} (${cid})` : String(name),
+      };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
 
 export default function Admin() {
   const { user } = useAuth();
   const location = useLocation();
-  const [tab, setTab] = useState(() => (
-    new URLSearchParams(location.search).get('oauth') ? 'client' : 'user'
-  ));
+  const [tab, setTab] = useState(() => {
+    const params = new URLSearchParams(location.search);
+    if (params.get('tab') === 'ads' || params.get('ads_oauth')) return 'ads';
+    if (params.get('oauth')) return 'client';
+    return 'user';
+  });
 
   useEffect(() => {
-    if (new URLSearchParams(location.search).get('oauth')) setTab('client');
+    const params = new URLSearchParams(location.search);
+    if (params.get('tab') === 'ads' || params.get('ads_oauth')) setTab('ads');
+    else if (params.get('oauth')) setTab('client');
   }, [location.search]);
   const [users, setUsers] = useState([]);
   const [usersLoading, setUsersLoading] = useState(true);
@@ -34,6 +57,8 @@ export default function Admin() {
   const [catalogLists, setCatalogLists] = useState({ siteHosts: [], appIds: [], sitesByDomain: {}, adUnitsByHost: {} });
   const [domainsLoading, setDomainsLoading] = useState(true);
   const [catalogLoading, setCatalogLoading] = useState(true);
+  const [adsAccountOptions, setAdsAccountOptions] = useState([]);
+  const [adsAccountsLoading, setAdsAccountsLoading] = useState(true);
 
   const [permSaving, setPermSaving] = useState(false);
   const [permError, setPermError] = useState(null);
@@ -48,6 +73,19 @@ export default function Admin() {
       setUsersError(getUserFacingMessage(err, 'Could not load users. Please refresh the page.'));
     } finally {
       setUsersLoading(false);
+    }
+  }, []);
+
+  const loadAdsAccounts = useCallback(async () => {
+    setAdsAccountsLoading(true);
+    try {
+      const list = await adsAPI.listAccounts();
+      setAdsAccountOptions(buildAdsAccountPickerOptions(Array.isArray(list) ? list : list?.accounts || []));
+    } catch (err) {
+      logErrorForDebug(err, 'Admin ads accounts picker');
+      setAdsAccountOptions([]);
+    } finally {
+      setAdsAccountsLoading(false);
     }
   }, []);
 
@@ -106,7 +144,11 @@ export default function Admin() {
       setDomainsLoading(false);
     }
   }, []);
-  useEffect(() => { loadUsers(); loadDomains(); }, [loadUsers, loadDomains]);
+  useEffect(() => { loadUsers(); loadDomains(); loadAdsAccounts(); }, [loadUsers, loadDomains, loadAdsAccounts]);
+
+  useEffect(() => {
+    if (tab === 'user' || tab === 'domains') loadAdsAccounts();
+  }, [tab, loadAdsAccounts]);
 
   // ─── Action handlers ──────────────────────────────────────────────────────
   const onCreate = async (payload) => {
@@ -141,8 +183,14 @@ export default function Admin() {
     <div className="dashboard-page admin-page">
       <PageHeader
         title="Admin"
-        subtitle="Users, inventory permissions, and GAM OAuth credentials"
-        summary={tab === 'user' ? 'User management' : tab === 'domains' ? 'Assign inventory access' : 'Client OAuth settings'}
+        subtitle="Users, inventory permissions, GAM OAuth, and Google Ads ROI setup"
+        summary={
+          tab === 'user' ? 'User management'
+            : tab === 'domains' ? 'Assign inventory access'
+              : tab === 'client' ? 'Client OAuth settings'
+                : tab === 'ads' ? 'Google Ads MCC & accounts'
+                  : ''
+        }
       />
 
       <div className="admin-tabs" role="tablist" aria-label="Admin sections">
@@ -155,6 +203,7 @@ export default function Admin() {
             className={`admin-tab ${tab === t.id ? 'active' : ''}`}
             onClick={() => setTab(t.id)}
           >
+            <t.Icon size={15} strokeWidth={1.75} className="admin-tab-icon" aria-hidden />
             {t.label}
           </button>
         ))}
@@ -170,6 +219,8 @@ export default function Admin() {
           catalogLoading={catalogLoading}
           catalogRows={catalogRows}
           catalogLists={catalogLists}
+          adsAccountOptions={adsAccountOptions}
+          adsAccountsLoading={adsAccountsLoading}
           onCreate={onCreate}
           onUpdate={onUpdate}
           onSavePermissions={onSavePermissions}
@@ -181,6 +232,8 @@ export default function Admin() {
 
       {tab === 'client' && <ClientSettings />}
 
+      {tab === 'ads' && <AdsAccountsAdmin />}
+
       {tab === 'domains' && (
         <DomainPermissions
           users={users}
@@ -190,6 +243,8 @@ export default function Admin() {
           catalogLoading={catalogLoading}
           catalogRows={catalogRows}
           catalogLists={catalogLists}
+          adsAccountOptions={adsAccountOptions}
+          adsAccountsLoading={adsAccountsLoading}
           onSave={onSaveDomainTab}
           saving={permSaving}
           error={permError}

@@ -8,7 +8,7 @@ import {
   DEFAULT_REPORT_METRICS,
   dimensionsToChips,
   metricsToChips,
-} from '../../utils/gamReportCatalog';
+} from '../../utils/report/gamReportCatalog';
 
 export {
   DEFAULT_REPORT_DIMENSIONS,

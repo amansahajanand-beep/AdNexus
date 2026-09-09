@@ -1,6 +1,6 @@
 import React from 'react';
-import UserProfilePanel from './ui/UserProfilePanel';
-import PageHeader from './ui/PageHeader';
+import UserProfilePanel from '../components/ui/UserProfilePanel';
+import PageHeader from '../components/ui/PageHeader';
 import { usePermissions } from '../hooks/usePermissions';
 
 export default function DomainUser() {

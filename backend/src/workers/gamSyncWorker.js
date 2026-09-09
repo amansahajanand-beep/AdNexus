@@ -8,7 +8,7 @@
  *   sync-backfill → calendar month / range until every day has KPI grain
  *   sync-fill-gaps → missing days in range (complete-month semantics)
  */
-const { Worker } = require('bullmq');
+const { Worker, DelayedError } = require('bullmq');
 const { redisSet, TTL, createBullmqConnection, isTransientRedisError } = require('../redisClient');
 const logger     = require('../utils/logger');
 const {
@@ -18,9 +18,27 @@ const {
   invalidateCacheForDate,
   logSync,
 } = require('../services/gamSyncService');
+const {
+  isTodayPriorityActive,
+  isGamJobAllowedDuringTodayPriority,
+  getTodayPriorityDeferMs,
+  TodayPriorityYieldError,
+} = require('../services/syncPriorityGate');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { runWithClient } = require('../utils/clientContext');
 const { getClientById, ensureBootstrapFromEnv } = require('../models/clientStore');
+
+async function deferForTodayPriority(job) {
+  const delayMs = await getTodayPriorityDeferMs();
+  logger.info(
+    `[gam-sync] Deferring "${job.name}" id=${job.id} for ${Math.round(delayMs / 1000)}s (today-priority)`
+  );
+  if (job.token) {
+    await job.moveToDelayed(Date.now() + delayMs, job.token);
+    throw new DelayedError();
+  }
+  throw new TodayPriorityYieldError(`Defer ${job.name} — no job token`);
+}
 
 function getGAMHelpers() {
   const { getHelpers, helpersReady } = require('../services/gamHelpers');
@@ -66,6 +84,11 @@ async function processJob(job) {
 
 async function processJobInner(job) {
   logger.info(`[gam-sync] Processing job "${job.name}" id=${job.id}`);
+
+  // Hourly window: only today (and light reconcile) jobs run; backfill yields/defers.
+  if (await isTodayPriorityActive() && !isGamJobAllowedDuringTodayPriority(job)) {
+    await deferForTodayPriority(job);
+  }
 
   if (job.name === 'archive-cold-data') {
     try {
@@ -188,7 +211,20 @@ async function processJobInner(job) {
 
     if (job.name === 'sync-today') {
       const day = targetDates[targetDates.length - 1];
-      totalUpserted = await streamSyncFromGAM(day, day, job.name);
+      const timeoutMs = Math.max(
+        5 * 60_000,
+        parseInt(process.env.SYNC_TODAY_JOB_TIMEOUT_MS || String(15 * 60_000), 10) || 15 * 60_000
+      );
+      totalUpserted = await Promise.race([
+        streamSyncFromGAM(day, day, job.name),
+        new Promise((_, reject) => {
+          setTimeout(() => {
+            const err = new Error(`sync-today timed out after ${Math.round(timeoutMs / 1000)}s`);
+            err.code = 'SYNC_TODAY_TIMEOUT';
+            reject(err);
+          }, timeoutMs);
+        }),
+      ]);
       await invalidateCacheForDate(day);
     } else if (job.name === 'sync-day') {
       const day = targetDates[0];
@@ -215,6 +251,10 @@ async function processJobInner(job) {
     await logSync(job.name, 'success', totalUpserted);
     logger.info(`[gam-sync] Job "${job.name}" done — ${totalUpserted} rows written (${startDate} → ${endDate})`);
   } catch (err) {
+    if (err instanceof DelayedError) throw err;
+    if (err?.yieldToToday || err instanceof TodayPriorityYieldError) {
+      await deferForTodayPriority(job);
+    }
     logger.error(`[gam-sync] Job "${job.name}" failed:`, err.message);
     await logSync(job.name, 'failed', totalUpserted, err.message);
     throw err;
@@ -229,6 +269,11 @@ function scheduleDrainAfterJob(job) {
 }
 
 async function drainAfterJob(job) {
+  // Don't enqueue more historical work while today-priority window is open.
+  if (await isTodayPriorityActive()) {
+    logger.info(`[gam-sync] skip drain after ${job.name} — today-priority active`);
+    return;
+  }
   let client = null;
   try {
     if (job.data?.clientId) client = await getClientById(job.data.clientId);

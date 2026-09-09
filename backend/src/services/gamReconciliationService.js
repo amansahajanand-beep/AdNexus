@@ -325,6 +325,10 @@ async function runBootReconciliation() {
 const drainInFlight = new Set();
 
 async function drainIncompleteHistory() {
+  const { isTodayPriorityActive } = require('./syncPriorityGate');
+  if (await isTodayPriorityActive()) {
+    return { missing: 0, queued: 0, skipped: true, reason: 'today-priority' };
+  }
   const { requireClientId, getClientId } = require('../utils/clientContext');
   let cid;
   try {

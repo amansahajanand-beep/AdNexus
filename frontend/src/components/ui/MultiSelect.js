@@ -205,13 +205,15 @@ export default function MultiSelect({
     applyBulkSearch(`${query}${pasted}`.trim());
   };
 
-  const label = allMode
-    ? 'All selected'
-    : value.length === 0
-      ? placeholder
-      : value.length === 1
-        ? (norm.find((o) => o.value === value[0])?.label ?? value[0])
-        : `${value.length} selected`;
+  const label = loading
+    ? 'Loading…'
+    : allMode && norm.length > 0
+      ? 'All selected'
+      : value.length === 0 || (allMode && norm.length === 0)
+        ? placeholder
+        : value.length === 1
+          ? (norm.find((o) => o.value === value[0])?.label ?? value[0])
+          : `${value.length} selected`;
 
   const menu = open && menuStyle ? (
     <div className="ms-menu ms-menu-portal" ref={menuRef} style={menuStyle}>

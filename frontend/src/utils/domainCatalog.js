@@ -1,4 +1,4 @@
-import { readDomainName } from './filters';
+import { readDomainName } from './filters/filters';
 import { isLikelyAppPackage, packageFromRow } from './appPackage';
 
 /** Build admin domain-picker options — one entry per root domain name (not ad unit). */

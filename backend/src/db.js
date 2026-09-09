@@ -1,12 +1,17 @@
+// Load .env when this module is required outside server.js / worker.js
+// (scripts, one-off requires) so we never fall back to stale hardcoded creds.
+require('dotenv').config();
+
 const { Pool } = require('pg');
 const logger = require('./utils/logger');
 
 const pool = new Pool({
   host:     process.env.PG_HOST     || '127.0.0.1',
   port:     parseInt(process.env.PG_PORT) || 5432,
-  user:     process.env.PG_USER     || 'gam_dashbaord_user',
-  password: process.env.PG_PASSWORD || 'GAM_Mediamonetix',
-  database: process.env.PG_DATABASE || 'gam_dashboard_db',
+  // Defaults match .env.example — always set PG_* in real .env
+  user:     process.env.PG_USER     || 'gam_user',
+  password: process.env.PG_PASSWORD || 'gam_password',
+  database: process.env.PG_DATABASE || 'gam_dashboard',
   ssl:      process.env.PG_SSL === 'true' ? { rejectUnauthorized: false } : false,
   // Sync jobs + API share this pool — keep enough headroom for dashboard reads
   // while hourly backfill is writing.
@@ -369,6 +374,171 @@ async function initSchema() {
     logger.warn('report_grain slice_key column:', e.message);
   }
 
+  // Google Ads ROI tables (MCC + client accounts, campaign map, spend, other expenses)
+  await schemaQuery(`
+    CREATE TABLE IF NOT EXISTS ads_accounts (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_type TEXT NOT NULL CHECK (account_type IN ('mcc', 'client')),
+      customer_id TEXT NOT NULL DEFAULT '',
+      descriptive_name TEXT NOT NULL DEFAULT '',
+      parent_mcc_id UUID REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      login_customer_id TEXT,
+      google_refresh_token_enc TEXT,
+      is_active BOOLEAN DEFAULT true,
+      include_in_roi BOOLEAN DEFAULT true,
+      last_sync_at TIMESTAMPTZ,
+      last_sync_error TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (client_id, customer_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS oauth_pending_sessions (
+      id UUID PRIMARY KEY,
+      product TEXT NOT NULL CHECK (product IN ('ads', 'gam')),
+      mode TEXT NOT NULL DEFAULT 'connect',
+      client_id UUID REFERENCES gam_clients(id) ON DELETE CASCADE,
+      refresh_token_enc TEXT,
+      candidates_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+      payload_json JSONB,
+      expires_at TIMESTAMPTZ NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+    CREATE INDEX IF NOT EXISTS idx_oauth_pending_expires
+      ON oauth_pending_sessions (expires_at);
+
+    CREATE TABLE IF NOT EXISTS ads_campaign_map (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      campaign_id TEXT NOT NULL,
+      campaign_name TEXT NOT NULL DEFAULT '',
+      target_type TEXT NOT NULL CHECK (target_type IN ('site', 'app')),
+      target_key TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (client_id, ads_account_id, campaign_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ads_spend_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      campaign_id TEXT NOT NULL,
+      campaign_name TEXT NOT NULL DEFAULT '',
+      app_id TEXT NOT NULL DEFAULT '',
+      cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks INT NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      conversions DOUBLE PRECISION NOT NULL DEFAULT 0,
+      conversion_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+      currency CHAR(3) NOT NULL DEFAULT 'USD',
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (client_id, ads_account_id, report_date, campaign_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ads_spend_country_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      campaign_id TEXT NOT NULL,
+      country_code TEXT NOT NULL DEFAULT '',
+      country_name TEXT NOT NULL DEFAULT '',
+      app_id TEXT NOT NULL DEFAULT '',
+      cost DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks INT NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      conversions DOUBLE PRECISION NOT NULL DEFAULT 0,
+      conversion_value DOUBLE PRECISION NOT NULL DEFAULT 0,
+      currency CHAR(3) NOT NULL DEFAULT 'USD',
+      cost_native DOUBLE PRECISION,
+      native_currency CHAR(3),
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (client_id, ads_account_id, report_date, campaign_id, country_code)
+    );
+
+    CREATE TABLE IF NOT EXISTS roi_other_expenses (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      expense_date DATE NOT NULL,
+      amount DOUBLE PRECISION NOT NULL,
+      label TEXT NOT NULL DEFAULT '',
+      target_type TEXT NOT NULL CHECK (target_type IN ('site', 'app', 'general')),
+      target_key TEXT NOT NULL DEFAULT '',
+      notes TEXT,
+      created_by TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+  `);
+
+  try {
+    // Existing installs may have created_by as UUID; app user ids are TEXT (e.g. user-…).
+    await schemaQuery(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND table_name = 'roi_other_expenses'
+            AND column_name = 'created_by'
+            AND data_type = 'uuid'
+        ) THEN
+          ALTER TABLE roi_other_expenses
+            ALTER COLUMN created_by TYPE TEXT USING created_by::text;
+        END IF;
+      END $$;
+    `);
+  } catch (e) {
+    logger.warn('roi_other_expenses.created_by TEXT migrate:', e.message);
+  }
+
+  try {
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_accounts_client ON ads_accounts (client_id)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_spend_client_date ON ads_spend_daily (client_id, report_date)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_spend_country_client_date ON ads_spend_country_daily (client_id, report_date)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ads_campaign_map_client ON ads_campaign_map (client_id)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_roi_expenses_client_date ON roi_other_expenses (client_id, expense_date)`);
+  } catch (e) {
+    logger.warn('ads ROI indexes:', e.message);
+  }
+
+  try {
+    await schemaQuery(`ALTER TABLE ads_accounts ADD COLUMN IF NOT EXISTS currency_code CHAR(3) NOT NULL DEFAULT 'USD'`);
+    await schemaQuery(`ALTER TABLE ads_spend_daily ADD COLUMN IF NOT EXISTS cost_native DOUBLE PRECISION`);
+    await schemaQuery(`ALTER TABLE ads_spend_daily ADD COLUMN IF NOT EXISTS native_currency CHAR(3)`);
+    await schemaQuery(`ALTER TABLE ads_spend_daily ADD COLUMN IF NOT EXISTS app_id TEXT NOT NULL DEFAULT ''`);
+  } catch (e) {
+    logger.warn('ads currency columns:', e.message);
+  }
+
+  // MCC delete must remove child accounts (not orphan them as "individual").
+  try {
+    const { rows: fkRows } = await schemaQuery(`
+      SELECT c.conname, pg_get_constraintdef(c.oid) AS def
+      FROM pg_constraint c
+      JOIN pg_class t ON t.oid = c.conrelid
+      WHERE t.relname = 'ads_accounts'
+        AND c.contype = 'f'
+        AND pg_get_constraintdef(c.oid) LIKE '%parent_mcc_id%'
+    `);
+    const needsCascade = fkRows.some((r) => !/ON DELETE CASCADE/i.test(String(r.def || '')));
+    if (needsCascade || fkRows.length === 0) {
+      for (const r of fkRows) {
+        await schemaQuery(`ALTER TABLE ads_accounts DROP CONSTRAINT IF EXISTS ${r.conname}`);
+      }
+      await schemaQuery(`
+        ALTER TABLE ads_accounts
+          ADD CONSTRAINT ads_accounts_parent_mcc_id_fkey
+          FOREIGN KEY (parent_mcc_id) REFERENCES ads_accounts(id) ON DELETE CASCADE
+      `);
+      logger.info('ads_accounts.parent_mcc_id FK → ON DELETE CASCADE');
+    }
+  } catch (e) {
+    logger.warn('ads_accounts parent_mcc_id FK cascade migrate:', e.message);
+  }
+
   // Retired warehouse — drop if leftover from older deploys (frees a lot of disk).
   try {
     await schemaQuery(`DROP TABLE IF EXISTS report_full_present CASCADE`);
@@ -469,6 +639,10 @@ const TENANT_TABLES = [
   'rollup_network_daily',
   'reconciliation_log',
   'sync_log',
+  'ads_accounts',
+  'ads_campaign_map',
+  'ads_spend_daily',
+  'roi_other_expenses',
 ];
 
 function safeIdent(name) {

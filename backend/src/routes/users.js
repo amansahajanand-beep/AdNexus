@@ -29,9 +29,10 @@ const {
 const logger = require('../utils/logger');
 
 const { validatePassword } = require('../utils/passwordPolicy');
+const { validateUsername, validateSavedName } = require('../utils/namePolicy');
 
 const { normalizePermissions, FLAG_KEYS, INVENTORY_SCOPE_KEYS } = require('../utils/permissions');
-const { cache } = require('../gamClient');
+const { cache } = require('../gam/client');
 const {
   findCachedInventoryRows,
   buildCatalogFilterOptions,
@@ -209,6 +210,11 @@ router.post('/', async (req, res) => {
 
   }
 
+  const nameCheck = validateUsername(username);
+  if (!nameCheck.valid) {
+    return res.status(400).json({ error: nameCheck.errors[0] });
+  }
+
   const pwCheck = validatePassword(password, { username: username.trim() });
 
   if (!pwCheck.valid) {
@@ -265,7 +271,11 @@ router.put('/:id', async (req, res) => {
 
   const updates = {};
 
-  if (username) updates.username = username.trim();
+  if (username) {
+    const nameCheck = validateUsername(username);
+    if (!nameCheck.valid) return res.status(400).json({ error: nameCheck.errors[0] });
+    updates.username = username.trim();
+  }
 
   if (email) updates.email = email;
 
@@ -284,6 +294,10 @@ router.put('/:id', async (req, res) => {
 
 
   const nextRole = role === 'admin' ? 'admin' : role === 'child' ? 'child' : existing.role;
+
+  if (existing.role === 'admin' && nextRole !== 'admin') {
+    return res.status(400).json({ error: 'Admin role cannot be changed to Domain User.' });
+  }
 
   if (role) updates.role = nextRole;
 

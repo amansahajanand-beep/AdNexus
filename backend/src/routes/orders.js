@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { cache } = require('../gamClient');
+const { cache } = require('../gam/client');
 const logger = require('../utils/logger');
 const { requireAuth } = require('../middleware/auth');
 const { hasFlag } = require('../utils/permissions');
@@ -60,7 +60,7 @@ router.get('/', async (req, res) => {
   if (cached) return res.json(cached);
 
   try {
-    const { getGAMClient } = require('../gamClient');
+    const { getGAMClient } = require('../gam/client');
     const auth = await getGAMClient();
     const tokenObj = await auth.getAccessToken();
     const token = tokenObj.token;

@@ -1,12 +1,28 @@
 /**
  * Google OAuth for GAM API access (not dashboard login).
- * Refresh tokens are stored on gam_clients — never written to .env.
+ * Connect with Google → discover networks → save to gam_clients → kick inventory sync.
  */
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const router = express.Router();
-const { getOAuthClient, getGAMClient } = require('../gamClient');
-const { getClientById, ensureBootstrapFromEnv, updateClientCredentials } = require('../models/clientStore');
+const { getGAMClient } = require('../gam/client');
+const {
+  getClientById,
+  ensureBootstrapFromEnv,
+  updateClientCredentials,
+  createClient,
+  getClientByNetworkCode,
+} = require('../models/clientStore');
+const { createUser, getUserByUsername } = require('../models/userStore');
+const { createPendingSession, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
+const {
+  isGamOAuthConfigured,
+  getConnectOAuthClient,
+  envGamOAuthApp,
+  listAccessibleNetworks,
+  kickGamInventorySync,
+} = require('../services/gamNetworkDiscovery');
+const { encryptSecret } = require('../utils/credentialsCrypto');
 const logger = require('../utils/logger');
 
 const SCOPES = [
@@ -16,13 +32,13 @@ const SCOPES = [
 
 const SECRET = () => process.env.JWT_SECRET || 'change_this_secret';
 
-function signOAuthState(clientId) {
-  return jwt.sign({ clientId, purpose: 'gam-oauth' }, SECRET(), { expiresIn: '15m' });
+function signOAuthState(payload) {
+  return jwt.sign({ ...payload, purpose: 'gam-oauth' }, SECRET(), { expiresIn: '20m' });
 }
 
 function verifyOAuthState(state) {
   const decoded = jwt.verify(state, SECRET());
-  if (!decoded?.clientId || decoded.purpose !== 'gam-oauth') {
+  if (decoded.purpose !== 'gam-oauth') {
     throw new Error('Invalid OAuth state');
   }
   return decoded;
@@ -33,14 +49,85 @@ function frontendAdminUrl(query = '') {
   return `${base}/admin${query}`;
 }
 
-function buildAuthUrl(client) {
-  const oauth2Client = getOAuthClient(client);
+function frontendOnboardUrl(query = '') {
+  const base = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
+  return `${base}/onboard${query}`;
+}
+
+function buildAuthUrl(client, statePayload = null) {
+  const oauth2Client = getConnectOAuthClient(client);
+  const state = statePayload
+    ? signOAuthState(statePayload)
+    : signOAuthState({ clientId: client?.id, mode: 'connect' });
   return oauth2Client.generateAuthUrl({
     access_type: 'offline',
     scope: SCOPES,
     prompt: 'consent',
-    state: signOAuthState(client.id),
+    state,
   });
+}
+
+async function commitGamNetwork({
+  clientId,
+  networkCode,
+  displayName,
+  refreshToken,
+  onboardPayload = null,
+}) {
+  const code = String(networkCode || '').trim();
+  if (!code) throw new Error('networkCode is required');
+
+  const envApp = envGamOAuthApp();
+  const googleClientId = envApp.clientId;
+  const googleClientSecret = envApp.clientSecret;
+  if (!googleClientId || !googleClientSecret) {
+    throw new Error('GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET must be set in .env');
+  }
+
+  if (onboardPayload) {
+    const dupNet = await getClientByNetworkCode(code);
+    if (dupNet) throw new Error('A client with this network code already exists.');
+    const dupUser = await getUserByUsername(String(onboardPayload.username).trim());
+    if (dupUser) throw new Error('Username already exists.');
+
+    const client = await createClient({
+      name: String(onboardPayload.name || displayName || `Network ${code}`).trim(),
+      networkCode: code,
+      googleClientId,
+      googleClientSecret,
+      refreshToken,
+      redirectUri: envApp.redirectUri || null,
+    });
+
+    const user = await createUser({
+      username: String(onboardPayload.username).trim(),
+      email: onboardPayload.email || `${String(onboardPayload.username).trim()}@local`,
+      password: onboardPayload.password,
+      role: 'admin',
+      permissions: null,
+      createdBy: 'self-onboard',
+      clientId: client.id,
+    });
+
+    await kickGamInventorySync(client);
+    return { client, user, created: true };
+  }
+
+  if (!clientId) throw new Error('clientId required');
+  const other = await getClientByNetworkCode(code);
+  if (other && other.id !== clientId) {
+    throw new Error('Network code is already used by another client.');
+  }
+
+  const next = await updateClientCredentials(clientId, {
+    networkCode: code,
+    googleClientId,
+    googleClientSecret,
+    refreshToken,
+    redirectUri: envApp.redirectUri || null,
+  });
+  await kickGamInventorySync(next);
+  return { client: next, created: false };
 }
 
 // Legacy bookmark / helper: start Google consent for the bootstrap (env-migrated) client.
@@ -51,12 +138,12 @@ router.get('/login', async (req, res) => {
       client = await getClientById(String(req.query.clientId));
     }
     if (!client) client = await ensureBootstrapFromEnv();
-    if (!client?.googleClientId || !client?.googleClientSecret) {
+    if (!isGamOAuthConfigured() && (!client?.googleClientId || !client?.googleClientSecret)) {
       return res.status(400).json({
-        error: 'No Google OAuth app on file. Register at /onboard or save client ID and secret in GAM credentials.',
+        error: 'No Google OAuth app on file. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env.',
       });
     }
-    res.redirect(buildAuthUrl(client));
+    res.redirect(buildAuthUrl(client, { clientId: client?.id, mode: 'connect' }));
   } catch (err) {
     logger.error('OAuth login error:', err.message);
     res.status(500).json({ error: 'Could not start Google OAuth', details: err.message });
@@ -70,40 +157,128 @@ router.get('/callback', async (req, res) => {
   }
 
   try {
-    let clientId = null;
+    let decoded = {};
     if (state) {
-      const decoded = verifyOAuthState(String(state));
-      clientId = decoded.clientId;
+      decoded = verifyOAuthState(String(state));
     }
-    const client = clientId
-      ? await getClientById(clientId)
-      : await ensureBootstrapFromEnv();
-    if (!client) {
-      return res.status(400).json({ error: 'Unknown client for this OAuth callback' });
+    const mode = decoded.mode || 'connect';
+    const pendingId = decoded.pendingSessionId || null;
+
+    let client = null;
+    if (decoded.clientId) {
+      client = await getClientById(decoded.clientId);
+    }
+    if (!client && mode !== 'onboard') {
+      client = await ensureBootstrapFromEnv();
     }
 
-    const oauth2Client = getOAuthClient(client);
+    const oauth2Client = getConnectOAuthClient(client);
     const { tokens } = await oauth2Client.getToken(code);
 
-    if (tokens.refresh_token) {
-      await updateClientCredentials(client.id, { refreshToken: tokens.refresh_token });
-      logger.info(`Google refresh token saved for client ${client.id}`);
-    } else {
+    if (!tokens.refresh_token) {
       logger.warn('Google callback had no refresh_token (user may have already granted access)');
+      if (mode === 'onboard') {
+        return res.redirect(frontendOnboardUrl('?oauth=error&reason=no_refresh_token'));
+      }
+      return res.redirect(frontendAdminUrl('?oauth=error&reason=no_refresh_token'));
     }
 
-    if (req.accepts('html')) {
-      return res.redirect(frontendAdminUrl('?oauth=connected'));
+    const refreshToken = tokens.refresh_token;
+    let networks = [];
+    try {
+      networks = await listAccessibleNetworks({ refreshToken, oauthClient: oauth2Client });
+    } catch (e) {
+      logger.error('getAllNetworks failed:', e.message);
+      if (mode === 'onboard') {
+        return res.redirect(frontendOnboardUrl(`?oauth=error&reason=${encodeURIComponent(e.message.slice(0, 80))}`));
+      }
+      return res.redirect(frontendAdminUrl(`?oauth=error&reason=${encodeURIComponent(e.message.slice(0, 80))}`));
     }
-    res.json({
-      success: true,
-      message: 'Authentication successful. Refresh token stored for this client.',
-      refresh_token_saved: !!tokens.refresh_token,
+
+    if (!networks.length) {
+      if (mode === 'onboard') {
+        return res.redirect(frontendOnboardUrl('?oauth=error&reason=no_networks'));
+      }
+      return res.redirect(frontendAdminUrl('?oauth=error&reason=no_networks'));
+    }
+
+    let onboardPayload = null;
+    if (mode === 'onboard' && pendingId) {
+      const pre = await getPendingSession(pendingId);
+      if (!pre || pre.product !== 'gam' || pre.mode !== 'onboard') {
+        return res.redirect(frontendOnboardUrl('?oauth=error&reason=session_expired'));
+      }
+      onboardPayload = pre.payload;
+      await deletePendingSession(pendingId);
+      if (onboardPayload?.passwordEnc) {
+        const { decryptSecret } = require('../utils/credentialsCrypto');
+        onboardPayload = {
+          ...onboardPayload,
+          password: decryptSecret(onboardPayload.passwordEnc),
+        };
+        delete onboardPayload.passwordEnc;
+      }
+    }
+
+    const candidates = networks.map((n) => ({
+      networkCode: n.networkCode,
+      displayName: n.displayName,
+      currencyCode: n.currencyCode,
+      timeZone: n.timeZone,
+    }));
+
+    // Single network → auto-commit
+    if (candidates.length === 1) {
+      try {
+        const result = await commitGamNetwork({
+          clientId: client?.id || null,
+          networkCode: candidates[0].networkCode,
+          displayName: candidates[0].displayName,
+          refreshToken,
+          onboardPayload: mode === 'onboard' ? onboardPayload : null,
+        });
+        if (mode === 'onboard') {
+          return res.redirect(frontendOnboardUrl('?oauth=connected'));
+        }
+        return res.redirect(frontendAdminUrl(
+          `?tab=client&oauth=connected&network=${encodeURIComponent(result.client.networkCode)}`
+        ));
+      } catch (e) {
+        logger.error('GAM auto-commit failed:', e.message);
+        if (mode === 'onboard') {
+          return res.redirect(frontendOnboardUrl(`?oauth=error&reason=${encodeURIComponent(e.message.slice(0, 80))}`));
+        }
+        return res.redirect(frontendAdminUrl(`?oauth=error&reason=${encodeURIComponent(e.message.slice(0, 80))}`));
+      }
+    }
+
+    // Multiple networks → picker
+    const session = await createPendingSession({
+      product: 'gam',
+      mode: mode === 'onboard' ? 'onboard' : 'connect',
+      clientId: client?.id || null,
+      refreshToken,
+      candidates,
+      payload: mode === 'onboard' && onboardPayload
+        ? {
+            name: onboardPayload.name,
+            username: onboardPayload.username,
+            email: onboardPayload.email,
+            passwordEnc: encryptSecret(onboardPayload.password),
+          }
+        : null,
     });
+
+    if (mode === 'onboard') {
+      return res.redirect(frontendOnboardUrl(`?oauth=pick&session=${encodeURIComponent(session.id)}`));
+    }
+    return res.redirect(
+      frontendAdminUrl(`?tab=client&oauth=pick&session=${encodeURIComponent(session.id)}`)
+    );
   } catch (err) {
     logger.error('OAuth callback error:', err.message);
     if (req.accepts('html')) {
-      return res.redirect(frontendAdminUrl(`?oauth=error`));
+      return res.redirect(frontendAdminUrl('?oauth=error'));
     }
     res.status(500).json({
       error: 'Authentication failed',
@@ -139,4 +314,7 @@ router.get('/status', async (req, res) => {
 });
 
 router.buildAuthUrl = buildAuthUrl;
+router.signOAuthState = signOAuthState;
+router.commitGamNetwork = commitGamNetwork;
+router.SCOPES = SCOPES;
 module.exports = router;

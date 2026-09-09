@@ -27,6 +27,7 @@ function flagsFromUser(user) {
 export default function DomainPermissions({
   users = [], usersLoading = false, domains = [], domainsLoading, catalogLoading = false,
   catalogRows = [], catalogLists = {},
+  adsAccountOptions = [], adsAccountsLoading = false,
   onSave, saving, error, onLoadDomains,
 }) {
   const [userId, setUserId] = useState('');
@@ -34,6 +35,7 @@ export default function DomainPermissions({
   const [allowedDomains, setAllowedDomains] = useState([]);
   const [allowedSites, setAllowedSites] = useState([]);
   const [allowedAppIds, setAllowedAppIds] = useState([]);
+  const [allowedAdsAccountIds, setAllowedAdsAccountIds] = useState([]);
   const [dateRestrictionStart, setDateRestrictionStart] = useState('');
   const [dateRestrictionEnd, setDateRestrictionEnd] = useState('');
   const [successMsg, setSuccessMsg] = useState(null);
@@ -51,6 +53,7 @@ export default function DomainPermissions({
     setAllowedDomains(selectedUser.permissions?.allowedDomains || []);
     setAllowedSites(selectedUser.permissions?.allowedSites || []);
     setAllowedAppIds(selectedUser.permissions?.allowedAppIds || []);
+    setAllowedAdsAccountIds(selectedUser.permissions?.allowedAdsAccountIds || []);
     const dr = readDateRestrictionFromUser(selectedUser);
     setDateRestrictionStart(dr.start);
     setDateRestrictionEnd(dr.end);
@@ -67,13 +70,17 @@ export default function DomainPermissions({
         allowedDomains,
         allowedSites,
         allowedAppIds,
+        allowedAdsAccountIds,
         ...dateRestrictionPayload(dateRestrictionStart, dateRestrictionEnd),
       };
       const oldUser = selectedUser;
+      const adsAccountLabelById = Object.fromEntries(
+        (adsAccountOptions || []).map((o) => [o.id, o.label])
+      );
       await onSave(selectedUser.id, payload, selectedUser.username);
-      setSuccessMsg(buildPermissionSaveSummary(oldUser.username, oldUser, payload));
+      setSuccessMsg(buildPermissionSaveSummary(oldUser.username, oldUser, payload, { adsAccountLabelById }));
     } catch (_) {}
-  }, [selectedUser, flags, allowedDomains, allowedSites, allowedAppIds, dateRestrictionStart, dateRestrictionEnd, onSave]);
+  }, [selectedUser, flags, allowedDomains, allowedSites, allowedAppIds, allowedAdsAccountIds, dateRestrictionStart, dateRestrictionEnd, onSave, adsAccountOptions]);
 
   return (
     <div className="admin-panel">
@@ -92,7 +99,7 @@ export default function DomainPermissions({
 
       <h3 className="admin-panel-title">Assign Permissions</h3>
       <p className="form-note" style={{ marginBottom: 12 }}>
-        Select a domain user and configure page access, metrics, actions, and data scope.
+        Select a domain user and configure page access, metrics, actions, inventory scope, and Google Ads accounts.
       </p>
 
       <div className="domain-perm-picker">
@@ -119,6 +126,8 @@ export default function DomainPermissions({
             onSitesChange={setAllowedSites}
             allowedAppIds={allowedAppIds}
             onAppIdsChange={setAllowedAppIds}
+            allowedAdsAccountIds={allowedAdsAccountIds}
+            onAdsAccountsChange={setAllowedAdsAccountIds}
             dateRestrictionStart={dateRestrictionStart}
             dateRestrictionEnd={dateRestrictionEnd}
             onDateRestrictionChange={(start, end) => {
@@ -130,6 +139,8 @@ export default function DomainPermissions({
             catalogLoading={catalogLoading}
             catalogRows={catalogRows}
             catalogLists={catalogLists}
+            adsAccountOptions={adsAccountOptions}
+            adsAccountsLoading={adsAccountsLoading}
           />
           <div className="domain-perm-actions">
             <Button variant="primary" loading={saving} onClick={handleSave}>

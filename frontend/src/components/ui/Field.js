@@ -18,7 +18,7 @@ const EyeIcon = ({ off }) => (
  * Labelled text/password input.
  * Password fields automatically get a show/hide (eye) toggle.
  */
-export function TextField({ label, type = 'text', value, onChange, placeholder, autoFocus, ...rest }) {
+export function TextField({ label, type = 'text', value, onChange, placeholder, autoFocus, leadingIcon = null, ...rest }) {
   const [show, setShow] = useState(false);
   const isPassword = type === 'password';
   const inputType = isPassword && show ? 'text' : type;
@@ -26,7 +26,8 @@ export function TextField({ label, type = 'text', value, onChange, placeholder, 
   return (
     <label className="ui-field">
       {label && <span className="ui-field-label">{label}</span>}
-      <span className={`ui-input-wrap ${isPassword ? 'has-toggle' : ''}`}>
+      <span className={`ui-input-wrap ${isPassword ? 'has-toggle' : ''} ${leadingIcon ? 'has-leading-icon' : ''}`.trim()}>
+        {leadingIcon ? <span className="ui-field-leading-icon" aria-hidden>{leadingIcon}</span> : null}
         <input
           className="ui-field-input"
           type={inputType}
@@ -114,7 +115,9 @@ export function PasswordField({
  * Labelled select dropdown.
  * options: [{ value, label }]
  */
-export function SelectField({ label, value, onChange, options = [], placeholder, loading = false, ...rest }) {
+export function SelectField({
+  label, value, onChange, options = [], placeholder, loading = false, disabled = false, ...rest
+}) {
   return (
     <label className={`ui-field ${loading ? 'ui-field-loading' : ''}`}>
       {label && <span className="ui-field-label">{label}</span>}
@@ -124,7 +127,7 @@ export function SelectField({ label, value, onChange, options = [], placeholder,
           className="ui-field-input"
           value={value}
           onChange={(e) => onChange?.(e.target.value)}
-          disabled={loading || rest.disabled}
+          disabled={loading || disabled}
           {...rest}
         >
           {loading

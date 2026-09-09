@@ -1,4 +1,5 @@
 import React from 'react';
+import { ShieldAlert } from './Icon';
 
 /**
  * Inline "Access Restricted" notice shown when a user lacks permission for a
@@ -11,7 +12,9 @@ export default function AccessRestricted({
   return (
     <div className="no-access-wrap">
       <div className="no-access-card">
-        <div className="no-access-icon" aria-hidden>!</div>
+        <div className="no-access-icon" aria-hidden>
+          <ShieldAlert size={28} strokeWidth={1.75} />
+        </div>
         <h2 className="no-access-title">{title}</h2>
         <p className="no-access-msg">{message}</p>
       </div>

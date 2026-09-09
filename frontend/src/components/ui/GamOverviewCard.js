@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom';
 import { AreaChart, Area, ResponsiveContainer } from 'recharts';
 import { CHART_SERIES } from '../../utils/chartTheme';
 import { METRIC_DEFS } from '../../utils/metricDefs';
+import { KpiIcon } from './Icon';
 
 function formatCompact(n) {
   const v = Math.abs(Number(n) || 0);
@@ -212,12 +213,15 @@ export default function GamOverviewCard({
       </div>
       <div className="gam-overview-metrics">
         {kpis.map((k) => (
-          <div key={k.label} className="gam-overview-metric">
-            <span className="gam-overview-metric-label">
-              {k.label}
+          <div key={k.label} className="gam-overview-metric kpi-tile">
+            <div className="kpi-tile-top">
+              <span className="kpi-icon-badge" aria-hidden>
+                <KpiIcon name={k.key === 'revenue' ? 'revenue' : k.key} size={16} />
+              </span>
               <MetricHelp defKey={k.key} />
-            </span>
+            </div>
             <span className="gam-overview-metric-value">{k.value}</span>
+            <span className="gam-overview-metric-label">{k.label}</span>
             <Delta change={k.change} loading={loading} compareLabel={compareLabel} />
             {!loading && <Sparkline data={k.spark} color={k.color} gradId={k.key} />}
           </div>
