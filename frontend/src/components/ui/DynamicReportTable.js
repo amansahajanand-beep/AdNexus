@@ -11,6 +11,7 @@ import { sortRowsByColumn } from '../../utils/enrichReportRows';
 import { useMedia } from '../../hooks/useMedia';
 import { showToast } from '../../hooks/useToast';
 import { downloadCsv, downloadExcel, exportCellValue } from '../../utils/tableExport';
+import { EmptyIcon } from './Icon';
 
 /**
  * GAM-style table — columns driven by selected dimensions & metrics.
@@ -332,7 +333,7 @@ export default function DynamicReportTable({
       <div className="table-wrap">
         {showEmptyPanel && !loading ? (
           <div className="gam-report-empty">
-            <div className="gam-report-empty-icon" aria-hidden>—</div>
+            <div className="gam-report-empty-icon" aria-hidden><EmptyIcon size={40} /></div>
             <p className="gam-report-empty-title">
               {noReport ? noReportMessage : emptyMessage}
             </p>

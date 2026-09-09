@@ -1,5 +1,6 @@
 import React from 'react';
 import DataFreshness from '../ui/DataFreshness';
+import { KpiIcon, ArrowUpRight, ArrowDownRight } from '../ui/Icon';
 import { buildRoiSummaryGroups } from '../../utils/report/roiView';
 
 function DeltaLine({ change, compareLabel, loading }) {
@@ -16,7 +17,11 @@ function DeltaLine({ change, compareLabel, loading }) {
   const isDown = n < 0;
   return (
     <span className={`gam-overview-delta ${isDown ? 'down' : 'up'}`}>
-      {isDown ? '▼' : '▲'} {Math.abs(n).toFixed(1)}%
+      {isDown
+        ? <ArrowDownRight size={12} strokeWidth={2} aria-hidden />
+        : <ArrowUpRight size={12} strokeWidth={2} aria-hidden />}
+      {' '}
+      {Math.abs(n).toFixed(1)}%
       {compareLabel ? <span className="gam-overview-delta-vs"> {compareLabel}</span> : null}
     </span>
   );
@@ -60,39 +65,44 @@ export default function RoiSummaryBoards({
           const cols = Math.max(1, group.metrics.length);
           const dense = cols >= 6;
           return (
-          <section
-            key={group.id}
-            className={`roi-kpi-board roi-kpi-board--${group.id}${dense ? ' is-dense' : ''}`}
-            style={{ '--roi-kpi-cols': String(cols) }}
-          >
-            <header className="roi-kpi-board-head">
-              <h3 className="roi-kpi-board-title">{group.title}</h3>
-              {group.hint ? <span className="roi-kpi-board-hint">{group.hint}</span> : null}
-            </header>
-            <div className="roi-kpi-metrics">
-              {group.metrics.map((m) => (
-                <div
-                  key={m.key}
-                  className={`roi-kpi-metric${m.emphasis ? ' is-emphasis' : ''}${m.tone ? ` tone-${m.tone}` : ''}`}
-                >
-                  <span className="roi-kpi-label">{m.label}</span>
-                  <span
-                    className={`roi-kpi-value${m.valueTone ? ` is-${m.valueTone}` : ''}`}
-                    title={!loading && m.title ? m.title : undefined}
+            <section
+              key={group.id}
+              className={`roi-kpi-board roi-kpi-board--${group.id}${dense ? ' is-dense' : ''}`}
+              style={{ '--roi-kpi-cols': String(cols) }}
+            >
+              <header className="roi-kpi-board-head">
+                <h3 className="roi-kpi-board-title">{group.title}</h3>
+                {group.hint ? <span className="roi-kpi-board-hint">{group.hint}</span> : null}
+              </header>
+              <div className="roi-kpi-metrics">
+                {group.metrics.map((m) => (
+                  <div
+                    key={m.key}
+                    className={`roi-kpi-metric${m.emphasis ? ' is-emphasis' : ''}${m.tone ? ` tone-${m.tone}` : ''}`}
                   >
-                    {loading
-                      ? <span className="card-spinner card-spinner-lg" aria-label="Loading" />
-                      : m.value}
-                  </span>
-                  {'delta' in m ? (
-                    <DeltaLine change={m.delta} compareLabel={compareLabel} loading={loading} />
-                  ) : (
-                    <span className="roi-kpi-spacer" aria-hidden />
-                  )}
-                </div>
-              ))}
-            </div>
-          </section>
+                    <span className="roi-kpi-label">
+                      <span className="kpi-icon-badge kpi-icon-badge--sm" aria-hidden>
+                        <KpiIcon name={m.key} size={13} />
+                      </span>
+                      {m.label}
+                    </span>
+                    <span
+                      className={`roi-kpi-value${m.valueTone ? ` is-${m.valueTone}` : ''}`}
+                      title={!loading && m.title ? m.title : undefined}
+                    >
+                      {loading
+                        ? <span className="card-spinner card-spinner-lg" aria-label="Loading" />
+                        : m.value}
+                    </span>
+                    {'delta' in m ? (
+                      <DeltaLine change={m.delta} compareLabel={compareLabel} loading={loading} />
+                    ) : (
+                      <span className="roi-kpi-spacer" aria-hidden />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </section>
           );
         })}
       </div>

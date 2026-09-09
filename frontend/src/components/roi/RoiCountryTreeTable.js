@@ -13,6 +13,7 @@ import {
 import { showToast } from '../../hooks/useToast';
 import { downloadCsv, downloadExcel } from '../../utils/tableExport';
 import RoiTreeEntityIcon from './RoiTreeEntityIcon';
+import { EmptyIcon } from '../ui/Icon';
 
 const COLS = [
   { id: 'label', label: 'Country / Account / Package / Site', type: 'dimension' },
@@ -525,7 +526,7 @@ export default function RoiCountryTreeTable({
       <div className="table-wrap">
         {showEmptyPanel && !loading ? (
           <div className="gam-report-empty">
-            <div className="gam-report-empty-icon" aria-hidden>—</div>
+            <div className="gam-report-empty-icon" aria-hidden><EmptyIcon size={40} /></div>
             <p className="gam-report-empty-title">{emptyMessage}</p>
             <p className="gam-report-empty-hint">
               Try a different date range, or clear a filter and click Apply Filter.

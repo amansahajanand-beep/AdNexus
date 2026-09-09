@@ -13,16 +13,29 @@ import { rememberLastRoute } from '../../utils/lastRoute';
 import { APP_TIMEZONE } from '../../utils/datetime';
 import { buildFreshnessLabel } from '../../utils/dataFreshness';
 import { applyTheme, isDarkTheme, readStoredTheme } from '../../utils/theme';
+import {
+  NavIcon,
+  Sun,
+  Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Menu,
+  X,
+  LogOut,
+  Settings,
+  UserRound,
+  ShieldAlert,
+} from '../ui/Icon';
 
 const FOCUS_KEY = 'adnexus.focusMode';
 
 const NAV_ITEMS = [
-  { to: '/dashboard', label: 'Dashboard', short: 'D', page: 'dashboard' },
-  { to: '/reporting', label: 'Reporting', short: 'R', page: 'reporting' },
-  { to: '/roi', label: 'ROI', short: 'O', page: 'roi' },
-  { to: '/presets', label: 'Presets', short: 'P', page: 'presets' },
-  { to: '/admin', label: 'Admin', short: 'A', adminOnly: true },
-  { to: '/domain-user', label: 'Domain User', short: 'U', page: 'domain-user' },
+  { to: '/dashboard', label: 'Dashboard', page: 'dashboard' },
+  { to: '/reporting', label: 'Reporting', page: 'reporting' },
+  { to: '/roi', label: 'ROI', page: 'roi' },
+  { to: '/presets', label: 'Presets', page: 'presets' },
+  { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
+  { to: '/domain-user', label: 'Domain User', page: 'domain-user' },
 ];
 
 function statusLabel(isMock, authError) {
@@ -231,7 +244,9 @@ export default function Layout() {
                 className={({ isActive }) => `nav-btn ${isActive ? 'active' : ''}`}
                 onClick={() => setMenuOpen(false)}
               >
-                <span className="nav-btn-short" aria-hidden>{item.short}</span>
+                <span className="nav-btn-icon" aria-hidden>
+                  <NavIcon page={item.page} size={focusMode ? 20 : 18} />
+                </span>
                 <span className="nav-btn-label">{item.label}</span>
               </NavLink>
             ))}
@@ -245,7 +260,9 @@ export default function Layout() {
               title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
               aria-pressed={darkMode}
             >
-              <span aria-hidden>{darkMode ? '☀' : '☾'}</span>
+              <span className="sidebar-toggle-icon" aria-hidden>
+                {darkMode ? <Sun size={16} strokeWidth={1.75} /> : <Moon size={16} strokeWidth={1.75} />}
+              </span>
               <span className="sidebar-focus-label">{darkMode ? 'Light' : 'Dark'}</span>
             </button>
             <button
@@ -255,7 +272,11 @@ export default function Layout() {
               title={focusMode ? 'Expand sidebar ([)' : 'Focus mode — more chart width ([)'}
               aria-pressed={focusMode}
             >
-              {focusMode ? '»' : '«'}
+              <span className="sidebar-toggle-icon" aria-hidden>
+                {focusMode
+                  ? <PanelLeftOpen size={16} strokeWidth={1.75} />
+                  : <PanelLeftClose size={16} strokeWidth={1.75} />}
+              </span>
               <span className="sidebar-focus-label">{focusMode ? 'Expand' : 'Focus'}</span>
             </button>
             <div className={liveClass} title={freshnessTitle}>
@@ -287,12 +308,21 @@ export default function Layout() {
                     </div>
                   </button>
                   {isAdmin && (
-                    <button type="button" className="user-dd-item" onClick={() => go('/admin')}>Admin Settings</button>
+                    <button type="button" className="user-dd-item" onClick={() => go('/admin')}>
+                      <Settings size={15} strokeWidth={1.75} aria-hidden />
+                      Admin Settings
+                    </button>
                   )}
                   {canPage('domain-user') && (
-                    <button type="button" className="user-dd-item" onClick={() => go('/domain-user')}>My Profile</button>
+                    <button type="button" className="user-dd-item" onClick={() => go('/domain-user')}>
+                      <UserRound size={15} strokeWidth={1.75} aria-hidden />
+                      My Profile
+                    </button>
                   )}
-                  <button type="button" className="user-dd-item" onClick={handleLogout}>Logout</button>
+                  <button type="button" className="user-dd-item" onClick={handleLogout}>
+                    <LogOut size={15} strokeWidth={1.75} aria-hidden />
+                    Logout
+                  </button>
                 </div>
               )}
             </div>
@@ -308,7 +338,7 @@ export default function Layout() {
               aria-expanded={menuOpen}
               onClick={() => setMenuOpen(o => !o)}
             >
-              {menuOpen ? '✕' : '☰'}
+              {menuOpen ? <X size={18} strokeWidth={1.75} /> : <Menu size={18} strokeWidth={1.75} />}
             </button>
             <BrandLogo />
             <button
@@ -319,7 +349,7 @@ export default function Layout() {
               aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
               aria-pressed={darkMode}
             >
-              {darkMode ? '☀' : '☾'}
+              {darkMode ? <Sun size={16} strokeWidth={1.75} /> : <Moon size={16} strokeWidth={1.75} />}
             </button>
             <span className="context-chip" title={`Currency ${currencyCode} · ${APP_TIMEZONE}`}>
               {currencyCode} · {tzShort}
@@ -334,7 +364,9 @@ export default function Layout() {
             {noAccess ? (
               <div className="no-access-wrap">
                 <div className="no-access-card">
-                  <div className="no-access-icon" aria-hidden>!</div>
+                  <div className="no-access-icon" aria-hidden>
+                    <ShieldAlert size={28} strokeWidth={1.75} />
+                  </div>
                   <h2 className="no-access-title">{noInventoryAssigned ? NO_DOMAINS_TITLE : 'Access Restricted'}</h2>
                   <p className="no-access-msg">
                     {noInventoryAssigned

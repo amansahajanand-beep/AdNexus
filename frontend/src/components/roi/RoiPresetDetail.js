@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { EmptyIcon } from '../ui/Icon';
 import { useNavigate } from 'react-router-dom';
 import RoiCountryTreeTable from './RoiCountryTreeTable';
 import RoiSummaryBoards from './RoiSummaryBoards';
@@ -192,6 +193,7 @@ export default function RoiPresetDetail({
   if (!presetItem) {
     return (
       <div className="presets-detail-empty" role="status">
+        <div className="presets-detail-empty-icon" aria-hidden><EmptyIcon size={36} /></div>
         <div className="warn-card-title">Select an ROI preset</div>
         <p className="form-note" style={{ margin: '8px 0 0' }}>
           Choose a saved ROI combo on the left to preview overview cards and the results table here.

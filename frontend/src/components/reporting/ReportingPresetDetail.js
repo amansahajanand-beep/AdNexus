@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import { EmptyIcon } from '../ui/Icon';
 import { useNavigate } from 'react-router-dom';
 import DynamicReportTable from '../ui/DynamicReportTable';
 import PresetDateToolbar from '../presets/PresetDateToolbar';
@@ -127,6 +128,7 @@ export default function ReportingPresetDetail({
   if (!presetItem) {
     return (
       <div className="presets-detail-empty" role="status">
+        <div className="presets-detail-empty-icon" aria-hidden><EmptyIcon size={36} /></div>
         <div className="warn-card-title">Select a Reporting preset</div>
         <p className="form-note" style={{ margin: '8px 0 0' }}>
           Choose a saved Reporting combo on the left to preview summary cards and the results table.

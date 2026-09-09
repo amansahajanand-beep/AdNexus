@@ -3,8 +3,9 @@ import { Link, useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../store/useAuth';
 import { TextField } from '../components/ui/Field';
 import Button from '../components/ui/Button';
-import BrandLogo, { BrandMark } from '../components/ui/BrandLogo';
+import { BrandMark } from '../components/ui/BrandLogo';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
+import { User, Lock } from '../components/ui/Icon';
 
 export default function Login() {
   const { login, error: authError } = useAuth();
@@ -51,12 +52,6 @@ export default function Login() {
 
   return (
     <div className="login-screen login-page">
-      <header className="login-topbar">
-        <div className="header-left">
-          <BrandLogo />
-        </div>
-      </header>
-
       <div className="login-body">
         <form
           key={formKey}
@@ -65,9 +60,12 @@ export default function Login() {
           noValidate
           autoComplete="off"
         >
-          <BrandMark size={56} className="login-logo" />
-          <h2 className="login-title">Sign in to AdNexus...</h2>
-          <p className="login-sub">Publisher Analytics for revenue, inventory, and performance</p>
+          <div className="login-brand-row">
+            <BrandMark size={40} className="login-logo" />
+            <span className="login-brand-name">AdNexus</span>
+          </div>
+          <h2 className="login-title">Sign in</h2>
+          <p className="login-sub">Welcome back. Sign in to continue to AdNexus.</p>
 
           {displayError && <div className="login-error">{displayError}</div>}
 
@@ -79,6 +77,7 @@ export default function Login() {
             autoFocus
             autoComplete="off"
             name="gam-username"
+            leadingIcon={<User size={16} strokeWidth={1.75} />}
           />
           <TextField
             label="Password"
@@ -88,16 +87,20 @@ export default function Login() {
             placeholder="Enter your password"
             autoComplete="new-password"
             name="gam-password"
+            leadingIcon={<Lock size={16} strokeWidth={1.75} />}
           />
 
           <Button type="submit" variant="primary" loading={loading} className="login-submit">
-            Login
+            Sign in
           </Button>
           <p className="onboard-login-link">
             New publisher? <Link to="/onboard">Register with GAM credentials</Link>
           </p>
         </form>
       </div>
+      <footer className="login-footer">
+        <span>© {new Date().getFullYear()} AdNexus</span>
+      </footer>
     </div>
   );
 }

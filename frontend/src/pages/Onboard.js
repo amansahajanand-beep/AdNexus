@@ -2,7 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { TextField } from '../components/ui/Field';
 import Button from '../components/ui/Button';
-import BrandLogo, { BrandMark } from '../components/ui/BrandLogo';
+import { BrandMark } from '../components/ui/BrandLogo';
 import { clientsAPI } from '../utils/api';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
 import {
@@ -12,6 +12,7 @@ import {
   USERNAME_RULES_HINT,
 } from '../utils/namePolicy';
 import { validatePassword, PASSWORD_RULES_HINT } from '../utils/passwordPolicy';
+import { Check, Link2, UserRound } from 'lucide-react';
 
 export default function Onboard() {
   const navigate = useNavigate();
@@ -150,11 +151,6 @@ export default function Onboard() {
 
   return (
     <div className="login-screen login-page">
-      <header className="login-topbar">
-        <div className="header-left">
-          <BrandLogo />
-        </div>
-      </header>
       <div className="login-body">
         <form
           className="login-card onboard-card"
@@ -162,13 +158,30 @@ export default function Onboard() {
           noValidate
           autoComplete="off"
         >
-          <BrandMark size={56} className="login-logo" />
+          <div className="login-brand-row">
+            <BrandMark size={40} className="login-logo" />
+            <span className="login-brand-name">AdNexus</span>
+          </div>
           <h2 className="login-title">Register your GAM network</h2>
           <p className="login-sub">
             {picker
               ? 'Choose the Ad Manager network to connect.'
               : 'Create your admin account, then Connect with Google to fetch your network automatically.'}
           </p>
+          <ol className="onboard-stepper" aria-label="Onboarding steps">
+            <li className={`onboard-step ${!picker ? 'is-active' : 'is-done'}`}>
+              <span className="onboard-step-icon" aria-hidden>
+                {!picker ? <UserRound size={14} strokeWidth={2} /> : <Check size={14} strokeWidth={2.25} />}
+              </span>
+              <span>Account</span>
+            </li>
+            <li className={`onboard-step ${picker ? 'is-active' : ''}`}>
+              <span className="onboard-step-icon" aria-hidden>
+                <Link2 size={14} strokeWidth={2} />
+              </span>
+              <span>Connect GAM</span>
+            </li>
+          </ol>
           {error && <div className="login-error">{error}</div>}
           {okMsg && <div className="client-settings-ok">{okMsg}</div>}
 

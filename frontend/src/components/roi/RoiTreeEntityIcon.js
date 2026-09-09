@@ -1,34 +1,11 @@
 import React, { useState } from 'react';
+import { Smartphone, Globe2 } from '../ui/Icon';
 
 /** ISO2 → flag image (flagcdn). */
 export function countryFlagUrl(countryCode) {
   const code = String(countryCode || '').trim().toLowerCase();
   if (!/^[a-z]{2}$/.test(code)) return null;
   return `https://flagcdn.com/w40/${code}.png`;
-}
-
-function GlobeIcon() {
-  return (
-    <svg className="roi-tree-entity-svg" viewBox="0 0 24 24" width="14" height="14" aria-hidden focusable="false">
-      <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="1.75" />
-      <path
-        d="M3.5 12h17M12 3.5c2.5 2.8 3.8 5.6 3.8 8.5S14.5 17.7 12 20.5C9.5 17.7 8.2 14.9 8.2 12S9.5 6.3 12 3.5z"
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="1.75"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
-
-function AppIcon() {
-  return (
-    <svg className="roi-tree-entity-svg" viewBox="0 0 24 24" width="14" height="14" aria-hidden focusable="false">
-      <rect x="5" y="2.5" width="14" height="19" rx="2.5" fill="none" stroke="currentColor" strokeWidth="1.75" />
-      <path d="M10 18.5h4" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
-    </svg>
-  );
 }
 
 /**
@@ -41,7 +18,7 @@ export default function RoiTreeEntityIcon({ kind, code, label }) {
   if (kind === 'site') {
     return (
       <span className="roi-tree-entity-glyph roi-tree-entity-glyph--site" title="Site" aria-hidden>
-        <GlobeIcon />
+        <Globe2 size={14} strokeWidth={1.75} />
       </span>
     );
   }
@@ -49,7 +26,7 @@ export default function RoiTreeEntityIcon({ kind, code, label }) {
   if (kind === 'app') {
     return (
       <span className="roi-tree-entity-glyph roi-tree-entity-glyph--app" title="Application" aria-hidden>
-        <AppIcon />
+        <Smartphone size={14} strokeWidth={1.75} />
       </span>
     );
   }

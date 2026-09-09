@@ -1,5 +1,6 @@
 import React from 'react';
 import { formatRoiMoney, formatRoiMoneyCompact } from '../../utils/report/roiView';
+import { KpiIcon } from '../ui/Icon';
 
 /**
  * Secondary ROI overview — App / Site / Total earn.
@@ -51,7 +52,12 @@ export default function RoiInventoryEarnOverview({
                 key={m.key}
                 className={`roi-kpi-metric${m.emphasis ? ' is-emphasis' : ''}`}
               >
-                <span className="roi-kpi-label">{m.label}</span>
+                  <span className="roi-kpi-label">
+                    <span className="kpi-icon-badge kpi-icon-badge--sm" aria-hidden>
+                      <KpiIcon name={m.key === 'total' ? 'total' : m.key} size={13} />
+                    </span>
+                    {m.label}
+                  </span>
                 <span
                   className="roi-kpi-value"
                   title={!loading ? m.title : undefined}

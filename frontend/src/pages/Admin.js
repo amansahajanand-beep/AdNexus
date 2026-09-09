@@ -10,11 +10,13 @@ import AdsAccountsAdmin from '../components/admin/AdsAccountsAdmin';
 import DomainPermissions from '../components/admin/DomainPermissions';
 import PageHeader from '../components/ui/PageHeader';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
+import { Users, ShieldAlert, Settings, Megaphone } from '../components/ui/Icon';
+
 const TABS = [
-  { id: 'user', label: 'Users' },
-  { id: 'domains', label: 'Assign Permissions' },
-  { id: 'client', label: 'GAM connection' },
-  { id: 'ads', label: 'Google Ads accounts' },
+  { id: 'user', label: 'Users', Icon: Users },
+  { id: 'domains', label: 'Assign Permissions', Icon: ShieldAlert },
+  { id: 'client', label: 'GAM connection', Icon: Settings },
+  { id: 'ads', label: 'Google Ads accounts', Icon: Megaphone },
 ];
 
 function buildAdsAccountPickerOptions(accounts = []) {
@@ -201,6 +203,7 @@ export default function Admin() {
             className={`admin-tab ${tab === t.id ? 'active' : ''}`}
             onClick={() => setTab(t.id)}
           >
+            <t.Icon size={15} strokeWidth={1.75} className="admin-tab-icon" aria-hidden />
             {t.label}
           </button>
         ))}

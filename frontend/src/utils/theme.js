@@ -22,7 +22,7 @@ export function applyTheme(theme) {
     document.documentElement.setAttribute('data-theme', next);
     document.documentElement.style.colorScheme = next;
     const meta = document.querySelector('meta[name="theme-color"]');
-    if (meta) meta.setAttribute('content', next === 'dark' ? '#0B1220' : '#0f172a');
+    if (meta) meta.setAttribute('content', next === 'dark' ? '#0B1220' : '#2563EB');
   }
   try {
     localStorage.setItem(THEME_KEY, next);

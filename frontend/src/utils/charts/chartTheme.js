@@ -1,6 +1,5 @@
 /**
- * Soft Stripe/Mixpanel-style chart tokens shared by Dashboard + Reporting.
- * Grid / axis / tooltip follow the active light/dark theme.
+ * Soft analytics chart tokens — follow active light/dark theme CSS vars.
  */
 
 import { isDarkTheme } from '../theme';
@@ -24,17 +23,23 @@ export const CHART_SERIES = {
   muted: '#94A3B8',
 };
 
+function cssVar(name, fallback) {
+  if (typeof document === 'undefined') return fallback;
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+
 function readThemeTokens() {
   const dark = isDarkTheme();
   return {
-    gridStroke: dark ? '#1E293B' : '#E8EEF5',
-    axisFill: dark ? '#94A3B8' : '#64748B',
-    tipBorder: dark ? '#334155' : '#E2E8F0',
-    tipBg: dark ? '#1E293B' : '#FFFFFF',
+    gridStroke: cssVar('--chart-grid', dark ? '#243044' : '#E2E8F0'),
+    axisFill: cssVar('--chart-axis', dark ? '#94A3B8' : '#64748B'),
+    tipBorder: cssVar('--chart-tip-border', dark ? '#334155' : '#E2E8F0'),
+    tipBg: cssVar('--chart-tip-bg', dark ? '#1A2336' : '#FFFFFF'),
     tipShadow: dark
-      ? '0 8px 24px rgba(0, 0, 0, 0.35)'
+      ? '0 8px 24px rgba(0, 0, 0, 0.4)'
       : '0 8px 24px rgba(15, 23, 42, 0.08)',
-    tipColor: dark ? '#F1F5F9' : '#0F172A',
+    tipColor: cssVar('--chart-tip-text', dark ? '#E8EEF7' : '#0F172A'),
   };
 }
 
