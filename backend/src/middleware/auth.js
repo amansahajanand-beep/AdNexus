@@ -111,6 +111,17 @@ function requireAdmin(req, res, next) {
   });
 }
 
+/** Domain-user (non-admin) only — used after router.use(requireAuth). */
+function requireDomainUser(req, res, next) {
+  if (!req.user) {
+    return sendAuthError(res, 401, 'Not authenticated', AUTH_CODES.NOT_AUTHENTICATED);
+  }
+  if (req.user.role === 'admin') {
+    return res.status(403).json({ error: 'Use Admin → Google Ads accounts for network-wide Ads setup.' });
+  }
+  return next();
+}
+
 // ─── Permission filter for API responses ──────────────────────────────────────
 /**
  * Applies user's permission filters to report query params
@@ -186,6 +197,7 @@ module.exports = {
   generateTokens,
   requireAuth,
   requireAdmin,
+  requireDomainUser,
   applyPermissions,
   filterSummary,
   filterByAllowedUnits,

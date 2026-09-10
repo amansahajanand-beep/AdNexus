@@ -51,6 +51,9 @@ export default function CommandPalette() {
     if (canPage('roi')) {
       list.push({ id: 'roi', label: 'ROI', hint: 'Spend vs earn', to: '/roi' });
     }
+    if (canPage('my-ads')) {
+      list.push({ id: 'my-ads', label: 'Google Ads', hint: 'Connect Ads accounts', to: '/my-ads' });
+    }
     if (canPage('presets')) {
       list.push({ id: 'presets', label: 'Presets', hint: 'Saved presets', to: '/presets' });
     }

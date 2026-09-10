@@ -107,6 +107,8 @@ async function getPendingSessionPublic(id) {
           name: session.payload.name || null,
           username: session.payload.username || null,
           email: session.payload.email || null,
+          userId: session.payload.userId || null,
+          returnTo: session.payload.returnTo || null,
         }
       : null,
   };

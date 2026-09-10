@@ -33,6 +33,7 @@ const NAV_ITEMS = [
   { to: '/dashboard', label: 'Dashboard', page: 'dashboard' },
   { to: '/reporting', label: 'Reporting', page: 'reporting' },
   { to: '/roi', label: 'ROI', page: 'roi' },
+  { to: '/my-ads', label: 'Google Ads', page: 'my-ads' },
   { to: '/presets', label: 'Presets', page: 'presets' },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/domain-user', label: 'Domain User', page: 'domain-user' },

@@ -5,6 +5,7 @@ export const PERMISSION_SECTIONS = {
     { key: 'canAccessDashboard', label: 'Dashboard', hint: 'Summary cards & detailed report' },
     { key: 'canAccessReporting', label: 'Reporting', hint: 'Full reports & CSV export' },
     { key: 'canAccessRoi', label: 'ROI', hint: 'Ads spend vs GAM earn & ROI %' },
+    { key: 'canAccessMyAds', label: 'Google Ads', hint: 'Connect own Google Ads accounts' },
     { key: 'canAccessDomainUser', label: 'Domain User', hint: 'Per-domain earnings view' },
   ],
   actions: [
@@ -104,7 +105,7 @@ export function hasPermission(user, key) {
 export function buildClientVisibility(user) {
   if (isAdmin(user)) {
     return {
-      pages: { dashboard: true, reporting: true, roi: true, domainUser: false, presets: true },
+      pages: { dashboard: true, reporting: true, roi: true, domainUser: false, myAds: false, presets: true },
       revenue: true, impressions: true, ctr: true, ecpm: true, programmatic: true,
       generate: true, download: true, filters: true, reportBuilder: true,
       orders: true, inventory: true,
@@ -117,6 +118,7 @@ export function buildClientVisibility(user) {
       reporting: p.canAccessReporting !== false,
       roi: p.canAccessRoi !== false,
       domainUser: p.canAccessDomainUser !== false,
+      myAds: p.canAccessMyAds !== false,
       presets: p.canAccessDashboard !== false || p.canAccessReporting !== false,
     },
     revenue: p.canSeeRevenue !== false,
@@ -134,7 +136,7 @@ export function buildClientVisibility(user) {
 }
 
 export function canAccessPage(user, page) {
-  if (page === 'domain-user' && isAdmin(user)) return false;
+  if ((page === 'domain-user' || page === 'my-ads') && isAdmin(user)) return false;
   if (isAdmin(user)) return true;
   if (page === 'presets') {
     return hasPermission(user, 'canAccessDashboard') || hasPermission(user, 'canAccessReporting');
@@ -144,6 +146,7 @@ export function canAccessPage(user, page) {
     reporting: 'canAccessReporting',
     roi: 'canAccessRoi',
     'domain-user': 'canAccessDomainUser',
+    'my-ads': 'canAccessMyAds',
   };
   const key = map[page];
   return key ? hasPermission(user, key) : false;
@@ -155,6 +158,7 @@ export function getDefaultHomeRoute(user) {
   if (vis.pages.dashboard) return '/dashboard';
   if (vis.pages.reporting) return '/reporting';
   if (vis.pages.roi) return '/roi';
+  if (vis.pages.myAds) return '/my-ads';
   if (vis.pages.domainUser) return '/domain-user';
   return '/login';
 }
@@ -162,7 +166,7 @@ export function getDefaultHomeRoute(user) {
 export function hasAnyPageAccess(user) {
   if (isAdmin(user)) return true;
   const vis = buildClientVisibility(user);
-  return vis.pages.dashboard || vis.pages.reporting || vis.pages.roi || vis.pages.domainUser;
+  return vis.pages.dashboard || vis.pages.reporting || vis.pages.roi || vis.pages.myAds || vis.pages.domainUser;
 }
 
 export function permissionsFromUser(user) {
@@ -188,6 +192,7 @@ export function permissionBadgeList(user) {
   if (p.canAccessDashboard !== false) badges.push({ label: 'Dashboard', type: 'page' });
   if (p.canAccessReporting !== false) badges.push({ label: 'Reporting', type: 'page' });
   if (p.canAccessRoi !== false) badges.push({ label: 'ROI', type: 'page' });
+  if (p.canAccessMyAds !== false) badges.push({ label: 'Google Ads', type: 'page' });
   if (p.canAccessDomainUser !== false) badges.push({ label: 'Domain User', type: 'page' });
   if (p.canUseReportBuilder === false) badges.push({ label: 'No builder', type: 'off' });
   if (p.canSeeProgrammatic === false) badges.push({ label: 'No programmatic', type: 'off' });

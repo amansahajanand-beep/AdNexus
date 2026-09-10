@@ -10,6 +10,7 @@ const { getAccountById, createAccount, updateAccount, upsertChildUnderMcc, getAc
 const { getClientById } = require('../models/clientStore');
 const { createPendingSession, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const { frontendBaseUrl } = require('../utils/frontendUrl');
+const { collectGrantIds, grantAdsAccountsToUser } = require('../utils/adsUserAccess');
 const logger = require('../utils/logger');
 
 const SECRET = () => process.env.JWT_SECRET || 'change_this_secret';
@@ -26,8 +27,17 @@ function verifyAdsState(state) {
   return decoded;
 }
 
-function frontendAdminUrl(query = '') {
-  return `${frontendBaseUrl()}/admin${query}`;
+/** returnTo: 'admin' (default) | 'my-ads' for domain-user Connect page. */
+function adsOAuthRedirect(decoded, query = '') {
+  const raw = String(query || '').replace(/^\?/, '');
+  const params = new URLSearchParams(raw);
+  if (decoded?.returnTo === 'my-ads') {
+    params.delete('tab');
+    const qs = params.toString();
+    return `${frontendBaseUrl()}/my-ads${qs ? `?${qs}` : ''}`;
+  }
+  if (!params.has('tab')) params.set('tab', 'ads');
+  return `${frontendBaseUrl()}/admin?${params.toString()}`;
 }
 
 function isAdsApiDisabledError(err) {
@@ -35,14 +45,28 @@ function isAdsApiDisabledError(err) {
   return /SERVICE_DISABLED|Google Ads API has not been used|googleads\.googleapis\.com/i.test(msg);
 }
 
-function adsOAuthErrorRedirect(err) {
+function adsOAuthErrorRedirect(err, decoded = null) {
   if (isAdsApiDisabledError(err)) {
-    return frontendAdminUrl(
-      '?tab=ads&ads_oauth=error&reason='
+    return adsOAuthRedirect(
+      decoded,
+      'ads_oauth=error&reason='
       + encodeURIComponent('Enable Google Ads API in Cloud project, wait a few minutes, then Connect again')
     );
   }
-  return frontendAdminUrl(`?tab=ads&ads_oauth=error&reason=${encodeURIComponent(String(err.message || err).slice(0, 80))}`);
+  return adsOAuthRedirect(
+    decoded,
+    `ads_oauth=error&reason=${encodeURIComponent(String(err.message || err).slice(0, 80))}`
+  );
+}
+
+async function grantConnectedAccounts(decoded, gamClient, rootAccount) {
+  if (decoded?.returnTo !== 'my-ads' || !decoded?.userId || !rootAccount) return;
+  try {
+    const ids = await collectGrantIds(gamClient.id, rootAccount);
+    await grantAdsAccountsToUser(decoded.userId, ids);
+  } catch (e) {
+    logger.warn('Ads grant to domain user failed:', e.message);
+  }
 }
 
 function buildAdsAuthUrl(gamClient, statePayload) {
@@ -78,8 +102,13 @@ async function discoverAdsCandidates(gamClient, refreshToken) {
   return { managers, individuals, accessible };
 }
 
-/** Create/update MCC + upsert level-1 partner accounts. */
-async function commitMccSelection(gamClient, { customerId, descriptiveName, refreshToken }) {
+/** Create/update MCC + upsert partner accounts (full tree under listMccChildAccounts). */
+async function commitMccSelection(gamClient, {
+  customerId,
+  descriptiveName,
+  refreshToken,
+  includeChildrenInRoi = false,
+}) {
   const cid = String(customerId || '').replace(/-/g, '');
   if (!/^\d{10}$/.test(cid)) throw new Error('Invalid MCC customer ID');
 
@@ -118,9 +147,18 @@ async function commitMccSelection(gamClient, { customerId, descriptiveName, refr
       await upsertChildUnderMcc(gamClient.id, mccAccount.id, {
         customerId: child.customerId,
         descriptiveName: child.descriptiveName,
-        includeInRoi: false,
+        includeInRoi: !!includeChildrenInRoi,
       });
       childrenCount += 1;
+    }
+    if (includeChildrenInRoi && childrenCount > 0) {
+      const { query } = require('../db');
+      await query(
+        `UPDATE ads_accounts
+         SET include_in_roi = true, updated_at = now()
+         WHERE parent_mcc_id = $1 AND account_type = 'client'`,
+        [mccAccount.id]
+      );
     }
     logger.info(`Ads MCC ${cid}: discovered ${childrenCount} child account(s)`);
   } catch (e) {
@@ -161,21 +199,23 @@ router.discoverAdsCandidates = discoverAdsCandidates;
 router.get('/callback', async (req, res) => {
   const { code, state } = req.query;
   if (!code || !state) {
-    return res.redirect(frontendAdminUrl('?ads_oauth=error&reason=missing_code'));
+    return res.redirect(adsOAuthRedirect(null, 'ads_oauth=error&reason=missing_code'));
   }
 
+  let decoded = null;
   try {
-    const decoded = verifyAdsState(String(state));
+    decoded = verifyAdsState(String(state));
     const gamClient = await getClientById(decoded.clientId);
     if (!gamClient) {
-      return res.redirect(frontendAdminUrl('?ads_oauth=error&reason=unknown_client'));
+      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=unknown_client'));
     }
 
+    const forDomainUser = decoded.returnTo === 'my-ads';
     const oauth2Client = getAdsOAuthClient(gamClient);
     const { tokens } = await oauth2Client.getToken(code);
     if (!tokens.refresh_token) {
       logger.warn('Ads OAuth callback missing refresh_token');
-      return res.redirect(frontendAdminUrl('?ads_oauth=error&reason=no_refresh_token'));
+      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=no_refresh_token'));
     }
 
     const refreshToken = tokens.refresh_token;
@@ -192,7 +232,7 @@ router.get('/callback', async (req, res) => {
     if (mode === 'individual' && decoded.adsAccountId) {
       const account = await getAccountById(decoded.adsAccountId);
       if (!account || account.clientId !== gamClient.id) {
-        return res.redirect(frontendAdminUrl('?ads_oauth=error&reason=account_mismatch'));
+        return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=account_mismatch'));
       }
       let info;
       try {
@@ -204,16 +244,17 @@ router.get('/callback', async (req, res) => {
       } catch (e) {
         logger.warn('Ads individual customer info:', e.message);
         if (isAdsApiDisabledError(e)) {
-          return res.redirect(adsOAuthErrorRedirect(e));
+          return res.redirect(adsOAuthErrorRedirect(e, decoded));
         }
         info = { customerId: account.customerId, descriptiveName: account.descriptiveName };
       }
-      await updateAccount(account.id, {
+      const updated = await updateAccount(account.id, {
         refreshToken,
         customerId: info.customerId || account.customerId,
         descriptiveName: info.descriptiveName || account.descriptiveName,
       });
-      return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected'));
+      await grantConnectedAccounts(decoded, gamClient, updated || account);
+      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
     }
 
     // Discover all accessible accounts → pending session → picker (or auto-commit single)
@@ -222,44 +263,50 @@ router.get('/callback', async (req, res) => {
       discovered = await discoverAdsCandidates(gamClient, refreshToken);
     } catch (e) {
       logger.error('Ads listAccessibleCustomers failed:', e.message);
-      return res.redirect(adsOAuthErrorRedirect(e));
+      return res.redirect(adsOAuthErrorRedirect(e, decoded));
     }
 
     const { managers, individuals } = discovered;
+    const mccOpts = { includeChildrenInRoi: forDomainUser };
 
     // Reconnecting a known MCC: update token + refresh children, skip picker
     if (decoded.adsAccountId && mode === 'mcc') {
       const account = await getAccountById(decoded.adsAccountId);
       if (account && account.clientId === gamClient.id) {
-        await commitMccSelection(gamClient, {
+        const { mccAccount } = await commitMccSelection(gamClient, {
           customerId: account.customerId,
           descriptiveName: account.descriptiveName,
           refreshToken,
+          ...mccOpts,
         });
-        return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected'));
+        await grantConnectedAccounts(decoded, gamClient, mccAccount);
+        return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
       }
     }
 
     if (managers.length === 1 && individuals.length === 0) {
-      await commitMccSelection(gamClient, {
+      const { mccAccount } = await commitMccSelection(gamClient, {
         customerId: managers[0].customerId,
         descriptiveName: managers[0].descriptiveName,
         refreshToken,
+        ...mccOpts,
       });
-      return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected'));
+      await grantConnectedAccounts(decoded, gamClient, mccAccount);
+      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
     }
 
     if (managers.length === 0 && individuals.length === 1) {
-      await commitIndividualSelection(gamClient, {
+      const account = await commitIndividualSelection(gamClient, {
         customerId: individuals[0].customerId,
         descriptiveName: individuals[0].descriptiveName,
         refreshToken,
       });
-      return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=connected_individual'));
+      await grantConnectedAccounts(decoded, gamClient, account);
+      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected_individual'));
     }
 
     if (managers.length === 0 && individuals.length === 0) {
-      return res.redirect(frontendAdminUrl('?tab=ads&ads_oauth=error&reason=no_accessible_accounts'));
+      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=no_accessible_accounts'));
     }
 
     const session = await createPendingSession({
@@ -271,14 +318,19 @@ router.get('/callback', async (req, res) => {
         ...managers.map((m) => ({ ...m, kind: 'mcc' })),
         ...individuals.map((i) => ({ ...i, kind: 'client' })),
       ],
+      payload: {
+        userId: decoded.userId || null,
+        returnTo: forDomainUser ? 'my-ads' : 'admin',
+        includeChildrenInRoi: forDomainUser,
+      },
     });
 
     return res.redirect(
-      frontendAdminUrl(`?tab=ads&ads_oauth=pick&session=${encodeURIComponent(session.id)}`)
+      adsOAuthRedirect(decoded, `ads_oauth=pick&session=${encodeURIComponent(session.id)}`)
     );
   } catch (err) {
     logger.error('Ads OAuth callback error:', err.message);
-    return res.redirect(adsOAuthErrorRedirect(err));
+    return res.redirect(adsOAuthErrorRedirect(err, decoded));
   }
 });
 
@@ -290,3 +342,4 @@ module.exports.commitIndividualSelection = commitIndividualSelection;
 module.exports.discoverAdsCandidates = discoverAdsCandidates;
 module.exports.getPendingSession = getPendingSession;
 module.exports.deletePendingSession = deletePendingSession;
+module.exports.adsOAuthRedirect = adsOAuthRedirect;

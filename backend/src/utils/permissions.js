@@ -471,6 +471,7 @@ const DEFAULT_CHILD_PERMISSIONS = {
   canAccessReporting: true,
   canAccessRoi: true,
   canAccessDomainUser: true,
+  canAccessMyAds: true,
   canLogin: true,
   canGenerateReports: true,
   canDownloadReports: true,
@@ -491,7 +492,7 @@ const DEFAULT_CHILD_PERMISSIONS = {
 };
 
 const FLAG_KEYS = [
-  'canAccessDashboard', 'canAccessReporting', 'canAccessRoi', 'canAccessDomainUser',
+  'canAccessDashboard', 'canAccessReporting', 'canAccessRoi', 'canAccessDomainUser', 'canAccessMyAds',
   'canLogin', 'canGenerateReports', 'canDownloadReports', 'canUseFilters', 'canUseReportBuilder',
   'canSeeRevenue', 'canSeeImpressions', 'canSeeCTR', 'canSeeECPM', 'canSeeProgrammatic',
   'canSeeOrders', 'canSeeInventory',
@@ -586,9 +587,10 @@ function canAccessPage(user, page) {
     reporting: 'canAccessReporting',
     roi: 'canAccessRoi',
     'domain-user': 'canAccessDomainUser',
+    'my-ads': 'canAccessMyAds',
     admin: null,
   };
-  if (page === 'domain-user' && isAdmin(user)) return false;
+  if ((page === 'domain-user' || page === 'my-ads') && isAdmin(user)) return false;
   if (isAdmin(user)) return true;
   const key = map[page];
   if (!key) return false;
@@ -598,7 +600,7 @@ function canAccessPage(user, page) {
 function buildVisibility(user) {
   if (isAdmin(user)) {
     return {
-      pages: { dashboard: true, reporting: true, roi: true, domainUser: false },
+      pages: { dashboard: true, reporting: true, roi: true, domainUser: false, myAds: false },
       revenue: true, impressions: true, ctr: true, ecpm: true, programmatic: true,
       generate: true, download: true, filters: true, reportBuilder: true,
       orders: true, inventory: true,
@@ -611,6 +613,7 @@ function buildVisibility(user) {
       reporting: p.canAccessReporting !== false,
       roi: p.canAccessRoi !== false,
       domainUser: p.canAccessDomainUser !== false,
+      myAds: p.canAccessMyAds !== false,
     },
     revenue: p.canSeeRevenue !== false,
     impressions: p.canSeeImpressions !== false,

@@ -279,6 +279,14 @@ export const adsAPI = {
   listExpenses: (params) => FAST_API.get('/ads/expenses', { params }),
   createExpense: (payload) => FAST_API.post('/ads/expenses', payload),
   deleteExpense: (id) => FAST_API.delete(`/ads/expenses/${id}`),
+  // Domain-user My Google Ads
+  myListAccounts: () => FAST_API.get('/ads/my/accounts'),
+  myOauthUrl: () => FAST_API.post('/ads/my/oauth-url'),
+  myOauthPending: (id) => FAST_API.get(`/ads/my/oauth/pending/${id}`),
+  myOauthSelect: (id, payload) => FAST_API.post(`/ads/my/oauth/pending/${id}/select`, payload),
+  myAccountOauthUrl: (id) => FAST_API.get(`/ads/my/accounts/${id}/oauth-url`),
+  myDisconnectAccount: (id) => FAST_API.post(`/ads/my/accounts/${id}/disconnect`),
+  mySync: (payload) => FAST_API.post('/ads/my/sync', payload || {}),
 };
 
 export const roiAPI = {
