@@ -10,6 +10,7 @@ import Roi from './pages/Roi';
 import Presets from './pages/Presets';
 import Admin from './pages/Admin';
 import DomainUser from './pages/DomainUser';
+import MyAds from './pages/MyAds';
 import PrivacyPolicy from './pages/PrivacyPolicy';
 import TermsOfService from './pages/TermsOfService';
 import ProtectedRoute from './components/routing/ProtectedRoute';
@@ -116,6 +117,7 @@ function AppRoutes() {
         <Route path="/roi" element={<PermissionRoute page="roi"><Roi /></PermissionRoute>} />
         <Route path="/presets" element={<PermissionRoute page="presets"><Presets /></PermissionRoute>} />
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
+        <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
       </Route>
 

@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth, requireAdmin, requireDomainUser } = require('../middleware/auth');
 const {
   buildAdsAuthUrl,
   commitMccSelection,
@@ -25,8 +25,13 @@ const { getPendingSessionPublic, getPendingSession, deletePendingSession } = req
 const { listCampaigns, isAdsOAuthConfigured, resolveOAuthApp, adsRedirectUri } = require('../ads/client');
 const { resolveRefreshForAccount, syncAllAccountsForClient, syncAccountSpend, enqueueAdsSyncAccounts } = require('../services/adsSyncService');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
-const { resolveAdsAccountIdsForUser, getAllowedAdsAccountIds } = require('../utils/permissions');
+const { resolveAdsAccountIdsForUser, getAllowedAdsAccountIds, hasFlag } = require('../utils/permissions');
 const { frontendBaseUrl } = require('../utils/frontendUrl');
+const {
+  collectGrantIds,
+  grantAdsAccountsToUser,
+  revokeAdsAccountsFromUser,
+} = require('../utils/adsUserAccess');
 const logger = require('../utils/logger');
 const { cache } = require('../gam/client');
 
@@ -72,6 +77,240 @@ router.get('/health', requireAdmin, (req, res) => {
     redirectUri: adsRedirectUri(),
     frontendUrl: frontendBaseUrl(),
   });
+});
+
+// ─── Domain-user: My Google Ads ───────────────────────────────────────────────
+function requireMyAdsAccess(req, res, next) {
+  if (!hasFlag(req.user, 'canAccessMyAds')) {
+    return res.status(403).json({ error: 'You do not have access to My Google Ads.' });
+  }
+  return next();
+}
+
+router.get('/my/accounts', requireDomainUser, requireMyAdsAccess, async (req, res) => {
+  try {
+    const clientId = req.client?.id || req.user.clientId;
+    const all = await listAccounts(clientId);
+    const allowed = getAllowedAdsAccountIds(req.user);
+    const accounts = allowed === null
+      ? []
+      : all.filter((a) => allowed.includes(String(a.id)));
+    res.json({ accounts });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/my/oauth-url', requireDomainUser, requireMyAdsAccess, async (req, res) => {
+  try {
+    if (!isAdsOAuthConfigured(req.client)) {
+      return res.status(400).json({
+        error: 'Google Ads OAuth is not configured. Ask your administrator to set Ads OAuth credentials.',
+      });
+    }
+    const url = buildAdsAuthUrl(req.client, {
+      clientId: req.client.id,
+      mode: 'mcc',
+      userId: req.user.id,
+      returnTo: 'my-ads',
+    });
+    res.json({ url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/my/oauth/pending/:id', requireDomainUser, requireMyAdsAccess, async (req, res) => {
+  try {
+    const session = await getPendingSessionPublic(req.params.id);
+    if (!session || session.product !== 'ads') {
+      return res.status(404).json({ error: 'OAuth session expired or not found. Connect with Google again.' });
+    }
+    if (session.clientId && session.clientId !== req.client.id) {
+      return res.status(403).json({ error: 'OAuth session belongs to another client.' });
+    }
+    if (session.payload?.userId && session.payload.userId !== req.user.id) {
+      return res.status(403).json({ error: 'OAuth session belongs to another user.' });
+    }
+    const managers = (session.candidates || []).filter((c) => c.kind === 'mcc' || c.isManager);
+    const individuals = (session.candidates || []).filter((c) => c.kind === 'client' || (!c.isManager && c.kind !== 'mcc'));
+    res.json({
+      sessionId: session.id,
+      managers,
+      individuals,
+      expiresAt: session.expiresAt,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/my/oauth/pending/:id/select', requireDomainUser, requireMyAdsAccess, async (req, res) => {
+  try {
+    const session = await getPendingSession(req.params.id);
+    if (!session || session.product !== 'ads') {
+      return res.status(404).json({ error: 'OAuth session expired or not found. Connect with Google again.' });
+    }
+    if (session.clientId && session.clientId !== req.client.id) {
+      return res.status(403).json({ error: 'OAuth session belongs to another client.' });
+    }
+    if (session.payload?.userId && session.payload.userId !== req.user.id) {
+      return res.status(403).json({ error: 'OAuth session belongs to another user.' });
+    }
+    const customerId = normalizeCustomerId(req.body?.customerId);
+    if (!customerId || !/^\d{10}$/.test(customerId)) {
+      return res.status(400).json({ error: 'customerId is required.' });
+    }
+    const candidate = (session.candidates || []).find(
+      (c) => String(c.customerId || '').replace(/-/g, '') === customerId
+    );
+    if (!candidate) {
+      return res.status(400).json({ error: 'Selected account is not in this OAuth session.' });
+    }
+
+    const isMcc = candidate.kind === 'mcc' || candidate.isManager;
+    let rootAccount;
+    let childrenCount = 0;
+    if (isMcc) {
+      const result = await commitMccSelection(req.client, {
+        customerId,
+        descriptiveName: candidate.descriptiveName,
+        refreshToken: session.refreshToken,
+        includeChildrenInRoi: true,
+      });
+      rootAccount = result.mccAccount;
+      childrenCount = result.childrenCount;
+    } else {
+      rootAccount = await commitIndividualSelection(req.client, {
+        customerId,
+        descriptiveName: candidate.descriptiveName,
+        refreshToken: session.refreshToken,
+      });
+    }
+
+    const grantIds = await collectGrantIds(req.client.id, rootAccount);
+    const updatedUser = await grantAdsAccountsToUser(req.user.id, grantIds);
+    await deletePendingSession(session.id);
+
+    return res.json({
+      ok: true,
+      accountType: isMcc ? 'mcc' : 'client',
+      account: rootAccount,
+      childrenCount,
+      allowedAdsAccountIds: updatedUser?.permissions?.allowedAdsAccountIds || grantIds,
+    });
+  } catch (err) {
+    logger.error('Domain-user Ads OAuth select failed:', err.message);
+    res.status(500).json({ error: err.message || 'Could not select Ads account' });
+  }
+});
+
+router.get('/my/accounts/:id/oauth-url', requireDomainUser, requireMyAdsAccess, async (req, res) => {
+  try {
+    const allowed = getAllowedAdsAccountIds(req.user);
+    if (allowed !== null && !allowed.includes(String(req.params.id))) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+    const account = await getAccountById(req.params.id);
+    if (!account || account.clientId !== req.client.id) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+    const url = buildAdsAuthUrl(req.client, {
+      clientId: req.client.id,
+      mode: account.accountType === 'mcc' ? 'mcc' : 'individual',
+      adsAccountId: account.id,
+      userId: req.user.id,
+      returnTo: 'my-ads',
+    });
+    res.json({ url });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Unlink from this user only — does not delete the network ads_accounts row. */
+router.post('/my/accounts/:id/disconnect', requireDomainUser, requireMyAdsAccess, async (req, res) => {
+  try {
+    const allowed = getAllowedAdsAccountIds(req.user);
+    if (allowed !== null && !allowed.includes(String(req.params.id))) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+    const account = await getAccountById(req.params.id);
+    if (!account || account.clientId !== req.client.id) {
+      return res.status(404).json({ error: 'Account not found' });
+    }
+    const revokeIds = await collectGrantIds(req.client.id, account);
+    const updatedUser = await revokeAdsAccountsFromUser(req.user.id, revokeIds);
+    res.json({
+      ok: true,
+      allowedAdsAccountIds: updatedUser?.permissions?.allowedAdsAccountIds || [],
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/my/sync', requireDomainUser, requireMyAdsAccess, async (req, res) => {
+  try {
+    if (!String(process.env.GOOGLE_ADS_DEVELOPER_TOKEN || '').trim()) {
+      return res.status(400).json({
+        error: 'Google Ads sync is not configured. Ask your administrator.',
+        total: 0,
+        accounts: 0,
+      });
+    }
+    const allowed = getAllowedAdsAccountIds(req.user);
+    if (allowed !== null && allowed.length === 0) {
+      return res.status(400).json({
+        error: 'No Google Ads accounts connected yet. Connect with Google first.',
+        total: 0,
+        accounts: 0,
+      });
+    }
+    const lookback = parseInt(process.env.GOOGLE_ADS_SYNC_LOOKBACK_DAYS || '30', 10) || 30;
+    const end = req.body?.endDate || todayInTZ();
+    const start = req.body?.startDate || shiftYMD(end, -(lookback - 1));
+    const { listSyncableClientAccounts } = require('../models/adsAccountStore');
+    let syncable = await listSyncableClientAccounts(req.client.id, { roiOnly: true });
+    if (allowed !== null) {
+      const set = new Set(allowed.map(String));
+      syncable = syncable.filter((a) => set.has(String(a.id)));
+    }
+    if (!syncable.length) {
+      return res.status(400).json({
+        error: 'No syncable connected accounts yet. Connect an account, then try Sync again.',
+        total: 0,
+        accounts: 0,
+        start,
+        end,
+      });
+    }
+
+    let total = 0;
+    const errors = [];
+    for (const account of syncable) {
+      try {
+        total += await syncAccountSpend(account, { startDate: start, endDate: end, gamClient: req.client });
+      } catch (err) {
+        const { formatAdsSyncError } = require('../services/adsSyncService');
+        errors.push({ accountId: account.id, error: formatAdsSyncError(err) });
+      }
+    }
+    res.json({
+      ok: errors.length === 0,
+      total,
+      accounts: syncable.length,
+      start,
+      end,
+      errors,
+      message: errors.length
+        ? `Synced with ${errors.length} error(s).`
+        : `Synced spend for ${syncable.length} account(s).`,
+    });
+  } catch (err) {
+    logger.error('Domain-user Ads sync:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── Accounts (admin) ─────────────────────────────────────────────────────────

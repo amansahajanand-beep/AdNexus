@@ -42,6 +42,7 @@ const NAV_ICONS = {
   presets: Bookmark,
   admin: Settings,
   'domain-user': UserRound,
+  'my-ads': Megaphone,
 };
 
 const FILTER_ICONS = {
