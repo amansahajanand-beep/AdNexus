@@ -79,6 +79,9 @@ const {
   REPORT_CACHE_TTL,
 } = require('./gamHelpers');
 
+/** "No data" answers are cached briefly only — GAM may fill the same query later. */
+const NO_DATA_RESPONSE_TTL = 60;
+
 // ─── Redis + PostgreSQL helpers (graceful — if not configured, fall through to GAM) ─
 let _redis = null, _db = null, _syncSvc = null, _gamSyncQueue = null;
 function getRedis() {
@@ -519,7 +522,7 @@ function mockDetailed({
   });
 
   const enriched = attachDimensionsToRows(
-    attachMetricsToRows(rows.map(syncLegacyFields), asArray(reportMetrics)),
+    attachMetricsToRows(rows.map(syncLegacyFields), asArray(reportMetrics), { fillMissing: true }),
     asArray(reportDimensions)
   );
   const totalRevenue = +enriched.reduce((a, r) => a + r.revenue, 0).toFixed(2);
@@ -665,6 +668,156 @@ function resolveDimensionSets(reportDimensions, opts = {}) {
   return sets.length ? sets : DETAILED_REPORT_DIMENSIONS;
 }
 
+// Friendly labels for GAM enums (must match frontend gamReportCatalogData labels).
+const GAM_DIM_LABEL = {
+  DATE: 'Date', MOBILE_APP_RESOLVED_ID: 'App ID', MOBILE_APP_NAME: 'App names', AD_UNIT_NAME: 'Ad unit', SITE_NAME: 'Site',
+  DOMAIN: 'Domain', URL_NAME: 'URL', WEB_PROPERTY_CODE: 'Web Property Code',
+  PROGRAMMATIC_CHANNEL_NAME: 'Programmatic channel', DEMAND_CHANNEL_NAME: 'Demand channel',
+  CHANNEL_NAME: 'Channel', ADVERTISER_NAME: 'Advertiser', ORDER_NAME: 'Order',
+  LINE_ITEM_NAME: 'Line item', CREATIVE_NAME: 'Creative', COUNTRY_NAME: 'Country',
+  DEVICE_CATEGORY_NAME: 'Device category', BROWSER_NAME: 'Browser',
+  OPERATING_SYSTEM_NAME: 'OS', CUSTOM_TARGETING_VALUE_ID: 'Custom targeting',
+  AD_TECHNOLOGY_PROVIDER_DOMAIN: 'Ad tech provider',
+  ADVERTISER_DOMAIN_NAME: 'Advertiser domain',
+};
+
+const GAM_MET_LABEL = {
+  TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE: 'Revenue',
+  TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS: 'Impressions',
+  TOTAL_LINE_ITEM_LEVEL_CLICKS: 'Clicks',
+  TOTAL_LINE_ITEM_LEVEL_CTR: 'CTR',
+  TOTAL_INVENTORY_LEVEL_UNFILLED_IMPRESSIONS: 'Unfilled impressions',
+  PROGRAMMATIC_ELIGIBLE_IMPRESSIONS: 'Eligible impressions',
+  PROGRAMMATIC_MATCHED_IMPRESSIONS: 'Matched impressions',
+  PROGRAMMATIC_REVENUE: 'Programmatic revenue',
+  TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS: 'Viewable impressions',
+  TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE: 'Viewable rate',
+  TOTAL_ACTIVE_VIEW_MEASURABLE_IMPRESSIONS_RATE: 'Measurable rate',
+  TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE: 'Total revenue',
+  TOTAL_LINE_ITEM_LEVEL_WITHOUT_CPD_AVERAGE_ECPM: 'Total average eCPM',
+  TOTAL_AD_REQUESTS: 'Total ad requests',
+  TOTAL_UNMATCHED_AD_REQUESTS: 'Total unmatched ad requests',
+  TOTAL_RESPONSES_SERVED: 'Total responses served',
+  TOTAL_FILL_RATE: 'Total fill rate',
+  TOTAL_CODE_SERVED_COUNT: 'Total code served count',
+  TOTAL_PROGRAMMATIC_ELIGIBLE_AD_REQUESTS: 'Programmatic eligible ad requests',
+  TOTAL_AVERAGE_ECPM: 'Total average eCPM',
+  TOTAL_REVENUE: 'Total revenue',
+};
+
+/** GAM does not allow Total ad requests (and siblings) with App ID / App name. */
+const APP_REPORT_DIMS = new Set(['MOBILE_APP_RESOLVED_ID', 'MOBILE_APP_NAME']);
+
+/**
+ * Closest GAM column that still breaks down by App ID.
+ * Network totals differ from Total ad requests — label must stay honest.
+ */
+const APP_AD_REQUEST_SUBSTITUTIONS = {
+  total_ad_requests: {
+    toId: 'total_programmatic_eligible_ad_requests',
+    toApi: 'TOTAL_PROGRAMMATIC_ELIGIBLE_AD_REQUESTS',
+    fromLabel: 'Total ad requests',
+    toLabel: 'Programmatic eligible ad requests',
+  },
+};
+
+function hasAppReportDimension(dimensionIds = []) {
+  return asArray(dimensionIds).some((id) => APP_REPORT_DIMS.has(catalogIdToGamEnum(id)));
+}
+
+/**
+ * When App ID/name is selected, rewrite Total ad requests to Programmatic eligible
+ * ad requests so GAM accepts the query and the table still gets an ad-request column.
+ */
+function rewriteMetricsForAppDimensions(dimensionIds = [], metricIds = []) {
+  if (!hasAppReportDimension(dimensionIds)) {
+    return { metricIds: asArray(metricIds), substitutions: [] };
+  }
+  const substitutions = [];
+  const out = [];
+  const seen = new Set();
+  for (const id of asArray(metricIds)) {
+    const sub = APP_AD_REQUEST_SUBSTITUTIONS[String(id || '').toLowerCase()];
+    if (sub) {
+      substitutions.push({
+        from: String(id).toLowerCase(),
+        to: sub.toId,
+        fromLabel: sub.fromLabel,
+        toLabel: sub.toLabel,
+      });
+      if (!seen.has(sub.toId)) {
+        seen.add(sub.toId);
+        out.push(sub.toId);
+      }
+      continue;
+    }
+    const key = String(id || '').toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(id);
+    }
+  }
+  return { metricIds: out, substitutions };
+}
+
+function metricLabelForId(id) {
+  const api = catalogIdToGamEnum(id);
+  if (GAM_MET_LABEL[api]) return GAM_MET_LABEL[api];
+  return String(id || '')
+    .split('_')
+    .filter(Boolean)
+    .map((w, i) => (i === 0 ? w.charAt(0).toUpperCase() + w.slice(1) : w))
+    .join(' ');
+}
+
+/**
+ * Metrics the user asked for that no row actually carries — GAM could not serve them
+ * with the requested dimensions. Used to keep the "partial" explanation on cached /
+ * warehouse-served rows, where the original warning is no longer attached.
+ */
+function deriveMissingMetricIds(rows = [], metricIds = []) {
+  const ids = [...new Set((metricIds || []).filter(Boolean))];
+  if (!ids.length || !rows.length) return [];
+  const present = new Set();
+  for (const row of rows) {
+    const metrics = row?.metrics || {};
+    for (const id of ids) {
+      if (metrics[id] != null) present.add(id);
+    }
+    if (present.size === ids.length) return [];
+  }
+  return ids.filter((id) => !present.has(id));
+}
+
+/** Column families GAM accepts alongside almost any inventory dimension. */
+const BROAD_COMPAT_METRIC = /^(TOTAL_LINE_ITEM_LEVEL_|TOTAL_INVENTORY_LEVEL_|TOTAL_ACTIVE_VIEW_)/;
+
+/**
+ * GAM rejects whole column families for some dimension sets — e.g. TOTAL_AD_REQUESTS
+ * with MOBILE_APP_RESOLVED_ID fails with COLUMNS_NOT_SUPPORTED_FOR_REQUESTED_DIMENSIONS.
+ * Peel the risky columns off (fewest first) so the user still gets the rest of the
+ * report instead of an empty one. Prefix slices alone can't do this: the offending
+ * column is usually in the middle of the selection.
+ */
+function compatMetricFallbacks(metricApis = []) {
+  const apis = (metricApis || []).filter(Boolean);
+  const risky = apis.filter((m) => !BROAD_COMPAT_METRIC.test(m));
+  if (!risky.length) return [];
+  const attempts = [];
+  const add = (mets) => {
+    const list = [...new Set((mets || []).filter(Boolean))];
+    if (!list.length) return;
+    if (attempts.some((a) => a.join(',') === list.join(','))) return;
+    attempts.push(list);
+  };
+  if (risky.length > 1) {
+    for (const drop of risky.slice(0, 3)) add(apis.filter((m) => m !== drop));
+  }
+  add(apis.filter((m) => BROAD_COMPAT_METRIC.test(m)));
+  add(BASE_DETAIL_METRICS);
+  return attempts;
+}
+
 function buildMetricAttempts(metricApis, opts = {}) {
   const compatOnly = Boolean(opts.compatOnly);
   const attempts = [];
@@ -680,6 +833,7 @@ function buildMetricAttempts(metricApis, opts = {}) {
 
   if (metricApis.length) {
     add(metricApis);
+    for (const fallback of compatMetricFallbacks(metricApis)) add(fallback);
     for (const n of [10, 8, 6, 4, 2]) {
       if (metricApis.length > n) add(metricApis.slice(0, n));
     }
@@ -728,9 +882,13 @@ async function downloadDetailedReport(startDate, endDate, countryFilter, dimensi
   const compatOnly = Boolean(opts.compatOnly);
   // Always forward poll opts — previously fastMode never reached pollReport.
   const pollOpts = { fastMode };
-  const dimensionCandidates = fastMode ? dimensionSets.slice(0, 1) : dimensionSets;
+  // Fast mode still needs the shrink ladder for rejected columns, otherwise one
+  // unsupported metric (e.g. Total ad requests + App ID) empties the whole report.
+  const dimensionCandidates = fastMode ? dimensionSets.slice(0, compatOnly ? 3 : 1) : dimensionSets;
   const metricAttempts = fastMode
-    ? (metricApis.length ? [metricApis] : [DEFAULT_DETAIL_METRICS, BASE_DETAIL_METRICS])
+    ? (metricApis.length
+      ? [metricApis, ...compatMetricFallbacks(metricApis)]
+      : [DEFAULT_DETAIL_METRICS, BASE_DETAIL_METRICS])
     : buildMetricAttempts(metricApis, { compatOnly });
 
   for (const dimensions of dimensionCandidates) {
@@ -740,6 +898,18 @@ async function downloadDetailedReport(startDate, endDate, countryFilter, dimensi
         const raw = await runReportAndDownload(xml, token, pollOpts);
         if (!rawRowsHaveMetrics(raw)) {
           logger.warn(`Detailed report dims=[${dimensions.join(', ')}] returned zero metrics, retrying`);
+          if (compatOnly) {
+            // GAM accepted these columns and reported nothing — other column sets
+            // would return the same emptiness, so don't burn more report jobs.
+            return {
+              raw: [],
+              dimensions,
+              fetchedMetrics: metrics,
+              partial: false,
+              fallback: false,
+              emptyCompat: true,
+            };
+          }
           continue;
         }
         const userDimKey = (dimensionSets[0] || []).join(',');
@@ -822,12 +992,23 @@ async function runDetailedReport({
     const numOr0 = v => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
     const intOr0 = v => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : 0; };
 
-    const metricIds = asArray(reportMetrics);
+    const requestedMetricIds = asArray(reportMetrics);
     let dimensionIds = asArray(reportDimensions);
     if (asArray(country).length && !dimensionIds.includes('country_name')) {
       dimensionIds = [...dimensionIds, 'country_name'];
     }
-    const metricApis = resolveMetricApis(reportMetrics);
+    const {
+      metricIds,
+      substitutions: adRequestSubstitutions,
+    } = rewriteMetricsForAppDimensions(dimensionIds, requestedMetricIds);
+    if (adRequestSubstitutions.length) {
+      logger.info(
+        `App dims present — substituting ${adRequestSubstitutions
+          .map((s) => `${s.fromLabel} → ${s.toLabel}`)
+          .join(', ')}`
+      );
+    }
+    const metricApis = resolveMetricApis(metricIds);
     const compatOnly = Boolean(opts.compatOnly);
     const invOnly = hasInventoryFilters({ domain, site, domainName, domainId })
       && !dimensionIds.length;
@@ -867,6 +1048,7 @@ async function runDetailedReport({
         reportWarningUsed: [],
         reportWarningUsedIds: [],
         reportWarningUsedMetricIds: [],
+        reportWarningSubstitutions: [],
       };
     }
 
@@ -878,7 +1060,9 @@ async function runDetailedReport({
     };
 
     let rows = raw.map((r) => {
-      const revenue = +(numOr0(r['Column.TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE']) / 1e6).toFixed(2);
+      // Keep sub-cent precision: rounding thousands of tiny app/country rows to cents
+      // adds up to a visibly wrong daily total.
+      const revenue = +(numOr0(r['Column.TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE']) / 1e6).toFixed(6);
       const impression = intOr0(r['Column.TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS']);
       const clicks = intOr0(r['Column.TOTAL_LINE_ITEM_LEVEL_CLICKS']);
       const unfilled = intOr0(r['Column.TOTAL_INVENTORY_LEVEL_UNFILLED_IMPRESSIONS']);
@@ -936,40 +1120,20 @@ async function runDetailedReport({
     rows = attachDimensionsToRows(attachMetricsToRows(rows, metricIds), dimensionIds);
     rows = enrichRowsWithCountryFilter(rows, country);
 
-    // Friendly label map for GAM enum → human name (must match frontend gamReportCatalogData labels).
-    const GAM_DIM_LABEL = {
-      DATE: 'Date', MOBILE_APP_RESOLVED_ID: 'App ID', MOBILE_APP_NAME: 'App names', AD_UNIT_NAME: 'Ad unit', SITE_NAME: 'Site',
-      DOMAIN: 'Domain', URL_NAME: 'URL', WEB_PROPERTY_CODE: 'Web Property Code',
-      PROGRAMMATIC_CHANNEL_NAME: 'Programmatic channel', DEMAND_CHANNEL_NAME: 'Demand channel',
-      CHANNEL_NAME: 'Channel', ADVERTISER_NAME: 'Advertiser', ORDER_NAME: 'Order',
-      LINE_ITEM_NAME: 'Line item', CREATIVE_NAME: 'Creative', COUNTRY_NAME: 'Country',
-      DEVICE_CATEGORY_NAME: 'Device category', BROWSER_NAME: 'Browser',
-      OPERATING_SYSTEM_NAME: 'OS', CUSTOM_TARGETING_VALUE_ID: 'Custom targeting',
-      AD_TECHNOLOGY_PROVIDER_DOMAIN: 'Ad tech provider',
-      ADVERTISER_DOMAIN_NAME: 'Advertiser domain',
-    };
-    const GAM_MET_LABEL = {
-      TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE: 'Revenue',
-      TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS: 'Impressions',
-      TOTAL_LINE_ITEM_LEVEL_CLICKS: 'Clicks',
-      TOTAL_LINE_ITEM_LEVEL_CTR: 'CTR',
-      TOTAL_INVENTORY_LEVEL_UNFILLED_IMPRESSIONS: 'Unfilled impressions',
-      PROGRAMMATIC_ELIGIBLE_IMPRESSIONS: 'Eligible impressions',
-      PROGRAMMATIC_MATCHED_IMPRESSIONS: 'Matched impressions',
-      PROGRAMMATIC_REVENUE: 'Programmatic revenue',
-      TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS: 'Viewable impressions',
-      TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE: 'Viewable rate',
-      TOTAL_ACTIVE_VIEW_MEASURABLE_IMPRESSIONS_RATE: 'Measurable rate',
-    };
-
     let reportWarning = null;
     let reportWarningSkipped = [];   // dims/metrics that could NOT run
     let reportWarningUsed = [];      // dims that DID run (display labels)
     let reportWarningUsedIds = [];   // dims that DID run (catalog ids — reliable for UI columns)
     let reportWarningUsedMetricIds = []; // metrics that DID run (catalog ids)
+    let reportWarningSubstitutions = adRequestSubstitutions.map((s) => ({
+      from: s.from,
+      to: s.to,
+      fromLabel: s.fromLabel,
+      toLabel: s.toLabel,
+    }));
 
     const userRequestedDims = dimensionIds.length > 0;
-    const userRequestedMets = metricIds.length > 0;
+    const userRequestedMets = requestedMetricIds.length > 0;
 
     if ((partial || fallback) && (userRequestedDims || userRequestedMets)) {
       const actualDimSet = new Set((actualDims || []).map(d => d.toUpperCase()));
@@ -980,7 +1144,9 @@ async function runDetailedReport({
         .filter(api => api && !actualDimSet.has(api))
         .map(api => GAM_DIM_LABEL[api] || api);
 
-      const skippedMets = metricIds
+      // Compare against what the user asked for (pre-substitution), so swapped
+      // Total ad requests still shows as skipped / explained.
+      const skippedMets = requestedMetricIds
         .map(id => catalogIdToGamEnum(id))
         .filter(api => api && !actualMetSet.has(api))
         .map(api => GAM_MET_LABEL[api] || api);
@@ -1014,6 +1180,29 @@ async function runDetailedReport({
       reportWarning = reportWarningSkipped.length > 0 ? 'partial' : 'fallback';
     }
 
+    // App-dim substitution alone (GAM accepted the rewritten query) still needs a
+    // partial warning so the UI swaps the column label and explains the change.
+    if (adRequestSubstitutions.length) {
+      for (const s of adRequestSubstitutions) {
+        const explain = `${s.fromLabel} → ${s.toLabel}`;
+        if (!reportWarningSkipped.includes(explain)) {
+          reportWarningSkipped = reportWarningSkipped
+            .filter((label) => label !== s.fromLabel)
+            .concat(explain);
+        }
+        if (!reportWarningUsedMetricIds.includes(s.to)) {
+          reportWarningUsedMetricIds.push(s.to);
+        }
+      }
+      for (const id of metricIds) {
+        if (!reportWarningUsedMetricIds.includes(id)) reportWarningUsedMetricIds.push(id);
+      }
+      if (!reportWarningUsedIds.length && dimensionIds.length) {
+        reportWarningUsedIds = [...dimensionIds];
+      }
+      reportWarning = reportWarning || 'partial';
+    }
+
     const trendMap = {};
     rows.forEach(r => { trendMap[r.date] = (trendMap[r.date] || 0) + r.revenue; });
     const trend = Object.keys(trendMap).sort().map(date => ({ date, earning: +trendMap[date].toFixed(2) }));
@@ -1026,6 +1215,7 @@ async function runDetailedReport({
       reportWarningUsed,
       reportWarningUsedIds,
       reportWarningUsedMetricIds,
+      reportWarningSubstitutions,
     };
   } catch (err) {
     logger.warn('Detailed report failed; returning empty rows to keep dashboard responsive:', err.message);
@@ -1037,6 +1227,7 @@ async function runDetailedReport({
       reportWarningUsed: [],
       reportWarningUsedIds: [],
       reportWarningUsedMetricIds: [],
+      reportWarningSubstitutions: [],
     };
   }
 }
@@ -1879,6 +2070,7 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
       reportWarningUsed: cached.reportWarningUsed || [],
       reportWarningUsedIds: cached.reportWarningUsedIds || [],
       reportWarningUsedMetricIds: cached.reportWarningUsedMetricIds || [],
+      reportWarningSubstitutions: cached.reportWarningSubstitutions || [],
     };
   }
 
@@ -1899,6 +2091,7 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
           reportWarningUsed: rData.reportWarningUsed || [],
           reportWarningUsedIds: rData.reportWarningUsedIds || [],
           reportWarningUsedMetricIds: rData.reportWarningUsedMetricIds || [],
+          reportWarningSubstitutions: rData.reportWarningSubstitutions || [],
         };
       }
       if (rData?.rows?.length) await r.redisDel(cacheKey);
@@ -1979,7 +2172,25 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
   if (asyncOnMiss) {
     let jobId = null;
     if (useAdhocStore) {
-      jobId = await enqueueAdhocReportJob(filters, cacheKey);
+      // A finished job that stored nothing means GAM genuinely has no rows for this
+      // dim/metric combo — answer "no data" instead of an endless building poll.
+      if (await hasAdhocEmptyMarker(cacheKey)) {
+        logger.info(`${logLabel}: background job found no data for ${filters.startDate}..${filters.endDate}`);
+        return emptyReportResult(cacheKey);
+      }
+      const enqueued = await enqueueAdhocReportJob(filters, cacheKey);
+      jobId = enqueued.jobId;
+      if (enqueued.state === 'completed') {
+        logger.info(`${logLabel}: adhoc job already finished with no rows — returning no data`);
+        await setAdhocEmptyMarker(cacheKey);
+        return emptyReportResult(cacheKey);
+      }
+      if (enqueued.state === 'failed') {
+        // No marker: the failure may be transient (Redis/GAM blip), so the next
+        // Apply Filter or Run again should start a fresh job right away.
+        logger.warn(`${logLabel}: adhoc job failed for ${filters.startDate}..${filters.endDate} — returning no data`);
+        return emptyReportResult(cacheKey, { jobFailed: true });
+      }
       if (!jobId) {
         logger.warn(`${logLabel}: async adhoc enqueue failed — falling through to live GAM`);
       } else {
@@ -2014,7 +2225,20 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
       } catch (_) { /* ignore */ }
 
       const queueLive = isSyncQueueLive();
-      const hasAnyCoverage = (coverage?.coveredDays || 0) > 0;
+      const coveredDays = coverage?.coveredDays || 0;
+      const totalDays = coverage?.totalDays || 0;
+      const hasAnyCoverage = coveredDays > 0;
+      // Fully synced range with no matching rows is a real empty result, not a
+      // job still running — reporting "building" here never resolves.
+      const coverageComplete = totalDays > 0 && coveredDays >= totalDays;
+
+      if (queueLive && coverageComplete) {
+        logger.info(
+          `${logLabel}: warehouse fully covered ${filters.startDate}..${filters.endDate}`
+          + ' with no matching rows — returning no data'
+        );
+        return emptyReportResult(cacheKey, { coverage });
+      }
 
       if (queueLive && hasAnyCoverage) {
         return {
@@ -2112,6 +2336,7 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
       reportWarningUsed: data.reportWarningUsed,
       reportWarningUsedIds: data.reportWarningUsedIds,
       reportWarningUsedMetricIds: data.reportWarningUsedMetricIds,
+      reportWarningSubstitutions: data.reportWarningSubstitutions,
     };
   });
 
@@ -2128,6 +2353,7 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
       reportWarningUsed: result.reportWarningUsed || [],
       reportWarningUsedIds: result.reportWarningUsedIds || [],
       reportWarningUsedMetricIds: result.reportWarningUsedMetricIds || [],
+      reportWarningSubstitutions: result.reportWarningSubstitutions || [],
     };
     cache.set(cacheKey, payload, REPORT_CACHE_TTL);
     if (r?.redisSet && (result.rows || []).length <= 3000) {
@@ -2164,13 +2390,62 @@ async function loadReportRowsCacheAside(filters, token, opts = {}) {
     reportWarningUsed: result.reportWarningUsed || [],
     reportWarningUsedIds: result.reportWarningUsedIds || [],
     reportWarningUsedMetricIds: result.reportWarningUsedMetricIds || [],
+    reportWarningSubstitutions: result.reportWarningSubstitutions || [],
   };
 }
 
+/** Rows we know are genuinely empty (job ran, GAM had nothing) — never "building". */
+function emptyReportResult(cacheKey, extra = {}) {
+  return {
+    rows: [],
+    cacheKey,
+    source: 'empty',
+    status: 'empty',
+    noData: true,
+    reportWarning: null,
+    reportWarningSkipped: [],
+    reportWarningUsed: [],
+    reportWarningUsedIds: [],
+    reportWarningUsedMetricIds: [],
+    ...extra,
+  };
+}
+
+const adhocEmptyKey = (cacheKey) => `${cacheKey}:empty`;
+
+async function hasAdhocEmptyMarker(cacheKey) {
+  if (cache.get(adhocEmptyKey(cacheKey))) return true;
+  try {
+    const r = getRedis();
+    if (r?.redisGet) {
+      const mark = await r.redisGet(adhocEmptyKey(cacheKey));
+      if (mark?.empty) return true;
+    }
+  } catch (_) { /* ignore */ }
+  return false;
+}
+
+async function setAdhocEmptyMarker(cacheKey) {
+  const ttl = getRedis()?.TTL?.REPORT_EMPTY || 300;
+  cache.set(adhocEmptyKey(cacheKey), { empty: true }, ttl);
+  try {
+    const r = getRedis();
+    if (r?.redisSet) await r.redisSet(adhocEmptyKey(cacheKey), { empty: true, completedAt: Date.now() }, ttl);
+  } catch (_) { /* ignore */ }
+}
+
+/**
+ * @returns {Promise<{jobId: string|null, state: 'queued'|'running'|'completed'|'failed'|'unavailable'}>}
+ *   'completed' / 'failed' mean the job already ran, so the caller must stop polling.
+ */
 async function enqueueAdhocReportJob(filters, cacheKey) {
   try {
     const { gamReportQueue } = require('../queues/gamSync');
-    if (!gamReportQueue) return null;
+    // A disabled stub queue silently drops jobs — say so, so the caller uses live GAM
+    // instead of waiting on a report that will never be built.
+    if (!gamReportQueue || gamReportQueue.disabled || !isSyncQueueLive()) {
+      return { jobId: null, state: 'unavailable' };
+    }
     const hash = (() => {
       try {
         const { buildAdhocQueryHash } = require('./gamSyncService');
@@ -2181,10 +2456,16 @@ async function enqueueAdhocReportJob(filters, cacheKey) {
     })();
     const jobId = `adhoc-${String(getClientId() || '').slice(0, 8)}-${hash}-${filters.startDate}-${filters.endDate}`.slice(0, 120);
     const existing = await gamReportQueue.getJob(jobId);
-    if (existing) {
+    if (existing && typeof existing.getState === 'function') {
       const state = await existing.getState().catch(() => null);
-      if (state === 'completed' || state === 'active' || state === 'waiting' || state === 'delayed') {
-        return jobId;
+      if (state === 'active' || state === 'waiting' || state === 'delayed' || state === 'paused') {
+        return { jobId, state: 'running' };
+      }
+      // Completed with nothing persisted, or failed after its retries: terminal either
+      // way. Drop the job so the next Apply Filter / Retry runs a fresh one.
+      if (state === 'completed' || state === 'failed') {
+        try { await existing.remove(); } catch (_) { /* ignore */ }
+        return { jobId, state };
       }
       try { await existing.remove(); } catch (_) { /* ignore */ }
     }
@@ -2203,10 +2484,10 @@ async function enqueueAdhocReportJob(filters, cacheKey) {
       backoff: { type: 'fixed', delay: 15000 },
     });
     logger.info(`Enqueued adhoc-report ${jobId}`);
-    return jobId;
+    return { jobId, state: 'queued' };
   } catch (e) {
     logger.warn('enqueueAdhocReportJob failed:', e.message);
-    return null;
+    return { jobId: null, state: 'unavailable' };
   }
 }
 
@@ -3252,6 +3533,7 @@ async function handleDetailedReport(req, res) {
     reportWarningUsedIds = [],
     reportWarningUsedMetricIds = [],
     precomputed = null,
+    reportWarningSubstitutions = [],
   ) => {
     const isScopedChild = req.user?.role !== 'admin' && userHasAssignedInventory(req.user);
     // Cap before JS scope when rows came from a large dump — prefer SQL-capped bundles.
@@ -3293,6 +3575,7 @@ async function handleDetailedReport(req, res) {
       reportWarningUsed,
       reportWarningUsedIds,
       reportWarningUsedMetricIds,
+      reportWarningSubstitutions,
     };
     if (wantAllRows) {
       return applyVisibility({
@@ -3342,7 +3625,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v16_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v17_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3400,6 +3683,28 @@ async function handleDetailedReport(req, res) {
     reportWarningUsedIds: [],
     reportWarningUsedMetricIds: [],
     pagination: { totalRows: 0, allRows: false },
+  }, req.user);
+
+  /** Report finished with nothing to show — terminal, so the UI stops polling. */
+  const noDataPayload = (extra = {}) => applyVisibility({
+    summary: {
+      totalRevenue: 0,
+      totalDomains: 0,
+      offeredRecords: 0,
+      currency: currency || 'USD',
+    },
+    rows: [],
+    trend: [],
+    isMock: false,
+    status: 'empty',
+    noData: true,
+    reportWarning: null,
+    reportWarningSkipped: [],
+    reportWarningUsed: [],
+    reportWarningUsedIds: [],
+    reportWarningUsedMetricIds: [],
+    pagination: { totalRows: 0, allRows: false },
+    ...extra,
   }, req.user);
 
   try {
@@ -3674,7 +3979,7 @@ async function handleDetailedReport(req, res) {
     // ── Miss: enqueue month jobs (grain) or adhoc GAM; never block HTTP ────────
     const token = await getToken().catch(() => null);
     const loaded = await loadReportRowsCacheAside(filters, token, {
-      cachePrefix: classified.mode === 'adhoc' ? 'report_detailed_custom_v1' : 'report_detailed_raw_v3',
+      cachePrefix: classified.mode === 'adhoc' ? 'report_detailed_custom_v2' : 'report_detailed_raw_v3',
       fastMode: true,
       useAdhocStore: classified.mode === 'adhoc',
       skipDb: false,
@@ -3702,6 +4007,8 @@ async function handleDetailedReport(req, res) {
           loaded.reportWarningUsed,
           loaded.reportWarningUsedIds,
           loaded.reportWarningUsedMetricIds,
+          null,
+          loaded.reportWarningSubstitutions || [],
         );
         body.status = 'building';
         body.coverage = loaded.coverage || null;
@@ -3713,23 +4020,86 @@ async function handleDetailedReport(req, res) {
       return res.json(payload);
     }
 
+    // Background job already ran and found nothing for this filter combination.
+    if (loaded.status === 'empty' && !loaded.rows?.length) {
+      logger.info(
+        `Reporting no data ${filters.startDate}..${filters.endDate}`
+        + (loaded.jobFailed ? ' (background job failed)' : '')
+      );
+      const payload = noDataPayload({ coverage: loaded.coverage || null });
+      // Short TTL only — new GAM data for the same query may land minutes later.
+      // A failed job is never cached so "Run again" retries immediately.
+      if (!loaded.jobFailed) cache.set(detailedRespKey, payload, NO_DATA_RESPONSE_TTL);
+      return res.json(payload);
+    }
+
     if (loaded.rows?.length) {
+      // Cached / warehouse rows arrive without the original GAM warning, so re-derive
+      // which requested metrics are simply not in the data. For App ID + Total ad
+      // requests, also re-apply the Programmatic eligible substitution so the column
+      // still appears under the honest label.
+      const {
+        metricIds: rewrittenMets,
+        substitutions: appSubs,
+      } = rewriteMetricsForAppDimensions(dimIds, metIds);
+      let warn = loaded.reportWarning || null;
+      let skipped = loaded.reportWarningSkipped || [];
+      let usedMetIds = loaded.reportWarningUsedMetricIds || [];
+      let subs = loaded.reportWarningSubstitutions || [];
+
+      if (appSubs.length) {
+        const presentSubs = appSubs.filter(
+          (s) => !deriveMissingMetricIds(loaded.rows, [s.to]).length
+        );
+        if (presentSubs.length) {
+          subs = presentSubs;
+          for (const s of presentSubs) {
+            const explain = `${s.fromLabel} → ${s.toLabel}`;
+            if (!skipped.includes(explain)) {
+              skipped = skipped.filter((l) => l !== s.fromLabel).concat(explain);
+            }
+            if (!usedMetIds.includes(s.to)) usedMetIds.push(s.to);
+          }
+          for (const id of rewrittenMets) {
+            if (!usedMetIds.includes(id) && !deriveMissingMetricIds(loaded.rows, [id]).length) {
+              usedMetIds.push(id);
+            }
+          }
+          warn = warn || 'partial';
+        }
+      }
+
+      const missingMetricIds = skipped.length
+        ? []
+        : deriveMissingMetricIds(loaded.rows, metIds);
+      if (!skipped.length && missingMetricIds.length) {
+        skipped = missingMetricIds.map(metricLabelForId);
+        usedMetIds = metIds.filter((id) => !missingMetricIds.includes(id));
+        warn = warn || 'partial';
+      }
+
       const body = buildScopedFromRows(
         loaded.rows,
         currency,
         false,
-        loaded.reportWarning,
-        loaded.reportWarningSkipped,
+        warn,
+        skipped,
         loaded.reportWarningUsed,
-        loaded.reportWarningUsedIds,
-        loaded.reportWarningUsedMetricIds,
+        loaded.reportWarningUsedIds?.length ? loaded.reportWarningUsedIds : dimIds,
+        usedMetIds,
+        null,
+        subs,
       );
       if (loaded.coverage) body.coverage = loaded.coverage;
       return res.json(await cacheDetailedResponse(body));
     }
 
+    // Every source answered and none had rows — a genuine empty result. Keep the
+    // backfill going, but never leave the UI on an endless "building" poll.
     await enqueueRangeSync(filters.startDate, filters.endDate);
-    return res.json(buildingPayload(null));
+    const emptyBody = noDataPayload();
+    cache.set(detailedRespKey, emptyBody, NO_DATA_RESPONSE_TTL);
+    return res.json(emptyBody);
   } catch (err) {
     logger.error('Detailed report error:', err.message);
     const empty = buildScopedFromRows([], currency, false);
@@ -3757,27 +4127,41 @@ async function handleProgrammaticReport(req, res) {
   const cacheKey = `report_programmatic_resp_v1_${startDate}_${endDate}_${asArray(country).slice().sort().join('|') || 'all'}`;
   const currency = process.env.GAM_CURRENCY || null;
   const cached = cache.get(cacheKey);
-  if (cached?.rows?.length || cached?.status === 'building') {
+  if (cached?.rows?.length || cached?.status === 'building' || cached?.empty) {
     return res.json(applyProgrammaticVisibility({ ...cached, currency }, req.user));
   }
 
   const r = getRedis();
   if (r?.redisGet) {
     const rData = await r.redisGet(cacheKey);
-    if (rData?.rows?.length || rData?.status === 'building') {
-      cache.set(cacheKey, rData, REPORT_CACHE_TTL);
+    // `empty` means the background job finished with no rows — serve that as a
+    // final answer instead of enqueuing again and replying "building" forever.
+    if (rData?.rows?.length || rData?.status === 'building' || rData?.empty) {
+      cache.set(
+        cacheKey,
+        rData,
+        rData.empty ? NO_DATA_RESPONSE_TTL : REPORT_CACHE_TTL
+      );
       return res.json(applyProgrammaticVisibility({ ...rData, currency }, req.user));
     }
   }
 
   // Miss → enqueue grain months + programmatic job; never block on GAM.
   const jobId = await enqueueFullReportSync(startDate, endDate);
+  let jobFinished = false;
   try {
     const { gamReportQueue } = require('../queues/gamSync');
     if (gamReportQueue) {
       const progJobId = `prog-${String(getClientId() || '').slice(0, 8)}-${startDate}-${endDate}`.slice(0, 120);
       const existing = await gamReportQueue.getJob(progJobId);
-      if (!existing) {
+      const state = existing && typeof existing.getState === 'function'
+        ? await existing.getState().catch(() => null)
+        : null;
+      // Already ran with no cached rows → no data. Drop it so a later request retries.
+      if (state === 'completed' || state === 'failed') {
+        jobFinished = true;
+        try { await existing.remove(); } catch (_) { /* ignore */ }
+      } else if (!existing) {
         await gamReportQueue.add('programmatic-report', {
           startDate,
           endDate,
@@ -3793,6 +4177,21 @@ async function handleProgrammaticReport(req, res) {
     }
   } catch (e) {
     logger.warn('Programmatic enqueue failed:', e.message);
+  }
+
+  if (jobFinished) {
+    const noData = {
+      rows: [],
+      startDate,
+      endDate,
+      isMock: false,
+      status: 'empty',
+      empty: true,
+      noData: true,
+      summary: { totalRevenue: 0, totalDomains: 0, offeredRecords: 0 },
+    };
+    cache.set(cacheKey, noData, NO_DATA_RESPONSE_TTL);
+    return res.json(applyProgrammaticVisibility({ ...noData, currency }, req.user));
   }
 
   const building = {

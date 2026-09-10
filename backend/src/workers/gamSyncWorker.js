@@ -398,6 +398,7 @@ async function processReportJob(job) {
         });
         const { persistAdhocRows, buildAdhocQueryHash } = require('../services/gamSyncService');
         const queryHash = data.queryHash || buildAdhocQueryHash(gamFilters);
+        const cacheKey = data.cacheKey;
         if (Array.isArray(result?.rows) && result.rows.length) {
           await persistAdhocRows(result.rows, {
             queryHash,
@@ -407,15 +408,30 @@ async function processReportJob(job) {
             metricKeys: Array.isArray(data.reportMetrics) ? data.reportMetrics : [],
             syncType: 'adhoc-report',
           });
-          const cacheKey = data.cacheKey;
           if (cacheKey) {
             try {
               await redisSet(cacheKey, {
                 rows: result.rows,
+                // Keep the full warning: GAM may have dropped columns it cannot
+                // serve with these dimensions, and the UI explains that.
                 reportWarning: result.reportWarning || null,
+                reportWarningSkipped: result.reportWarningSkipped || [],
+                reportWarningUsed: result.reportWarningUsed || [],
+                reportWarningUsedIds: result.reportWarningUsedIds || [],
+                reportWarningUsedMetricIds: result.reportWarningUsedMetricIds || [],
+                reportWarningSubstitutions: result.reportWarningSubstitutions || [],
               }, TTL.REPORT);
             } catch (_) { /* ignore */ }
           }
+        } else if (cacheKey) {
+          // GAM has nothing for this dim/metric combo. Remember that briefly so the
+          // Reporting page answers "no data" instead of polling "building" forever.
+          try {
+            await redisSet(`${cacheKey}:empty`, {
+              empty: true,
+              completedAt: Date.now(),
+            }, TTL.REPORT_EMPTY);
+          } catch (_) { /* ignore */ }
         }
         logger.info(`[gam-report] adhoc-report done (${result?.rows?.length || 0} rows)`);
       } catch (e) {
@@ -444,10 +460,17 @@ async function processReportJob(job) {
           startDate,
           endDate,
           isMock: false,
+          // Flag a finished-but-empty run so the API stops replying "building".
+          empty: !(rows || []).length,
+          status: (rows || []).length ? undefined : 'empty',
         };
         const cacheKey = data.cacheKey
           || `report_programmatic_resp_v1_${startDate}_${endDate}_all`;
-        await redisSet(cacheKey, payload, TTL.REPORT);
+        await redisSet(
+          cacheKey,
+          payload,
+          payload.empty ? TTL.REPORT_EMPTY : TTL.REPORT
+        );
         logger.info(`[gam-report] programmatic-report done (${payload.rows.length} rows)`);
       } catch (e) {
         logger.error('[gam-report] programmatic-report failed:', e.message);
