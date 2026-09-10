@@ -9,6 +9,7 @@ const { getAdsOAuthClient, ADS_SCOPE, listAccessibleCustomerIds, fetchCustomerIn
 const { getAccountById, createAccount, updateAccount, upsertChildUnderMcc, getAccountByCustomerId } = require('../models/adsAccountStore');
 const { getClientById } = require('../models/clientStore');
 const { createPendingSession, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
+const { frontendBaseUrl } = require('../utils/frontendUrl');
 const logger = require('../utils/logger');
 
 const SECRET = () => process.env.JWT_SECRET || 'change_this_secret';
@@ -26,8 +27,7 @@ function verifyAdsState(state) {
 }
 
 function frontendAdminUrl(query = '') {
-  const base = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
-  return `${base}/admin${query}`;
+  return `${frontendBaseUrl()}/admin${query}`;
 }
 
 function isAdsApiDisabledError(err) {

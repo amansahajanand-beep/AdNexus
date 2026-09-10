@@ -130,9 +130,14 @@ async function fetchCustomerInfo(gamClient, { customerId, refreshToken, loginCus
   };
 }
 
-/** List client accounts under an MCC (one level). */
+/**
+ * List client accounts under an MCC, at any depth. customer_client returns the
+ * whole tree, so sub-MCCs are traversed rather than dropped — restricting to
+ * level 1 hides every account below a sub-manager.
+ */
 async function listMccChildAccounts(gamClient, { mccCustomerId, refreshToken }) {
   const api = createAdsApi(gamClient);
+  const rootId = String(mccCustomerId).replace(/-/g, '');
   const customer = customerClient(api, {
     customerId: mccCustomerId,
     refreshToken,
@@ -143,10 +148,10 @@ async function listMccChildAccounts(gamClient, { mccCustomerId, refreshToken }) 
       customer_client.client_customer,
       customer_client.descriptive_name,
       customer_client.id,
+      customer_client.level,
       customer_client.manager,
       customer_client.status
     FROM customer_client
-    WHERE customer_client.level = 1
   `);
   return (rows || []).map((r) => {
     const cc = r.customer_client || r;
@@ -157,7 +162,7 @@ async function listMccChildAccounts(gamClient, { mccCustomerId, refreshToken }) 
       isManager: !!cc.manager,
       status: cc.status,
     };
-  }).filter((a) => a.customerId && !a.isManager);
+  }).filter((a) => a.customerId && a.customerId !== rootId && !a.isManager);
 }
 
 async function fetchCampaignSpend(gamClient, {

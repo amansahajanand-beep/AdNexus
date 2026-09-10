@@ -26,6 +26,7 @@ const { listCampaigns, isAdsOAuthConfigured, resolveOAuthApp, adsRedirectUri } =
 const { resolveRefreshForAccount, syncAllAccountsForClient, syncAccountSpend, enqueueAdsSyncAccounts } = require('../services/adsSyncService');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { resolveAdsAccountIdsForUser, getAllowedAdsAccountIds } = require('../utils/permissions');
+const { frontendBaseUrl } = require('../utils/frontendUrl');
 const logger = require('../utils/logger');
 const { cache } = require('../gam/client');
 
@@ -69,6 +70,7 @@ router.get('/health', requireAdmin, (req, res) => {
     oauthSource: oauth.source,
     oauthClientId: oauth.clientId || null,
     redirectUri: adsRedirectUri(),
+    frontendUrl: frontendBaseUrl(),
   });
 });
 

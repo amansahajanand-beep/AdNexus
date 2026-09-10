@@ -372,6 +372,7 @@ async function releaseLock(key) {
 const TTL = {
   TODAY: 30 * 60,          // 30 min (present-day data)
   REPORT: 30 * 60,         // 30 min — Postgres is source of truth
+  REPORT_EMPTY: 5 * 60,    // 5 min — "GAM returned no rows" marker (short: data may arrive)
   ORDERS: 60 * 60,         // 1 hour
   INVENTORY: 60 * 60,      // 1 hour
   COUNTRIES: 24 * 60 * 60, // 24 hours

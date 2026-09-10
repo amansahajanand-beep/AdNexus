@@ -74,6 +74,7 @@ import { downloadCsv, downloadExcel, exportCellValue } from '../utils/tableExpor
 
 const PAGE_SIZE = 50;
 const POLL_MS = 30 * 60 * 1000; // matches backend 30-min cache TTL
+const BUILDING_POLL_MAX_TRIES = 36; // 36 × 5s ≈ 3 min before we call it empty
 
 const MET_REVENUE = 'total_line_item_level_cpm_and_cpc_revenue';
 const MET_IMPRESSIONS = 'total_line_item_level_impressions';
@@ -255,6 +256,8 @@ export default function Reporting() {
   const skipInitialLoadRef = useRef(cacheFresh);
   const loadGenRef = useRef(0);
   const buildingPollRef = useRef(0);
+  // Set when the background report never finished — stops the endless hourglass.
+  const [buildingTimedOut, setBuildingTimedOut] = useState(false);
 
   useEffect(() => {
     setRecentFilters(getRecentFilters(user?.id));
@@ -482,6 +485,7 @@ export default function Reporting() {
     // Cancel any in-flight building poll from a prior load.
     buildingPollRef.current += 1;
     const buildingPollId = buildingPollRef.current;
+    setBuildingTimedOut(false);
 
     const hasRows = (payload) => {
       if (!payload) return false;
@@ -553,7 +557,12 @@ export default function Reporting() {
         const poll = async () => {
           if (buildingPollId !== buildingPollRef.current) return;
           tries += 1;
-          if (tries > 120) return;
+          // ~3 min. Past that the job is stuck or has nothing to return; show the
+          // empty-result card instead of an hourglass that never goes away.
+          if (tries > BUILDING_POLL_MAX_TRIES) {
+            setBuildingTimedOut(true);
+            return;
+          }
           await new Promise((r) => setTimeout(r, 5000));
           if (buildingPollId !== buildingPollRef.current) return;
           try {
@@ -1073,22 +1082,49 @@ export default function Reporting() {
   }, [effectiveAppliedDims, data]);
 
   const effectiveMets = useMemo(() => {
-    if (!data?.reportWarning) return effectiveAppliedMets;
+    const substitutions = Array.isArray(data?.reportWarningSubstitutions)
+      ? data.reportWarningSubstitutions
+      : [];
+    const applySubs = (ids) => (ids || []).map((id) => {
+      const hit = substitutions.find((s) => String(s.from).toLowerCase() === String(id).toLowerCase());
+      return hit?.to || id;
+    });
+
+    if (!data?.reportWarning) {
+      return substitutions.length ? applySubs(effectiveAppliedMets) : effectiveAppliedMets;
+    }
     const usedMetIds = new Set(
       (data.reportWarningUsedMetricIds || []).map((s) => String(s).toLowerCase())
     );
     if (usedMetIds.size) {
-      const matched = effectiveAppliedMets.filter((id) => usedMetIds.has(String(id).toLowerCase()));
+      const swapped = applySubs(effectiveAppliedMets);
+      const matched = swapped.filter((id) => usedMetIds.has(String(id).toLowerCase()));
+      // Auto-substituted metrics (e.g. Programmatic eligible ad requests) may not
+      // be in the user's selection — append any used ids we still need to show.
+      for (const id of usedMetIds) {
+        if (!matched.some((m) => String(m).toLowerCase() === id)) {
+          const fromApplied = swapped.find((m) => String(m).toLowerCase() === id);
+          matched.push(fromApplied || id);
+        }
+      }
       if (matched.length) return matched;
-      if (Array.isArray(data?.rows) && data.rows.length) return effectiveAppliedMets;
+      if (Array.isArray(data?.rows) && data.rows.length) return swapped;
     }
     // Partial response without metric ids: drop metrics listed as skipped by label.
     const skipped = new Set(
       (data.reportWarningSkipped || []).map((s) => String(s).toLowerCase())
     );
-    if (!skipped.size) return effectiveAppliedMets;
-    const kept = effectiveAppliedMets.filter((id) => !skipped.has(String(metricLabel(id)).toLowerCase()));
-    return kept.length ? kept : effectiveAppliedMets;
+    if (!skipped.size) return applySubs(effectiveAppliedMets);
+    const kept = applySubs(effectiveAppliedMets).filter((id) => {
+      const label = String(metricLabel(id)).toLowerCase();
+      if (skipped.has(label)) return false;
+      // "Total ad requests → Programmatic …" chips should not hide the substitute.
+      for (const s of skipped) {
+        if (s.startsWith(`${label} →`)) return false;
+      }
+      return true;
+    });
+    return kept.length ? kept : applySubs(effectiveAppliedMets);
   }, [effectiveAppliedMets, data]);
 
   const tableConfig = useMemo(
@@ -1152,23 +1188,47 @@ export default function Reporting() {
     effectiveAppliedMets,
   ]);
 
+  const stillBuilding = Boolean(
+    (data?.status === 'building' || progData?.status === 'building')
+    && !buildingTimedOut
+  );
+
   const showNoReportCard = Boolean(
     reportReady
     && !loading
     && totalRecordCount === 0
     && (data || progData)
-    && data?.status !== 'building'
-    && progData?.status !== 'building'
+    && !stillBuilding
+  );
+
+  /**
+   * The report ran and simply had nothing to return — different message from
+   * "these dimensions can't be combined".
+   */
+  const isEmptyResult = Boolean(
+    showNoReportCard
+    && (buildingTimedOut || data?.status === 'empty' || progData?.status === 'empty')
+    && !skippedChips.length
   );
 
   const clearIncompatibleReporting = () => {
     const skip = new Set(unavailableChips.map((s) => String(s).toLowerCase()));
+    const subFrom = new Set(
+      (data?.reportWarningSubstitutions || []).map((s) => String(s.from).toLowerCase())
+    );
+    // Chips like "Total ad requests → Programmatic eligible ad requests"
+    for (const chip of unavailableChips) {
+      const left = String(chip).split('→')[0].trim().toLowerCase();
+      if (left) skip.add(left);
+    }
     const nextDims = reportDimensions.filter((id) => (
       !skip.has(String(dimensionLabel(id)).toLowerCase()) && !skip.has(String(id).toLowerCase())
     ));
-    const nextMets = reportMetrics.filter((id) => (
-      !skip.has(String(metricLabel(id)).toLowerCase()) && !skip.has(String(id).toLowerCase())
-    ));
+    const nextMets = reportMetrics.filter((id) => {
+      const key = String(id).toLowerCase();
+      if (subFrom.has(key)) return false;
+      return !skip.has(String(metricLabel(id)).toLowerCase()) && !skip.has(key);
+    });
     const dropDomain = skip.has('domain name');
     const dropSite = skip.has('site');
     const dropAd = skip.has('ad unit');
@@ -1203,10 +1263,7 @@ export default function Reporting() {
   const hasReportData = !loading && totalRecordCount > 0;
   const showSummaryCards = canGenerate && hasApplied && (loading || hasReportData);
   // Only show the hourglass when we are waiting AND have nothing useful on screen yet.
-  const showBuildingBanner = Boolean(
-    (data?.status === 'building' || progData?.status === 'building')
-    && !hasReportData
-  );
+  const showBuildingBanner = Boolean(stillBuilding && !hasReportData);
 
   const handleRemoveChip = (chip) => {
     if (chip.field === 'date') {
@@ -1703,8 +1760,9 @@ export default function Reporting() {
               <div className="warn-card-body">
                 <div className="warn-card-title">Showing compatible data</div>
                 <div className="warn-card-desc">
-                  Some selected dimensions or metrics can&apos;t be combined in one GAM report.
-                  Results below use the compatible subset. Remove the unavailable items for a complete selection.
+                  {Array.isArray(data?.reportWarningSubstitutions) && data.reportWarningSubstitutions.length
+                    ? 'GAM cannot break Total ad requests down by App ID. The table shows Programmatic eligible ad requests instead (closest supported metric).'
+                    : 'Some selected dimensions or metrics can\'t be combined in one GAM report. Results below use the compatible subset. Remove the unavailable items for a complete selection.'}
                 </div>
                 {canFilter && skippedChips.length > 0 && (
                   <div className="warn-card-btns">
@@ -1735,17 +1793,26 @@ export default function Reporting() {
                 <span aria-hidden>i</span>
               </div>
               <div className="warn-card-body">
-                <div className="warn-card-title">No report data found</div>
+                <div className="warn-card-title">
+                  {isEmptyResult ? 'No data for these filters' : 'No report data found'}
+                </div>
                 <div className="warn-card-desc">
-                  The highlighted dimensions on the right could not return any data for your selected filters and date range.
-                  These dimensions are not supported in the current combination — remove them or adjust your selection to view complete data.
+                  {isEmptyResult
+                    ? 'The report finished, but this combination of filters, dimensions and date range returned no records. Try a wider date range, fewer breakdown filters, or run it again in a few minutes if today’s data is still coming in.'
+                    : 'The highlighted dimensions on the right could not return any data for your selected filters and date range. These dimensions are not supported in the current combination — remove them or adjust your selection to view complete data.'}
                 </div>
                 <div className="warn-card-btns">
                   {canFilter && (
                     <>
-                      <button type="button" className="warn-btn-primary" onClick={clearIncompatibleReporting}>
-                        Remove these and apply
-                      </button>
+                      {isEmptyResult ? (
+                        <button type="button" className="warn-btn-primary" onClick={() => load()}>
+                          ↻ Run again
+                        </button>
+                      ) : (
+                        <button type="button" className="warn-btn-primary" onClick={clearIncompatibleReporting}>
+                          Remove these and apply
+                        </button>
+                      )}
                       <button type="button" className="warn-btn-secondary" onClick={reset}>↺ Reset Filters</button>
                     </>
                   )}
@@ -1753,19 +1820,25 @@ export default function Reporting() {
               </div>
             </div>
 
-            <div className="warn-card-right">
-              <div className="warn-card-section-label">Unavailable dimensions for current selection</div>
-              <div className="warn-chip-row">
-                {unavailableChips.map((name) => (
-                  <span key={name} className="warn-chip warn-chip-unavail">{name}</span>
-                ))}
+            {!isEmptyResult && (
+              <div className="warn-card-right">
+                <div className="warn-card-section-label">Unavailable dimensions for current selection</div>
+                <div className="warn-chip-row">
+                  {unavailableChips.map((name) => (
+                    <span key={name} className="warn-chip warn-chip-unavail">{name}</span>
+                  ))}
+                </div>
               </div>
-            </div>
+            )}
           </div>
 
           <div className="warn-card-hint-bar">
             <span className="warn-card-hint-icon" aria-hidden>i</span>
-            <span>Some selected filters and metrics can&apos;t be combined in the same report. Remove incompatible filters to view complete data.</span>
+            <span>
+              {isEmptyResult
+                ? 'Reports for the current day fill in as Google Ad Manager delivers data, so a fresh run can return rows later.'
+                : 'Some selected filters and metrics can’t be combined in the same report. Remove incompatible filters to view complete data.'}
+            </span>
           </div>
         </div>
       )}

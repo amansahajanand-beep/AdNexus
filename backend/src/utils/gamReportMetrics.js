@@ -61,6 +61,25 @@ function parseGamMetricValue(api, raw) {
   return +num.toFixed(4);
 }
 
+/**
+ * Parse a value straight out of a GAM report CSV column.
+ *
+ * Differs from parseGamMetricValue in one way that matters: report money columns are
+ * ALWAYS micros, so never guess by magnitude. Guessing turned a row worth 5764 micros
+ * ($0.005764) into $5,764 and a day of app rows into $2M instead of $16.5k.
+ * parseGamMetricValue keeps its heuristic because the sync path also feeds it values
+ * that have already been converted to dollars.
+ */
+function parseGamRawColumnValue(api, raw) {
+  if (raw == null || raw === '') return 0;
+  const num = parseFloat(raw);
+  if (!Number.isFinite(num)) return 0;
+  if (MONEY_APIS.test(String(api).toUpperCase())) {
+    return num === 0 ? 0 : +(num / 1e6).toFixed(6);
+  }
+  return parseGamMetricValue(api, num);
+}
+
 function rowSeed(row) {
   const s = `${row.date || ''}|${row.site || ''}|${row.appId || ''}`;
   let h = 0;
@@ -167,13 +186,19 @@ function parseDimensionsFromGamRow(rawRow, dimensionIds = []) {
   return dimensions;
 }
 
-function attachMetricsToRows(rows, metricIds = []) {
+/**
+ * @param opts.fillMissing — synthesize values for metrics the source didn't return.
+ *   Mock mode only: on live GAM rows a synthesized number would be indistinguishable
+ *   from real reporting data.
+ */
+function attachMetricsToRows(rows, metricIds = [], opts = {}) {
   const ids = [...new Set((metricIds || []).filter(Boolean))];
   if (!ids.length) return rows;
+  const fillMissing = Boolean(opts.fillMissing);
   return rows.map((row) => {
     const metrics = { ...(row.metrics || {}) };
     ids.forEach((id) => {
-      if (metrics[id] == null) metrics[id] = mockMetricValue(id, row);
+      if (metrics[id] == null && fillMissing) metrics[id] = mockMetricValue(id, row);
     });
     const next = { ...row, metrics };
     const gamRevenue = Number(row.revenue) || 0;
@@ -201,7 +226,7 @@ function parseMetricsFromGamRow(rawRow, metricIds = []) {
     const api = catalogIdToGamEnum(id);
     const raw = rawRow[`Column.${api}`];
     if (raw == null || raw === '') return;
-    metrics[id] = parseGamMetricValue(api, raw);
+    metrics[id] = parseGamRawColumnValue(api, raw);
   });
   return metrics;
 }
@@ -254,6 +279,7 @@ module.exports = {
   coerceWarehouseRevenue,
   pickRowRevenueDollars,
   parseGamMetricValue,
+  parseGamRawColumnValue,
   mockMetricValue,
   attachMetricsToRows,
   attachDimensionsToRows,

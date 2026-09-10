@@ -23,6 +23,7 @@ const {
   kickGamInventorySync,
 } = require('../services/gamNetworkDiscovery');
 const { encryptSecret } = require('../utils/credentialsCrypto');
+const { frontendBaseUrl } = require('../utils/frontendUrl');
 const logger = require('../utils/logger');
 
 const SCOPES = [
@@ -45,13 +46,11 @@ function verifyOAuthState(state) {
 }
 
 function frontendAdminUrl(query = '') {
-  const base = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
-  return `${base}/admin${query}`;
+  return `${frontendBaseUrl()}/admin${query}`;
 }
 
 function frontendOnboardUrl(query = '') {
-  const base = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/$/, '');
-  return `${base}/onboard${query}`;
+  return `${frontendBaseUrl()}/onboard${query}`;
 }
 
 function buildAuthUrl(client, statePayload = null) {

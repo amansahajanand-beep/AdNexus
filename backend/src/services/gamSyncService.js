@@ -3884,6 +3884,35 @@ async function hasAdhocCoverage(startDate, endDate, queryHash) {
   return rows.length > 0 && Number(rows[0].row_count) > 0;
 }
 
+const MONEY_METRIC_KEY = /revenue|ecpm|cpc|earnings|cost_per/i;
+
+/**
+ * Repair report_adhoc rows stored before GAM money columns were parsed as micros:
+ * 5764 micros ($0.005764) was saved as 5764 dollars, which showed a $16.7k day as $2M.
+ *
+ * The old parser mangled exactly one band — whole micros from 1000 to 999999, i.e. real
+ * amounts under $1 — and divided everything above it correctly. So a stored value that
+ * is a whole number in that band is always un-divided micros: a genuine row would have
+ * to be worth exactly $5,764.000000 to collide. Anything fractional is already dollars.
+ * Safe to delete once these cached queries have been refreshed from GAM.
+ */
+const LEGACY_MICROS_MIN = 1000;
+const LEGACY_MICROS_MAX = 1e6;
+
+function repairLegacyMicrosMetrics(rawMetrics) {
+  const metrics = { ...(rawMetrics || {}) };
+  for (const [key, value] of Object.entries(metrics)) {
+    if (!MONEY_METRIC_KEY.test(key)) continue;
+    const num = Number(value);
+    if (!Number.isFinite(num)) continue;
+    const abs = Math.abs(num);
+    if (num !== Math.floor(num)) continue;
+    if (abs < LEGACY_MICROS_MIN || abs >= LEGACY_MICROS_MAX) continue;
+    metrics[key] = +(num / 1e6).toFixed(6);
+  }
+  return metrics;
+}
+
 /**
  * Read Reporting-page rows from report_adhoc for an exact query_hash + date range.
  * Returns canonical flat rows (via normalizeReportRows).
@@ -3909,7 +3938,7 @@ async function fetchAdhocFromDB(startDate, endDate, queryHash) {
 
   return normalizeReportRows(rows.map((row) => {
     const dimensions = { ...(row.dimensions || {}) };
-    const metrics = { ...(row.metrics || {}) };
+    const metrics = repairLegacyMicrosMetrics(row.metrics);
     if (row.inv_domain && !dimensions.domainName) {
       dimensions.domainName = row.inv_domain;
       dimensions.domain = row.inv_domain;

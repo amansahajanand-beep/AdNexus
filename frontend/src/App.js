@@ -10,6 +10,8 @@ import Roi from './pages/Roi';
 import Presets from './pages/Presets';
 import Admin from './pages/Admin';
 import DomainUser from './pages/DomainUser';
+import PrivacyPolicy from './pages/PrivacyPolicy';
+import TermsOfService from './pages/TermsOfService';
 import ProtectedRoute from './components/routing/ProtectedRoute';
 import AdminRoute from './components/routing/AdminRoute';
 import PermissionRoute from './components/routing/PermissionRoute';
@@ -103,6 +105,8 @@ function AppRoutes() {
       {/* Public */}
       <Route path="/login" element={<PublicOnlyRoute><Login /></PublicOnlyRoute>} />
       <Route path="/onboard" element={<PublicOnlyRoute><Onboard /></PublicOnlyRoute>} />
+      <Route path="/privacy" element={<PrivacyPolicy />} />
+      <Route path="/terms" element={<TermsOfService />} />
 
       {/* Authenticated app shell */}
       <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
