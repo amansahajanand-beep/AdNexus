@@ -11,6 +11,7 @@ const { getClientById } = require('../models/clientStore');
 const { createPendingSession, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const { frontendBaseUrl } = require('../utils/frontendUrl');
 const { collectGrantIds, grantAdsAccountsToUser } = require('../utils/adsUserAccess');
+const { runWithClient } = require('../utils/clientContext');
 const logger = require('../utils/logger');
 
 const SECRET = () => process.env.JWT_SECRET || 'change_this_secret';
@@ -210,124 +211,128 @@ router.get('/callback', async (req, res) => {
       return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=unknown_client'));
     }
 
-    const forDomainUser = decoded.returnTo === 'my-ads';
-    const oauth2Client = getAdsOAuthClient(gamClient);
-    const { tokens } = await oauth2Client.getToken(code);
-    if (!tokens.refresh_token) {
-      logger.warn('Ads OAuth callback missing refresh_token');
-      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=no_refresh_token'));
-    }
-
-    const refreshToken = tokens.refresh_token;
-    const mode = decoded.mode || 'mcc';
-
-    // Persist token early when reconnecting a known account — Ads API may still be disabled.
-    if (decoded.adsAccountId) {
-      const early = await getAccountById(decoded.adsAccountId);
-      if (early && early.clientId === gamClient.id) {
-        await updateAccount(early.id, { refreshToken });
+    // FORCE RLS on ads_accounts requires app.client_id (= gamClient.id).
+    // This callback is unauthenticated, so set tenant context explicitly.
+    return await runWithClient(gamClient, async () => {
+      const forDomainUser = decoded.returnTo === 'my-ads';
+      const oauth2Client = getAdsOAuthClient(gamClient);
+      const { tokens } = await oauth2Client.getToken(code);
+      if (!tokens.refresh_token) {
+        logger.warn('Ads OAuth callback missing refresh_token');
+        return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=no_refresh_token'));
       }
-    }
 
-    if (mode === 'individual' && decoded.adsAccountId) {
-      const account = await getAccountById(decoded.adsAccountId);
-      if (!account || account.clientId !== gamClient.id) {
-        return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=account_mismatch'));
-      }
-      let info;
-      try {
-        info = await fetchCustomerInfo(gamClient, {
-          customerId: account.customerId,
-          refreshToken,
-          loginCustomerId: account.loginCustomerId,
-        });
-      } catch (e) {
-        logger.warn('Ads individual customer info:', e.message);
-        if (isAdsApiDisabledError(e)) {
-          return res.redirect(adsOAuthErrorRedirect(e, decoded));
+      const refreshToken = tokens.refresh_token;
+      const mode = decoded.mode || 'mcc';
+
+      // Persist token early when reconnecting a known account — Ads API may still be disabled.
+      if (decoded.adsAccountId) {
+        const early = await getAccountById(decoded.adsAccountId);
+        if (early && early.clientId === gamClient.id) {
+          await updateAccount(early.id, { refreshToken });
         }
-        info = { customerId: account.customerId, descriptiveName: account.descriptiveName };
       }
-      const updated = await updateAccount(account.id, {
-        refreshToken,
-        customerId: info.customerId || account.customerId,
-        descriptiveName: info.descriptiveName || account.descriptiveName,
-      });
-      await grantConnectedAccounts(decoded, gamClient, updated || account);
-      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
-    }
 
-    // Discover all accessible accounts → pending session → picker (or auto-commit single)
-    let discovered;
-    try {
-      discovered = await discoverAdsCandidates(gamClient, refreshToken);
-    } catch (e) {
-      logger.error('Ads listAccessibleCustomers failed:', e.message);
-      return res.redirect(adsOAuthErrorRedirect(e, decoded));
-    }
+      if (mode === 'individual' && decoded.adsAccountId) {
+        const account = await getAccountById(decoded.adsAccountId);
+        if (!account || account.clientId !== gamClient.id) {
+          return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=account_mismatch'));
+        }
+        let info;
+        try {
+          info = await fetchCustomerInfo(gamClient, {
+            customerId: account.customerId,
+            refreshToken,
+            loginCustomerId: account.loginCustomerId,
+          });
+        } catch (e) {
+          logger.warn('Ads individual customer info:', e.message);
+          if (isAdsApiDisabledError(e)) {
+            return res.redirect(adsOAuthErrorRedirect(e, decoded));
+          }
+          info = { customerId: account.customerId, descriptiveName: account.descriptiveName };
+        }
+        const updated = await updateAccount(account.id, {
+          refreshToken,
+          customerId: info.customerId || account.customerId,
+          descriptiveName: info.descriptiveName || account.descriptiveName,
+        });
+        await grantConnectedAccounts(decoded, gamClient, updated || account);
+        return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
+      }
 
-    const { managers, individuals } = discovered;
-    const mccOpts = { includeChildrenInRoi: forDomainUser };
+      // Discover all accessible accounts → pending session → picker (or auto-commit single)
+      let discovered;
+      try {
+        discovered = await discoverAdsCandidates(gamClient, refreshToken);
+      } catch (e) {
+        logger.error('Ads listAccessibleCustomers failed:', e.message);
+        return res.redirect(adsOAuthErrorRedirect(e, decoded));
+      }
 
-    // Reconnecting a known MCC: update token + refresh children, skip picker
-    if (decoded.adsAccountId && mode === 'mcc') {
-      const account = await getAccountById(decoded.adsAccountId);
-      if (account && account.clientId === gamClient.id) {
+      const { managers, individuals } = discovered;
+      const mccOpts = { includeChildrenInRoi: forDomainUser };
+
+      // Reconnecting a known MCC: update token + refresh children, skip picker
+      if (decoded.adsAccountId && mode === 'mcc') {
+        const account = await getAccountById(decoded.adsAccountId);
+        if (account && account.clientId === gamClient.id) {
+          const { mccAccount } = await commitMccSelection(gamClient, {
+            customerId: account.customerId,
+            descriptiveName: account.descriptiveName,
+            refreshToken,
+            ...mccOpts,
+          });
+          await grantConnectedAccounts(decoded, gamClient, mccAccount);
+          return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
+        }
+      }
+
+      if (managers.length === 1 && individuals.length === 0) {
         const { mccAccount } = await commitMccSelection(gamClient, {
-          customerId: account.customerId,
-          descriptiveName: account.descriptiveName,
+          customerId: managers[0].customerId,
+          descriptiveName: managers[0].descriptiveName,
           refreshToken,
           ...mccOpts,
         });
         await grantConnectedAccounts(decoded, gamClient, mccAccount);
         return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
       }
-    }
 
-    if (managers.length === 1 && individuals.length === 0) {
-      const { mccAccount } = await commitMccSelection(gamClient, {
-        customerId: managers[0].customerId,
-        descriptiveName: managers[0].descriptiveName,
+      if (managers.length === 0 && individuals.length === 1) {
+        const account = await commitIndividualSelection(gamClient, {
+          customerId: individuals[0].customerId,
+          descriptiveName: individuals[0].descriptiveName,
+          refreshToken,
+        });
+        await grantConnectedAccounts(decoded, gamClient, account);
+        return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected_individual'));
+      }
+
+      if (managers.length === 0 && individuals.length === 0) {
+        return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=no_accessible_accounts'));
+      }
+
+      const session = await createPendingSession({
+        product: 'ads',
+        mode: 'connect',
+        clientId: gamClient.id,
         refreshToken,
-        ...mccOpts,
+        candidates: [
+          ...managers.map((m) => ({ ...m, kind: 'mcc' })),
+          ...individuals.map((i) => ({ ...i, kind: 'client' })),
+        ],
+        payload: {
+          userId: decoded.userId || null,
+          returnTo: forDomainUser ? 'my-ads' : 'admin',
+          includeChildrenInRoi: forDomainUser,
+        },
       });
-      await grantConnectedAccounts(decoded, gamClient, mccAccount);
-      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
-    }
 
-    if (managers.length === 0 && individuals.length === 1) {
-      const account = await commitIndividualSelection(gamClient, {
-        customerId: individuals[0].customerId,
-        descriptiveName: individuals[0].descriptiveName,
-        refreshToken,
-      });
-      await grantConnectedAccounts(decoded, gamClient, account);
-      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected_individual'));
-    }
-
-    if (managers.length === 0 && individuals.length === 0) {
-      return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=error&reason=no_accessible_accounts'));
-    }
-
-    const session = await createPendingSession({
-      product: 'ads',
-      mode: 'connect',
-      clientId: gamClient.id,
-      refreshToken,
-      candidates: [
-        ...managers.map((m) => ({ ...m, kind: 'mcc' })),
-        ...individuals.map((i) => ({ ...i, kind: 'client' })),
-      ],
-      payload: {
-        userId: decoded.userId || null,
-        returnTo: forDomainUser ? 'my-ads' : 'admin',
-        includeChildrenInRoi: forDomainUser,
-      },
+      return res.redirect(
+        adsOAuthRedirect(decoded, `ads_oauth=pick&session=${encodeURIComponent(session.id)}`)
+      );
     });
-
-    return res.redirect(
-      adsOAuthRedirect(decoded, `ads_oauth=pick&session=${encodeURIComponent(session.id)}`)
-    );
   } catch (err) {
     logger.error('Ads OAuth callback error:', err.message);
     return res.redirect(adsOAuthErrorRedirect(err, decoded));
