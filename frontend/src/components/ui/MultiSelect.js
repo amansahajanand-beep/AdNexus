@@ -99,9 +99,28 @@ export default function MultiSelect({
   const MAX_VISIBLE_OPTIONS = 300;
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
-    if (!q) return norm;
-    return norm.filter((o) => String(o.label).toLowerCase().includes(q));
-  }, [norm, query]);
+    const base = !q
+      ? norm
+      : norm.filter((o) => String(o.label).toLowerCase().includes(q));
+
+    // Pin selected / pasted values to the top so they stay visible in long lists.
+    if (allMode || selectedSet.size === 0) return base;
+
+    const selected = [];
+    const rest = [];
+    for (const o of base) {
+      if (selectedSet.has(o.value)) selected.push(o);
+      else rest.push(o);
+    }
+    const order = new Map(
+      (value || [])
+        .filter((v) => v !== ALL_SENTINEL)
+        .map((v, i) => [v, i])
+    );
+    selected.sort((a, b) => (order.get(a.value) ?? 0) - (order.get(b.value) ?? 0)
+      || String(a.label).localeCompare(String(b.label)));
+    return [...selected, ...rest];
+  }, [norm, query, selectedSet, allMode, value]);
 
   const visibleOptions = useMemo(() => {
     if (query.trim()) return filtered;

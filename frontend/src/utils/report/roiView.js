@@ -591,11 +591,11 @@ export function buildCountryTree(
       profitExpense: Number(row.profitExpense) || 0,
       roiSpendPercent: row.targetType === 'site' ? null : row.roiSpendPercent,
       roiExpensePercent: row.roiExpensePercent,
-      impressions: row.targetType === 'site' ? 0 : (Number(row.impressions) || 0),
-      clicks: row.targetType === 'site' ? 0 : (Number(row.clicks) || 0),
-      conversions: row.targetType === 'site' ? 0 : (Number(row.conversions) || 0),
-      ctr: row.targetType === 'site' ? null : row.ctr,
-      ecpm: row.targetType === 'site' ? null : row.ecpm,
+      impressions: Number(row.impressions) || 0,
+      clicks: Number(row.clicks) || 0,
+      conversions: Number(row.conversions) || 0,
+      ctr: row.ctr,
+      ecpm: row.ecpm,
     });
   });
   dailyByPackage.forEach((days, key) => {
@@ -648,11 +648,11 @@ export function buildCountryTree(
         profitExpense: Number(row.profitExpense) || 0,
         roiSpendPercent: isSite ? null : row.roiSpendPercent,
         roiExpensePercent: row.roiExpensePercent,
-        impressions: isSite ? 0 : (Number(row.impressions) || 0),
-        clicks: isSite ? 0 : (Number(row.clicks) || 0),
-        conversions: isSite ? 0 : (Number(row.conversions) || 0),
-        ctr: isSite ? null : row.ctr,
-        ecpm: isSite ? null : row.ecpm,
+        impressions: Number(row.impressions) || 0,
+        clicks: Number(row.clicks) || 0,
+        conversions: Number(row.conversions) || 0,
+        ctr: row.ctr,
+        ecpm: row.ecpm,
       });
     });
 

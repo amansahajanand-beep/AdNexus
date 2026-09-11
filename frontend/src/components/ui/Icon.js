@@ -33,6 +33,7 @@ import {
   Lock,
   Network,
   LayoutGrid,
+  CircleHelp,
 } from 'lucide-react';
 
 const NAV_ICONS = {
@@ -43,6 +44,7 @@ const NAV_ICONS = {
   admin: Settings,
   'domain-user': UserRound,
   'my-ads': Megaphone,
+  help: CircleHelp,
 };
 
 const FILTER_ICONS = {
