@@ -56,8 +56,28 @@ async function listRoiClientAccounts(clientId) {
   return rows.map(mapPublic);
 }
 
-async function listSyncableClientAccounts(clientId, { roiOnly = false } = {}) {
+async function listSyncableClientAccounts(clientId, {
+  roiOnly = false,
+  staleBefore = null,
+  limit = null,
+  orderByStale = false,
+} = {}) {
   const roiClause = roiOnly ? 'AND a.include_in_roi = true' : '';
+  const params = [clientId];
+  let staleClause = '';
+  if (staleBefore) {
+    params.push(new Date(staleBefore).toISOString());
+    // Never-synced or older than threshold — rotate through large MCC trees safely.
+    staleClause = ` AND (a.last_sync_at IS NULL OR a.last_sync_at < $${params.length}::timestamptz)`;
+  }
+  let limitClause = '';
+  if (limit != null && Number(limit) > 0) {
+    params.push(Math.min(Math.max(parseInt(limit, 10) || 0, 1), 5000));
+    limitClause = ` LIMIT $${params.length}`;
+  }
+  const orderClause = orderByStale
+    ? ' ORDER BY a.last_sync_at ASC NULLS FIRST, a.customer_id ASC'
+    : '';
   const { rows } = await query(
     `SELECT a.*,
             COALESCE(a.google_refresh_token_enc, m.google_refresh_token_enc) AS google_refresh_token_enc,
@@ -82,8 +102,8 @@ async function listSyncableClientAccounts(clientId, { roiOnly = false } = {}) {
        AND a.is_active = true
        AND COALESCE(a.google_refresh_token_enc, m.google_refresh_token_enc) IS NOT NULL
        AND NULLIF(TRIM(a.customer_id), '') IS NOT NULL
-       ${roiClause}`,
-    [clientId]
+       ${roiClause}${staleClause}${orderClause}${limitClause}`,
+    params
   );
   return rows.map((row) => {
     const runtime = mapRuntime(row);

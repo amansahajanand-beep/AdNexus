@@ -43,7 +43,11 @@ async function loadSyncFreshness() {
   }
   try {
     const { rows } = await query(
-      `SELECT MAX(last_sync_at) AS t FROM ads_accounts WHERE client_id = $1`,
+      `SELECT MAX(last_sync_at) AS t FROM ads_accounts
+       WHERE client_id = $1
+         AND account_type = 'client'
+         AND is_active = true
+         AND include_in_roi = true`,
       [clientId]
     );
     adsLastSyncedAt = rows[0]?.t || null;

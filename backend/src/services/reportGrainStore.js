@@ -674,7 +674,20 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
     opts.groupByCountry || opts.groupByDevice || (opts.countryNames && opts.countryNames.length)
   );
   let filterOpts;
-  if (wantsGeo) {
+  const appOnly = Boolean(
+    opts.groupByApp
+    || (
+      (opts.apps || []).length
+      && !(opts.domains || []).length
+      && !(opts.sites || []).length
+      && !(opts.adUnitNames || []).length
+    )
+  );
+  if (appOnly) {
+    // App ID × country lives on the app_id lean slice (not inventory_core).
+    filterOpts = { ...opts, kpiSliceOnly: false, sliceKey: 'app_id' };
+    delete filterOpts.inventorySlicesOnly;
+  } else if (wantsGeo) {
     filterOpts = { ...opts, kpiSliceOnly: false, inventorySlicesOnly: true };
     delete filterOpts.sliceKey;
   } else {
@@ -701,7 +714,7 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
        COALESCE(${siteExpr}, '') AS site_url,
        COALESCE(${adUnitExpr}, '') AS ad_unit,
        '' AS app_id`;
-  } else if (opts.apps?.length && !opts.domains?.length && !opts.sites?.length) {
+  } else if (opts.groupByApp || (opts.apps?.length && !opts.domains?.length && !opts.sites?.length)) {
     groupExprs = [`g.report_date`, appExpr];
     selectDims = `
        '' AS domain_name,

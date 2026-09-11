@@ -2625,6 +2625,124 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     return null;
   }
 
+  const hasWebInv = (opts.domains || []).length > 0
+    || (opts.sites || []).length > 0
+    || (opts.adUnitNames || []).length > 0;
+  const hasAppInv = (opts.apps || []).length > 0 || Boolean(opts.groupByApp);
+
+  // Site/Domain + App ID AND'd on one slice empties app×country (app_id slice has no sites).
+  // Union web inventory_core rows with app_id×country rows — same idea as Dashboard compat.
+  if (hasWebInv && hasAppInv) {
+    const [webBundle, appBundle] = await Promise.all([
+      fetchReportingIdGrainFromDB(startDate, endDate, {
+        ...opts,
+        apps: [],
+        groupByApp: false,
+      }, t0),
+      fetchReportingIdGrainFromDB(startDate, endDate, {
+        ...opts,
+        domains: [],
+        sites: [],
+        adUnitNames: [],
+        groupByApp: true,
+        groupBySite: false,
+      }, t0),
+    ]);
+    const merged = mergeReportingBundles(webBundle, appBundle, opts);
+    if (merged) {
+      logger.info(
+        `Reporting web∪app id-grain ${startDate}..${endDate}`
+        + ` table=${merged.rows?.length || 0} in ${Date.now() - t0}ms`
+      );
+      return { ...merged, source: 'reporting-id-grain-union' };
+    }
+    return null;
+  }
+
+  return fetchReportingIdGrainFromDB(startDate, endDate, opts, t0);
+}
+
+/** Merge two Reporting bundles (web + app) into one table payload. */
+function mergeReportingBundles(webBundle, appBundle, opts = {}) {
+  if (!webBundle && !appBundle) return null;
+  if (webBundle && !appBundle) return webBundle;
+  if (appBundle && !webBundle) return appBundle;
+
+  const webRows = webBundle.rows || [];
+  const appRows = appBundle.rows || [];
+  const limit = Math.min(
+    Math.max(parseInt(opts.tableLimit, 10) || 2500, 50),
+    15000
+  );
+  const rows = [...webRows, ...appRows]
+    .sort((a, b) => (Number(b.revenue) || 0) - (Number(a.revenue) || 0)
+      || (Number(b.impression) || 0) - (Number(a.impression) || 0))
+    .slice(0, limit);
+
+  const impressions = (Number(webBundle.summary?.impressions) || 0)
+    + (Number(appBundle.summary?.impressions) || 0);
+  const revenue = +((Number(webBundle.summary?.revenue) || 0)
+    + (Number(appBundle.summary?.revenue) || 0)).toFixed(2);
+  const clicks = (Number(webBundle.summary?.clicks) || 0)
+    + (Number(appBundle.summary?.clicks) || 0);
+  const grainCount = (Number(webBundle.grainCount) || 0)
+    + (Number(appBundle.grainCount) || 0);
+
+  const trendMap = new Map();
+  for (const t of [...(webBundle.trend || []), ...(appBundle.trend || [])]) {
+    const key = t.date;
+    const prev = trendMap.get(key) || { date: key, earning: 0, impressions: 0 };
+    prev.earning = +((prev.earning || 0) + (Number(t.earning) || Number(t.revenue) || 0)).toFixed(2);
+    prev.impressions += Math.round(Number(t.impressions) || 0);
+    trendMap.set(key, prev);
+  }
+  const trend = [...trendMap.values()].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const viewability = webBundle.summary?.viewability || appBundle.summary?.viewability || 0;
+
+  return {
+    summary: {
+      totalEarning: revenue,
+      totalEarningChange: 0,
+      selectRange: revenue,
+      selectRangeChange: 0,
+      last7Days: +trend.slice(-7).reduce((a, x) => a + (x.earning || 0), 0).toFixed(2),
+      last7DaysChange: 0,
+      pageViews: Math.round(impressions),
+      pageViewsChange: 0,
+      impressions: Math.round(impressions),
+      impressionsChange: 0,
+      clicks: Math.round(clicks),
+      clicksChange: 0,
+      ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
+      revenue,
+      revenueChange: 0,
+      ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
+      ecpmChange: 0,
+      viewability,
+      viewabilityChange: 0,
+      totalDomains: countAppAndWebsiteDomainsFromRows(rows),
+      currency: opts.currency || webBundle.summary?.currency || appBundle.summary?.currency || 'USD',
+    },
+    trend,
+    charts: { revenue: [], device: [], country: [], performance: [] },
+    rows,
+    pagination: {
+      totalRows: rows.length,
+      returnedRows: rows.length,
+      truncated: (webRows.length + appRows.length) > rows.length || grainCount > rows.length,
+      allRows: false,
+      compact: true,
+    },
+    grainCount: grainCount || rows.length,
+    source: 'reporting-id-grain-union',
+  };
+}
+
+/**
+ * Reporting id-grain table — inventory_core (web) or app_id slice (apps), with optional country.
+ */
+async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = Date.now()) {
+  const dayCount = inclusiveDayCount(startDate, endDate);
   const clientId = requireClientId();
   const ids = await resolveInventoryFilterIds(clientId, opts);
   // Filters were provided but nothing resolved — empty result, not a full scan.
@@ -2634,17 +2752,28 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
   if ((opts.countryNames || []).length && !ids.countryIds.length) return null;
 
   const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
-  const perDay = Math.max(6, Math.min(40, Math.ceil(tableLimit / dayCount)));
 
+  const hasWeb = (opts.domains || []).length > 0
+    || (opts.sites || []).length > 0
+    || (opts.adUnitNames || []).length > 0;
   const byCountry = Boolean(opts.groupByCountry || ids.countryIds.length);
   const byDevice = Boolean(opts.groupByDevice);
   const byAdUnit = Boolean(ids.adUnitIds.length || (opts.adUnitNames || []).length);
-  const byApp = hasAppsOnly;
+  // App reports (filter or App ID/name dimensions) must use app_id slice + group by app.
+  // Never AND site filters onto app_id rows — that wipes country breakdowns.
+  const byApp = Boolean(
+    opts.groupByApp
+    || ((opts.apps || []).length > 0 && !hasWeb)
+  );
+
+  const perDay = (byApp && byCountry)
+    ? Math.max(80, Math.min(300, Math.ceil(tableLimit / dayCount)))
+    : Math.max(6, Math.min(40, Math.ceil(tableLimit / dayCount)));
 
   const params = [clientId, startDate, endDate];
   let whereCore = `g.client_id = $1::uuid AND g.slice_key = '${byApp ? 'app_id' : 'inventory_core'}'`;
 
-  if ((opts.domains || []).length) {
+  if (!byApp && (opts.domains || []).length) {
     const domainNames = (opts.domains || [])
       .map((s) => String(s || '').trim().toLowerCase())
       .filter(Boolean);
@@ -2673,11 +2802,11 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
       )
     )`;
   }
-  if (ids.siteIds.length) {
+  if (!byApp && ids.siteIds.length) {
     params.push(ids.siteIds);
     whereCore += ` AND g.site_id = ANY($${params.length}::int[])`;
   }
-  if (ids.adUnitIds.length) {
+  if (!byApp && ids.adUnitIds.length) {
     params.push(ids.adUnitIds);
     whereCore += ` AND g.ad_unit_id = ANY($${params.length}::int[])`;
   }
@@ -2840,7 +2969,8 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
 
   logger.info(
     `Reporting id-grain-fast ${startDate}..${endDate}`
-    + ` grain≈${grainCount} table=${tableRows.length} in ${Date.now() - t0}ms`
+    + ` slice=${byApp ? 'app_id' : 'inventory_core'}`
+    + `${byCountry ? '+country' : ''} grain≈${grainCount} table=${tableRows.length} in ${Date.now() - t0}ms`
   );
 
   return {
