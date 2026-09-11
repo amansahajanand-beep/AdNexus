@@ -15,18 +15,24 @@ const {
   isAdsJobAllowedDuringTodayPriority,
   getTodayPriorityDeferMs,
 } = require('../services/syncPriorityGate');
+const {
+  isAdsRateLimited,
+  getAdsRateLimitDeferMs,
+  isAdsRateLimitError,
+  parseAdsRateLimitRetrySec,
+  beginAdsRateLimit,
+} = require('../services/adsRateLimitGate');
 
-async function deferForTodayPriority(job) {
-  const delayMs = await getTodayPriorityDeferMs();
+async function deferJob(job, delayMs, reason) {
   logger.info(
-    `[ads-sync] Deferring job ${job.id} for ${Math.round(delayMs / 1000)}s (today-priority)`
+    `[ads-sync] Deferring job ${job.id} for ${Math.round(delayMs / 1000)}s (${reason})`
   );
   if (job.token) {
     await job.moveToDelayed(Date.now() + delayMs, job.token);
     throw new DelayedError();
   }
-  const err = new Error('Deferred for today-priority');
-  err.yieldToToday = true;
+  const err = new Error(`Deferred for ${reason}`);
+  err.yieldToToday = reason === 'today-priority';
   throw err;
 }
 
@@ -37,8 +43,12 @@ async function processJob(job) {
     return;
   }
 
+  if (await isAdsRateLimited()) {
+    await deferJob(job, await getAdsRateLimitDeferMs(), 'ads-rate-limit');
+  }
+
   if (await isTodayPriorityActive() && !isAdsJobAllowedDuringTodayPriority(job)) {
-    await deferForTodayPriority(job);
+    await deferJob(job, await getTodayPriorityDeferMs(), 'today-priority');
   }
 
   const client = await getClientById(clientId);
@@ -54,22 +64,39 @@ async function processJob(job) {
     const roiOnly = job.data?.roiOnly !== false;
 
     if (job.name === 'ads-sync-account' && job.data?.adsAccountId) {
+      if (await isAdsRateLimited()) {
+        await deferJob(job, await getAdsRateLimitDeferMs(), 'ads-rate-limit');
+      }
       const account = await getAccountById(job.data.adsAccountId);
       if (!account) return;
-      const n = await syncAccountSpend(account, { startDate: start, endDate: end, gamClient: client });
-      logger.info(`[ads-sync] account ${account.customerId} wrote ${n}`);
-      return { rows: n };
+      try {
+        const n = await syncAccountSpend(account, { startDate: start, endDate: end, gamClient: client });
+        logger.info(`[ads-sync] account ${account.customerId} wrote ${n}`);
+        return { rows: n };
+      } catch (e) {
+        const retrySec = parseAdsRateLimitRetrySec(e);
+        if (retrySec != null || isAdsRateLimitError(e)) {
+          await beginAdsRateLimit(retrySec || 15 * 60, { reason: `job-account=${account.customerId}` });
+          await deferJob(job, await getAdsRateLimitDeferMs(), 'ads-rate-limit');
+        }
+        throw e;
+      }
     }
 
     // Default: one job syncs all ROI-enabled client accounts for this GAM tenant.
+    // Optional batch/stale flags from job data only (manual/debug) — not forced for today.
     const result = await syncAllAccountsForClient(client, {
       startDate: start,
       endDate: end,
       roiOnly,
+      maxAccounts: job.data?.maxAccounts ?? null,
+      preferStale: job.data?.preferStale === true,
+      staleMinutes: job.data?.staleMinutes ?? null,
     });
     logger.info(
       `[ads-sync] client=${clientId.slice(0, 8)} accounts=${result.accounts} `
       + `total=${result.total} errors=${result.errors.length}`
+      + `${result.rateLimited ? ' rateLimited=1' : ''}`
     );
     return result;
   });

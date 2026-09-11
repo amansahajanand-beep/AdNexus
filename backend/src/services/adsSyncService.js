@@ -13,6 +13,24 @@ const {
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { getClient } = require('../utils/clientContext');
 const { normalizeCurrency } = require('../utils/adsCurrency');
+const {
+  parseAdsRateLimitRetrySec,
+  isAdsRateLimitError,
+  beginAdsRateLimit,
+  isAdsRateLimited,
+} = require('./adsRateLimitGate');
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function adsAccountDelayMs() {
+  return Math.max(0, parseInt(process.env.ADS_SYNC_ACCOUNT_DELAY_MS || '500', 10) || 500);
+}
+
+function adsTodayAccountBatch() {
+  return Math.max(5, parseInt(process.env.ADS_SYNC_ACCOUNT_BATCH || '40', 10) || 40);
+}
 
 function formatAdsSyncError(err) {
   if (!err) return 'Unknown Ads sync error';
@@ -161,8 +179,42 @@ function adsSyncRoiOnly() {
   return raw !== 'false' && raw !== '0' && raw !== 'no';
 }
 
-async function syncAllAccountsForClient(gamClient, { startDate, endDate, roiOnly = adsSyncRoiOnly() } = {}) {
-  const accounts = await listSyncableClientAccounts(gamClient.id, { roiOnly });
+async function syncAllAccountsForClient(gamClient, {
+  startDate,
+  endDate,
+  roiOnly = adsSyncRoiOnly(),
+  maxAccounts = null,
+  preferStale = false,
+  staleMinutes = null,
+} = {}) {
+  if (await isAdsRateLimited()) {
+    const { getAdsRateLimitState } = require('./adsRateLimitGate');
+    const state = await getAdsRateLimitState();
+    logger.warn(
+      `Ads sync skipped (rate-limited) client=${gamClient.id.slice(0, 8)} `
+      + `remaining≈${Math.round((state.remainingMs || 0) / 60000)}m`
+    );
+    return {
+      total: 0,
+      accounts: 0,
+      errors: [{ error: 'rate_limited' }],
+      rateLimited: true,
+    };
+  }
+
+  const limit = maxAccounts != null && maxAccounts > 0
+    ? maxAccounts
+    : null;
+  const staleBefore = preferStale && staleMinutes != null && staleMinutes > 0
+    ? new Date(Date.now() - staleMinutes * 60 * 1000)
+    : null;
+
+  const accounts = await listSyncableClientAccounts(gamClient.id, {
+    roiOnly,
+    staleBefore,
+    limit,
+    orderByStale: Boolean(preferStale || limit),
+  });
   let total = 0;
   const errors = [];
   // Warm FX once for the whole client batch (avoid per-account live FX HTTP spam).
@@ -171,7 +223,22 @@ async function syncAllAccountsForClient(gamClient, { startDate, endDate, roiOnly
     await refreshFxRates();
   } catch (_) { /* ignore */ }
 
-  for (const acc of accounts) {
+  const delayMs = adsAccountDelayMs();
+  for (let i = 0; i < accounts.length; i += 1) {
+    if (await isAdsRateLimited()) {
+      logger.warn(
+        `Ads sync abort mid-batch (rate-limited) client=${gamClient.id.slice(0, 8)} `
+        + `done=${i}/${accounts.length}`
+      );
+      return {
+        total,
+        accounts: accounts.length,
+        errors,
+        rateLimited: true,
+        abortedAt: i,
+      };
+    }
+    const acc = accounts[i];
     try {
       total += await syncAccountSpend(acc, { startDate, endDate, gamClient });
     } catch (e) {
@@ -179,6 +246,27 @@ async function syncAllAccountsForClient(gamClient, { startDate, endDate, roiOnly
       logger.error(`Ads sync failed for ${acc.customerId}:`, message);
       await setSyncStatus(acc.id, { error: message });
       errors.push({ accountId: acc.id, customerId: acc.customerId, error: message });
+
+      const retrySec = parseAdsRateLimitRetrySec(e) || parseAdsRateLimitRetrySec(message);
+      if (retrySec != null || isAdsRateLimitError(message)) {
+        await beginAdsRateLimit(retrySec || 15 * 60, {
+          reason: `account=${acc.customerId}`,
+        });
+        logger.warn(
+          `Ads sync abort — Google quota hit after ${i + 1}/${accounts.length} accounts; `
+          + `pausing remaining syncs`
+        );
+        return {
+          total,
+          accounts: accounts.length,
+          errors,
+          rateLimited: true,
+          abortedAt: i + 1,
+        };
+      }
+    }
+    if (delayMs > 0 && i < accounts.length - 1) {
+      await sleep(delayMs);
     }
   }
   return { total, accounts: accounts.length, errors };
@@ -198,9 +286,29 @@ async function enqueueAdsSyncAccounts(gamClient, adsSyncQueue, {
   fanOutAccounts = false,
   roiOnly = adsSyncRoiOnly(),
   skipIfTodayPriority = false,
+  maxAccounts = null,
+  preferStale = false,
+  staleMinutes = null,
 } = {}) {
   if (!gamClient?.id || !adsSyncQueue) {
     throw new Error('enqueueAdsSyncAccounts requires client and adsSyncQueue');
+  }
+
+  if (await isAdsRateLimited()) {
+    const { getAdsRateLimitState } = require('./adsRateLimitGate');
+    const state = await getAdsRateLimitState();
+    logger.warn(
+      `Ads sync enqueue skipped (rate-limited) client=${gamClient.id.slice(0, 8)} `
+      + `remaining≈${Math.round((state.remainingMs || 0) / 60000)}m`
+    );
+    return {
+      accounts: 0,
+      jobs: 0,
+      skipped: true,
+      rateLimited: true,
+      start: startDate,
+      end: endDate,
+    };
   }
 
   if (skipIfTodayPriority) {
@@ -268,6 +376,9 @@ async function enqueueAdsSyncAccounts(gamClient, adsSyncQueue, {
       startDate: start,
       endDate: end,
       roiOnly,
+      maxAccounts,
+      preferStale,
+      staleMinutes,
     },
     {
       jobId: prefix,
@@ -279,7 +390,8 @@ async function enqueueAdsSyncAccounts(gamClient, adsSyncQueue, {
     }
   );
   logger.info(
-    `Ads sync enqueued 1 client job (${accounts.length} account(s)) `
+    `Ads sync enqueued 1 client job (${accounts.length} account(s)`
+    + `${maxAccounts ? `, batch≤${maxAccounts}` : ''}) `
     + `client=${gamClient.id.slice(0, 8)} ${start}→${end}`
   );
   return { accounts: accounts.length, jobs: 1, start, end };
@@ -307,4 +419,6 @@ module.exports = {
   backfillAccountAppIds,
   resolveRefreshForAccount,
   formatAdsSyncError,
+  adsSyncRoiOnly,
+  adsTodayAccountBatch,
 };

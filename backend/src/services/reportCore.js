@@ -3625,7 +3625,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v18_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v19_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3736,6 +3736,12 @@ async function handleDetailedReport(req, res) {
     const wantsSiteCol = reportDimIds.some((d) => (
       d === 'site_name' || d === 'site' || d === 'SITE_NAME' || d === 'url_name'
     )) || reportDimIds.length === 0; // default inventory table includes site
+    const wantsAppCol = reportDimIds.some((d) => (
+      d === 'mobile_app_resolved_id'
+      || d === 'mobile_app_name'
+      || d === 'MOBILE_APP_RESOLVED_ID'
+      || d === 'MOBILE_APP_NAME'
+    )) || apps.length > 0;
     let tableLimit = 2000;
     try {
       const { reportingTableLimit } = require('./reportGrainStore');
@@ -3754,8 +3760,9 @@ async function handleDetailedReport(req, res) {
       skipAdUnitLike,
       groupByCountry: wantsCountryCol,
       groupByDevice: wantsDeviceCol,
-      groupBySite: wantsSiteCol,
-      tableGrain: wantsSiteCol ? 'site' : 'domain',
+      groupBySite: wantsSiteCol && !wantsAppCol,
+      groupByApp: wantsAppCol,
+      tableGrain: wantsAppCol ? 'app' : (wantsSiteCol ? 'site' : 'domain'),
       // Reporting: skip dashboard chart scans; use lateral day samples for long ranges.
       reportingFast: true,
       skipCharts: true,

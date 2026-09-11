@@ -199,6 +199,17 @@ function isAdsCronEnabled() {
 /** Hourly: refresh Google Ads spend for today only (ROI present data). */
 async function enqueueAdsSyncToday({ reason } = {}) {
   if (!isAdsCronEnabled()) return;
+  try {
+    const { isAdsRateLimited, getAdsRateLimitState } = require('../services/adsRateLimitGate');
+    if (await isAdsRateLimited()) {
+      const state = await getAdsRateLimitState();
+      logger.warn(
+        `Cron: ads-sync-today skipped (rate-limited) remaining≈${Math.round((state.remainingMs || 0) / 60000)}m`
+      );
+      return;
+    }
+  } catch (_) { /* gate optional */ }
+
   const today = todayInTZ();
   const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
   const tag = reason ? ` (${reason})` : '';
@@ -206,17 +217,24 @@ async function enqueueAdsSyncToday({ reason } = {}) {
   await eachActiveClient(async (client) => {
     const cid = client.id;
     try {
-      const { accounts, jobs } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
+      const { accounts, jobs, skipped, rateLimited } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
         startDate: today,
         endDate: today,
         jobIdPrefix: `ads-sync-today-${cid.slice(0, 8)}-${today}-${hourSlot}`,
         priority: 1,
       });
+      if (skipped || rateLimited) return;
       logger.info(
         `Cron: enqueued ads-sync-today jobs=${jobs} accounts=${accounts} for ${today} `
         + `client=${cid.slice(0, 8)}${tag}`
       );
     } catch (e) {
+      if (/JobId|already exists|duplicate/i.test(e.message || '')) {
+        logger.info(
+          `Cron: ads-sync-today already queued client=${cid.slice(0, 8)}${tag}`
+        );
+        return;
+      }
       logger.error('Cron: failed to enqueue ads-sync-today:', e.message);
     }
   });
