@@ -137,6 +137,7 @@ export function buildClientVisibility(user) {
 
 export function canAccessPage(user, page) {
   if ((page === 'domain-user' || page === 'my-ads') && isAdmin(user)) return false;
+  if (page === 'help') return true;
   if (isAdmin(user)) return true;
   if (page === 'presets') {
     return hasPermission(user, 'canAccessDashboard') || hasPermission(user, 'canAccessReporting');

@@ -128,8 +128,8 @@ function TreeChevron({ open, hasChildren }) {
 
 function renderMetric(row, colId, currency = 'USD') {
   const earnOnly = row.targetType === 'site' || row.earnOnly || row.level === 'site';
-  // Sites show revenue only — Ads engagement columns are blank.
-  if (earnOnly && ['adsSpend', 'impressions', 'clicks', 'ctr', 'ecpm', 'roiSpendPercent'].includes(colId)) {
+  // Sites are earn-first: blank Ads spend / ROI spend %, but show engagement + eCPM.
+  if (earnOnly && ['adsSpend', 'roiSpendPercent'].includes(colId)) {
     return '—';
   }
   if (colId === 'adsSpend') return money(row.adsSpend, currency);

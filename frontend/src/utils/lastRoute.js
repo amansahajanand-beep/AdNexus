@@ -2,7 +2,7 @@ import { getDefaultHomeRoute, isAdmin, canAccessPage } from './auth/permissions'
 
 const KEY = 'adnexus.lastRoute';
 
-const ALLOWED = new Set(['/dashboard', '/reporting', '/roi', '/presets', '/admin', '/domain-user']);
+const ALLOWED = new Set(['/dashboard', '/reporting', '/roi', '/presets', '/admin', '/domain-user', '/my-ads', '/help']);
 
 export function rememberLastRoute(pathname) {
   const path = String(pathname || '').split('?')[0];
@@ -25,12 +25,14 @@ export function readLastRoute() {
 
 function routeAllowed(user, path) {
   if (path === '/admin') return isAdmin(user);
+  if (path === '/help') return true;
   const pageMap = {
     '/dashboard': 'dashboard',
     '/reporting': 'reporting',
     '/roi': 'roi',
     '/presets': 'presets',
     '/domain-user': 'domain-user',
+    '/my-ads': 'my-ads',
   };
   const page = pageMap[path];
   if (page) return canAccessPage(user, page);

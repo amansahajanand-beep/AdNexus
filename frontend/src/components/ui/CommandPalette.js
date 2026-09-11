@@ -57,6 +57,7 @@ export default function CommandPalette() {
     if (canPage('presets')) {
       list.push({ id: 'presets', label: 'Presets', hint: 'Saved presets', to: '/presets' });
     }
+    list.push({ id: 'help', label: 'Help', hint: 'How to use AdNexus', to: '/help' });
     if (canPage('dashboard')) {
       getReportPresets(PRESET_PAGES.dashboard, user?.id).slice(0, 4).forEach((f) => {
         list.push({

@@ -1049,6 +1049,72 @@ function sumSiteEarnFromMap(earnByTargetCountry, siteKey, {
   return round2(sum);
 }
 
+/**
+ * When multiple Ads accounts spend on the same app package in a country,
+ * GAM earn is identical for each — claim it once for the top-spend account
+ * (stable UUID tie-break). Others keep spend/engagement with earn = 0.
+ */
+function claimAppPackageEarnWinners(rows = [], { includeDate = false } = {}) {
+  const groups = new Map();
+  for (const r of rows) {
+    if (String(r.targetType || '') !== 'app') continue;
+    const pkg = String(r.targetKey || '').trim().toLowerCase();
+    if (!pkg) continue;
+    const country = String(r.countryCode || r.countryName || '').trim().toUpperCase() || '—';
+    const datePart = includeDate ? `${ymd(r.date)}|` : '';
+    const gKey = `${datePart}${country}|app|${pkg}`;
+    if (!groups.has(gKey)) groups.set(gKey, []);
+    groups.get(gKey).push(r);
+  }
+  const winners = new Set();
+  for (const list of groups.values()) {
+    list.sort((a, b) =>
+      (Number(b.adsSpend) || 0) - (Number(a.adsSpend) || 0)
+      || String(a.adsAccountId || '').localeCompare(String(b.adsAccountId || ''))
+    );
+    const w = list[0];
+    const pkg = String(w.targetKey || '').trim().toLowerCase();
+    const country = String(w.countryCode || w.countryName || '').trim().toUpperCase() || '—';
+    const datePart = includeDate ? `${ymd(w.date)}|` : '';
+    winners.add(`${datePart}${w.adsAccountId}|${country}|app|${pkg}`);
+  }
+  return winners;
+}
+
+function appPackageWinnerKey(row, { includeDate = false } = {}) {
+  const pkg = String(row.targetKey || '').trim().toLowerCase();
+  const country = String(row.countryCode || row.countryName || '').trim().toUpperCase() || '—';
+  const datePart = includeDate ? `${ymd(row.date)}|` : '';
+  return `${datePart}${row.adsAccountId}|${country}|app|${pkg}`;
+}
+
+/** Lookup GAM site engagement (impressions/clicks) with the same country matching as earn. */
+function sumSiteEngagementFromMap(engagementByTargetCountry, siteKey, {
+  countryName = null,
+  countryCode = null,
+} = {}) {
+  const empty = { impressions: 0, clicks: 0 };
+  if (!engagementByTargetCountry?.size) return empty;
+  const host = normSiteHost(siteKey);
+  const nameK = String(countryName || '').trim().toLowerCase();
+  const codeK = String(countryCode || '').trim().toLowerCase();
+  let impressions = 0;
+  let clicks = 0;
+  for (const [key, eng] of engagementByTargetCountry.entries()) {
+    const parsed = parseTargetCountryEarnKey(key);
+    if (!parsed || parsed.targetType !== 'site') continue;
+    if (normSiteHost(parsed.targetKey) !== host) continue;
+    const ck = parsed.countryKey;
+    if (!ck) continue;
+    const match = countryKeysEqual(ck, nameK)
+      || (codeK && codeK !== '—' && countryKeysEqual(ck, codeK));
+    if (!match) continue;
+    impressions += Number(eng?.impressions) || 0;
+    clicks += Number(eng?.clicks) || 0;
+  }
+  return { impressions: Math.round(impressions), clicks: Math.round(clicks) };
+}
+
 /** Index Ads countries by name and ISO code for nesting GAM site earn. */
 function buildCountryMetaIndex(countrySpendRows = []) {
   const index = new Map();
@@ -1162,6 +1228,7 @@ function resolveSiteHostAccount({
 function synthesizeSitePackagesFromEarn({
   countryTargetRows = [],
   earnByTargetCountry,
+  siteEngagementByCountry = null,
   siteKeyFilter,
   countrySpendRows = [],
 }) {
@@ -1211,6 +1278,12 @@ function synthesizeSitePackagesFromEarn({
         .replace(/^_|_$/g, '')
         .slice(0, 24) || 'ZZ';
 
+    const eng = siteEngagementByCountry?.get(earnKey)
+      || sumSiteEngagementFromMap(siteEngagementByCountry, exactKey, {
+        countryName: parsed.countryKey,
+        countryCode,
+      });
+
     added.push({
       adsAccountId: 'gam-sites',
       accountName: 'GAM sites',
@@ -1221,8 +1294,8 @@ function synthesizeSitePackagesFromEarn({
       countryName,
       gamCountryKey: parsed.countryKey,
       adsSpend: 0,
-      impressions: 0,
-      clicks: 0,
+      impressions: Number(eng?.impressions) || 0,
+      clicks: Number(eng?.clicks) || 0,
       conversions: 0,
       earnOnly: true,
     });
@@ -1356,8 +1429,9 @@ function expandSiteHostKeys(siteKeys = []) {
 }
 
 /**
- * Selected GAM sites → earn by country.
+ * Selected GAM sites → earn + engagement by country.
  * Exact host match on inventory_core (finance2.x.com ≠ x.com).
+ * Returns { earnMap, engagementMap } — engagementMap values are { impressions, clicks }.
  */
 async function loadSelectedSitesEarnByCountry(clientId, start, end, siteKeys = []) {
   const hosts = [...new Set(
@@ -1365,13 +1439,14 @@ async function loadSelectedSitesEarnByCountry(clientId, start, end, siteKeys = [
       .map((k) => normSiteHost(k))
       .filter(Boolean)
   )];
-  if (!hosts.length) return new Map();
+  if (!hosts.length) return { earnMap: new Map(), engagementMap: new Map() };
 
   const { rows } = await query(
     `SELECT LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) AS target_key,
             LOWER(TRIM(COALESCE(NULLIF(dc.name, ''), 'unknown'))) AS country_key,
             COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
-            COALESCE(SUM(g.impressions), 0)::float8 AS impressions
+            COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+            COALESCE(SUM(g.clicks), 0)::float8 AS clicks
      FROM report_grain g
      JOIN dim_site ds
        ON ds.id = g.site_id
@@ -1386,17 +1461,28 @@ async function loadSelectedSitesEarnByCountry(clientId, start, end, siteKeys = [
     [clientId, start, end, hosts]
   );
 
-  const map = new Map();
+  const earnMap = new Map();
+  const engagementMap = new Map();
   (rows || []).forEach((r) => {
     const tKey = normSiteHost(r.target_key);
     const cKey = String(r.country_key || '').trim().toLowerCase() || 'unknown';
     if (!tKey) return;
-    const earn = coerceWarehouseRevenue(r.revenue, Number(r.impressions) || 0);
-    if (!(earn > 0)) return;
+    const impressions = Math.round(Number(r.impressions) || 0);
+    const clicks = Math.round(Number(r.clicks) || 0);
+    const earn = coerceWarehouseRevenue(r.revenue, impressions);
     const k = `site:${tKey}:${cKey}`;
-    map.set(k, round2((map.get(k) || 0) + earn));
+    if (earn > 0) {
+      earnMap.set(k, round2((earnMap.get(k) || 0) + earn));
+    }
+    if (impressions > 0 || clicks > 0) {
+      const prev = engagementMap.get(k) || { impressions: 0, clicks: 0 };
+      engagementMap.set(k, {
+        impressions: prev.impressions + impressions,
+        clicks: prev.clicks + clicks,
+      });
+    }
   });
-  return map;
+  return { earnMap, engagementMap };
 }
 
 /** Scoped target×country earn — limits report_grain to known apps/sites/countries. */
@@ -2383,7 +2469,7 @@ async function buildRoiCountryBreakdown(clientId, {
     && !(accountFilter?.length || campaignFilter?.length)
     && !countryTargetRows.some((r) => r.targetType && r.targetKey && (Number(r.adsSpend) || 0) > 0);
 
-  const [earnByCountry, earnByTargetCountryApps, earnByTargetCountryDaily, siteEarnByCountry] = await Promise.all([
+  const [earnByCountry, earnByTargetCountryApps, earnByTargetCountryDaily, siteEarnBundle] = await Promise.all([
     needsNetworkCountryEarn
       ? loadGamEarnByCountry(clientId, start, end)
       : Promise.resolve(new Map()),
@@ -2405,8 +2491,11 @@ async function buildRoiCountryBreakdown(clientId, {
       : Promise.resolve(new Map()),
     siteKeyFilter?.size
       ? loadSelectedSitesEarnByCountry(clientId, start, end, siteKeyFilter)
-      : Promise.resolve(new Map()),
+      : Promise.resolve({ earnMap: new Map(), engagementMap: new Map() }),
   ]);
+
+  const siteEarnByCountry = siteEarnBundle?.earnMap || new Map();
+  const siteEngagementByCountry = siteEarnBundle?.engagementMap || new Map();
 
   // Merge site×country earn (independent of Ads) into the target earn map.
   const earnByTargetCountry = new Map(earnByTargetCountryApps);
@@ -2417,6 +2506,7 @@ async function buildRoiCountryBreakdown(clientId, {
   countryTargetRows = synthesizeSitePackagesFromEarn({
     countryTargetRows,
     earnByTargetCountry: siteEarnByCountry.size ? siteEarnByCountry : earnByTargetCountry,
+    siteEngagementByCountry,
     siteKeyFilter,
     countrySpendRows,
   });
@@ -2542,6 +2632,7 @@ async function buildRoiCountryBreakdown(clientId, {
     );
   }
 
+  const appEarnWinners = claimAppPackageEarnWinners(countryTargetRows);
   const countryTargetBreakdown = await Promise.all(countryTargetRows.map(async (row) => {
     const countryKey = String(row.gamCountryKey || row.countryName || '').trim().toLowerCase();
     const earnKey = `${row.targetType}:${row.targetKey}:${countryKey}`;
@@ -2559,6 +2650,9 @@ async function buildRoiCountryBreakdown(clientId, {
       }
     } else {
       targetEarn = earnByTargetCountry.get(earnKey) || 0;
+      if (targetEarn > 0 && !appEarnWinners.has(appPackageWinnerKey(row))) {
+        targetEarn = 0;
+      }
     }
     const rowSpend = isSite ? 0 : (Number(row.adsSpend) || 0);
     const tk = targetExpenseKey(row.targetType, row.targetKey);
@@ -2567,11 +2661,26 @@ async function buildRoiCountryBreakdown(clientId, {
       rowSpend,
       spendTotalByTarget.get(tk) || 0
     );
+    let impressions = Number(row.impressions) || 0;
+    let clicks = Number(row.clicks) || 0;
+    let conversions = Number(row.conversions) || 0;
+    if (isSite && !(impressions > 0) && !(clicks > 0)) {
+      const eng = sumSiteEngagementFromMap(siteEngagementByCountry, row.targetKey, {
+        countryName: row.gamCountryKey || row.countryName,
+        countryCode: row.countryCode,
+      });
+      impressions = eng.impressions;
+      clicks = eng.clicks;
+    }
     const spendMetrics = await metricsFor(targetEarn, rowSpend, otherExpenses, {
-      impressions: isSite ? 0 : row.impressions,
-      clicks: isSite ? 0 : row.clicks,
-      conversions: isSite ? 0 : row.conversions,
+      impressions,
+      clicks,
+      conversions,
     }, { endDate: end });
+    // Sites without Ads spend: show revenue eCPM (earn / imps × 1000) instead of Ads eCPM.
+    if (isSite && !(rowSpend > 0) && spendMetrics.impressions > 0 && spendMetrics.earn > 0) {
+      spendMetrics.ecpm = round2((spendMetrics.earn / spendMetrics.impressions) * 1000);
+    }
     const account = accountById.get(row.adsAccountId);
     return {
       adsAccountId: row.adsAccountId,
@@ -2587,21 +2696,29 @@ async function buildRoiCountryBreakdown(clientId, {
       profitExpense: spendMetrics.profitExpense,
       roiSpendPercent: isSite ? null : spendMetrics.roiSpendPercent,
       roiExpensePercent: spendMetrics.roiExpensePercent,
-      impressions: isSite ? 0 : spendMetrics.impressions,
-      clicks: isSite ? 0 : spendMetrics.clicks,
-      conversions: isSite ? 0 : spendMetrics.conversions,
-      ctr: isSite ? null : spendMetrics.ctr,
-      ecpm: isSite ? null : spendMetrics.ecpm,
+      impressions: spendMetrics.impressions,
+      clicks: spendMetrics.clicks,
+      conversions: spendMetrics.conversions,
+      ctr: spendMetrics.ctr,
+      ecpm: spendMetrics.ecpm,
       earnOnly: isSite,
     };
   }));
 
+  const dailyAppEarnWinners = claimAppPackageEarnWinners(countryTargetDailyRows || [], { includeDate: true });
   const countryTargetDailyBreakdown = await Promise.all((countryTargetDailyRows || [])
     .filter((row) => (Number(row.adsSpend) || 0) > 0)
     .map(async (row) => {
       const countryKey = String(row.countryName || '').trim().toLowerCase();
       const earnKey = `${row.date}:${row.targetType}:${row.targetKey}:${countryKey}`;
-      const targetEarn = earnByTargetCountryDaily.get(earnKey) || 0;
+      let targetEarn = earnByTargetCountryDaily.get(earnKey) || 0;
+      if (
+        row.targetType === 'app'
+        && targetEarn > 0
+        && !dailyAppEarnWinners.has(appPackageWinnerKey(row, { includeDate: true }))
+      ) {
+        targetEarn = 0;
+      }
       const tk = targetExpenseKey(row.targetType, row.targetKey);
       const dayKey = `${ymd(row.date)}:${tk}`;
       const otherExpenses = allocateTargetExpense(
@@ -2681,10 +2798,10 @@ async function getRoiSummary(clientId, {
   includeDaily = null,
 } = {}) {
   const cacheKey = breakdownOnly
-    ? `roi_bd_v16_${clientId}_${JSON.stringify({
+    ? `roi_bd_v17_${clientId}_${JSON.stringify({
       start, end, targetType, accountIds, campaignIds, appKeys, siteKeys, countryCodes, includeDaily,
     })}`
-    : `roi_sum_v16_${clientId}_${JSON.stringify({
+    : `roi_sum_v17_${clientId}_${JSON.stringify({
       start,
       end,
       targetType,
@@ -3231,6 +3348,7 @@ async function getRoiSummary(clientId, {
     });
     const inlineSpendByTargetDate = sumAdsSpendByTargetDate(countryTargetDailyRows || []);
 
+    const inlineAppEarnWinners = claimAppPackageEarnWinners(countryTargetRows);
     countryTargetBreakdown = await Promise.all(countryTargetRows.map(async (row) => {
       const countryKey = String(row.gamCountryKey || row.countryName || '').trim().toLowerCase();
       const earnKey = `${row.targetType}:${row.targetKey}:${countryKey}`;
@@ -3248,6 +3366,9 @@ async function getRoiSummary(clientId, {
         }
       } else {
         targetEarn = earnByTargetCountry.get(earnKey) || 0;
+        if (targetEarn > 0 && !inlineAppEarnWinners.has(appPackageWinnerKey(row))) {
+          targetEarn = 0;
+        }
       }
       const rowSpend = isSite ? 0 : (Number(row.adsSpend) || 0);
       const tk = targetExpenseKey(row.targetType, row.targetKey);
@@ -3257,10 +3378,13 @@ async function getRoiSummary(clientId, {
         inlineSpendByTarget.get(tk) || 0
       );
       const spendMetrics = await metricsFor(targetEarn, rowSpend, otherExpenses, {
-        impressions: isSite ? 0 : row.impressions,
-        clicks: isSite ? 0 : row.clicks,
-        conversions: isSite ? 0 : row.conversions,
+        impressions: Number(row.impressions) || 0,
+        clicks: Number(row.clicks) || 0,
+        conversions: Number(row.conversions) || 0,
       }, { endDate: end });
+      if (isSite && !(rowSpend > 0) && spendMetrics.impressions > 0 && spendMetrics.earn > 0) {
+        spendMetrics.ecpm = round2((spendMetrics.earn / spendMetrics.impressions) * 1000);
+      }
       const account = accountById.get(row.adsAccountId);
       return {
         adsAccountId: row.adsAccountId,
@@ -3276,21 +3400,29 @@ async function getRoiSummary(clientId, {
         profitExpense: spendMetrics.profitExpense,
         roiSpendPercent: isSite ? null : spendMetrics.roiSpendPercent,
         roiExpensePercent: spendMetrics.roiExpensePercent,
-        impressions: isSite ? 0 : spendMetrics.impressions,
-        clicks: isSite ? 0 : spendMetrics.clicks,
-        conversions: isSite ? 0 : spendMetrics.conversions,
-        ctr: isSite ? null : spendMetrics.ctr,
-        ecpm: isSite ? null : spendMetrics.ecpm,
+        impressions: spendMetrics.impressions,
+        clicks: spendMetrics.clicks,
+        conversions: spendMetrics.conversions,
+        ctr: spendMetrics.ctr,
+        ecpm: spendMetrics.ecpm,
         earnOnly: isSite,
       };
     }));
 
+    const inlineDailyWinners = claimAppPackageEarnWinners(countryTargetDailyRows || [], { includeDate: true });
     countryTargetDailyBreakdown = await Promise.all((countryTargetDailyRows || [])
       .filter((row) => (Number(row.adsSpend) || 0) > 0)
       .map(async (row) => {
         const countryKey = String(row.countryName || '').trim().toLowerCase();
         const earnKey = `${row.date}:${row.targetType}:${row.targetKey}:${countryKey}`;
-        const targetEarn = earnByTargetCountryDaily.get(earnKey) || 0;
+        let targetEarn = earnByTargetCountryDaily.get(earnKey) || 0;
+        if (
+          row.targetType === 'app'
+          && targetEarn > 0
+          && !inlineDailyWinners.has(appPackageWinnerKey(row, { includeDate: true }))
+        ) {
+          targetEarn = 0;
+        }
         const tk = targetExpenseKey(row.targetType, row.targetKey);
         const dayKey = `${ymd(row.date)}:${tk}`;
         const otherExpenses = allocateTargetExpense(
@@ -3368,7 +3500,9 @@ function invalidateRoiSummaryCache(clientId) {
   const id = String(clientId);
   const keys = cache.keys().filter((k) => {
     const s = String(k);
-    return s.startsWith(`roi_sum_v14_${id}`) || s.startsWith(`roi_bd_v14_${id}`)
+    return s.startsWith(`roi_sum_v17_${id}`) || s.startsWith(`roi_bd_v17_${id}`)
+      || s.startsWith(`roi_sum_v16_${id}`) || s.startsWith(`roi_bd_v16_${id}`)
+      || s.startsWith(`roi_sum_v14_${id}`) || s.startsWith(`roi_bd_v14_${id}`)
       || s.startsWith(`roi_sum_v13_${id}`) || s.startsWith(`roi_bd_v13_${id}`)
       || s.startsWith(`roi_sum_v12_${id}`) || s.startsWith(`roi_bd_v12_${id}`)
       || s.startsWith(`roi_sum_v11_${id}`) || s.startsWith(`roi_bd_v11_${id}`)

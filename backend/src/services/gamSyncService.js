@@ -2696,10 +2696,23 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
 
   const groupCols = ['g.report_date'];
   const selectIds = [`g.report_date`];
+  // Site-level tables (incl. site × country): do not GROUP BY domain_id — the same
+  // SITE_NAME often has domain_id=0 and a filled domain_id across grain rows, which
+  // duplicated hosts in Reporting while the UI only showed date/site/country.
+  const siteGrain = !byApp && !byAdUnit && Boolean(
+    opts.groupBySite
+    || (opts.sites || []).length
+    || ids.siteIds.length
+  );
   if (byApp) {
     groupCols.push(`COALESCE(NULLIF(TRIM(g.app_id), ''), NULLIF(TRIM(g.app_name), ''), '')`);
     selectIds.push(`COALESCE(NULLIF(TRIM(g.app_id), ''), NULLIF(TRIM(g.app_name), ''), '') AS app_id`);
     selectIds.push(`0 AS domain_id`, `0 AS site_id`, `0 AS ad_unit_id`);
+  } else if (siteGrain) {
+    groupCols.push('g.site_id');
+    selectIds.push('MAX(g.domain_id)::int AS domain_id', 'g.site_id');
+    selectIds.push('0 AS ad_unit_id');
+    selectIds.push(`'' AS app_id`);
   } else {
     groupCols.push('g.domain_id', 'g.site_id');
     selectIds.push('g.domain_id', 'g.site_id');

@@ -37,6 +37,7 @@ const NAV_ITEMS = [
   { to: '/presets', label: 'Presets', page: 'presets' },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/domain-user', label: 'Domain User', page: 'domain-user' },
+  { to: '/help', label: 'Help', page: 'help', always: true },
 ];
 
 function statusLabel(isMock, authError) {
@@ -154,6 +155,7 @@ export default function Layout() {
   const initial = (user?.username || 'U').charAt(0).toUpperCase();
   const navItems = NAV_ITEMS.filter((i) => {
     if (i.adminOnly) return isAdmin;
+    if (i.always) return true;
     if (i.page) return canPage(i.page);
     return true;
   });
@@ -362,7 +364,7 @@ export default function Layout() {
           </header>
 
           <main className="app-main">
-            {noAccess ? (
+            {noAccess && location.pathname !== '/help' ? (
               <div className="no-access-wrap">
                 <div className="no-access-card">
                   <div className="no-access-icon" aria-hidden>
@@ -373,6 +375,9 @@ export default function Layout() {
                     {noInventoryAssigned
                       ? NO_DOMAINS_MSG
                       : "You don't have permission to access this resource. Please contact your administrator."}
+                  </p>
+                  <p className="no-access-msg" style={{ marginTop: 12 }}>
+                    See <NavLink to="/help">Help</NavLink> for what to ask your admin and how filters work.
                   </p>
                 </div>
               </div>

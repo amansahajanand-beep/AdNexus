@@ -709,9 +709,11 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
        '' AS ad_unit,
        COALESCE(${appExpr}, '') AS app_id`;
   } else if (opts.sites?.length || opts.groupBySite) {
-    groupExprs = [`g.report_date`, domainExpr, siteExpr];
+    // Site grain: group by site host only so domain_id / domainExpr variants
+    // (empty vs filled) do not duplicate the same SITE_NAME × country row.
+    groupExprs = [`g.report_date`, siteExpr];
     selectDims = `
-       ${domainExpr} AS domain_name,
+       COALESCE(MAX(${domainExpr}), '') AS domain_name,
        COALESCE(${siteExpr}, '') AS site_url,
        '' AS ad_unit,
        '' AS app_id`;

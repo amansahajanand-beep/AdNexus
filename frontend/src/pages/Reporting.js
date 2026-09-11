@@ -44,6 +44,7 @@ import {
   resolveReportTableConfig,
   buildReportColumns,
   hasActiveReport,
+  aggregateRowsByColumns,
 } from '../utils/dynamicReportTable';
 import { enrichReportRows, sortRowsByCompleteness } from '../utils/enrichReportRows';
 import { resolveReportingQuery } from '../utils/reportSelection';
@@ -1145,8 +1146,10 @@ export default function Reporting() {
         ? (progData?.rows || [])
         : (data?.rows || []);
     const enriched = enrichReportRows(raw, tableConfig.dimensions, tableConfig.metrics);
-    if (tableConfig.mode === 'inventory') return enriched;
-    return sortRowsByCompleteness(enriched, reportColumns);
+    // Roll up to visible columns so site × country isn't split by hidden domain_id variants.
+    const rolled = aggregateRowsByColumns(enriched, reportColumns);
+    if (tableConfig.mode === 'inventory') return rolled;
+    return sortRowsByCompleteness(rolled, reportColumns);
   }, [tableConfig, progData, data, reportColumns]);
 
   const displayRows = useMemo(() => {
