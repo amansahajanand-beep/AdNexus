@@ -3,9 +3,10 @@
  * Runs in the same Node process (imported from server.js).
  *
  * Job types:
- *   sync-today    → report_present (unified grain)
- *   sync-day      → one historical day
- *   sync-backfill → calendar month / range until every day has KPI grain
+ *   sync-today     → report_grain Totals (unified grain)
+ *   sync-extended  → AdX + Ad Server + Active View metrics merge
+ *   sync-day       → one historical day
+ *   sync-backfill  → calendar month / range until every day has KPI grain
  *   sync-fill-gaps → missing days in range (complete-month semantics)
  */
 const { Worker, DelayedError } = require('bullmq');
@@ -28,16 +29,24 @@ const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { runWithClient } = require('../utils/clientContext');
 const { getClientById, ensureBootstrapFromEnv } = require('../models/clientStore');
 
-async function deferForTodayPriority(job) {
-  const delayMs = await getTodayPriorityDeferMs();
+/** In-process guards so extended never stampedes the PG pool alongside sync-today. */
+let syncTodayRunning = 0;
+let syncExtendedRunning = 0;
+
+async function deferJob(job, delayMs, reason) {
+  const ms = Math.max(15_000, delayMs | 0);
   logger.info(
-    `[gam-sync] Deferring "${job.name}" id=${job.id} for ${Math.round(delayMs / 1000)}s (today-priority)`
+    `[gam-sync] Deferring "${job.name}" id=${job.id} for ${Math.round(ms / 1000)}s (${reason})`
   );
   if (job.token) {
-    await job.moveToDelayed(Date.now() + delayMs, job.token);
+    await job.moveToDelayed(Date.now() + ms, job.token);
     throw new DelayedError();
   }
   throw new TodayPriorityYieldError(`Defer ${job.name} — no job token`);
+}
+
+async function deferForTodayPriority(job) {
+  await deferJob(job, await getTodayPriorityDeferMs(), 'today-priority');
 }
 
 function getGAMHelpers() {
@@ -215,17 +224,52 @@ async function processJobInner(job) {
         5 * 60_000,
         parseInt(process.env.SYNC_TODAY_JOB_TIMEOUT_MS || String(15 * 60_000), 10) || 15 * 60_000
       );
-      totalUpserted = await Promise.race([
-        streamSyncFromGAM(day, day, job.name),
-        new Promise((_, reject) => {
-          setTimeout(() => {
-            const err = new Error(`sync-today timed out after ${Math.round(timeoutMs / 1000)}s`);
-            err.code = 'SYNC_TODAY_TIMEOUT';
-            reject(err);
-          }, timeoutMs);
-        }),
-      ]);
+      syncTodayRunning += 1;
+      try {
+        totalUpserted = await Promise.race([
+          streamSyncFromGAM(day, day, job.name),
+          new Promise((_, reject) => {
+            setTimeout(() => {
+              const err = new Error(`sync-today timed out after ${Math.round(timeoutMs / 1000)}s`);
+              err.code = 'SYNC_TODAY_TIMEOUT';
+              reject(err);
+            }, timeoutMs);
+          }),
+        ]);
+      } finally {
+        syncTodayRunning = Math.max(0, syncTodayRunning - 1);
+      }
       await invalidateCacheForDate(day);
+    } else if (job.name === 'sync-extended') {
+      // AdX + Ad Server + Active View → merge into grain.metrics (no Totals overwrite).
+      if (syncTodayRunning > 0) {
+        await deferJob(job, 120_000, 'sync-today still running');
+      }
+      syncExtendedRunning += 1;
+      if (syncExtendedRunning > 1) {
+        syncExtendedRunning -= 1;
+        await deferJob(job, 90_000, 'another sync-extended running');
+      }
+      const day = targetDates[0];
+      const timeoutMs = Math.max(
+        10 * 60_000,
+        parseInt(process.env.SYNC_EXTENDED_JOB_TIMEOUT_MS || String(45 * 60_000), 10) || 45 * 60_000
+      );
+      try {
+        totalUpserted = await Promise.race([
+          streamSyncFromGAM(day, day, job.name, { extendedOnly: true }),
+          new Promise((_, reject) => {
+            setTimeout(() => {
+              const err = new Error(`sync-extended timed out after ${Math.round(timeoutMs / 1000)}s`);
+              err.code = 'SYNC_EXTENDED_TIMEOUT';
+              reject(err);
+            }, timeoutMs);
+          }),
+        ]);
+        await invalidateCacheForDate(day);
+      } finally {
+        syncExtendedRunning = Math.max(0, syncExtendedRunning - 1);
+      }
     } else if (job.name === 'sync-day') {
       const day = targetDates[0];
       totalUpserted = await streamSyncFromGAM(day, day, job.name);
@@ -274,6 +318,7 @@ async function drainAfterJob(job) {
     logger.info(`[gam-sync] skip drain after ${job.name} — today-priority active`);
     return;
   }
+  if (job.name === 'sync-extended') return;
   let client = null;
   try {
     if (job.data?.clientId) client = await getClientById(job.data.clientId);
@@ -290,7 +335,8 @@ function startWorker() {
     return null;
   }
 
-  const syncConcurrency = Math.min(5, Math.max(1, parseInt(process.env.GAM_SYNC_CONCURRENCY || '4', 10) || 4));
+  // Default 2 — leave PG pool headroom for Dashboard/Reporting during sync.
+  const syncConcurrency = Math.min(5, Math.max(1, parseInt(process.env.GAM_SYNC_CONCURRENCY || '2', 10) || 2));
   const worker = new Worker('gam-sync', processJob, {
     connection: createBullmqConnection('BullMQ gam-sync worker'),
     concurrency: syncConcurrency,

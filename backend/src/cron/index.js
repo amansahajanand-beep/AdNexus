@@ -4,7 +4,8 @@
  * All times are in Asia/Singapore timezone.
  *
  * Tuned for Upstash command budget + heap safety:
- *   - Hourly: lean today only (GAM + 1 Ads job per client)
+ *   - Hourly: lean today Totals only (GAM + 1 Ads job per client)
+ *   - Every ~90m: sync-extended (AdX + Ad Server + Active View → grain.metrics)
  *   - Every 6h: lean yesterday (GAM + Ads)
  *   - Hourly :30: GAM reconcile only (Ads reconcile opt-in via ADS_RECONCILE_CRON)
  *   - 2AM: one job per calendar month until every day has KPI grain
@@ -97,6 +98,62 @@ async function enqueueLeanYesterdayAndFullToday({ reason } = {}) {
       logger.info(`Cron: enqueued lean sync-day for ${yesterday} client=${cid.slice(0, 8)}${tag}`);
     } catch (e) {
       logger.error('Cron: failed to enqueue sync-day:', e.message);
+    }
+  });
+}
+
+/**
+ * Ad Exchange + Ad Server + Active View → merge into report_grain.metrics.
+ * Lower priority than sync-today; skipped/deferred while today-priority is active.
+ * Today is enqueued first; yesterday is delayed so they never stampede the PG pool.
+ */
+async function enqueueExtendedMetricsSync({ reason } = {}) {
+  const tag = reason ? ` (${reason})` : '';
+  try {
+    const { isTodayPriorityActive } = require('../services/syncPriorityGate');
+    if (await isTodayPriorityActive()) {
+      logger.info(`Cron: sync-extended skipped — today-priority active${tag}`);
+      return;
+    }
+  } catch (_) { /* gate optional at boot */ }
+
+  const today = todayInTZ();
+  const yesterday = shiftYMD(today, -1);
+  const slot = Math.floor(Date.now() / (90 * 60 * 1000));
+
+  await eachActiveClient(async (client) => {
+    const cid = client.id;
+    const days = [
+      { day: today, delay: 0 },
+      // Stagger yesterday so only one extended day hits the pool at a time.
+      { day: yesterday, delay: Math.max(0, parseInt(process.env.SYNC_EXTENDED_YDAY_DELAY_MS || String(15 * 60_000), 10) || 15 * 60_000) },
+    ];
+    for (const { day, delay } of days) {
+      try {
+        await gamSyncQueue.add('sync-extended', {
+          date: day,
+          clientId: cid,
+          extendedOnly: true,
+        }, {
+          jobId: `sync-extended-${cid.slice(0, 8)}-${day}-${slot}`,
+          priority: 5,
+          attempts: 2,
+          backoff: { type: 'fixed', delay: 120000 },
+          delay,
+        });
+        logger.info(
+          `Cron: enqueued sync-extended for ${day} client=${cid.slice(0, 8)}`
+          + `${delay ? ` delay=${Math.round(delay / 1000)}s` : ''}${tag}`
+        );
+      } catch (e) {
+        if (/already exists/i.test(String(e.message || ''))) {
+          logger.info(
+            `Cron: sync-extended already queued ${day} client=${cid.slice(0, 8)}${tag}`
+          );
+          continue;
+        }
+        logger.error('Cron: failed to enqueue sync-extended:', e.message);
+      }
     }
   });
 }
@@ -427,6 +484,15 @@ function startCron() {
     await runHourlyTodayPrioritySync({ reason: 'hourly' });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── Every ~90 minutes: AdX + Ad Server + Active View (merge into grain.metrics)
+  // Never at :00 (hourly Totals) — use :45 / :15 on alternating hours.
+  cron.schedule('45 0,3,6,9,12,15,18,21 * * *', async () => {
+    await enqueueExtendedMetricsSync({ reason: 'extended-90m' });
+  }, { timezone: 'Asia/Singapore' });
+  cron.schedule('15 1,4,7,10,13,16,19,22 * * *', async () => {
+    await enqueueExtendedMetricsSync({ reason: 'extended-90m' });
+  }, { timezone: 'Asia/Singapore' });
+
   // ── Every 6 hours: yesterday lean + Ads spend yesterday ─────────────────
   cron.schedule('15 */6 * * *', async () => {
     await enqueueLeanYesterdayAndFullToday({ reason: '6h' });
@@ -534,7 +600,8 @@ function startCron() {
   }, { timezone: 'Asia/Singapore' });
 
   logger.info(
-    'Cron jobs started: hourly today-priority (+ads 1 job/client), :30 GAM reconcile '
+    'Cron jobs started: hourly today-priority (+ads 1 job/client), ~90m sync-extended '
+    + '(AdX/AdServer/ActiveView), :30 GAM reconcile '
     + '(Ads reconcile off unless ADS_RECONCILE_CRON=true), 1AM reconcile-historical,'
     + ' 6h yesterday (+ads), 2AM complete-month, 3AM archive, 4AM ads-full, '
     + '3h ads-recent off unless ADS_RECENT_CRON=true, 15m watchdog, boot kickoff'
@@ -545,12 +612,23 @@ function startCron() {
     enqueueHourlyLeanSync({ reason: 'boot' }).catch((e) => {
       logger.warn('Cron: boot sync-today enqueue failed:', e.message);
     });
+    // Extended metrics only after Totals have room — avoid PG pool stampede with sync-today.
+    const bootExtendedDelayMs = Math.max(
+      5 * 60_000,
+      parseInt(process.env.SYNC_EXTENDED_BOOT_DELAY_MS || String(20 * 60_000), 10) || 20 * 60_000
+    );
+    setTimeout(() => {
+      enqueueExtendedMetricsSync({ reason: 'boot' }).catch((e) => {
+        logger.warn('Cron: boot sync-extended enqueue failed:', e.message);
+      });
+    }, bootExtendedDelayMs);
   });
 }
 
 module.exports = {
   startCron,
   enqueueHourlyLeanSync,
+  enqueueExtendedMetricsSync,
   runHourlyTodayPrioritySync,
   enqueueRecentGapFill,
   enqueueMonthCompleteBackfill,

@@ -182,6 +182,23 @@ function moneyFromMetric(m, ...keys) {
   return 0;
 }
 
+/** Normalize sync metrics to UPPERCASE GAM enums for report_grain.metrics JSONB. */
+function metricsJsonFromRow(metrics = {}) {
+  const out = {};
+  for (const [k, v] of Object.entries(metrics || {})) {
+    if (v == null || v === '') continue;
+    const api = String(k || '').replace(/^Column\./i, '').trim().toUpperCase();
+    if (!api || api === 'REVENUE' || api === 'IMPRESSION' || api === 'IMPRESSIONS'
+      || api === 'CLICKS' || api === 'ECPM' || api === 'VIEWABLERATE') {
+      continue;
+    }
+    const n = Number(v);
+    if (!Number.isFinite(n)) continue;
+    out[api] = n;
+  }
+  return out;
+}
+
 function metricsFromRow(metrics = {}) {
   const m = metrics || {};
 
@@ -195,6 +212,7 @@ function metricsFromRow(metrics = {}) {
     pickMetric(m, 'TOTAL_LINE_ITEM_LEVEL_CLICKS', 'clicks')
   ) || 0);
 
+  // Typed KPI columns must stay Total line-item only — AdX/AdServer land in metrics JSONB.
   let revenue = moneyFromMetric(
     m,
     'revenue',
@@ -223,7 +241,15 @@ function metricsFromRow(metrics = {}) {
     pickMetric(m, 'TOTAL_INVENTORY_LEVEL_UNFILLED_IMPRESSIONS', 'unfilled')
   ) || 0);
 
-  return { impressions, clicks, revenue, viewablePct, ecpm, unfilled };
+  return {
+    impressions,
+    clicks,
+    revenue,
+    viewablePct,
+    ecpm,
+    unfilled,
+    metricsJson: metricsJsonFromRow(m),
+  };
 }
 
 /**
@@ -234,13 +260,13 @@ async function normalizeRowToGrain(row, clientId) {
   const met = metricsFromRow(row.metrics);
   const cid = clientId || requireClientId();
 
-  const [countryId, deviceId, adUnitId, domainId, siteId] = await Promise.all([
-    resolveCountryId(dims.country),
-    resolveDeviceId(dims.device),
-    resolveAdUnitId(cid, dims.adUnit),
-    resolveDomainId(cid, dims.domain),
-    resolveSiteId(cid, dims.site),
-  ]);
+  const [countryId, deviceId, adUnitId, domainId, siteId] = [
+    await resolveCountryId(dims.country),
+    await resolveDeviceId(dims.device),
+    await resolveAdUnitId(cid, dims.adUnit),
+    await resolveDomainId(cid, dims.domain),
+    await resolveSiteId(cid, dims.site),
+  ];
 
   return {
     client_id: cid,
@@ -261,6 +287,7 @@ async function normalizeRowToGrain(row, clientId) {
     ecpm: met.ecpm || null,
     unfilled: met.unfilled || null,
     currency: row.currency || 'USD',
+    metrics: met.metricsJson || {},
   };
 }
 
@@ -298,16 +325,29 @@ function grainRowToLegacyDimensions(grainRow, lookups = {}) {
 }
 
 function grainRowToLegacyMetrics(grainRow) {
-  return {
+  const stored = grainRow.metrics && typeof grainRow.metrics === 'object'
+    ? grainRow.metrics
+    : {};
+  const out = {
     TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS: grainRow.impressions,
     TOTAL_LINE_ITEM_LEVEL_CLICKS: grainRow.clicks,
     TOTAL_LINE_ITEM_LEVEL_CPM_AND_CPC_REVENUE: grainRow.revenue,
+    TOTAL_LINE_ITEM_LEVEL_ALL_REVENUE: grainRow.revenue,
     TOTAL_ACTIVE_VIEW_VIEWABLE_IMPRESSIONS_RATE: grainRow.viewable_pct,
     TOTAL_LINE_ITEM_LEVEL_WITHOUT_CPD_AVERAGE_ECPM: grainRow.ecpm,
     impression: grainRow.impressions,
     revenue: grainRow.revenue,
     clicks: grainRow.clicks,
   };
+  for (const [k, v] of Object.entries(stored)) {
+    if (v == null || v === '') continue;
+    const api = String(k).toUpperCase();
+    const n = Number(v);
+    if (!Number.isFinite(n)) continue;
+    out[api] = n;
+    out[api.toLowerCase()] = n;
+  }
+  return out;
 }
 
 module.exports = {
@@ -322,4 +362,5 @@ module.exports = {
   grainRowToLegacyMetrics,
   dimFromRow,
   metricsFromRow,
+  metricsJsonFromRow,
 };

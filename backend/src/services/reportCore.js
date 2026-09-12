@@ -70,7 +70,7 @@ const {
   pickRowRevenueDollars,
 } = require('../utils/gamReportMetrics');
 
-const { classifyReportingQuery } = require('../utils/warehouseGrain');
+const { classifyReportingQuery, isGrainMetric } = require('../utils/warehouseGrain');
 const { isMockClient, getClientId } = require('../utils/clientContext');
 const {
   getToken,
@@ -721,6 +721,22 @@ const APP_AD_REQUEST_SUBSTITUTIONS = {
   },
 };
 
+/**
+ * Metrics GAM may reject with inventory dims, or that are not stored in lean grain.
+ * Prefer storing real Ad Exchange / Ad Server / AdSense in report_grain.metrics
+ * (see EXTENDED_GRAIN_METRICS). Keep aliases only for niche ids still missing.
+ *
+ * Labels stay honest via reportWarningSubstitutions when a rewrite still runs.
+ */
+const WAREHOUSE_METRIC_ALIASES = {
+  // Niche Ad Exchange variants not yet in EXTENDED_GRAIN_METRICS
+  ad_exchange_lift_earnings: {
+    toId: 'ad_exchange_line_item_level_revenue',
+    fromLabel: 'Ad Exchange lift earnings',
+    toLabel: 'Ad Exchange revenue',
+  },
+};
+
 function hasAppReportDimension(dimensionIds = []) {
   return asArray(dimensionIds).some((id) => APP_REPORT_DIMS.has(catalogIdToGamEnum(id)));
 }
@@ -758,6 +774,129 @@ function rewriteMetricsForAppDimensions(dimensionIds = [], metricIds = []) {
     }
   }
   return { metricIds: out, substitutions };
+}
+
+/**
+ * When dimensions are all warehouse grain dims but metrics are not (e.g. Ad Exchange
+ * with Country), map metrics onto SAFE warehouse columns so Reporting can answer
+ * from report_grain instead of waiting on an adhoc GAM job GAM may reject.
+ */
+function rewriteUnsupportedMetricsToWarehouse(dimensionIds = [], metricIds = []) {
+  const { isGrainDimension, isGrainMetric } = require('../utils/warehouseGrain');
+  const dims = asArray(dimensionIds);
+  const mets = asArray(metricIds);
+  if (!mets.length) {
+    return { metricIds: mets, substitutions: [], skippedUnmapped: [], composed: false };
+  }
+
+  const dimApis = dims.map((id) => catalogIdToGamEnum(id)).filter(Boolean);
+  const allDimsGrain = !dimApis.length || dimApis.every(
+    (d) => d === 'DATE' || isGrainDimension(d)
+  );
+  if (!allDimsGrain) {
+    return { metricIds: mets, substitutions: [], skippedUnmapped: [], composed: false };
+  }
+
+  const alreadyGrain = mets.every((id) => {
+    const api = catalogIdToGamEnum(id);
+    return !api || isGrainMetric(api);
+  });
+  if (alreadyGrain) {
+    return { metricIds: mets, substitutions: [], skippedUnmapped: [], composed: false };
+  }
+
+  const substitutions = [];
+  const skippedUnmapped = [];
+  const out = [];
+  const seen = new Set();
+
+  for (const id of mets) {
+    const key = String(id || '').toLowerCase();
+    const api = catalogIdToGamEnum(id);
+    if (api && isGrainMetric(api)) {
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(id);
+      }
+      continue;
+    }
+    const alias = WAREHOUSE_METRIC_ALIASES[key];
+    if (alias) {
+      substitutions.push({
+        from: key,
+        to: alias.toId,
+        fromLabel: alias.fromLabel,
+        toLabel: alias.toLabel,
+      });
+      if (!seen.has(alias.toId)) {
+        seen.add(alias.toId);
+        out.push(alias.toId);
+      }
+      continue;
+    }
+    skippedUnmapped.push(metricLabelForId(id));
+  }
+
+  // Nothing mapped — keep originals so adhoc/GAM can still try.
+  if (!out.length) {
+    return { metricIds: mets, substitutions: [], skippedUnmapped: [], composed: false };
+  }
+
+  return {
+    metricIds: out,
+    substitutions,
+    skippedUnmapped,
+    composed: substitutions.length > 0 || skippedUnmapped.length > 0,
+  };
+}
+
+/** Ensure grain aggregate rows expose catalog metric ids the Reporting table reads. */
+function stampWarehouseMetricsOnRows(rows = []) {
+  return (rows || []).map((row) => {
+    const imp = Math.round(Number(row.impression ?? row.impressions) || 0);
+    const rev = Number(row.revenue) || 0;
+    const clicks = Math.round(Number(row.clicks) || 0);
+    const metrics = { ...(row.metrics || {}) };
+    if (metrics.total_line_item_level_impressions == null) {
+      metrics.total_line_item_level_impressions = imp;
+    }
+    if (metrics.total_line_item_level_clicks == null) {
+      metrics.total_line_item_level_clicks = clicks;
+    }
+    if (metrics.total_line_item_level_all_revenue == null) {
+      metrics.total_line_item_level_all_revenue = rev;
+    }
+    if (metrics.total_line_item_level_cpm_and_cpc_revenue == null) {
+      metrics.total_line_item_level_cpm_and_cpc_revenue = rev;
+    }
+    if (metrics.total_line_item_level_ctr == null && imp > 0) {
+      metrics.total_line_item_level_ctr = +((clicks / imp) * 100).toFixed(4);
+    }
+    if (metrics.total_line_item_level_without_cpd_average_ecpm == null && imp > 0 && rev > 0) {
+      metrics.total_line_item_level_without_cpd_average_ecpm = +((rev / imp) * 1000).toFixed(4);
+    }
+    if (row.viewableRate != null && metrics.total_active_view_viewable_impressions_rate == null) {
+      metrics.total_active_view_viewable_impressions_rate = Number(row.viewableRate) || 0;
+    }
+    return { ...row, metrics, revenueDollars: true };
+  });
+}
+
+/** Copy warehouse metric values onto the user's original metric ids (Ad Exchange → Total). */
+function applyMetricSubstitutionsToRows(rows = [], substitutions = []) {
+  if (!substitutions?.length) return rows;
+  return (rows || []).map((row) => {
+    const metrics = { ...(row.metrics || {}) };
+    for (const s of substitutions) {
+      const from = String(s.from || '').toLowerCase();
+      const to = String(s.to || '').toLowerCase();
+      if (!from || !to) continue;
+      if (metrics[from] == null && metrics[to] != null) {
+        metrics[from] = metrics[to];
+      }
+    }
+    return { ...row, metrics };
+  });
 }
 
 function metricLabelForId(id) {
@@ -3609,7 +3748,14 @@ async function handleDetailedReport(req, res) {
 
   const currency = process.env.GAM_CURRENCY || null;
   const dimIds = asArray(filters.reportDimensions);
-  const metIds = asArray(filters.reportMetrics);
+  const originalMetIds = asArray(filters.reportMetrics);
+  // Compose warehouse-safe metrics for grain dims (Country/Site/App × Ad Exchange, etc.)
+  // so Reporting does not hang on adhoc GAM for combos lean grain can already answer.
+  const warehouseRewrite = rewriteUnsupportedMetricsToWarehouse(dimIds, originalMetIds);
+  const metIds = warehouseRewrite.metricIds.length
+    ? warehouseRewrite.metricIds
+    : originalMetIds;
+  filters.reportMetrics = metIds;
   const dimensionApis = dimIds.map(catalogIdToGamEnum).filter(Boolean);
   const metricApis = metIds.map(catalogIdToGamEnum).filter(Boolean);
   const classified = classifyReportingQuery(dimensionApis, metricApis);
@@ -3620,12 +3766,20 @@ async function handleDetailedReport(req, res) {
     filters.reportMetrics = metIds.filter((id) => classified.usedMetrics.includes(catalogIdToGamEnum(id)));
   }
 
+  const warehouseSubChips = (warehouseRewrite.substitutions || []).map(
+    (s) => `${s.fromLabel} → ${s.toLabel}`
+  );
+  const warehouseSkipChips = [
+    ...warehouseSubChips,
+    ...(warehouseRewrite.skippedUnmapped || []).map((l) => `${l} (not in warehouse)`),
+  ];
+
   // Compact response cache (final JSON) — warm clicks like Dashboard.
   const pageKey = wantAllRows
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v19_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v21_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3635,6 +3789,8 @@ async function handleDetailedReport(req, res) {
     domainId: filters.domainId,
     reportDimensions: filters.reportDimensions,
     reportMetrics: filters.reportMetrics,
+    // Include original metrics so Ad Exchange → Total compose gets its own cache entry.
+    originalMetrics: originalMetIds,
     allRows: wantAllRows ? '1' : '0',
   })}_${pageKey}`;
 
@@ -3778,7 +3934,13 @@ async function handleDetailedReport(req, res) {
           invOpts
         );
         if (bundle) {
-          const scopedRows = normalizeReportRows(bundle.rows || []);
+          let scopedRows = stampWarehouseMetricsOnRows(
+            normalizeReportRows(bundle.rows || [])
+          );
+          scopedRows = applyMetricSubstitutionsToRows(
+            scopedRows,
+            warehouseRewrite.substitutions
+          );
           const revenue = Number(bundle.summary?.revenue) || 0;
           const totalDomains = bundle.summary?.totalDomains != null
             ? Number(bundle.summary.totalDomains) || 0
@@ -3792,6 +3954,11 @@ async function handleDetailedReport(req, res) {
               }
               return keys.size;
             })();
+          const composedPartial = Boolean(
+            warehouseSkipChips.length
+            || classified.skippedDims?.length
+            || classified.skippedMets?.length
+          );
           const body = applyVisibility({
             summary: {
               ...(bundle.summary || {}),
@@ -3808,21 +3975,22 @@ async function handleDetailedReport(req, res) {
               }).rows,
             trend: bundle.trend || [],
             isMock: false,
-            reportWarning: (classified.skippedDims?.length || classified.skippedMets?.length)
-              ? 'partial' : null,
+            reportWarning: composedPartial ? 'partial' : null,
             reportWarningSkipped: [
+              ...warehouseSkipChips,
               ...(classified.skippedDims || []),
               ...(classified.skippedMets || []),
             ],
             reportWarningUsed: classified.usedDims || [],
-            reportWarningUsedIds: classified.mode === 'grain' ? dimIds.filter((id) => {
+            reportWarningUsedIds: dimIds.filter((id) => {
               const api = catalogIdToGamEnum(id);
               return !api || classified.usedDims.includes(api) || api === 'DATE';
-            }) : [],
-            reportWarningUsedMetricIds: classified.mode === 'grain' ? metIds.filter((id) => {
+            }),
+            reportWarningUsedMetricIds: metIds.filter((id) => {
               const api = catalogIdToGamEnum(id);
-              return !api || classified.usedMetrics.includes(api);
-            }) : [],
+              return !api || classified.usedMetrics.includes(api) || isGrainMetric(api);
+            }),
+            reportWarningSubstitutions: warehouseRewrite.substitutions || [],
             pagination: wantAllRows
               ? {
                 totalRows: scopedRows.length,
@@ -3856,7 +4024,8 @@ async function handleDetailedReport(req, res) {
           }
           logger.info(
             `Reporting fast ${bundle.source || 'bundle'} ${filters.startDate}..${filters.endDate}`
-            + ` grain≈${bundle.grainCount || 0} in ${Date.now() - t0}ms`
+            + ` grain≈${bundle.grainCount || 0}`
+            + `${warehouseRewrite.composed ? ' composed=1' : ''} in ${Date.now() - t0}ms`
           );
           return res.json(await cacheDetailedResponse(body));
         }
@@ -3900,9 +4069,14 @@ async function handleDetailedReport(req, res) {
           'grain',
           'site-merge',
         ]);
-        const scopedRows = sqlApplied.has(bundle.source)
+        let scopedRows = sqlApplied.has(bundle.source)
           ? normalizeReportRows(bundle.rows || [])
           : prepareScopedReportRows(bundle.rows || [], rowFilters, req.user);
+        scopedRows = stampWarehouseMetricsOnRows(scopedRows);
+        scopedRows = applyMetricSubstitutionsToRows(
+          scopedRows,
+          warehouseRewrite.substitutions
+        );
         const revenue = Number(bundle.summary?.revenue) || 0;
         const truncated = Boolean(bundle.pagination?.truncated)
           || (Number(bundle.grainCount) || 0) > scopedRows.length;
@@ -3918,6 +4092,12 @@ async function handleDetailedReport(req, res) {
             }
             return keys.size;
           })();
+        const composedPartial = Boolean(
+          warehouseSkipChips.length
+          || compat.skipped?.length
+          || classified.skippedDims?.length
+          || classified.skippedMets?.length
+        );
         const body = applyVisibility({
           summary: {
             ...(bundle.summary || {}),
@@ -3934,22 +4114,23 @@ async function handleDetailedReport(req, res) {
             }).rows,
           trend: bundle.trend || [],
           isMock: false,
-          reportWarning: (compat.skipped?.length || classified.skippedDims?.length || classified.skippedMets?.length)
-            ? 'partial' : null,
+          reportWarning: composedPartial ? 'partial' : null,
           reportWarningSkipped: [
+            ...warehouseSkipChips,
             ...(compat.skipped || []),
             ...(classified.skippedDims || []),
             ...(classified.skippedMets || []),
           ],
           reportWarningUsed: classified.usedDims || [],
-          reportWarningUsedIds: classified.mode === 'grain' ? dimIds.filter((id) => {
+          reportWarningUsedIds: dimIds.filter((id) => {
             const api = catalogIdToGamEnum(id);
             return !api || classified.usedDims.includes(api) || api === 'DATE';
-          }) : [],
-          reportWarningUsedMetricIds: classified.mode === 'grain' ? metIds.filter((id) => {
+          }),
+          reportWarningUsedMetricIds: metIds.filter((id) => {
             const api = catalogIdToGamEnum(id);
-            return !api || classified.usedMetrics.includes(api);
-          }) : [],
+            return !api || classified.usedMetrics.includes(api) || isGrainMetric(api);
+          }),
+          reportWarningSubstitutions: warehouseRewrite.substitutions || [],
           pagination: wantAllRows
             ? {
               totalRows: scopedRows.length,
@@ -3977,7 +4158,8 @@ async function handleDetailedReport(req, res) {
         }
         logger.info(
           `Reporting lean/rollup bundle ${filters.startDate}..${filters.endDate}`
-          + ` grain≈${bundle.grainCount || 0} in ${Date.now() - t0}ms`
+          + ` grain≈${bundle.grainCount || 0}`
+          + `${warehouseRewrite.composed ? ' composed=1' : ''} in ${Date.now() - t0}ms`
         );
         return res.json(await cacheDetailedResponse(body));
       }

@@ -2,6 +2,7 @@ const {
   FULL_SYNC_DIM_SLICES,
   FULL_SYNC_METRIC_BATCHES,
   SAFE_METRICS,
+  EXTENDED_GRAIN_METRICS,
   pickBestFullSlice,
 } = require('../utils/fullReportSyncCatalog');
 const {
@@ -9,6 +10,7 @@ const {
   LEAN_SYNC_DIM_SLICES,
   LEAN_SYNC_METRIC_ATTEMPTS,
   getMetricAttemptsForSlice,
+  getSupplementalMetricBatchesForSlice,
 } = require('../utils/warehouseGrain');
 const { parseGamMetricValue, gamMoneyToDollars, coerceWarehouseRevenue, pickRowRevenueDollars } = require('../utils/gamReportMetrics');
 
@@ -1796,6 +1798,46 @@ function mapDomainTableRow(r) {
   const country = r.country || '';
   const device = r.device || '';
   const ecpm = impression > 0 && revenue > 0 ? +((revenue / impression) * 1000).toFixed(2) : 0;
+
+  const metrics = {
+    total_line_item_level_impressions: impression,
+    total_line_item_level_clicks: clicks,
+    total_line_item_level_all_revenue: revenue,
+    total_line_item_level_cpm_and_cpc_revenue: revenue,
+    total_line_item_level_ctr: impression > 0 && clicks > 0 ? +((clicks / impression) * 100).toFixed(4) : 0,
+    total_line_item_level_without_cpd_average_ecpm: ecpm,
+    total_active_view_viewable_impressions_rate: viewableRate,
+  };
+
+  // Extended warehouse metrics (Ad Exchange / Ad Server / AdSense) from JSONB sums.
+  const ext = r.ext_metrics && typeof r.ext_metrics === 'object' ? r.ext_metrics : {};
+  for (const [k, v] of Object.entries(ext)) {
+    if (v == null || v === '') continue;
+    const id = String(k).toLowerCase();
+    const n = Number(v);
+    if (!Number.isFinite(n)) continue;
+    metrics[id] = n;
+  }
+  // Also accept flat m_* columns from SQL SELECT aliases.
+  for (const [k, v] of Object.entries(r)) {
+    if (!k.startsWith('m_') || v == null || v === '') continue;
+    const id = k.slice(2);
+    const n = Number(v);
+    if (!Number.isFinite(n)) continue;
+    if (metrics[id] == null) metrics[id] = n;
+  }
+
+  // Recompute rate metrics from summed AdX counts when possible.
+  const adxImp = Number(metrics.ad_exchange_line_item_level_impressions) || 0;
+  const adxClicks = Number(metrics.ad_exchange_line_item_level_clicks) || 0;
+  const adxRev = Number(metrics.ad_exchange_line_item_level_revenue) || 0;
+  if (adxImp > 0) {
+    metrics.ad_exchange_line_item_level_ctr = +((adxClicks / adxImp) * 100).toFixed(4);
+    if (adxRev > 0) {
+      metrics.ad_exchange_line_item_level_average_ecpm = +((adxRev / adxImp) * 1000).toFixed(4);
+    }
+  }
+
   return {
     date: r.report_date,
     report_date: r.report_date,
@@ -1823,7 +1865,19 @@ function mapDomainTableRow(r) {
     viewableRate,
     ecpm,
     currency: r.currency || 'USD',
+    metrics,
   };
+}
+
+/** SQL fragments: SUM each extended metric key from report_grain.metrics JSONB. */
+function grainExtendedMetricSumSql(alias = 'g') {
+  const keys = EXTENDED_GRAIN_METRICS || [];
+  if (!keys.length) return 'NULL::jsonb AS ext_metrics';
+  // Build a single jsonb object of summed values (avoids 50+ result columns).
+  const pairs = keys.map((api) => (
+    `'${api}', COALESCE(SUM(NULLIF(${alias}.metrics->>'${api}','')::double precision), 0)`
+  ));
+  return `jsonb_strip_nulls(jsonb_build_object(${pairs.join(', ')})) AS ext_metrics`;
 }
 
 /** Distinct domain/app count from inventory Site rollups (full range, not truncated table). */
@@ -2514,6 +2568,7 @@ async function hydrateGrainIdRows(rawRows) {
       viewable_raw: r.viewable_raw,
       clicks: r.clicks,
       currency: r.currency,
+      ext_metrics: r.ext_metrics || {},
     });
   });
 }
@@ -2913,7 +2968,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
          day_rows.domain_id, day_rows.site_id, day_rows.ad_unit_id,
          day_rows.country_id, day_rows.device_id, day_rows.app_id,
          day_rows.impression, day_rows.revenue_raw, day_rows.viewable_raw,
-         day_rows.clicks, day_rows.currency
+         day_rows.clicks, day_rows.currency, day_rows.ext_metrics
        FROM generate_series($2::date, $3::date, '1 day'::interval) AS d(day)
        CROSS JOIN LATERAL (
          SELECT
@@ -2932,11 +2987,15 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
                ELSE 0
              END AS viewable_raw,
              COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
-             COALESCE(MAX(g.currency), 'USD') AS currency
+             COALESCE(MAX(g.currency), 'USD') AS currency,
+             ${grainExtendedMetricSumSql('g')}
            FROM report_grain g
            WHERE ${whereDay}
            GROUP BY ${groupCols.join(', ')}
-           HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+           HAVING COALESCE(SUM(g.impressions), 0) > 0
+             OR COALESCE(SUM(g.revenue), 0) > 0
+             OR COALESCE(SUM(NULLIF(g.metrics->>'AD_EXCHANGE_LINE_ITEM_LEVEL_IMPRESSIONS','')::double precision), 0) > 0
+             OR COALESCE(SUM(NULLIF(g.metrics->>'AD_SERVER_IMPRESSIONS','')::double precision), 0) > 0
            ORDER BY COALESCE(SUM(g.revenue), 0) DESC, COALESCE(SUM(g.impressions), 0) DESC
            LIMIT $${perDayIdx}
          ) ranked
@@ -3416,17 +3475,66 @@ function metricAttemptKey(metrics) {
 }
 
 /**
- * Try one dim slice with metric fallbacks. Returns { count } when streaming,
- * or a row array when not. Null when every attempt fails / returns empty.
+ * Lean / extended GAM pull for one dim slice.
+ *   - default: SAFE Totals only (hourly Dashboard path)
+ *   - opts.extendedOnly: AdX + Ad Server + Active View batches only (merge into metrics)
  */
-async function pullLeanSlice(dims, label, token, buildDateXML, startDate, endDate, onBatch) {
+async function pullLeanSlice(dims, label, token, buildDateXML, startDate, endDate, onBatch, opts = {}) {
   const { runReportAndDownload } = require('../gam/reportTransport');
   const stream = typeof onBatch === 'function';
   const seen = new Set();
   let lastErr;
-  const metricAttempts = getMetricAttemptsForSlice(label);
-  for (const metrics of metricAttempts) {
-    const key = metricAttemptKey(metrics);
+  let primaryResult = null;
+  const extendedOnly = opts.extendedOnly === true;
+
+  if (!extendedOnly) {
+    const metricAttempts = getMetricAttemptsForSlice(label);
+    for (const metrics of metricAttempts) {
+      const key = metricAttemptKey(metrics);
+      if (!metrics.length || seen.has(key)) continue;
+      seen.add(key);
+      try {
+        const xml = buildSyncReportXML(dims, metrics, buildDateXML, startDate, endDate);
+        const raw = await runReportAndDownload(xml, token, stream ? { onBatch } : {});
+        if (stream) {
+          const count = Number(raw?.count) || 0;
+          if (count > 0) {
+            logger.info(
+              `GAM lean slice ${label} OK dims=[${dims.join(', ')}] metrics=${metrics.length}`
+              + ` rows=${count} range=${startDate}..${endDate} (streamed)`
+            );
+            return { streamed: true, count, dims, metrics };
+          }
+          logger.warn(`GAM lean slice ${label} returned 0 rows (metrics=${metrics.length})`);
+          continue;
+        }
+        if (Array.isArray(raw) && raw.length) {
+          logger.info(
+            `GAM lean slice ${label} OK dims=[${dims.join(', ')}] metrics=${metrics.length}`
+            + ` rows=${raw.length} range=${startDate}..${endDate}`
+          );
+          return raw;
+        }
+        logger.warn(`GAM lean slice ${label} returned 0 rows (metrics=${metrics.length})`);
+      } catch (err) {
+        lastErr = err;
+        logger.warn(
+          `GAM lean slice ${label} failed dims=[${dims.join(', ')}] metrics=${metrics.length}: ${err.message}`
+        );
+      }
+    }
+    if (lastErr) {
+      logger.warn(`GAM lean slice ${label} exhausted metric fallbacks: ${lastErr.message}`);
+    }
+    return null;
+  }
+
+  const extras = getSupplementalMetricBatchesForSlice(label);
+  let extraRows = 0;
+  let anyOk = false;
+  for (const batch of extras) {
+    const metrics = batch.metrics || [];
+    const key = `extra:${metricAttemptKey(metrics)}`;
     if (!metrics.length || seen.has(key)) continue;
     seen.add(key);
     try {
@@ -3435,34 +3543,34 @@ async function pullLeanSlice(dims, label, token, buildDateXML, startDate, endDat
       if (stream) {
         const count = Number(raw?.count) || 0;
         if (count > 0) {
+          extraRows += count;
+          anyOk = true;
           logger.info(
-            `GAM lean slice ${label} OK dims=[${dims.join(', ')}] metrics=${metrics.length}`
-            + ` rows=${count} range=${startDate}..${endDate} (streamed)`
+            `GAM extended slice ${label}/${batch.key} OK metrics=${metrics.length} rows=${count}`
           );
-          return { streamed: true, count, dims, metrics };
         }
-        logger.warn(`GAM lean slice ${label} returned 0 rows (metrics=${metrics.length})`);
         continue;
       }
       if (Array.isArray(raw) && raw.length) {
+        extraRows += raw.length;
+        anyOk = true;
+        if (Array.isArray(primaryResult)) primaryResult = primaryResult.concat(raw);
+        else primaryResult = raw;
         logger.info(
-          `GAM lean slice ${label} OK dims=[${dims.join(', ')}] metrics=${metrics.length}`
-          + ` rows=${raw.length} range=${startDate}..${endDate}`
+          `GAM extended slice ${label}/${batch.key} OK metrics=${metrics.length} rows=${raw.length}`
         );
-        return raw;
       }
-      logger.warn(`GAM lean slice ${label} returned 0 rows (metrics=${metrics.length})`);
     } catch (err) {
-      lastErr = err;
       logger.warn(
-        `GAM lean slice ${label} failed dims=[${dims.join(', ')}] metrics=${metrics.length}: ${err.message}`
+        `GAM extended slice ${label}/${batch.key} skipped: ${String(err.message || err).slice(0, 140)}`
       );
     }
   }
-  if (lastErr) {
-    logger.warn(`GAM lean slice ${label} exhausted metric fallbacks: ${lastErr.message}`);
+  if (extraRows > 0) {
+    logger.info(`GAM extended slice ${label} merged ≈${extraRows} row(s)`);
   }
-  return null;
+  if (stream) return anyOk ? { streamed: true, count: extraRows, dims, metrics: [] } : null;
+  return primaryResult;
 }
 
 /**
@@ -3479,9 +3587,12 @@ async function fetchFromGAM(startDate, endDate, onBatch, opts = {}) {
   let totalRows = 0;
   const collected = [];
   let lastErr;
-  const slices = Array.isArray(opts.sliceKeys) && opts.sliceKeys.length
+  let slices = Array.isArray(opts.sliceKeys) && opts.sliceKeys.length
     ? LEAN_SYNC_DIM_SLICES.filter((s) => opts.sliceKeys.includes(s.key))
-    : LEAN_SYNC_DIM_SLICES;
+    : [...LEAN_SYNC_DIM_SLICES];
+  if (opts.extendedOnly) {
+    slices = slices.filter((s) => s.key !== 'network_kpi');
+  }
   const yieldOnTodayPriority = opts.yieldOnTodayPriority === true;
   const { assertNotTodayPriority } = yieldOnTodayPriority
     ? require('./syncPriorityGate')
@@ -3502,7 +3613,8 @@ async function fetchFromGAM(startDate, endDate, onBatch, opts = {}) {
         buildDateXML,
         startDate,
         endDate,
-        sliceOnBatch
+        sliceOnBatch,
+        opts
       );
       if (!got) continue;
       okSlices += 1;
@@ -3557,12 +3669,15 @@ async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill',
   let grainCount = 0;
   const touchedDates = new Set();
   const kpiOnly = opts.kpiOnly === true || syncType === 'sync-network-kpi';
+  const extendedOnly = opts.extendedOnly === true || syncType === 'sync-extended';
   const today = todayInTZ();
   // Historical fills must yield mid-run when hourly today-priority turns on.
+  // Extended metrics also yield so hourly Totals stay first.
   const yieldOnTodayPriority = syncType !== 'sync-today'
     && !(syncType === 'sync-day' && startDate === today && endDate === today);
   const fetchOpts = {
     ...(kpiOnly ? { kpiOnly: true, sliceKeys: ['network_kpi'] } : {}),
+    ...(extendedOnly ? { extendedOnly: true } : {}),
     yieldOnTodayPriority,
     syncType,
   };
@@ -3585,7 +3700,8 @@ async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill',
     dates.push(startDate);
   }
   if (dates.length) {
-    if (!kpiOnly) {
+    // Extended-only merges metrics into existing grain — never delete Totals rows.
+    if (!kpiOnly && !extendedOnly) {
       try {
         await deleteStaleGrain(dates, syncStartedAt);
       } catch (e) {
@@ -3602,17 +3718,20 @@ async function streamSyncFromGAM(startDate, endDate, syncType = 'sync-backfill',
         logger.warn(`[${syncType}] rollup rebuild skipped:`, e.message);
       }
     }
-    try {
-      const { rebuildNetworkRollupsFromGrain } = require('./networkRollupStore');
-      await rebuildNetworkRollupsFromGrain(dates, syncType);
-    } catch (e) {
-      logger.warn(`[${syncType}] network rollup rebuild skipped:`, e.message);
+    if (!extendedOnly) {
+      try {
+        const { rebuildNetworkRollupsFromGrain } = require('./networkRollupStore');
+        await rebuildNetworkRollupsFromGrain(dates, syncType);
+      } catch (e) {
+        logger.warn(`[${syncType}] network rollup rebuild skipped:`, e.message);
+      }
     }
   }
   await invalidateCacheForDate(endDate);
   logger.info(
     `[${syncType}] ${startDate}..${endDate} streamed rows≈${count} → report_grain=${grainCount}`
     + (kpiOnly ? ' (network_kpi only)' : '')
+    + (extendedOnly ? ' (extended AdX/AdServer/ActiveView)' : '')
   );
   return grainCount;
 }

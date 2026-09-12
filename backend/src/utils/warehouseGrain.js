@@ -2,7 +2,11 @@
  * Unified warehouse grain for report_present + report_daily.
  * Dashboard and Reporting SQL-filter this set. Anything else is adhoc GAM.
  */
-const { SAFE_METRICS } = require('./fullReportSyncCatalog');
+const {
+  SAFE_METRICS,
+  EXTENDED_GRAIN_METRICS,
+  LEAN_SUPPLEMENTAL_METRIC_BATCHES,
+} = require('./fullReportSyncCatalog');
 
 const UNIFIED_GRAIN_DIMS = [
   'DATE',
@@ -16,7 +20,9 @@ const UNIFIED_GRAIN_DIMS = [
   'PROGRAMMATIC_CHANNEL_NAME',
 ];
 
+/** Typed KPI columns (SAFE). Extended families live in report_grain.metrics JSONB. */
 const UNIFIED_GRAIN_METRICS = [...SAFE_METRICS];
+const WAREHOUSE_GRAIN_METRICS = [...new Set([...SAFE_METRICS, ...EXTENDED_GRAIN_METRICS])];
 
 /**
  * Lean sync pulls these compatible slices separately, then upserts into
@@ -103,6 +109,16 @@ function getMetricAttemptsForSlice(sliceKey) {
   return LEAN_SYNC_METRIC_ATTEMPTS;
 }
 
+/**
+ * Extra metric families for sync-extended (AdX / Ad Server / Active View).
+ * network_kpi stays totals-only.
+ */
+function getSupplementalMetricBatchesForSlice(sliceKey) {
+  const sk = String(sliceKey || '').trim();
+  if (sk === 'network_kpi') return [];
+  return LEAN_SUPPLEMENTAL_METRIC_BATCHES;
+}
+
 /** Prefer full SAFE metrics; shrink columns before dims if GAM rejects the combo. */
 const LEAN_SYNC_METRIC_ATTEMPTS = [
   UNIFIED_GRAIN_METRICS,
@@ -117,7 +133,7 @@ const LEAN_SYNC_METRIC_ATTEMPTS = [
 ];
 
 const GRAIN_DIM_SET = new Set(UNIFIED_GRAIN_DIMS);
-const GRAIN_MET_SET = new Set(UNIFIED_GRAIN_METRICS);
+const GRAIN_MET_SET = new Set(WAREHOUSE_GRAIN_METRICS);
 
 /** Max dims (including DATE) and metrics for a custom GAM / adhoc report. */
 const MAX_CUSTOM_DIMS = Math.max(2, parseInt(process.env.MAX_CUSTOM_REPORT_DIMS || '8', 10) || 8);
@@ -190,11 +206,15 @@ function classifyReportingQuery(dimensionApis = [], metricApis = []) {
 module.exports = {
   UNIFIED_GRAIN_DIMS,
   UNIFIED_GRAIN_METRICS,
+  WAREHOUSE_GRAIN_METRICS,
+  EXTENDED_GRAIN_METRICS,
   NETWORK_KPI_METRICS,
   REVENUE_STRICT_SLICES,
   LEAN_SYNC_DIM_SLICES,
   LEAN_SYNC_METRIC_ATTEMPTS,
+  LEAN_SUPPLEMENTAL_METRIC_BATCHES,
   getMetricAttemptsForSlice,
+  getSupplementalMetricBatchesForSlice,
   MAX_CUSTOM_DIMS,
   MAX_CUSTOM_METS,
   isGrainDimension,

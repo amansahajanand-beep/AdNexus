@@ -13,11 +13,10 @@ const pool = new Pool({
   password: process.env.PG_PASSWORD || 'gam_password',
   database: process.env.PG_DATABASE || 'gam_dashboard',
   ssl:      process.env.PG_SSL === 'true' ? { rejectUnauthorized: false } : false,
-  // Sync jobs + API share this pool — keep enough headroom for dashboard reads
-  // while hourly backfill is writing.
-  max: parseInt(process.env.PG_POOL_MAX || '20', 10),
+  // Sync jobs + API share this pool — leave headroom for Dashboard reads during sync.
+  max: parseInt(process.env.PG_POOL_MAX || '40', 10),
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '30000', 10),
+  connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '60000', 10),
 });
 
 function formatPgError(err) {
@@ -286,6 +285,7 @@ async function initSchema() {
       ecpm          REAL,
       unfilled      BIGINT,
       currency      CHAR(3) NOT NULL DEFAULT 'USD',
+      metrics       JSONB NOT NULL DEFAULT '{}'::jsonb,
       synced_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       PRIMARY KEY (
         client_id, report_date, country_id, device_id,
@@ -317,10 +317,12 @@ async function initSchema() {
   try {
     await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS grain_retention_days INT DEFAULT 365`);
     await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS rollup_retention_days INT DEFAULT 365`);
-    await schemaQuery(`ALTER TABLE report_grain ADD COLUMN IF NOT EXISTS slice_key TEXT NOT NULL DEFAULT ''`);
   } catch (e) {
     logger.warn('gam_clients retention columns:', e.message);
   }
+
+  // report_grain.metrics / slice_key ALTERs run after listen (ensureGrainMetricsColumn)
+  // so a locked partitioned table cannot block API startup.
 
   try {
     const { rows } = await schemaQuery(`
@@ -352,6 +354,7 @@ async function initSchema() {
           ecpm          REAL,
           unfilled      BIGINT,
           currency      CHAR(3) NOT NULL DEFAULT 'USD',
+          metrics       JSONB NOT NULL DEFAULT '{}'::jsonb,
           synced_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
           PRIMARY KEY (
             client_id, report_date, country_id, device_id,
@@ -367,12 +370,8 @@ async function initSchema() {
     logger.warn('report_grain partition setup:', e.message);
   }
 
-  // Partition conversion creates a fresh report_grain — ensure slice_key exists after that step.
-  try {
-    await schemaQuery(`ALTER TABLE report_grain ADD COLUMN IF NOT EXISTS slice_key TEXT NOT NULL DEFAULT ''`);
-  } catch (e) {
-    logger.warn('report_grain slice_key column:', e.message);
-  }
+  // Partition conversion creates a fresh report_grain — column ensures run after listen.
+  // (Avoid ACCESS EXCLUSIVE waits here during boot.)
 
   // Google Ads ROI tables (MCC + client accounts, campaign map, spend, other expenses)
   await schemaQuery(`
@@ -821,4 +820,34 @@ async function finishTenantBackfill() {
   logger.info('Multi-client tenancy schema ready (client_id on all report tables)');
 }
 
-module.exports = { query, schemaQuery, initSchema, finishTenantBackfill, pool };
+/**
+ * Add report_grain.slice_key + metrics JSONB after listen.
+ * Uses one pooled client so lock_timeout actually applies to the ALTER.
+ */
+async function ensureGrainMetricsColumn() {
+  const client = await pool.connect();
+  try {
+    await client.query(`SET lock_timeout = '15s'`);
+    await client.query(`ALTER TABLE report_grain ADD COLUMN IF NOT EXISTS slice_key TEXT NOT NULL DEFAULT ''`);
+    await client.query(`ALTER TABLE report_grain ADD COLUMN IF NOT EXISTS metrics JSONB DEFAULT '{}'::jsonb`);
+    logger.info('report_grain.metrics column ready');
+    try {
+      const { upsertGrainBatch } = require('./services/reportGrainStore');
+      if (upsertGrainBatch) upsertGrainBatch._metricsColReady = true;
+    } catch (_) { /* circular / not loaded */ }
+  } catch (e) {
+    logger.warn('report_grain.metrics column deferred:', e.message);
+  } finally {
+    try { await client.query(`SET lock_timeout = 0`); } catch (_) { /* ignore */ }
+    client.release();
+  }
+}
+
+module.exports = {
+  query,
+  schemaQuery,
+  initSchema,
+  finishTenantBackfill,
+  ensureGrainMetricsColumn,
+  pool,
+};
