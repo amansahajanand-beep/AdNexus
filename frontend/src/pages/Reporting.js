@@ -1764,10 +1764,10 @@ export default function Reporting() {
                 <div className="warn-card-title">Showing compatible data</div>
                 <div className="warn-card-desc">
                   {Array.isArray(data?.reportWarningSubstitutions) && data.reportWarningSubstitutions.length
-                    ? 'GAM cannot break Total ad requests down by App ID. The table shows Programmatic eligible ad requests instead (closest supported metric).'
+                    ? 'Some selected metrics can’t be combined exactly as in Google Ad Manager for this dimension mix. AdNexus mapped them to the closest warehouse totals so you still get a country/site/app breakdown.'
                     : 'Some selected dimensions or metrics can\'t be combined in one GAM report. Results below use the compatible subset. Remove the unavailable items for a complete selection.'}
                 </div>
-                {canFilter && skippedChips.length > 0 && (
+                {canFilter && skippedChips.some((c) => !String(c).includes('→')) && (
                   <div className="warn-card-btns">
                     <button type="button" className="warn-btn-primary" onClick={clearIncompatibleReporting}>
                       Remove these and apply
@@ -1777,7 +1777,11 @@ export default function Reporting() {
               </div>
             </div>
             <div className="warn-card-right">
-              <div className="warn-card-section-label">Skipped (incompatible)</div>
+              <div className="warn-card-section-label">
+                {Array.isArray(data?.reportWarningSubstitutions) && data.reportWarningSubstitutions.length
+                  ? 'Mapped metrics'
+                  : 'Skipped (incompatible)'}
+              </div>
               <div className="warn-chip-row">
                 {skippedChips.map((name) => (
                   <span key={name} className="warn-chip warn-chip-unavail">{name}</span>

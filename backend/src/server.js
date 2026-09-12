@@ -158,7 +158,8 @@ async function startServer() {
 
     setImmediate(async () => {
       try {
-        const { finishTenantBackfill } = require('./db');
+        const { finishTenantBackfill, ensureGrainMetricsColumn } = require('./db');
+        await ensureGrainMetricsColumn();
         await finishTenantBackfill();
       } catch (e) {
         logger.warn('Tenant client_id backfill failed (non-fatal):', e.message);

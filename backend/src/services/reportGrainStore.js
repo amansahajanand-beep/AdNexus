@@ -128,6 +128,19 @@ async function upsertGrainBatch(grainRows) {
 
   const BATCH = Math.max(50, parseInt(process.env.PG_UPSERT_BATCH || '250', 10));
   let upserted = 0;
+  let metricsColReady = upsertGrainBatch._metricsColReady;
+  if (metricsColReady == null) {
+    try {
+      const { rows } = await query(
+        `SELECT 1 FROM information_schema.columns
+         WHERE table_name = 'report_grain' AND column_name = 'metrics' LIMIT 1`
+      );
+      metricsColReady = rows.length > 0;
+    } catch (_) {
+      metricsColReady = false;
+    }
+    upsertGrainBatch._metricsColReady = metricsColReady;
+  }
 
   for (let i = 0; i < grainRows.length; i += BATCH) {
     const chunk = grainRows.slice(i, i + BATCH);
@@ -135,37 +148,75 @@ async function upsertGrainBatch(grainRows) {
     const params = [];
     let p = 1;
     for (const g of chunk) {
-      values.push(
-        `($${p++}::uuid,$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},NOW())`
+      if (metricsColReady) {
+        values.push(
+          `($${p++}::uuid,$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++}::jsonb,NOW())`
+        );
+        params.push(
+          g.client_id, g.report_date, g.country_id, g.device_id,
+          g.ad_unit_id, g.domain_id, g.site_id,
+          g.channel_name, g.app_name, g.app_id,
+          g.slice_key || CANONICAL_KPI_SLICE,
+          g.impressions, g.clicks, g.revenue,
+          g.viewable_pct, g.ecpm, g.unfilled, g.currency,
+          JSON.stringify(g.metrics && typeof g.metrics === 'object' ? g.metrics : {})
+        );
+      } else {
+        values.push(
+          `($${p++}::uuid,$${p++}::date,$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},$${p++},NOW())`
+        );
+        params.push(
+          g.client_id, g.report_date, g.country_id, g.device_id,
+          g.ad_unit_id, g.domain_id, g.site_id,
+          g.channel_name, g.app_name, g.app_id,
+          g.slice_key || CANONICAL_KPI_SLICE,
+          g.impressions, g.clicks, g.revenue,
+          g.viewable_pct, g.ecpm, g.unfilled, g.currency
+        );
+      }
+    }
+    if (metricsColReady) {
+      await query(
+        `INSERT INTO report_grain (
+           client_id, report_date, country_id, device_id, ad_unit_id, domain_id, site_id,
+           channel_name, app_name, app_id, slice_key,
+           impressions, clicks, revenue, viewable_pct, ecpm, unfilled, currency, metrics, synced_at
+         ) VALUES ${values.join(',\n')}
+         ON CONFLICT (client_id, report_date, country_id, device_id, ad_unit_id, domain_id, site_id, channel_name, app_name, app_id)
+         DO UPDATE SET
+           slice_key = COALESCE(NULLIF(EXCLUDED.slice_key, ''), report_grain.slice_key),
+           impressions = COALESCE(NULLIF(EXCLUDED.impressions, 0), report_grain.impressions),
+           clicks = COALESCE(NULLIF(EXCLUDED.clicks, 0), report_grain.clicks),
+           revenue = COALESCE(NULLIF(EXCLUDED.revenue, 0), report_grain.revenue),
+           viewable_pct = COALESCE(NULLIF(EXCLUDED.viewable_pct, 0), report_grain.viewable_pct),
+           ecpm = COALESCE(NULLIF(EXCLUDED.ecpm, 0), report_grain.ecpm),
+           unfilled = COALESCE(NULLIF(EXCLUDED.unfilled, 0), report_grain.unfilled),
+           currency = EXCLUDED.currency,
+           metrics = COALESCE(report_grain.metrics, '{}'::jsonb) || COALESCE(EXCLUDED.metrics, '{}'::jsonb),
+           synced_at = EXCLUDED.synced_at`,
+        params
       );
-      params.push(
-        g.client_id, g.report_date, g.country_id, g.device_id,
-        g.ad_unit_id, g.domain_id, g.site_id,
-        g.channel_name, g.app_name, g.app_id,
-        g.slice_key || CANONICAL_KPI_SLICE,
-        g.impressions, g.clicks, g.revenue,
-        g.viewable_pct, g.ecpm, g.unfilled, g.currency
+    } else {
+      await query(
+        `INSERT INTO report_grain (
+           client_id, report_date, country_id, device_id, ad_unit_id, domain_id, site_id,
+           channel_name, app_name, app_id, slice_key,
+           impressions, clicks, revenue, viewable_pct, ecpm, unfilled, currency, synced_at
+         ) VALUES ${values.join(',\n')}
+         ON CONFLICT (client_id, report_date, country_id, device_id, ad_unit_id, domain_id, site_id, channel_name, app_name, app_id)
+         DO UPDATE SET
+           slice_key = COALESCE(NULLIF(EXCLUDED.slice_key, ''), report_grain.slice_key),
+           impressions = COALESCE(NULLIF(EXCLUDED.impressions, 0), report_grain.impressions),
+           clicks = COALESCE(NULLIF(EXCLUDED.clicks, 0), report_grain.clicks),
+           revenue = COALESCE(NULLIF(EXCLUDED.revenue, 0), report_grain.revenue),
+           viewable_pct = COALESCE(NULLIF(EXCLUDED.viewable_pct, 0), report_grain.viewable_pct),
+           ecpm = COALESCE(NULLIF(EXCLUDED.ecpm, 0), report_grain.ecpm),
+           unfilled = COALESCE(NULLIF(EXCLUDED.unfilled, 0), report_grain.unfilled),
+           currency = EXCLUDED.currency,
+           synced_at = EXCLUDED.synced_at`,
+        params
       );
     }
-    await query(
-      `INSERT INTO report_grain (
-         client_id, report_date, country_id, device_id, ad_unit_id, domain_id, site_id,
-         channel_name, app_name, app_id, slice_key,
-         impressions, clicks, revenue, viewable_pct, ecpm, unfilled, currency, synced_at
-       ) VALUES ${values.join(',\n')}
-       ON CONFLICT (client_id, report_date, country_id, device_id, ad_unit_id, domain_id, site_id, channel_name, app_name, app_id)
-       DO UPDATE SET
-         slice_key = COALESCE(NULLIF(EXCLUDED.slice_key, ''), report_grain.slice_key),
-         impressions = COALESCE(NULLIF(EXCLUDED.impressions, 0), report_grain.impressions),
-         clicks = COALESCE(NULLIF(EXCLUDED.clicks, 0), report_grain.clicks),
-         revenue = COALESCE(NULLIF(EXCLUDED.revenue, 0), report_grain.revenue),
-         viewable_pct = COALESCE(NULLIF(EXCLUDED.viewable_pct, 0), report_grain.viewable_pct),
-         ecpm = COALESCE(NULLIF(EXCLUDED.ecpm, 0), report_grain.ecpm),
-         unfilled = COALESCE(NULLIF(EXCLUDED.unfilled, 0), report_grain.unfilled),
-         currency = EXCLUDED.currency,
-         synced_at = EXCLUDED.synced_at`,
-      params
-    );
     upserted += chunk.length;
   }
   return upserted;
@@ -175,7 +226,11 @@ async function upsertGrainRows(normalizedRows, syncType = 'sync') {
   if (!normalizedRows?.length) return 0;
 
   const clientId = requireClientId();
-  const PROCESS_CHUNK = Math.max(100, parseInt(process.env.GRAIN_NORMALIZE_CHUNK || '500', 10));
+  const defaultChunk = syncType === 'sync-extended' ? 150 : 500;
+  const PROCESS_CHUNK = Math.max(
+    50,
+    parseInt(process.env.GRAIN_NORMALIZE_CHUNK || String(defaultChunk), 10) || defaultChunk
+  );
   let upserted = 0;
 
   for (let i = 0; i < normalizedRows.length; i += PROCESS_CHUNK) {
@@ -198,6 +253,11 @@ async function upsertGrainRows(normalizedRows, syncType = 'sync') {
 
     await ensureGrainPartitionsForDates(partitionDates);
     upserted += await upsertGrainBatch(grainRows);
+
+    // Brief yield between chunks so API reads can borrow pool connections.
+    if (i + PROCESS_CHUNK < normalizedRows.length) {
+      await new Promise((r) => setImmediate(r));
+    }
   }
 
   return upserted;
