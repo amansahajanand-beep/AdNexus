@@ -641,18 +641,36 @@ function resolveDimensionSets(reportDimensions, opts = {}) {
   // Reporting custom queries: only try the user's dimensions (progressive shrink).
   // Do not inject unrelated default inventory dims — that would show non-requested data.
   const compatOnly = Boolean(opts.compatOnly);
+  const wantsCountry = custom.includes('COUNTRY_NAME');
+  const wantsSite = custom.includes('SITE_NAME') || custom.includes('URL_NAME');
+  const wantsDomain = custom.includes('DOMAIN');
+  const wantsApp = custom.includes('MOBILE_APP_RESOLVED_ID') || custom.includes('MOBILE_APP_NAME');
 
   if (custom.length) {
-    add(custom);
-    if (!custom.includes('DATE')) add(['DATE', ...custom]);
+    // Country reports: try GAM-compatible sets FIRST.
+    // DOMAIN+SITE+COUNTRY often fails COLUMNS_NOT_SUPPORTED and fastMode then
+    // falls back to Site-only — which is why Country disappeared from results.
+    if (wantsCountry) {
+      if (wantsApp) {
+        add(['DATE', 'COUNTRY_NAME', 'MOBILE_APP_RESOLVED_ID']);
+        add(['DATE', 'COUNTRY_NAME', 'MOBILE_APP_NAME', 'MOBILE_APP_RESOLVED_ID']);
+        add(['DATE', 'COUNTRY_NAME', 'MOBILE_APP_NAME']);
+      }
+      if (wantsSite) add(['DATE', 'SITE_NAME', 'COUNTRY_NAME']);
+      if (wantsDomain) add(['DATE', 'DOMAIN', 'COUNTRY_NAME']);
+      add(['DATE', 'COUNTRY_NAME']);
+      // Full request last — may fail; country-safe sets above already preferred.
+      add(custom.includes('DATE') ? custom : ['DATE', ...custom]);
+    } else {
+      add(custom);
+      if (!custom.includes('DATE')) add(['DATE', ...custom]);
+    }
     for (const n of [10, 8, 6, 4, 3, 2]) {
       if (custom.length > n) add(custom.slice(0, n));
     }
     const inventory = custom.filter((d) => !/PROGRAMMATIC|DEMAND_CHANNEL|ADVERTISER/i.test(d));
     if (inventory.length && inventory.length !== custom.length) add(inventory);
     if (inventory.length > 6) add(inventory.slice(0, 6));
-    // Probe a capped set of single dims so "select all" stays GAM-compatible without
-    // exploding into hundreds of report jobs.
     const singles = custom.filter((d) => d !== 'DATE').slice(0, 8);
     for (const d of singles) {
       add(['DATE', d]);
@@ -1023,7 +1041,14 @@ async function downloadDetailedReport(startDate, endDate, countryFilter, dimensi
   const pollOpts = { fastMode };
   // Fast mode still needs the shrink ladder for rejected columns, otherwise one
   // unsupported metric (e.g. Total ad requests + App ID) empties the whole report.
-  const dimensionCandidates = fastMode ? dimensionSets.slice(0, compatOnly ? 3 : 1) : dimensionSets;
+  // Country reports: try several country-safe dim sets (Site×Country, Country-only, …)
+  // — slice(0,1) caused Site-only fallback and dropped Country from the UI.
+  const hasCountryDim = (dimensionSets || []).some((set) => (
+    Array.isArray(set) && set.includes('COUNTRY_NAME')
+  ));
+  const dimensionCandidates = fastMode
+    ? dimensionSets.slice(0, (compatOnly || hasCountryDim) ? Math.max(6, compatOnly ? 3 : 1) : 1)
+    : dimensionSets;
   const metricAttempts = fastMode
     ? (metricApis.length
       ? [metricApis, ...compatMetricFallbacks(metricApis)]
@@ -1088,6 +1113,22 @@ async function downloadDetailedReport(startDate, endDate, countryFilter, dimensi
 
   if (fastMode) {
     logger.info('Fast dashboard report mode enabled; using a shorter fallback path');
+  }
+
+  // Never substitute Site-only (or other defaults) when the user asked for Country —
+  // that produced "Skipped: Country" while showing incomplete Site rows.
+  if (hasCountryDim) {
+    logger.info(
+      `Detailed report: no Country-compatible GAM set (${lastErr?.message || 'exhausted'}) — not falling back to Site-only`
+    );
+    return {
+      raw: [],
+      dimensions: [],
+      fetchedMetrics: [],
+      partial: false,
+      fallback: false,
+      emptyCompat: true,
+    };
   }
 
   // Guaranteed fallback for dashboard/lean paths — never 500 for valid GAM credentials.
@@ -2773,22 +2814,32 @@ function emptyDashboardCompatPayload(filters, currency) {
 async function fetchLeanDashboardBundleCompatible(svc, startDate, endDate, baseOpts) {
   const hasWeb = (baseOpts.domains?.length || 0)
     || (baseOpts.sites?.length || 0)
-    || (baseOpts.adUnitNames?.length || 0);
-  const hasApp = (baseOpts.apps?.length || 0) > 0;
+    || (baseOpts.adUnitNames?.length || 0)
+    || Boolean(baseOpts.groupBySite)
+    || baseOpts.tableGrain === 'site'
+    || baseOpts.tableGrain === 'domain';
+  const hasApp = (baseOpts.apps?.length || 0) > 0 || Boolean(baseOpts.groupByApp);
 
-  // Mixed web+app: skip the doomed AND query — go straight to parallel union (faster).
+  // Mixed web+app (filters OR dimensions): never AND on one slice — union like Reporting.
   if (!(hasWeb && hasApp)) {
     const primary = await svc.fetchLeanDashboardBundleFromDB(startDate, endDate, baseOpts);
     if (primary) return { bundle: primary, skipped: [], usedOpts: baseOpts };
     return null;
   }
 
-  const webOpts = { ...baseOpts, apps: [] };
+  const webOpts = {
+    ...baseOpts,
+    apps: [],
+    groupByApp: false,
+  };
   const appOpts = {
     ...baseOpts,
     domains: [],
     sites: [],
     adUnitNames: [],
+    groupByApp: true,
+    groupBySite: false,
+    tableGrain: 'app',
   };
   const [webBundle, appBundle] = await Promise.all([
     svc.fetchLeanDashboardBundleFromDB(startDate, endDate, webOpts),
@@ -3656,11 +3707,16 @@ async function handleDetailedReport(req, res) {
 
   // POST JSON sends allRows:true (boolean); GET sends "true" string — accept both.
   // Without this, multi-filter POSTs paginate to 50 rows ordered by date DESC → "today only".
-  const wantAllRows = req.query.allRows === true
+  let wantAllRows = req.query.allRows === true
     || req.query.allRows === 1
     || req.query.allRows === '1'
-    || req.query.allRows === 'true';
-  const MAX_REPORTING_CLIENT_ROWS = 5000;
+    || req.query.allRows === 'true'
+    || req.body?.allRows === true
+    || req.body?.allRows === 1
+    || req.body?.allRows === '1'
+    || req.body?.allRows === 'true';
+  // Country reports must ship the full breakdown (overview = table).
+  const MAX_REPORTING_CLIENT_ROWS = 50000;
 
   const buildScopedFromRows = (
     allRows,
@@ -3779,7 +3835,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v21_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v27_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3883,26 +3939,46 @@ async function handleDetailedReport(req, res) {
     const wantsCountryCol = reportDimIds.some((d) => (
       d === 'country_name' || d === 'country' || d === 'COUNTRY_NAME'
     )) || toFilterArray(filters.country).length > 0;
+    if (wantsCountryCol) wantAllRows = true;
     const wantsDeviceCol = reportDimIds.some((d) => (
       d === 'device_category_name'
       || d === 'mobile_device_name'
       || d === 'device'
       || d === 'DEVICE_CATEGORY_NAME'
     ));
-    const wantsSiteCol = reportDimIds.some((d) => (
-      d === 'site_name' || d === 'site' || d === 'SITE_NAME' || d === 'url_name'
-    )) || reportDimIds.length === 0; // default inventory table includes site
+    const wantsDomainCol = reportDimIds.some((d) => (
+      d === 'domain' || d === 'DOMAIN' || d === 'domain_name'
+    ));
     const wantsAppCol = reportDimIds.some((d) => (
       d === 'mobile_app_resolved_id'
       || d === 'mobile_app_name'
       || d === 'MOBILE_APP_RESOLVED_ID'
       || d === 'MOBILE_APP_NAME'
     )) || apps.length > 0;
+    // Site column: only when explicitly selected or site filter — not sticky defaults on App-only.
+    const wantsSiteCol = reportDimIds.some((d) => (
+      d === 'site_name' || d === 'site' || d === 'SITE_NAME' || d === 'url_name'
+    )) || sites.length > 0
+      || (reportDimIds.length === 0 && !wantsCountryCol && !wantsAppCol);
     let tableLimit = 2000;
     try {
       const { reportingTableLimit } = require('./reportGrainStore');
       tableLimit = reportingTableLimit(filters.startDate, filters.endDate, 2000);
     } catch (_) { /* ignore */ }
+    // Country-only (or Country + metrics): DATE×country like pre-AdX GAM dumps.
+    const countryOnlyTable = wantsCountryCol && !wantsSiteCol && !wantsDomainCol && !wantsAppCol
+      && !domains.length && !sites.length && !apps.length;
+    // App×Country (no site/domain filters): stay on app_id slice — never AND with Site.
+    const appCountryTable = wantsAppCol && !wantsSiteCol && !domains.length && !sites.length
+      && !(toFilterArray(filters.domainName).length);
+    // Country × Site/Domain needs room for full country lists (not top-N sites only).
+    const countryTableLimit = wantsCountryCol
+      ? Math.max(
+        tableLimit,
+        inclusiveDayCount(filters.startDate, filters.endDate) * 500,
+        10000
+      )
+      : tableLimit;
     const invOpts = {
       domains,
       sites,
@@ -3910,15 +3986,19 @@ async function handleDetailedReport(req, res) {
       apps,
       countryNames: resolveCountryNamesForDb(filters.country),
       currency,
-      tableLimit,
+      tableLimit: countryTableLimit,
       selectedDomains: domains,
       webInventoryOr,
       skipAdUnitLike,
       groupByCountry: wantsCountryCol,
       groupByDevice: wantsDeviceCol,
-      groupBySite: wantsSiteCol && !wantsAppCol,
+      groupBySite: wantsSiteCol && !appCountryTable,
       groupByApp: wantsAppCol,
-      tableGrain: wantsAppCol ? 'app' : (wantsSiteCol ? 'site' : 'domain'),
+      tableGrain: appCountryTable
+        ? 'app'
+        : (wantsAppCol && !wantsSiteCol
+          ? 'app'
+          : (wantsSiteCol ? 'site' : (countryOnlyTable ? 'country' : 'domain'))),
       // Reporting: skip dashboard chart scans; use lateral day samples for long ranges.
       reportingFast: true,
       skipCharts: true,
@@ -3933,7 +4013,9 @@ async function handleDetailedReport(req, res) {
           filters.endDate,
           invOpts
         );
-        if (bundle) {
+        const countryOk = !wantsCountryCol
+          || (bundle?.rows || []).some((r) => String(r.country || r.COUNTRY_NAME || '').trim());
+        if (bundle && countryOk && (bundle.rows?.length || bundle.grainCount)) {
           let scopedRows = stampWarehouseMetricsOnRows(
             normalizeReportRows(bundle.rows || [])
           );
@@ -4045,6 +4127,14 @@ async function handleDetailedReport(req, res) {
       );
       if (compat?.bundle) {
         const bundle = compat.bundle;
+        const countryOk = !wantsCountryCol
+          || (bundle?.rows || []).some((r) => String(r.country || r.COUNTRY_NAME || '').trim());
+        if (!countryOk) {
+          logger.info(
+            `Reporting lean skipped — country dim requested but rows lack country labels`
+            + ` ${filters.startDate}..${filters.endDate} (falling through to GAM/adhoc)`
+          );
+        } else {
         const rowFilters = bundle.source === 'compat-union'
           ? { ...filters, domain: [], site: [], domainName: [], domainId: [] }
           : {
@@ -4162,20 +4252,25 @@ async function handleDetailedReport(req, res) {
           + `${warehouseRewrite.composed ? ' composed=1' : ''} in ${Date.now() - t0}ms`
         );
         return res.json(await cacheDetailedResponse(body));
+        } // countryOk
       }
     }
 
-    // ── Miss: enqueue month jobs (grain) or adhoc GAM; never block HTTP ────────
+    // ── Miss: sync grain + for Country use live GAM with country-safe dim sets ─
+    // (never Site-only fallback that drops Country from the report).
     const token = await getToken().catch(() => null);
     const loaded = await loadReportRowsCacheAside(filters, token, {
-      cachePrefix: classified.mode === 'adhoc' ? 'report_detailed_custom_v2' : 'report_detailed_raw_v3',
-      fastMode: true,
-      useAdhocStore: classified.mode === 'adhoc',
+      cachePrefix: (classified.mode === 'adhoc' || wantsCountryCol)
+        ? 'report_detailed_custom_v2'
+        : 'report_detailed_raw_v3',
+      // Country needs the full dim ladder (Site×Country, Country-only, …).
+      fastMode: !wantsCountryCol,
+      useAdhocStore: classified.mode === 'adhoc' || wantsCountryCol,
       skipDb: false,
       persistOnGam: true,
-      enqueueSyncOnMiss: classified.mode !== 'adhoc',
+      enqueueSyncOnMiss: true,
       asyncOnMiss: true,
-      logLabel: classified.mode === 'adhoc' ? 'Reporting adhoc' : 'Reporting',
+      logLabel: (classified.mode === 'adhoc' || wantsCountryCol) ? 'Reporting country/adhoc' : 'Reporting',
     });
 
     if (loaded.status === 'building' || loaded.source === 'building') {

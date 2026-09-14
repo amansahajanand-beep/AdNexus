@@ -145,12 +145,25 @@ const LEGACY_DIMENSION = {
   demand_channel_name: (r) => r.demandChannel || r.channel,
 };
 
+/** Dimensions that must never get synthetic placeholders (e.g. country-name:—:844). */
+const NO_PROXY_DIMENSIONS = new Set([
+  'country_name',
+  'country',
+  'country_code',
+  'country_criteria_id',
+  'COUNTRY_NAME',
+  'COUNTRY_CODE',
+  'COUNTRY_CRITERIA_ID',
+]);
+
 function dimensionProxyValue(dimensionId, row) {
   const legacy = LEGACY_DIMENSION[dimensionId];
   if (legacy) {
     const v = legacy(row);
     if (v != null && v !== '' && v !== '—') return String(v);
   }
+  // Never invent geo labels — fake "country-name:…:NNN" looks like real criteria IDs.
+  if (NO_PROXY_DIMENSIONS.has(String(dimensionId || ''))) return '—';
   const seed = rowSeed(row);
   const base = row.site || row.appId || row.date || 'row';
   const slug = String(dimensionId).replace(/_/g, '-');
@@ -167,6 +180,10 @@ function attachDimensionsToRows(rows, dimensionIds = []) {
       const fromLegacy = LEGACY_DIMENSION[id]?.(row);
       if (fromLegacy != null && fromLegacy !== '' && fromLegacy !== '—') {
         dimensions[id] = String(fromLegacy);
+        return;
+      }
+      if (NO_PROXY_DIMENSIONS.has(String(id || ''))) {
+        dimensions[id] = '—';
         return;
       }
       dimensions[id] = dimensionProxyValue(id, row);

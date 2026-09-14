@@ -40,11 +40,12 @@ const NETWORK_KPI_METRICS = [
 /** Slices that must include ALL_REVENUE — never fall back to CPM-only bundles. */
 const REVENUE_STRICT_SLICES = new Set(['network_kpi', 'inventory_core', 'channel']);
 
+/**
+ * Order matters: pull Country/Site/App slices BEFORE network_kpi.
+ * If sync-today times out mid-run, we keep breakdown grain instead of only DATE totals.
+ * Stale cleanup must not wipe slices that did not refresh this run.
+ */
 const LEAN_SYNC_DIM_SLICES = [
-  {
-    key: 'network_kpi',
-    dims: ['DATE'],
-  },
   {
     key: 'inventory_core',
     dims: [
@@ -86,7 +87,14 @@ const LEAN_SYNC_DIM_SLICES = [
     key: 'rich_core',
     dims: ['DATE', 'COUNTRY_NAME', 'DEVICE_CATEGORY_NAME', 'AD_UNIT_NAME'],
   },
+  {
+    key: 'network_kpi',
+    dims: ['DATE'],
+  },
 ];
+
+/** Slices required before stale-delete may remove prior Country/Site/App grain. */
+const CRITICAL_LEAN_SLICES = ['inventory_core', 'app_id'];
 
 /** Metric attempts per slice — revenue-strict slices never drop ALL_REVENUE. */
 function getMetricAttemptsForSlice(sliceKey) {
@@ -211,6 +219,7 @@ module.exports = {
   NETWORK_KPI_METRICS,
   REVENUE_STRICT_SLICES,
   LEAN_SYNC_DIM_SLICES,
+  CRITICAL_LEAN_SLICES,
   LEAN_SYNC_METRIC_ATTEMPTS,
   LEAN_SUPPLEMENTAL_METRIC_BATCHES,
   getMetricAttemptsForSlice,
