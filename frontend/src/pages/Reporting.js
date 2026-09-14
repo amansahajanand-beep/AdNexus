@@ -794,18 +794,26 @@ export default function Reporting() {
   // Mirror those auto columns into the Report Builder dimension picker so they
   // show as already selected — the user never has to re-check them (and can't
   // accidentally break the report by selecting only part of the set). Manual
-  // dimension choices are preserved.
+  // dimension choices are preserved, except sticky default Domain/Site are
+  // dropped for App-only filters so App×Country stays on the app_id slice.
   const autoDimsRef = useRef([]);
   useEffect(() => {
     setReportDimensions((prev) => {
       const prevAuto = autoDimsRef.current;
-      const manual = (prev || []).filter(
+      const appOnly = Boolean(domainId?.length)
+        && !(domain?.length)
+        && !(site?.length)
+        && !(domainName?.length);
+      let manual = (prev || []).filter(
         (d) => !prevAuto.includes(d) && !autoInventoryDims.includes(d)
       );
+      if (appOnly) {
+        manual = manual.filter((d) => d !== 'domain' && d !== 'site_name' && d !== 'url_name');
+      }
       return [...autoInventoryDims, ...manual];
     });
     autoDimsRef.current = autoInventoryDims;
-  }, [autoInventoryDims]);
+  }, [autoInventoryDims, domainId, domain, site, domainName]);
 
   // Load the (lightweight) country list once for the filter dropdown.
   useEffect(() => {

@@ -231,10 +231,104 @@ function loadCachedAppPackageMaps() {
   try {
     const { cache } = require('../gam/client');
     const catalog = cache.get('filter_catalog_inventory_v25');
-    return rehydrateAppPackageMaps(catalog?.appPackageMaps);
+    const fromCatalog = rehydrateAppPackageMaps(catalog?.appPackageMaps);
+    if (fromCatalog.byPackage.size || fromCatalog.byResolvedId.size || fromCatalog.byName.size) {
+      return fromCatalog;
+    }
+  } catch (_) { /* ignore */ }
+  return loadGrainAppPackageMapsFallback();
+}
+
+/** When filter-catalog maps are cold, derive package↔name↔numeric aliases from app_id grain. */
+let _grainAppMapsCache = { at: 0, maps: null };
+function loadGrainAppPackageMapsFallback() {
+  if (_grainAppMapsCache.maps && Date.now() - _grainAppMapsCache.at < 5 * 60 * 1000) {
+    return _grainAppMapsCache.maps;
+  }
+  try {
+    const { query } = require('../db');
+    // Sync path used by SQL builders — fire-and-forget warm on first miss is handled below.
+    // Prefer last successful maps; empty until warmAppPackageMapsFromGrain() fills them.
+    if (_grainAppMapsCache.maps) return _grainAppMapsCache.maps;
+  } catch (_) { /* ignore */ }
+  return { byPackage: new Map(), byName: new Map(), byResolvedId: new Map() };
+}
+
+async function warmAppPackageMapsFromGrain() {
+  try {
+    const { query } = require('../db');
+    const { rows } = await query(
+      `SELECT DISTINCT
+         NULLIF(TRIM(app_id), '') AS app_id,
+         NULLIF(TRIM(app_name), '') AS app_name
+       FROM report_grain
+       WHERE slice_key = 'app_id'
+         AND report_date >= (CURRENT_DATE - INTERVAL '14 days')
+         AND (
+           NULLIF(TRIM(app_id), '') IS NOT NULL
+           OR NULLIF(TRIM(app_name), '') IS NOT NULL
+         )
+       LIMIT 20000`
+    );
+    const byPackage = new Map();
+    const byName = new Map();
+    const byResolvedId = new Map();
+    const nameToPackages = new Map();
+    const nameToIds = new Map();
+
+    for (const r of rows || []) {
+      const id = norm(r.app_id);
+      const name = norm(r.app_name);
+      if (id && isLikelyAppPackage(id)) {
+        byPackage.set(id, name || id);
+        if (name && name !== id) {
+          byName.set(name, id);
+          if (!nameToPackages.has(name)) nameToPackages.set(name, new Set());
+          nameToPackages.get(name).add(id);
+        }
+      } else if (id && isGamInternalAppId(id)) {
+        if (name) {
+          if (!nameToIds.has(name)) nameToIds.set(name, new Set());
+          nameToIds.get(name).add(id);
+        }
+      } else if (id && name) {
+        byName.set(name, id);
+      }
+    }
+
+    // Link numeric GAM ids ↔ packages that share the same display name.
+    nameToIds.forEach((ids, name) => {
+      const pkgs = nameToPackages.get(name);
+      if (!pkgs?.size) return;
+      const pkg = [...pkgs][0];
+      ids.forEach((gamId) => byResolvedId.set(gamId, pkg));
+    });
+
+    const maps = { byPackage, byName, byResolvedId };
+    _grainAppMapsCache = { at: Date.now(), maps };
+    try {
+      const { cache } = require('../gam/client');
+      const catalog = cache.get('filter_catalog_inventory_v25') || {};
+      if (!catalog.appPackageMaps || !Object.keys(catalog.appPackageMaps.byPackage || {}).length) {
+        cache.set('filter_catalog_inventory_v25', {
+          ...catalog,
+          appPackageMaps: mapsToPlain(maps),
+        }, 3600);
+      }
+    } catch (_) { /* ignore */ }
+    return maps;
   } catch (_) {
     return { byPackage: new Map(), byName: new Map(), byResolvedId: new Map() };
   }
+}
+
+/** Expand + ensure grain alias maps are warm (async callers). */
+async function expandAppFilterAliasesAsync(apps = []) {
+  let maps = loadCachedAppPackageMaps();
+  if (!maps.byPackage.size && !maps.byResolvedId.size) {
+    maps = await warmAppPackageMapsFromGrain();
+  }
+  return expandAppFilterAliases(apps, maps);
 }
 
 /** Keys used to match App ID filters / permissions — package, resolved IDs, and display names. */
@@ -308,7 +402,9 @@ module.exports = {
   collectRowAppKeys,
   rowMatchesAppKeys,
   expandAppFilterAliases,
+  expandAppFilterAliasesAsync,
   loadCachedAppPackageMaps,
+  warmAppPackageMapsFromGrain,
   isMobileAppRow,
   appPackageForPicker,
   isLikelyAppPackage,

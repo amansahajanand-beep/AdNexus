@@ -9,7 +9,20 @@ const {
   grainRowToLegacyDimensions,
   grainRowToLegacyMetrics,
 } = require('./dimLookupService');
+const { expandAppFilterAliases, loadCachedAppPackageMaps, warmAppPackageMapsFromGrain } = require('../utils/appIdentity');
 const logger = require('../utils/logger');
+
+function expandedAppFilterValues(apps = []) {
+  return expandAppFilterAliases(apps, loadCachedAppPackageMaps())
+    .map((s) => String(s || '').trim().toLowerCase())
+    .filter(Boolean);
+}
+
+async function ensureAppAliasMapsWarm() {
+  const maps = loadCachedAppPackageMaps();
+  if (maps.byPackage.size || maps.byResolvedId.size) return maps;
+  return warmAppPackageMapsFromGrain();
+}
 
 const RICH_GRAIN_SQL = `(g.country_id IS NOT NULL AND g.country_id <> 0 AND g.device_id IS NOT NULL AND g.device_id <> 0)`;
 
@@ -532,6 +545,7 @@ async function fetchGrainLegacyFromDB(startDate, endDate) {
 }
 
 async function fetchGrainLeanRowsFromDB(startDate, endDate, opts = {}) {
+  if ((opts.apps || []).length) await ensureAppAliasMapsWarm();
   const clientId = requireClientId();
   const params = [clientId, startDate, endDate];
   let extra = '';
@@ -563,9 +577,14 @@ async function fetchGrainLeanRowsFromDB(startDate, endDate, opts = {}) {
     extra += ` AND LOWER(COALESCE(ds.name, '')) = ANY($${params.length}::text[])`;
   }
   if (apps.length) {
-    params.push(apps);
-    extra += ` AND (LOWER(COALESCE(g.app_id, '')) = ANY($${params.length}::text[])
-      OR LOWER(COALESCE(g.app_name, '')) = ANY($${params.length}::text[]))`;
+    const expanded = expandedAppFilterValues(apps);
+    if (expanded.length) {
+      params.push(expanded);
+      extra += ` AND (LOWER(COALESCE(g.app_id, '')) = ANY($${params.length}::text[])
+        OR LOWER(COALESCE(g.app_name, '')) = ANY($${params.length}::text[]))`;
+    } else {
+      extra += ' AND FALSE';
+    }
   }
   if (countryNames.length) {
     params.push(countryNames);
@@ -694,9 +713,14 @@ function appendGrainInventoryFilters(params, extra, opts = {}) {
     clause += ` AND LOWER(COALESCE(ds.name, '')) = ANY($${params.length}::text[])`;
   }
   if (apps.length) {
-    params.push(apps);
-    clause += ` AND (LOWER(COALESCE(g.app_id, '')) = ANY($${params.length}::text[])
-      OR LOWER(COALESCE(g.app_name, '')) = ANY($${params.length}::text[]))`;
+    const expanded = expandedAppFilterValues(apps);
+    if (expanded.length) {
+      params.push(expanded);
+      clause += ` AND (LOWER(COALESCE(g.app_id, '')) = ANY($${params.length}::text[])
+        OR LOWER(COALESCE(g.app_name, '')) = ANY($${params.length}::text[]))`;
+    } else {
+      clause += ' AND FALSE';
+    }
   }
   if (countryNames.length) {
     params.push(countryNames);
@@ -728,6 +752,7 @@ function reportingTableLimit(startDate, endDate, requested) {
  * aggregating the entire multi-month range into a giant hash before LIMIT.
  */
 async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
+  if ((opts.apps || []).length || opts.groupByApp) await ensureAppAliasMapsWarm();
   const clientId = requireClientId();
   const params = [clientId, startDate, endDate];
   const wantsGeo = Boolean(
@@ -764,10 +789,26 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
   const deviceExpr = `COALESCE(NULLIF(TRIM(dd.name), ''), '')`;
   const byCountry = Boolean(opts.groupByCountry || (opts.countryNames && opts.countryNames.length));
   const byDevice = Boolean(opts.groupByDevice);
+  const countryPrimary = byCountry
+    && !opts.groupByApp
+    && !(opts.apps?.length)
+    && !(opts.sites?.length)
+    && !(opts.domains?.length)
+    && !(opts.adUnitNames?.length)
+    && !opts.groupBySite
+    && (opts.tableGrain === 'country' || (!opts.tableGrain && !opts.groupBySite));
 
   let groupExprs;
   let selectDims;
-  if (opts.adUnitNames?.length) {
+  if (countryPrimary) {
+    // Full country list (pre-AdX / GAM-like) — date × country only.
+    groupExprs = [`g.report_date`];
+    selectDims = `
+       '' AS domain_name,
+       '' AS site_url,
+       '' AS ad_unit,
+       '' AS app_id`;
+  } else if (opts.adUnitNames?.length) {
     groupExprs = [`g.report_date`, domainExpr, siteExpr, adUnitExpr];
     selectDims = `
        ${domainExpr} AS domain_name,
@@ -817,10 +858,22 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
   const startMs = new Date(`${startDate}T12:00:00`).getTime();
   const endMs = new Date(`${endDate}T12:00:00`).getTime();
   const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
-  const perDay = Math.max(8, Math.min(80, Math.ceil(tableLimit / dayCount)));
-  params.push(perDay);
+  const fullCountryTable = byCountry;
+  const countryRowCap = fullCountryTable
+    ? Math.min(100000, Math.max(tableLimit, dayCount * 1000, 25000))
+    : tableLimit;
+  const perDay = countryPrimary
+    ? Math.max(250, Math.min(500, Math.ceil(tableLimit / dayCount)))
+    : byCountry
+      ? Math.max(120, Math.min(400, Math.ceil(tableLimit / dayCount)))
+      : Math.max(8, Math.min(80, Math.ceil(tableLimit / dayCount)));
+  if (fullCountryTable) {
+    params.push(countryRowCap);
+  } else {
+    params.push(perDay);
+  }
   const perDayIdx = params.length;
-  params.push(tableLimit);
+  params.push(fullCountryTable ? countryRowCap : tableLimit);
   const limitIdx = params.length;
 
   const groupBy = groupExprs.join(', ');
@@ -829,7 +882,28 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
     : '';
 
   const { rows } = await query(
-    `SELECT
+    fullCountryTable
+      ? `SELECT
+           to_char(g.report_date, 'YYYY-MM-DD') AS report_date,
+           ${selectDims},
+           COALESCE(SUM(g.impressions), 0)::float8 AS impression,
+           COALESCE(SUM(g.revenue), 0)::float8 AS revenue_raw,
+           CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+             THEN COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)
+                  / COALESCE(SUM(g.impressions), 0)
+             ELSE 0
+           END AS viewable_raw,
+           COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+           COALESCE(MAX(g.currency), 'USD') AS currency
+         ${GRAIN_JOIN_SQL}
+         WHERE g.client_id = $1::uuid
+           AND g.report_date BETWEEN $2::date AND $3::date
+           ${extra}${havingDomain}
+         GROUP BY ${groupBy}
+         HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+         ORDER BY g.report_date ASC, COALESCE(SUM(g.revenue), 0) DESC
+         LIMIT $${limitIdx}`
+      : `SELECT
        to_char(day_rows.report_date, 'YYYY-MM-DD') AS report_date,
        day_rows.domain_name, day_rows.site_url, day_rows.ad_unit, day_rows.app_id,
        day_rows.country, day_rows.device,
@@ -867,7 +941,6 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
          LIMIT $${perDayIdx}
        ) ranked
      ) AS day_rows
-     -- Interleave days (rank then date) so page-1 is not only the latest day.
      ORDER BY day_rows.day_rank ASC, day_rows.report_date DESC, day_rows.revenue_raw DESC
      LIMIT $${limitIdx}`,
     params
@@ -905,8 +978,28 @@ async function listGrainDatesMissingRichDims(startDate, endDate) {
   return rows.map((r) => r.report_date);
 }
 
-async function deleteStaleGrain(dates, syncStartedAt) {
+/**
+ * Remove prior grain rows for dates touched this sync.
+ * When sliceKeys is provided, only those slices are cleaned — never wipe
+ * Country/Site/App grain because only network_kpi refreshed.
+ */
+async function deleteStaleGrain(dates, syncStartedAt, sliceKeys = null) {
   if (!dates?.length) return;
+  const keys = Array.isArray(sliceKeys)
+    ? [...new Set(sliceKeys.map((k) => String(k || '').trim()).filter(Boolean))]
+    : null;
+  if (keys && !keys.length) return;
+  if (keys) {
+    await query(
+      `DELETE FROM report_grain
+       WHERE client_id = $2::uuid
+         AND report_date = ANY($1::date[])
+         AND synced_at < $3
+         AND COALESCE(slice_key, '') = ANY($4::text[])`,
+      [dates, requireClientId(), syncStartedAt, keys]
+    );
+    return;
+  }
   await query(
     `DELETE FROM report_grain
      WHERE client_id = $2::uuid
