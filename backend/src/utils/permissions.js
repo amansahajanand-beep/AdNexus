@@ -1,3 +1,6 @@
+
+
+
 const { rowMatchesAppKeys, isMobileAppRow: rowIsMobileApp, isLikelyAppPackage } = require('./appIdentity');
 const { buildDateRestrictionPayload, resolveDateRestriction } = require('./dateRestriction');
 const {
@@ -296,6 +299,12 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
   ) {
     // Full domain+site assignment applied together — prefer sites (more specific).
     domains = [];
+  }
+
+  // Never leave apps unconstrained for children with App ID assignments — otherwise
+  // rollup/groupByApp returns every network package (Reporting leak).
+  if (!apps.length && scope.appIds?.size) {
+    apps = [...scope.appIds];
   }
 
   // Domains/sites use LIKE ANY and hang when huge; prefer sites, cap domains.

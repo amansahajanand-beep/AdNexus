@@ -1921,6 +1921,42 @@ function prepareScopedReportRows(allRows, filters, user) {
   return scopeRowsToUser(rows, user, siteCtx);
 }
 
+/**
+ * SQL rollup/lean paths skip row scoping for speed — but scoped children must NEVER
+ * see App IDs / sites outside their assignment. Always enforce scope for them.
+ */
+function rowsForReportBundle(rows, filters, user, { sqlTrusted = false } = {}) {
+  const isScopedChild = user?.role !== 'admin' && userHasAssignedInventory(user);
+  if (isScopedChild || !sqlTrusted) {
+    return prepareScopedReportRows(rows, filters, user);
+  }
+  return normalizeReportRows(rows || []);
+}
+
+function countAppAndWebsiteDomainsFromRows(rows = []) {
+  const keys = new Set();
+  for (const r of rows) {
+    const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+    const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+    if (domain) keys.add(`web:${domain}`);
+    if (app) keys.add(`app:${app}`);
+  }
+  return keys.size;
+}
+
+/** Recompute KPI cards from scoped rows (SQL summary may be network-wide). */
+function summaryForScopedRows(rows, currency, baseSummary = {}) {
+  const derived = deriveDashboardSummary(rows || [], [], currency, false);
+  return {
+    ...baseSummary,
+    ...derived,
+    totalRevenue: derived.revenue,
+    totalDomains: countAppAndWebsiteDomainsFromRows(rows),
+    offeredRecords: (rows || []).length,
+    currency: currency || baseSummary.currency || derived.currency || 'USD',
+  };
+}
+
 /** Normalize, enrich site hosts, then apply user inventory scope (domain / site / app). */
 function prepareDomainUserRows(allRows, user) {
   const siteCtx = buildScopeSiteContextForUser(user);
@@ -3362,9 +3398,14 @@ async function handleDashboard(req, res) {
           'grain',
           'site-merge',
         ]);
-        const scopedRows = sqlApplied.has(bundle.source)
-          ? normalizeReportRows(bundle.rows || [])
-          : prepareScopedReportRows(bundle.rows, rowFilters, req.user);
+        // SQL filters are best-effort. Scoped children must always be clipped to
+        // assigned App IDs / sites — otherwise rollup/compat-union leaks other apps.
+        const scopedRows = rowsForReportBundle(bundle.rows, rowFilters, req.user, {
+          sqlTrusted: sqlApplied.has(bundle.source),
+        });
+        const scopedSummary = (req.user?.role !== 'admin' && userHasAssignedInventory(req.user))
+          ? summaryForScopedRows(scopedRows, currency, bundle.summary || {})
+          : { ...bundle.summary, currency: currency || bundle.summary?.currency };
         logger.info(
           `Dashboard ${bundle.source === 'rollup' ? 'rollup' : (bundle.source || 'lean SQL')} bundle ${filters.startDate}..${filters.endDate}`
           + ` grain≈${bundle.grainCount} table=${scopedRows.length}`
@@ -3389,7 +3430,7 @@ async function handleDashboard(req, res) {
             reportWarningUsedMetricIds: [],
           };
         const payload = applyVisibility({
-          summary: { ...bundle.summary, currency: currency || bundle.summary.currency },
+          summary: scopedSummary,
           rows: scopedRows,
           trend: bundle.trend,
           charts: bundle.charts,
@@ -4016,26 +4057,35 @@ async function handleDetailedReport(req, res) {
         const countryOk = !wantsCountryCol
           || (bundle?.rows || []).some((r) => String(r.country || r.COUNTRY_NAME || '').trim());
         if (bundle && countryOk && (bundle.rows?.length || bundle.grainCount)) {
+          const rowFilters = {
+            ...filters,
+            domain: domains,
+            site: sites,
+            domainName: toFilterArray(filters.domainName),
+            domainId: apps,
+          };
           let scopedRows = stampWarehouseMetricsOnRows(
-            normalizeReportRows(bundle.rows || [])
+            rowsForReportBundle(bundle.rows || [], rowFilters, req.user, { sqlTrusted: true })
           );
           scopedRows = applyMetricSubstitutionsToRows(
             scopedRows,
             warehouseRewrite.substitutions
           );
-          const revenue = Number(bundle.summary?.revenue) || 0;
-          const totalDomains = bundle.summary?.totalDomains != null
-            ? Number(bundle.summary.totalDomains) || 0
-            : (() => {
-              const keys = new Set();
-              for (const r of scopedRows) {
-                const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
-                const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
-                if (domain) keys.add(`web:${domain}`);
-                if (app) keys.add(`app:${app}`);
-              }
-              return keys.size;
-            })();
+          const scopedChild = isScopedChild;
+          const scopedSummary = scopedChild
+            ? summaryForScopedRows(scopedRows, currency, bundle.summary || {})
+            : null;
+          const revenue = scopedChild
+            ? Number(scopedSummary.totalRevenue) || 0
+            : (Number(bundle.summary?.revenue) || 0);
+          const totalDomains = scopedChild
+            ? Number(scopedSummary.totalDomains) || 0
+            : (bundle.summary?.totalDomains != null
+              ? Number(bundle.summary.totalDomains) || 0
+              : countAppAndWebsiteDomainsFromRows(scopedRows));
+          const offeredRecords = scopedChild
+            ? scopedRows.length
+            : (bundle.grainCount || scopedRows.length);
           const composedPartial = Boolean(
             warehouseSkipChips.length
             || classified.skippedDims?.length
@@ -4043,10 +4093,10 @@ async function handleDetailedReport(req, res) {
           );
           const body = applyVisibility({
             summary: {
-              ...(bundle.summary || {}),
+              ...(scopedSummary || bundle.summary || {}),
               totalRevenue: revenue,
               totalDomains,
-              offeredRecords: bundle.grainCount || scopedRows.length,
+              offeredRecords,
               currency: currency || bundle.summary?.currency || 'USD',
             },
             rows: wantAllRows
@@ -4079,7 +4129,7 @@ async function handleDetailedReport(req, res) {
                 returnedRows: scopedRows.length,
                 truncated: Boolean(bundle.pagination?.truncated),
                 allRows: true,
-                offeredRecords: bundle.grainCount || scopedRows.length,
+                offeredRecords,
               }
               : {
                 ...(paginateRows(scopedRows, {
@@ -4088,7 +4138,7 @@ async function handleDetailedReport(req, res) {
                 }).pagination),
                 totalRows: scopedRows.length,
                 truncated: Boolean(bundle.pagination?.truncated),
-                offeredRecords: bundle.grainCount || scopedRows.length,
+                offeredRecords,
               },
           }, req.user);
           if (!wantAllRows && scopedRows.length) {
@@ -4159,29 +4209,31 @@ async function handleDetailedReport(req, res) {
           'grain',
           'site-merge',
         ]);
-        let scopedRows = sqlApplied.has(bundle.source)
-          ? normalizeReportRows(bundle.rows || [])
-          : prepareScopedReportRows(bundle.rows || [], rowFilters, req.user);
+        let scopedRows = rowsForReportBundle(bundle.rows || [], rowFilters, req.user, {
+          sqlTrusted: sqlApplied.has(bundle.source),
+        });
         scopedRows = stampWarehouseMetricsOnRows(scopedRows);
         scopedRows = applyMetricSubstitutionsToRows(
           scopedRows,
           warehouseRewrite.substitutions
         );
-        const revenue = Number(bundle.summary?.revenue) || 0;
+        const scopedChild = isScopedChild;
+        const scopedSummary = scopedChild
+          ? summaryForScopedRows(scopedRows, currency, bundle.summary || {})
+          : null;
+        const revenue = scopedChild
+          ? Number(scopedSummary.totalRevenue) || 0
+          : (Number(bundle.summary?.revenue) || 0);
         const truncated = Boolean(bundle.pagination?.truncated)
           || (Number(bundle.grainCount) || 0) > scopedRows.length;
-        const totalDomains = bundle.summary?.totalDomains != null
-          ? Number(bundle.summary.totalDomains) || 0
-          : (() => {
-            const keys = new Set();
-            for (const r of scopedRows) {
-              const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
-              const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
-              if (domain) keys.add(`web:${domain}`);
-              if (app) keys.add(`app:${app}`);
-            }
-            return keys.size;
-          })();
+        const totalDomains = scopedChild
+          ? Number(scopedSummary.totalDomains) || 0
+          : (bundle.summary?.totalDomains != null
+            ? Number(bundle.summary.totalDomains) || 0
+            : countAppAndWebsiteDomainsFromRows(scopedRows));
+        const offeredRecords = scopedChild
+          ? scopedRows.length
+          : (bundle.grainCount || scopedRows.length);
         const composedPartial = Boolean(
           warehouseSkipChips.length
           || compat.skipped?.length
@@ -4190,10 +4242,10 @@ async function handleDetailedReport(req, res) {
         );
         const body = applyVisibility({
           summary: {
-            ...(bundle.summary || {}),
+            ...(scopedSummary || bundle.summary || {}),
             totalRevenue: revenue,
             totalDomains,
-            offeredRecords: bundle.grainCount || scopedRows.length,
+            offeredRecords,
             currency: currency || bundle.summary?.currency || 'USD',
           },
           rows: wantAllRows
@@ -4241,15 +4293,17 @@ async function handleDetailedReport(req, res) {
           body.rows = paged.rows;
           body.pagination = {
             ...paged.pagination,
-            // Use returned table size — not raw grainCount — so UI pages across days.
             totalRows: scopedRows.length,
             truncated: truncated || scopedRows.length > paged.rows.length,
+            offeredRecords,
           };
         }
         logger.info(
           `Reporting lean/rollup bundle ${filters.startDate}..${filters.endDate}`
           + ` grain≈${bundle.grainCount || 0}`
-          + `${warehouseRewrite.composed ? ' composed=1' : ''} in ${Date.now() - t0}ms`
+          + `${warehouseRewrite.composed ? ' composed=1' : ''}`
+          + (scopedChild ? ` scoped user=${req.user.username} apps=${scopedRows.length}` : '')
+          + ` in ${Date.now() - t0}ms`
         );
         return res.json(await cacheDetailedResponse(body));
         } // countryOk
