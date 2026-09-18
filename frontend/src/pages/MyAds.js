@@ -7,6 +7,11 @@ import { Megaphone } from '../components/ui/Icon';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
 import { confirmDialog } from '../hooks/useConfirmDialog';
 import { authSuccess } from '../store/actions/authActions';
+import {
+  ADS_RECONNECT_INSTRUCTIONS,
+  accountNeedsReconnect,
+  isAdsAuthError,
+} from '../utils/adsAuthError';
 
 function formatCustomerId(id) {
   const d = String(id || '').replace(/\D/g, '');
@@ -216,9 +221,12 @@ export default function MyAds() {
       <td className="td-mono">{formatCustomerId(account.customerId)}</td>
       <td>{account.accountType === 'mcc' ? 'Manager (MCC)' : 'Client'}</td>
       <td>
-        {account.hasRefreshToken ? 'Connected' : 'Needs reconnect'}
+        {accountNeedsReconnect(account) ? 'Needs reconnect' : 'Connected'}
         {account.lastSyncAt ? (
           <div className="reporting-sub" style={{ margin: 0 }}>{formatSyncAt(account.lastSyncAt)}</div>
+        ) : null}
+        {account.lastSyncError ? (
+          <div className="ads-sync-err" title={account.lastSyncError}>{account.lastSyncError}</div>
         ) : null}
       </td>
       <td style={{ textAlign: 'right', whiteSpace: 'nowrap' }}>
@@ -260,6 +268,30 @@ export default function MyAds() {
 
       {error && <div className="login-error">{error}</div>}
       {okMsg && <div className="client-settings-ok">{okMsg}</div>}
+
+      {(accounts.some((a) => accountNeedsReconnect(a)) || accounts.some((a) => a.lastSyncError)) && (
+        <div className="warn-card warn-card-partial" role="alert" style={{ marginTop: 12 }}>
+          <div className="warn-card-main" style={{ gridTemplateColumns: '1fr' }}>
+            <div className="warn-card-left" style={{ borderRight: 'none' }}>
+              <div className="warn-card-icon-wrap"><span aria-hidden>!</span></div>
+              <div className="warn-card-body">
+                <div className="warn-card-title">
+                  {accounts.some((a) => isAdsAuthError(a.lastSyncError) || !a.hasRefreshToken)
+                    ? 'Google Ads login needs reconnect'
+                    : 'Google Ads sync reported errors'}
+                </div>
+                <div className="warn-card-desc">
+                  <ol style={{ margin: '0 0 0 1.1rem', padding: 0 }}>
+                    {ADS_RECONNECT_INSTRUCTIONS.map((line) => (
+                      <li key={line} style={{ marginBottom: 6 }}>{line}</li>
+                    ))}
+                  </ol>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {picker && (
         <div className="filter-card ads-form-card">

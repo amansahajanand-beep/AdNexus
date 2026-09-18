@@ -156,7 +156,13 @@ async function startServer() {
       logger.warn('[tenancy] Startup bootstrap failed (non-fatal):', e.message);
     }
 
-    setImmediate(async () => {
+    // Heavy DDL + rollup rebuilds take table locks. Delay and serialize so the first
+    // dashboard/login requests are not fighting ALTER/backfill (pool death spiral).
+    const startupDdlDelayMs = Math.max(
+      0,
+      parseInt(process.env.STARTUP_DDL_DELAY_MS || '8000', 10) || 8000
+    );
+    setTimeout(async () => {
       try {
         const { finishTenantBackfill, ensureGrainMetricsColumn } = require('./db');
         await ensureGrainMetricsColumn();
@@ -164,9 +170,9 @@ async function startServer() {
       } catch (e) {
         logger.warn('Tenant client_id backfill failed (non-fatal):', e.message);
       }
-    });
 
-    setImmediate(async () => {
+      // Rollup rebuild after DDL only — never in parallel with ALTER.
+      // Still useful when SYNC_DISABLED (local dashboards need rollups), but deferred.
       try {
         const { listActiveClients } = require('./models/clientStore');
         const { runWithClient } = require('./utils/clientContext');
@@ -181,7 +187,10 @@ async function startServer() {
       } catch (e) {
         logger.warn('Startup rollup backfill failed (non-fatal):', e.message);
       }
-    });
+    }, startupDdlDelayMs);
+    if (startupDdlDelayMs > 0) {
+      logger.info(`Startup DDL/rollup deferred ${startupDdlDelayMs}ms (avoid lock stampede)`);
+    }
 
     // ── Redis connection (lazy, non-blocking)
     if (process.env.SYNC_DISABLED !== 'true') {

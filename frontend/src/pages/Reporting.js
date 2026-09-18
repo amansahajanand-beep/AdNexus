@@ -77,6 +77,37 @@ const PAGE_SIZE = 50;
 const POLL_MS = 30 * 60 * 1000; // matches backend 30-min cache TTL
 const BUILDING_POLL_MAX_TRIES = 36; // 36 × 5s ≈ 3 min before we call it empty
 
+function reportingAppliedKey(applied = {}) {
+  const list = (v) => (Array.isArray(v) ? v : (v != null && v !== '' ? [v] : []))
+    .map((x) => String(x).trim().toLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join(',');
+  const dims = (applied.reportDimensions || []).map(String).sort().join(',');
+  const mets = (applied.reportMetrics || []).map(String).sort().join(',');
+  return [
+    String(applied.startDate || '').slice(0, 10),
+    String(applied.endDate || '').slice(0, 10),
+    list(applied.domain),
+    list(applied.site),
+    list(applied.domainName),
+    list(applied.domainId),
+    list(applied.country),
+    dims,
+    mets,
+  ].join('|');
+}
+
+function reportPayloadHasRows(payload) {
+  if (!payload) return false;
+  if (Array.isArray(payload.rows) && payload.rows.length > 0) return true;
+  const s = payload.summary || {};
+  return (Number(s.totalRevenue) || 0) > 0
+    || (Number(s.offeredRecords) || 0) > 0
+    || (Number(s.impressions) || 0) > 0
+    || (Number(s.revenue) || 0) > 0;
+}
+
 const MET_REVENUE = 'total_line_item_level_cpm_and_cpc_revenue';
 const MET_IMPRESSIONS = 'total_line_item_level_impressions';
 const MET_CTR = 'total_line_item_level_ctr';
@@ -134,7 +165,12 @@ export default function Reporting() {
   const inventoryScope = getAssignedInventoryScope(user);
   const inventoryAssigned = hasAssignedInventory(user);
   const filterVisibility = getAssignedFilterVisibility(user);
-  const saved = useSelector((s) => s.reports?.reporting);
+  const scopedNormOpts = useMemo(() => ({
+    expandAll: !!filterVisibility.isScopedUser,
+    assignedScope: inventoryScope,
+  }), [filterVisibility.isScopedUser, inventoryScope]);
+  const savedRaw = useSelector((s) => s.reports?.reporting);
+  const saved = (!savedRaw?.userId || savedRaw.userId === user?.id) ? savedRaw : null;
   const { networkInfo } = useOutletContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const shareHydratedRef = useRef(false);
@@ -210,23 +246,30 @@ export default function Reporting() {
 
   const [applied, setApplied] = useState(() => {
     const withCountry = (obj) => ({ ...obj, country: normalizeCountry(obj?.country) });
-    const ensureDefaultMetrics = (obj) => {
+    const ensureDefaults = (obj) => {
       const o = withCountry(obj);
-      if (o.reportMetrics?.length) return o;
-      return { ...o, reportMetrics: [...DEFAULT_REPORT_METRICS] };
+      const next = { ...o };
+      if (!next.reportMetrics?.length) next.reportMetrics = [...DEFAULT_REPORT_METRICS];
+      if (!next.reportDimensions?.length) next.reportDimensions = [...DEFAULT_REPORT_DIMENSIONS];
+      if (!next.reportSettings || typeof next.reportSettings !== 'object') {
+        next.reportSettings = { ...DEFAULT_REPORT_SETTINGS };
+      } else if (!next.reportSettings.runType) {
+        next.reportSettings = { ...DEFAULT_REPORT_SETTINGS, ...next.reportSettings };
+      }
+      return next;
     };
     // Domain user: never restore auto-applied full inventory — dates + default metrics only.
     if (filterVisibility.isScopedUser) {
-      return ensureDefaultMetrics({
+      return ensureDefaults({
         ...buildDefaultApplied(),
         startDate: saved?.applied?.startDate || saved?.startDate || todayInit.startDate,
         endDate: saved?.applied?.endDate || saved?.endDate || todayInit.endDate,
         ...EMPTY_INVENTORY_FILTERS,
       });
     }
-    if (saved?.applied) return ensureDefaultMetrics(saved.applied);
-    if (scopedAutoLoad) return ensureDefaultMetrics(buildScopedApplied());
-    return ensureDefaultMetrics(buildDefaultApplied());
+    if (saved?.applied) return ensureDefaults(saved.applied);
+    if (scopedAutoLoad) return ensureDefaults(buildScopedApplied());
+    return ensureDefaults(buildDefaultApplied());
   });
   const [data, setData] = useState(() => (cacheFresh ? saved?.data : null) ?? null);
   // Nothing loads or shows until the user clicks Apply Filter. The only
@@ -234,7 +277,7 @@ export default function Reporting() {
   const [hasApplied, setHasApplied] = useState(
     () => Boolean(cacheFresh && (saved?.data || saved?.progData))
   );
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(() => !Boolean(cacheFresh && (saved?.data || saved?.progData)));
   const [slowLoad, setSlowLoad] = useState(false);
   const [recentFilters, setRecentFilters] = useState(() => getRecentFilters(user?.id));
   const slowTimerRef = useRef(null);
@@ -257,6 +300,10 @@ export default function Reporting() {
   const skipInitialLoadRef = useRef(cacheFresh);
   const loadGenRef = useRef(0);
   const buildingPollRef = useRef(0);
+  const loadInFlightRef = useRef(false);
+  const loadKeyRef = useRef('');
+  const dataRef = useRef(null);
+  const progDataRef = useRef(null);
   // Set when the background report never finished — stops the endless hourglass.
   const [buildingTimedOut, setBuildingTimedOut] = useState(false);
 
@@ -482,42 +529,51 @@ export default function Reporting() {
     const query = resolveReportingQuery(applied);
     if (!query) return;
     const { dims, mets } = query;
+    const key = reportingAppliedKey(applied);
+    // Coalesce identical in-flight loads (Strict Mode / applied object churn).
+    if (loadInFlightRef.current && loadKeyRef.current === key) return;
+    if (silent && loadInFlightRef.current) return;
+
     const loadGen = ++loadGenRef.current;
     // Cancel any in-flight building poll from a prior load.
     buildingPollRef.current += 1;
     const buildingPollId = buildingPollRef.current;
     setBuildingTimedOut(false);
+    loadInFlightRef.current = true;
+    loadKeyRef.current = key;
 
-    const hasRows = (payload) => {
-      if (!payload) return false;
-      if (Array.isArray(payload.rows) && payload.rows.length > 0) return true;
-      const s = payload.summary || {};
-      return (Number(s.totalRevenue) || 0) > 0
-        || (Number(s.offeredRecords) || 0) > 0
-        || (Number(s.impressions) || 0) > 0;
-    };
-
-    /** Never let a later empty "building" response wipe rows we already have. */
+    /** Never let a later empty response wipe rows we already have for this query. */
     const applyDetailed = (payload) => {
       if (loadGen !== loadGenRef.current) return;
       setData((prev) => {
-        if (payload?.status === 'building' && !hasRows(payload) && hasRows(prev)) {
-          return { ...prev, status: undefined };
+        if (!reportPayloadHasRows(payload) && reportPayloadHasRows(prev) && prev?._queryKey === key) {
+          if (payload?.status === 'building' || payload?.status === 'partial') {
+            return { ...prev, status: payload.status };
+          }
+          if (payload?.status !== 'ready' && payload?.status !== 'empty') return prev;
         }
-        return payload;
+        const next = payload ? { ...payload, _queryKey: key } : payload;
+        dataRef.current = next;
+        return next;
       });
     };
     const applyProg = (payload) => {
       if (loadGen !== loadGenRef.current) return;
       setProgData((prev) => {
-        if (payload?.status === 'building' && !hasRows(payload) && hasRows(prev)) {
-          return { ...prev, status: undefined };
+        if (!reportPayloadHasRows(payload) && reportPayloadHasRows(prev) && prev?._queryKey === key) {
+          if (payload?.status === 'building' || payload?.status === 'partial') {
+            return { ...prev, status: payload.status };
+          }
+          if (payload?.status !== 'ready' && payload?.status !== 'empty') return prev;
         }
-        return payload;
+        const next = payload ? { ...payload, _queryKey: key } : payload;
+        progDataRef.current = next;
+        return next;
       });
     };
 
-    if (!silent) {
+    const hasCached = reportPayloadHasRows(dataRef.current) || reportPayloadHasRows(progDataRef.current);
+    if (!silent && !hasCached) {
       setLoading(true);
       setSlowLoad(false);
       clearTimeout(slowTimerRef.current);
@@ -527,7 +583,7 @@ export default function Reporting() {
     try {
       const cfg = resolveReportTableConfig(dims, mets);
       const dateFilters = {
-        ...normalizeInventorySelections(applied || {}, {}),
+        ...normalizeInventorySelections(applied || {}, {}, scopedNormOpts),
         startDate: applied.startDate || todayInit.startDate,
         endDate: applied.endDate || todayInit.endDate,
         reportDimensions: dims,
@@ -549,6 +605,8 @@ export default function Reporting() {
       setFetchedAt(Date.now());
       // Only poll when we truly have no usable data yet (don't flash building over good rows).
       const needsPoll = (!silent)
+        && !reportPayloadHasRows(detailed)
+        && !reportPayloadHasRows(programmatic)
         && (
           detailed?.status === 'building'
           || programmatic?.status === 'building'
@@ -576,9 +634,13 @@ export default function Reporting() {
             if (buildingPollId !== buildingPollRef.current) return;
             if (againDetailed) applyDetailed(againDetailed);
             if (againProg) applyProg(againProg);
+            const gotRows = reportPayloadHasRows(againDetailed) || reportPayloadHasRows(againProg);
             const stillBuilding = (
-              againDetailed?.status === 'building'
-              || againProg?.status === 'building'
+              !gotRows
+              && (
+                againDetailed?.status === 'building'
+                || againProg?.status === 'building'
+              )
             );
             if (stillBuilding) {
               poll();
@@ -608,8 +670,10 @@ export default function Reporting() {
         || err?.code === 'ERR_NETWORK'
       ) {
         setError(getUserFacingMessage(err, 'Could not load the report. Please try again or narrow your filters.'));
-        setData(null);
-        setProgData(null);
+        if (!reportPayloadHasRows(dataRef.current)) {
+          setData(null);
+          setProgData(null);
+        }
       } else {
         setError(null);
         setData({
@@ -621,19 +685,32 @@ export default function Reporting() {
             ...dims.map((id) => dimensionLabel(id)),
             ...mets.map((id) => metricLabel(id)),
           ],
+          _queryKey: key,
         });
         setProgData(null);
         setLastUpdated(nowTimeInTZ());
         setFetchedAt(Date.now());
       }
     } finally {
-      if (!silent && loadGen === loadGenRef.current) {
-        setLoading(false);
-        setSlowLoad(false);
-        clearTimeout(slowTimerRef.current);
+      if (loadGen === loadGenRef.current) {
+        loadInFlightRef.current = false;
+        if (!silent) {
+          setLoading(false);
+          setSlowLoad(false);
+          clearTimeout(slowTimerRef.current);
+        }
       }
     }
-  }, [applied, todayInit.startDate, todayInit.endDate, canGenerate]);
+  }, [applied, todayInit.startDate, todayInit.endDate, canGenerate, scopedNormOpts]);
+
+  const appliedQueryKey = useMemo(() => reportingAppliedKey(applied), [applied]);
+
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+  useEffect(() => {
+    progDataRef.current = progData;
+  }, [progData]);
 
   useEffect(() => {
     if (!canGenerate) return;
@@ -645,7 +722,7 @@ export default function Reporting() {
     }
     load();
     setPage(1);
-  }, [load, canGenerate, applied, hasApplied]);
+  }, [load, canGenerate, appliedQueryKey, hasApplied]);
 
   useEffect(() => {
     if (!canGenerate) return;
@@ -654,6 +731,7 @@ export default function Reporting() {
     dispatch(saveReportPage({
       pageKey: 'reporting',
       payload: {
+        userId: user?.id,
         applied, data, progData, catalog, fetchedAt, lastUpdated,
         preset, startDate, endDate, country, domain, site, domainName, domainId,
         search, page, filtersOpen, breakdownOpen, chipsExpanded,
@@ -661,7 +739,7 @@ export default function Reporting() {
       },
     }));
   }, [
-    dispatch, applied, data, progData, catalog, fetchedAt, lastUpdated,
+    dispatch, user?.id, applied, data, progData, catalog, fetchedAt, lastUpdated,
     preset, startDate, endDate, country, domain, site, domainName, domainId,
     search, page, filtersOpen, breakdownOpen, chipsExpanded,
     reportDimensions, reportMetrics, reportSettings,
@@ -810,7 +888,10 @@ export default function Reporting() {
       if (appOnly) {
         manual = manual.filter((d) => d !== 'domain' && d !== 'site_name' && d !== 'url_name');
       }
-      return [...autoInventoryDims, ...manual];
+      const next = [...autoInventoryDims, ...manual];
+      // Keep Dashboard-like date×domain×site defaults when nothing is selected.
+      if (!next.length && !appOnly) return [...DEFAULT_REPORT_DIMENSIONS];
+      return next;
     });
     autoDimsRef.current = autoInventoryDims;
   }, [autoInventoryDims, domainId, domain, site, domainName]);
@@ -831,7 +912,7 @@ export default function Reporting() {
     if (!resolveReportingQuery(applied)) return undefined;
     pollRef.current = setInterval(() => load(true), POLL_MS);
     return () => clearInterval(pollRef.current);
-}, [load, applied, canGenerate, hasApplied]);
+  }, [load, appliedQueryKey, canGenerate, hasApplied]);
 
   // Default metrics always allow Apply; scoped users still need inventory when they clear defaults.
   const inventoryDraft = useMemo(
@@ -1202,6 +1283,7 @@ export default function Reporting() {
   const stillBuilding = Boolean(
     (data?.status === 'building' || progData?.status === 'building')
     && !buildingTimedOut
+    && totalRecordCount === 0
   );
 
   const showNoReportCard = Boolean(
@@ -1270,9 +1352,9 @@ export default function Reporting() {
     && skippedChips.length > 0
   );
 
-  // Summary cards only after apply, and only when the report returned rows.
-  const hasReportData = !loading && totalRecordCount > 0;
-  const showSummaryCards = canGenerate && hasApplied && (loading || hasReportData);
+  // Keep cards/table visible during refresh if we already have rows (don't gate on !loading).
+  const hasReportData = totalRecordCount > 0;
+  const showSummaryCards = canGenerate && hasApplied && (hasReportData || loading);
   // Only show the hourglass when we are waiting AND have nothing useful on screen yet.
   const showBuildingBanner = Boolean(stillBuilding && !hasReportData);
 

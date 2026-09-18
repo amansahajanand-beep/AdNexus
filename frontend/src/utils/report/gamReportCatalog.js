@@ -80,7 +80,8 @@ export const REPORT_SETTINGS_OPTIONS = {
 };
 
 export const DEFAULT_REPORT_SETTINGS = {
-  runType: 'totals',
+  // Match Dashboard Inventory Breakdown: date × domain × site rows by default.
+  runType: 'breakdown',
   currency: 'USD',
   timezone: 'Asia/Singapore',
   adUnitView: 'FLAT',

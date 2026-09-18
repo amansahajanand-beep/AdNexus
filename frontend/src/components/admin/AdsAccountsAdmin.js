@@ -5,6 +5,11 @@ import Button from '../ui/Button';
 import TableSearchBar from '../ui/TableSearchBar';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 import { confirmDialog } from '../../hooks/useConfirmDialog';
+import {
+  ADS_RECONNECT_INSTRUCTIONS,
+  accountNeedsReconnect,
+  isAdsAuthError,
+} from '../../utils/adsAuthError';
 
 const PAGE_SIZE = 10;
 
@@ -275,19 +280,20 @@ export default function AdsAccountsAdmin() {
 
   const removeAccount = async (id, { isMcc = false, childCount = 0 } = {}) => {
     const ok = await confirmDialog({
-      title: isMcc ? 'Remove MCC manager?' : 'Remove account?',
+      title: isMcc ? 'Disconnect MCC OAuth?' : 'Disconnect OAuth?',
       message: isMcc
         ? (childCount > 0
-          ? `This removes the MCC and all ${childCount} connected child account(s). They will not become individual accounts.`
-          : 'This removes the MCC manager account link.')
-        : 'Remove this Google Ads account link?',
+          ? `Clears Google login for this MCC and ${childCount} child account(s). Synced spend history is kept. Use Reconnect afterwards to resume sync.`
+          : 'Clears Google login for this MCC. Synced spend history is kept. Use Reconnect afterwards to resume sync.')
+        : 'Clears Google login for this account. Synced spend history is kept. Use Reconnect afterwards to resume sync.',
     });
     if (!ok) return;
     try {
-      await adsAPI.deleteAccount(id);
+      const result = await adsAPI.deleteAccount(id);
+      setOkMsg(result?.message || 'OAuth disconnected. Spend history was kept.');
       await load();
     } catch (err) {
-      setError(getUserFacingMessage(err, 'Could not delete account.'));
+      setError(getUserFacingMessage(err, 'Could not disconnect account.'));
     }
   };
 
@@ -343,6 +349,44 @@ export default function AdsAccountsAdmin() {
 
       {error && <div className="login-error">{error}</div>}
       {okMsg && <div className="client-settings-ok">{okMsg}</div>}
+
+      {(accounts.some((a) => accountNeedsReconnect(a)) || accounts.some((a) => a.lastSyncError)) && (
+        <div className="warn-card warn-card-partial" role="alert" style={{ marginTop: 12 }}>
+          <div className="warn-card-main" style={{ gridTemplateColumns: '1fr' }}>
+            <div className="warn-card-left" style={{ borderRight: 'none' }}>
+              <div className="warn-card-icon-wrap"><span aria-hidden>!</span></div>
+              <div className="warn-card-body">
+                <div className="warn-card-title">
+                  {accounts.some((a) => isAdsAuthError(a.lastSyncError) || !a.hasRefreshToken)
+                    ? 'Google Ads login needs reconnect'
+                    : 'Google Ads sync reported errors'}
+                </div>
+                <div className="warn-card-desc">
+                  <ol style={{ margin: '0 0 0 1.1rem', padding: 0 }}>
+                    {ADS_RECONNECT_INSTRUCTIONS.map((line) => (
+                      <li key={line} style={{ marginBottom: 6 }}>{line}</li>
+                    ))}
+                  </ol>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="filter-card ads-form-card" style={{ marginTop: 12 }}>
+        <div className="filter-card-head">
+          <span className="filter-card-title">How to fix invalid_grant</span>
+        </div>
+        <ol className="help-bullets" style={{ margin: '0 0 8px 1.1rem' }}>
+          {ADS_RECONNECT_INSTRUCTIONS.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ol>
+        <p className="reporting-sub" style={{ margin: 0 }}>
+          Tip: use <strong>Reconnect</strong> on the MCC row (not each child). Top-level Connect with Google also works if you pick the same manager.
+        </p>
+      </div>
 
       {picker && (
         <div className="filter-card ads-form-card">
@@ -542,24 +586,29 @@ export default function AdsAccountsAdmin() {
                 <div className="ads-mcc-identity">
                   <strong className="ads-mcc-name">{mcc.descriptiveName || 'MCC'}</strong>
                   <span className="td-mono ads-mcc-id">{formatCustomerId(mcc.customerId)}</span>
-                  <span className={`ads-badge ${mcc.hasRefreshToken ? 'ok' : 'warn'}`}>
-                    {mcc.hasRefreshToken ? 'Connected' : 'Needs token'}
+                  <span className={`ads-badge ${accountNeedsReconnect(mcc) ? 'warn' : 'ok'}`}>
+                    {accountNeedsReconnect(mcc)
+                      ? (mcc.hasRefreshToken ? 'Needs reconnect' : 'Needs token')
+                      : 'Connected'}
                   </span>
                 </div>
                 <div className="row-actions">
-                  {!mcc.hasRefreshToken && (
-                    <button type="button" className="link-action" onClick={() => connectAccount(mcc.id)}>
-                      Connect with Google
-                    </button>
+                  <button type="button" className="link-action" onClick={() => connectAccount(mcc.id)}>
+                    Reconnect
+                  </button>
+                  {mcc.lastSyncError && (
+                    <span className="ads-sync-err" title={mcc.lastSyncError} style={{ maxWidth: 280 }}>
+                      {mcc.lastSyncError}
+                    </span>
                   )}
                   <button
                     type="button"
                     className="link-action"
-                    disabled={!mcc.hasRefreshToken}
-                    title={mcc.hasRefreshToken ? 'Fetch client accounts under this MCC' : 'Connect with Google first'}
+                    disabled={!mcc.hasRefreshToken || accountNeedsReconnect(mcc)}
+                    title={mcc.hasRefreshToken && !accountNeedsReconnect(mcc) ? 'Fetch client accounts under this MCC' : 'Reconnect with Google first'}
                     onClick={async () => {
-                      if (!mcc.hasRefreshToken) {
-                        setError('Connect this MCC with Google first, then refresh children.');
+                      if (!mcc.hasRefreshToken || accountNeedsReconnect(mcc)) {
+                        setError('Reconnect this MCC with Google first, then refresh children.');
                         return;
                       }
                       try {
@@ -581,7 +630,7 @@ export default function AdsAccountsAdmin() {
                       childCount: clients.filter((c) => c.parentMccId === mcc.id).length,
                     })}
                   >
-                    Remove
+                    Disconnect OAuth
                   </button>
                 </div>
               </div>
@@ -639,7 +688,12 @@ export default function AdsAccountsAdmin() {
                       <tbody>
                         {children.map((child) => (
                           <tr key={child.id}>
-                            <td data-label="Child">{child.descriptiveName || formatCustomerId(child.customerId)}</td>
+                            <td data-label="Child">
+                              {child.descriptiveName || formatCustomerId(child.customerId)}
+                              {child.lastSyncError ? (
+                                <div className="ads-sync-err" title={child.lastSyncError}>{child.lastSyncError}</div>
+                              ) : null}
+                            </td>
                             <td className="td-mono" data-label="Customer ID">{formatCustomerId(child.customerId)}</td>
                             <td data-label="In ROI">
                               <label className="ads-check">
@@ -722,8 +776,10 @@ export default function AdsAccountsAdmin() {
                     </label>
                   </td>
                   <td data-label="Status">
-                    <span className={`ads-badge ${a.hasRefreshToken ? 'ok' : 'warn'}`}>
-                      {a.hasRefreshToken ? 'Connected' : 'Needs token'}
+                    <span className={`ads-badge ${accountNeedsReconnect(a) ? 'warn' : 'ok'}`}>
+                      {accountNeedsReconnect(a)
+                        ? (a.hasRefreshToken ? 'Needs reconnect' : 'Needs token')
+                        : 'Connected'}
                     </span>
                     {a.lastSyncError && (
                       <div className="ads-sync-err" title={a.lastSyncError}>{a.lastSyncError}</div>
@@ -732,13 +788,11 @@ export default function AdsAccountsAdmin() {
                   <td className="muted" data-label="Last sync">{formatSyncAt(a.lastSyncAt)}</td>
                   <td data-label="Actions">
                     <div className="row-actions">
-                      {!a.hasRefreshToken && (
-                        <button type="button" className="link-action" onClick={() => connectAccount(a.id)}>
-                          Connect
-                        </button>
-                      )}
+                      <button type="button" className="link-action" onClick={() => connectAccount(a.id)}>
+                        Reconnect
+                      </button>
                       <button type="button" className="link-action danger" onClick={() => removeAccount(a.id)}>
-                        Remove
+                        Disconnect OAuth
                       </button>
                     </div>
                   </td>

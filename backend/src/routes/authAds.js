@@ -6,7 +6,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const router = express.Router();
 const { getAdsOAuthClient, ADS_SCOPE, listAccessibleCustomerIds, fetchCustomerInfo, listMccChildAccounts } = require('../ads/client');
-const { getAccountById, createAccount, updateAccount, upsertChildUnderMcc, getAccountByCustomerId } = require('../models/adsAccountStore');
+const { getAccountById, createAccount, updateAccount, upsertChildUnderMcc, getAccountByCustomerId, clearSyncErrorsForAccountTree } = require('../models/adsAccountStore');
 const { getClientById } = require('../models/clientStore');
 const { createPendingSession, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const { frontendBaseUrl } = require('../utils/frontendUrl');
@@ -230,6 +230,12 @@ router.get('/callback', async (req, res) => {
         const early = await getAccountById(decoded.adsAccountId);
         if (early && early.clientId === gamClient.id) {
           await updateAccount(early.id, { refreshToken });
+          await clearSyncErrorsForAccountTree(early.id);
+          // MCC children sync with the manager token — keep parent MCC token in sync too.
+          if (early.parentMccId) {
+            await updateAccount(early.parentMccId, { refreshToken });
+            await clearSyncErrorsForAccountTree(early.parentMccId);
+          }
         }
       }
 
@@ -257,6 +263,12 @@ router.get('/callback', async (req, res) => {
           customerId: info.customerId || account.customerId,
           descriptiveName: info.descriptiveName || account.descriptiveName,
         });
+        if (account.parentMccId) {
+          await updateAccount(account.parentMccId, { refreshToken });
+          await clearSyncErrorsForAccountTree(account.parentMccId);
+        } else {
+          await clearSyncErrorsForAccountTree(account.id);
+        }
         await grantConnectedAccounts(decoded, gamClient, updated || account);
         return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
       }
@@ -283,6 +295,7 @@ router.get('/callback', async (req, res) => {
             refreshToken,
             ...mccOpts,
           });
+          await clearSyncErrorsForAccountTree(mccAccount?.id || account.id);
           await grantConnectedAccounts(decoded, gamClient, mccAccount);
           return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
         }
@@ -295,6 +308,7 @@ router.get('/callback', async (req, res) => {
           refreshToken,
           ...mccOpts,
         });
+        await clearSyncErrorsForAccountTree(mccAccount.id);
         await grantConnectedAccounts(decoded, gamClient, mccAccount);
         return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected'));
       }
@@ -305,6 +319,7 @@ router.get('/callback', async (req, res) => {
           descriptiveName: individuals[0].descriptiveName,
           refreshToken,
         });
+        await clearSyncErrorsForAccountTree(account.id);
         await grantConnectedAccounts(decoded, gamClient, account);
         return res.redirect(adsOAuthRedirect(decoded, 'ads_oauth=connected_individual'));
       }

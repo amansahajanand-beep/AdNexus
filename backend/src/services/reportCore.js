@@ -3,7 +3,6 @@ const { cache } = require('../gam/client');
 const logger = require('../utils/logger');
 const {
   scopeRowsToUser,
-  applyScopedOverviewSiteTightening,
   trendFromRows,
   buildVisibility,
   canAccessPage,
@@ -48,13 +47,13 @@ const {
   enrichRowsWithCatalogSites,
 } = require('../utils/domainUserAggregate');
 const { readReportRangeFromStore } = require('./reportReadService');
+const { singleflight } = require('../utils/singleflight');
 const {
   rowMatchesInventoryFilters,
   hasInventoryFilters,
   filterRowsByInventory,
   toFilterArray,
   lookupCatalogAdUnitHost,
-  rowMatchesAppFilter,
   inventoryFilterFamilyLabels,
 } = require('../utils/inventoryFilters');
 const { normalizeReportRows, rowsHaveMetrics } = require('../utils/rowNormalize');
@@ -1979,36 +1978,12 @@ function mergeReportRowsByLineKey(primary = [], extra = []) {
   return out;
 }
 
-/** Scoped user overview KPIs — same strict filter path as dashboard Apply Filter on assigned inventory. */
+/** Scoped user overview KPIs — full assignment (domains ∪ sites ∪ apps), same as empty-filter SQL. */
 function prepareScopedOverviewRows(allRows, user) {
   const scope = getUserInventoryScope(user);
   if (!scope) return enrichRowsForInventoryScope(allRows, user);
-
-  // Prefer sites over domains for web; never AND domains+sites+apps (empties KPIs).
-  const invFilters = {};
-  if (scope.sites?.size) invFilters.site = [...scope.sites];
-  else if (scope.domains?.size) invFilters.domain = [...scope.domains];
-  else if (scope.appIds?.size) invFilters.domainId = [...scope.appIds];
-
-  if (!Object.keys(invFilters).length) {
-    return prepareDomainUserRows(allRows, user);
-  }
-
-  let rows = prepareScopedReportRows(allRows, invFilters, user);
-
-  // Domains/sites + apps: add mobile-app rows (web∪app), not network-wide.
-  if ((scope.sites?.size || scope.domains?.size) && scope.appIds?.size) {
-    const siteCtx = buildScopeSiteContextForUser(user);
-    const scoped = scopeRowsToUser(enrichRowsForInventoryScope(allRows, user), user, siteCtx);
-    const appRows = applyScopedOverviewSiteTightening(
-      scoped.filter((row) => isMobileAppRow(row) && rowMatchesAppFilter(row, [...scope.appIds])),
-      user,
-      siteCtx
-    );
-    rows = mergeReportRowsByLineKey(rows, appRows);
-  }
-
-  return rows;
+  // rowMatchesUserScope already ORs web domains/sites and unions apps.
+  return prepareDomainUserRows(allRows, user);
 }
 
 /** Load raw detailed rows — memory → Redis → PostgreSQL → GAM (shared by overview + domain user). */
@@ -2848,10 +2823,33 @@ function emptyDashboardCompatPayload(filters, currency) {
  * compatible dim/metric subset — and flag what could not be combined.
  */
 async function fetchLeanDashboardBundleCompatible(svc, startDate, endDate, baseOpts) {
+  let clientKey = 'x';
+  try {
+    clientKey = require('../utils/clientContext').getClientId() || 'x';
+  } catch (_) { /* no tenant */ }
+  const flightKey = [
+    'dash-bundle',
+    clientKey,
+    startDate,
+    endDate,
+    (baseOpts.domains || []).join(','),
+    (baseOpts.sites || []).join(','),
+    (baseOpts.apps || []).join(','),
+    (baseOpts.adUnitNames || []).join(','),
+    baseOpts.webInventoryOr ? 'or' : 'and',
+    baseOpts.tableGrain || '',
+    baseOpts.groupByApp ? '1' : '0',
+    baseOpts.groupBySite ? '1' : '0',
+  ].join('|');
+  return singleflight(flightKey, () => fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, baseOpts));
+}
+
+async function fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, baseOpts) {
   const hasWeb = (baseOpts.domains?.length || 0)
     || (baseOpts.sites?.length || 0)
     || (baseOpts.adUnitNames?.length || 0)
     || Boolean(baseOpts.groupBySite)
+    || Boolean(baseOpts.forceWebInventory)
     || baseOpts.tableGrain === 'site'
     || baseOpts.tableGrain === 'domain';
   const hasApp = (baseOpts.apps?.length || 0) > 0 || Boolean(baseOpts.groupByApp);
@@ -2890,6 +2888,20 @@ async function fetchLeanDashboardBundleCompatible(svc, startDate, endDate, baseO
     };
   }
   if (appBundle && !webBundle) {
+    const wantsSiteOrDomainDims = Boolean(
+      baseOpts.groupBySite
+      || baseOpts.tableGrain === 'site'
+      || baseOpts.tableGrain === 'domain'
+      || baseOpts.forceWebInventory
+    );
+    // Do not label Domain/Site "incompatible" when those dims were requested —
+    // web often fails only because assigned hosts are missing from dim_site.
+    if (wantsSiteOrDomainDims) {
+      logger.info(
+        `lean compat: web empty with Domain/Site dims ${startDate}..${endDate} — falling through`
+      );
+      return null;
+    }
     const skipped = [];
     if (baseOpts.domains?.length) skipped.push('Domain name');
     if (baseOpts.sites?.length) skipped.push('Site');
@@ -3201,6 +3213,13 @@ async function handleDashboardOverview(req, res) {
     return res.json(body);
   } catch (err) {
     logger.error('Dashboard overview error:', err.message);
+    if (/timeout exceeded when trying to connect|Connection terminated|too many clients/i.test(err.message || '')) {
+      return res.status(503).json({
+        error: 'Database is busy. Please retry in a moment.',
+        code: 'PG_POOL_BUSY',
+        isMock: false,
+      });
+    }
     const { classifyGoogleAuthError } = require('../utils/googleAuthErrors');
     const classified = classifyGoogleAuthError(err);
     if (classified) return res.status(classified.status).json(classified);
@@ -3876,7 +3895,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v27_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = `report_detailed_resp_v30_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4067,6 +4086,19 @@ async function handleDetailedReport(req, res) {
           let scopedRows = stampWarehouseMetricsOnRows(
             rowsForReportBundle(bundle.rows || [], rowFilters, req.user, { sqlTrusted: true })
           );
+          // Default Domain/Site report must not accept DATE-only / unlabeled totals when
+          // the Dashboard lean path can still return inventory breakdown rows.
+          const needsDomainSiteLabels = wantsSiteCol || wantsDomainCol;
+          const hasDomainSiteLabels = scopedRows.some((r) => (
+            String(r.domainName || r.domain || r.gamDomain || '').trim()
+            || String(r.siteUrl || r.siteName || r.gamSite || '').trim()
+          ));
+          if (needsDomainSiteLabels && scopedRows.length && !hasDomainSiteLabels) {
+            logger.info(
+              `Reporting fast skipped — Domain/Site requested but rows lack labels`
+              + ` ${filters.startDate}..${filters.endDate} (falling through to lean)`
+            );
+          } else {
           scopedRows = applyMetricSubstitutionsToRows(
             scopedRows,
             warehouseRewrite.substitutions
@@ -4160,6 +4192,7 @@ async function handleDetailedReport(req, res) {
             + `${warehouseRewrite.composed ? ' composed=1' : ''} in ${Date.now() - t0}ms`
           );
           return res.json(await cacheDetailedResponse(body));
+          }
         }
       } catch (fastErr) {
         logger.warn('Reporting fast path failed, falling back:', fastErr.message);
@@ -4217,6 +4250,18 @@ async function handleDetailedReport(req, res) {
           scopedRows,
           warehouseRewrite.substitutions
         );
+        // Reject app-only / unlabeled totals when Domain or Site columns were requested.
+        const needsDomainSiteLabels = wantsSiteCol || wantsDomainCol;
+        const hasDomainSiteLabels = scopedRows.some((r) => (
+          String(r.domainName || r.domain || r.gamDomain || '').trim()
+          || String(r.siteUrl || r.siteName || r.gamSite || '').trim()
+        ));
+        if (needsDomainSiteLabels && scopedRows.length && !hasDomainSiteLabels) {
+          logger.info(
+            `Reporting lean skipped — Domain/Site requested but rows lack labels`
+            + ` ${filters.startDate}..${filters.endDate} (falling through)`
+          );
+        } else {
         const scopedChild = isScopedChild;
         const scopedSummary = scopedChild
           ? summaryForScopedRows(scopedRows, currency, bundle.summary || {})
@@ -4306,6 +4351,7 @@ async function handleDetailedReport(req, res) {
           + ` in ${Date.now() - t0}ms`
         );
         return res.json(await cacheDetailedResponse(body));
+        } // hasDomainSiteLabels
         } // countryOk
       }
     }

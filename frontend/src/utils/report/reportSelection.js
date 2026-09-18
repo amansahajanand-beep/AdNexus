@@ -83,6 +83,19 @@ export function resolveReportingQuery(applied = {}) {
     if (asFilterArray(applied.country).length && !dims.includes('country_name')) {
       dims = [...dims, 'country_name'];
     }
+    // Country dimension alone should still break down by date × domain × site × country
+    // (Dashboard-like), not collapse to a single DATE×country totals row.
+    if (dims.includes('country_name') || dims.includes('country')) {
+      const appOnly = asFilterArray(applied.domainId).length
+        && !asFilterArray(applied.domain).length
+        && !asFilterArray(applied.site).length
+        && !asFilterArray(applied.domainName).length;
+      if (!appOnly) {
+        if (!dims.includes('date')) dims = ['date', ...dims];
+        if (!dims.includes('domain')) dims = [...dims, 'domain'];
+        if (!dims.includes('site_name')) dims = [...dims, 'site_name'];
+      }
+    }
     // App-only inventory: drop sticky default Domain/Site so we stay on app_id×country.
     if (
       asFilterArray(applied.domainId).length
@@ -96,9 +109,9 @@ export function resolveReportingQuery(applied = {}) {
       if (!dims.includes('date')) dims = ['date', ...dims];
     }
     return {
-      dims,
+      dims: [...new Set(dims)],
       mets: userMets.length ? userMets : [...DEFAULT_REPORT_METRICS],
-      tableDims: dims,
+      tableDims: [...new Set(dims)],
     };
   }
 

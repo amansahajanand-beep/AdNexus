@@ -16,8 +16,28 @@ const pool = new Pool({
   // Sync jobs + API share this pool — leave headroom for Dashboard reads during sync.
   max: parseInt(process.env.PG_POOL_MAX || '40', 10),
   idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '60000', 10),
+  // Fail fast when saturated — 60s waits jam the UI and amplify stampedes.
+  connectionTimeoutMillis: parseInt(process.env.PG_CONNECT_TIMEOUT_MS || '10000', 10),
 });
+
+/** True when the pool is nearly exhausted (not a single transient waiter). */
+function isPoolSaturated() {
+  const max = pool.options?.max || 40;
+  const waiting = pool.waitingCount || 0;
+  const idle = pool.idleCount || 0;
+  const total = pool.totalCount || 0;
+  // Require a real backlog — waiting===1 with idle connections is normal under load.
+  return waiting >= 5 || (total >= Math.max(2, max - 2) && idle === 0);
+}
+
+function poolStats() {
+  return {
+    total: pool.totalCount || 0,
+    idle: pool.idleCount || 0,
+    waiting: pool.waitingCount || 0,
+    max: pool.options?.max || 40,
+  };
+}
 
 function formatPgError(err) {
   if (!err) return 'unknown error';
@@ -49,9 +69,11 @@ pool.query('SELECT 1').then(() => {
 /**
  * Run a query. Returns { rows, rowCount }.
  * Sets app.client_id so FORCE RLS isolates each tenant's report rows.
+ * opts.statementTimeoutMs — optional per-call statement_timeout (dashboard reads).
  */
-async function query(sql, params = []) {
+async function query(sql, params = [], opts = {}) {
   const client = await pool.connect();
+  const timeoutMs = parseInt(opts.statementTimeoutMs, 10) || 0;
   try {
     let clientId = null;
     try {
@@ -62,8 +84,14 @@ async function query(sql, params = []) {
     } else {
       await client.query(`SELECT set_config('app.client_id', '', false)`);
     }
+    if (timeoutMs > 0) {
+      await client.query(`SET statement_timeout = ${timeoutMs}`);
+    }
     return await client.query(sql, params);
   } finally {
+    if (timeoutMs > 0) {
+      try { await client.query('SET statement_timeout = 0'); } catch (_) { /* ignore */ }
+    }
     try {
       await client.query(`SELECT set_config('app.client_id', '', false)`);
     } catch (_) { /* ignore */ }
@@ -822,12 +850,32 @@ async function finishTenantBackfill() {
 
 /**
  * Add report_grain.slice_key + metrics JSONB after listen.
- * Uses one pooled client so lock_timeout actually applies to the ALTER.
+ * Skips ALTER when columns already exist (avoids lock fights with dashboard reads).
  */
 async function ensureGrainMetricsColumn() {
+  try {
+    const { rows } = await schemaQuery(
+      `SELECT column_name
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = 'report_grain'
+         AND column_name IN ('slice_key', 'metrics')`
+    );
+    const have = new Set((rows || []).map((r) => r.column_name));
+    if (have.has('slice_key') && have.has('metrics')) {
+      try {
+        const { upsertGrainBatch } = require('./services/reportGrainStore');
+        if (upsertGrainBatch) upsertGrainBatch._metricsColReady = true;
+      } catch (_) { /* circular / not loaded */ }
+      return;
+    }
+  } catch (e) {
+    logger.warn('report_grain column probe failed:', e.message);
+  }
+
   const client = await pool.connect();
   try {
-    await client.query(`SET lock_timeout = '15s'`);
+    await client.query(`SET lock_timeout = '3s'`);
     await client.query(`ALTER TABLE report_grain ADD COLUMN IF NOT EXISTS slice_key TEXT NOT NULL DEFAULT ''`);
     await client.query(`ALTER TABLE report_grain ADD COLUMN IF NOT EXISTS metrics JSONB DEFAULT '{}'::jsonb`);
     logger.info('report_grain.metrics column ready');
@@ -849,5 +897,7 @@ module.exports = {
   initSchema,
   finishTenantBackfill,
   ensureGrainMetricsColumn,
+  isPoolSaturated,
+  poolStats,
   pool,
 };

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useOutletContext, useSearchParams } from 'react-router-dom';
+import { useDispatch, useSelector } from 'react-redux';
+import { useOutletContext, useSearchParams, Link } from 'react-router-dom';
 import PageHeader from '../components/ui/PageHeader';
 import RoiCountryTreeTable from '../components/roi/RoiCountryTreeTable';
 import RoiSummaryBoards from '../components/roi/RoiSummaryBoards';
@@ -31,6 +32,8 @@ import {
   clampDateValue,
 } from '../utils/dateRestriction';
 import { useAuth } from '../store/useAuth';
+import { saveReportPage } from '../store/slices/reportSlice';
+import { isReportCacheFresh, slimRoiForCache } from '../hooks/useReportPageCache';
 import { nowTimeInTZ } from '../utils/datetime';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
 import { useMedia } from '../hooks/useMedia';
@@ -59,6 +62,7 @@ import {
 } from '../utils/report/roiView';
 
 const ROI_TIP_KEY = 'adnexus.guide.roi.v1';
+const ROI_POLL_MS = 30 * 60 * 1000;
 
 function money(n, currency = 'USD') {
   return formatRoiMoney(n, currency);
@@ -82,8 +86,40 @@ function emptyExpenseSlot() {
   };
 }
 
+function defaultRoiApplied(user, todayInit) {
+  const r = clampPresetRange('today', getDateRestriction(user));
+  return {
+    startDate: r?.startDate || todayInit.startDate,
+    endDate: r?.endDate || todayInit.endDate,
+    targetType: 'all',
+    accountIds: null,
+    campaignIds: null,
+    appKeys: null,
+    siteKeys: null,
+    countryCodes: null,
+  };
+}
+
+function roiLoadKeyFromApplied(applied, userId) {
+  return JSON.stringify({
+    startDate: applied?.startDate || null,
+    endDate: applied?.endDate || null,
+    targetType: applied?.targetType || 'all',
+    accountIds: applied?.accountIds || null,
+    campaignIds: applied?.campaignIds || null,
+    appKeys: applied?.appKeys || null,
+    siteKeys: applied?.siteKeys || null,
+    countryCodes: applied?.countryCodes || null,
+    userId: userId || null,
+  });
+}
+
 export default function Roi() {
+  const dispatch = useDispatch();
   const { user } = useAuth();
+  const savedRaw = useSelector((s) => s.reports?.roi);
+  const saved = (!savedRaw?.userId || savedRaw.userId === user?.id) ? savedRaw : null;
+  const cacheFresh = isReportCacheFresh(saved, ROI_POLL_MS);
   const outlet = useOutletContext() || {};
   const networkInfo = outlet.networkInfo;
   const [searchParams] = useSearchParams();
@@ -95,49 +131,54 @@ export default function Roi() {
   );
   const todayInit = useMemo(() => defaultReportRangeForUser(user), [user]);
 
-  const [preset, setPreset] = useState('today');
-  const [startDate, setStartDate] = useState(() => {
-    const r = clampPresetRange('today', getDateRestriction(user));
-    return r?.startDate || todayInit.startDate;
-  });
-  const [endDate, setEndDate] = useState(() => {
-    const r = clampPresetRange('today', getDateRestriction(user));
-    return r?.endDate || todayInit.endDate;
-  });
-  const [applied, setApplied] = useState(() => {
-    const r = clampPresetRange('today', getDateRestriction(user));
-    return {
-      startDate: r?.startDate || todayInit.startDate,
-      endDate: r?.endDate || todayInit.endDate,
-      targetType: 'all',
-      accountIds: null,
-      campaignIds: null,
-      appKeys: null,
-      siteKeys: null,
-      countryCodes: null,
-    };
-  });
-  const [filterAccountIds, setFilterAccountIds] = useState(() => toAllSelection());
-  const [filterCampaignIds, setFilterCampaignIds] = useState(() => toAllSelection());
-  const [filterAppKeys, setFilterAppKeys] = useState(() => toAllSelection());
-  const [filterSiteKeys, setFilterSiteKeys] = useState([]);
-  const [filterCountryCodes, setFilterCountryCodes] = useState(() => toAllSelection());
-  const [roiAccountOptions, setRoiAccountOptions] = useState([]);
-  const [roiCampaignOptions, setRoiCampaignOptions] = useState([]);
-  const [roiAppOptions, setRoiAppOptions] = useState([]);
-  const [roiCountryOptions, setRoiCountryOptions] = useState([]);
-  const [roiSiteOptions, setRoiSiteOptions] = useState([]);
+  const [preset, setPreset] = useState(() => saved?.preset ?? 'today');
+  const [startDate, setStartDate] = useState(() => (
+    saved?.startDate || saved?.applied?.startDate
+    || clampPresetRange('today', getDateRestriction(user))?.startDate
+    || todayInit.startDate
+  ));
+  const [endDate, setEndDate] = useState(() => (
+    saved?.endDate || saved?.applied?.endDate
+    || clampPresetRange('today', getDateRestriction(user))?.endDate
+    || todayInit.endDate
+  ));
+  const [applied, setApplied] = useState(() => (
+    saved?.applied && saved.applied.startDate
+      ? saved.applied
+      : defaultRoiApplied(user, todayInit)
+  ));
+  const [filterAccountIds, setFilterAccountIds] = useState(() => (
+    saved?.filterAccountIds?.length ? saved.filterAccountIds : toAllSelection()
+  ));
+  const [filterCampaignIds, setFilterCampaignIds] = useState(() => (
+    saved?.filterCampaignIds?.length ? saved.filterCampaignIds : toAllSelection()
+  ));
+  const [filterAppKeys, setFilterAppKeys] = useState(() => (
+    saved?.filterAppKeys?.length ? saved.filterAppKeys : toAllSelection()
+  ));
+  const [filterSiteKeys, setFilterSiteKeys] = useState(() => saved?.filterSiteKeys || []);
+  const [filterCountryCodes, setFilterCountryCodes] = useState(() => (
+    saved?.filterCountryCodes?.length ? saved.filterCountryCodes : toAllSelection()
+  ));
+  const [roiAccountOptions, setRoiAccountOptions] = useState(() => saved?.roiAccountOptions || []);
+  const [roiCampaignOptions, setRoiCampaignOptions] = useState(() => saved?.roiCampaignOptions || []);
+  const [roiAppOptions, setRoiAppOptions] = useState(() => saved?.roiAppOptions || []);
+  const [roiCountryOptions, setRoiCountryOptions] = useState(() => saved?.roiCountryOptions || []);
+  const [roiSiteOptions, setRoiSiteOptions] = useState(() => saved?.roiSiteOptions || []);
   const [roiSitesLoading, setRoiSitesLoading] = useState(false);
   const [roiCampaignsLoading, setRoiCampaignsLoading] = useState(false);
   const [roiCampaignsFallback, setRoiCampaignsFallback] = useState(false);
   const [roiAppsLoading, setRoiAppsLoading] = useState(false);
   const [roiCountriesLoading, setRoiCountriesLoading] = useState(false);
   const [roiCountriesFallback, setRoiCountriesFallback] = useState(false);
-  const [data, setData] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [breakdownLoading, setBreakdownLoading] = useState(false);
+  const [data, setData] = useState(() => (cacheFresh || saved?.data ? saved?.data : null) ?? null);
+  const [loading, setLoading] = useState(() => !saved?.data);
+  const [breakdownLoading, setBreakdownLoading] = useState(() => (
+    !saved?.data?.countryTargetBreakdown?.length && !saved?.data?.countryBreakdown?.length
+  ));
   const [error, setError] = useState(null);
-  const [lastUpdated, setLastUpdated] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(() => saved?.lastUpdated ?? null);
+  const [fetchedAt, setFetchedAt] = useState(() => saved?.fetchedAt ?? null);
   const [filtersOpen, setFiltersOpen] = useState(true);
 
   const [compareMode, setCompareMode] = useState(() => loadComparePrefs(user?.id).mode);
@@ -145,6 +186,7 @@ export default function Roi() {
   const [compareEnd, setCompareEnd] = useState(() => loadComparePrefs(user?.id).endDate);
   const [priorSummary, setPriorSummary] = useState(null);
   const [thresholdBanners, setThresholdBanners] = useState([]);
+  const [adsSyncHealth, setAdsSyncHealth] = useState(null);
   const [showRoiTip, setShowRoiTip] = useState(() => {
     try {
       return localStorage.getItem(ROI_TIP_KEY) !== 'done';
@@ -177,6 +219,19 @@ export default function Roi() {
   const skipPrefsSaveRef = useRef(true);
   const loadAbortRef = useRef(null);
   const breakdownAbortRef = useRef(null);
+  const dataRef = useRef(data);
+  const savedLoadKeyRef = useRef(saved?.loadKey || null);
+  const skipLoadRef = useRef(Boolean(
+    cacheFresh
+    && saved?.data
+    && saved?.loadKey
+    && saved.loadKey === roiLoadKeyFromApplied(saved.applied || applied, user?.id)
+  ));
+  const staleSilentRoiRef = useRef(Boolean(saved?.data && saved?.fetchedAt && !cacheFresh));
+
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
 
   useEffect(() => {
     try {
@@ -372,29 +427,22 @@ export default function Roi() {
     };
   }, []);
 
-  const loadKey = useMemo(() => JSON.stringify({
-    startDate: applied?.startDate || null,
-    endDate: applied?.endDate || null,
-    targetType: applied?.targetType || 'all',
-    accountIds: applied?.accountIds || null,
-    campaignIds: applied?.campaignIds || null,
-    appKeys: applied?.appKeys || null,
-    siteKeys: applied?.siteKeys || null,
-    countryCodes: applied?.countryCodes || null,
-    userId: user?.id || null,
-  }), [
-    applied?.startDate,
-    applied?.endDate,
-    applied?.targetType,
-    applied?.accountIds,
-    applied?.campaignIds,
-    applied?.appKeys,
-    applied?.siteKeys,
-    applied?.countryCodes,
-    user?.id,
-  ]);
+  const loadKey = useMemo(
+    () => roiLoadKeyFromApplied(applied, user?.id),
+    [
+      applied?.startDate,
+      applied?.endDate,
+      applied?.targetType,
+      applied?.accountIds,
+      applied?.campaignIds,
+      applied?.appKeys,
+      applied?.siteKeys,
+      applied?.countryCodes,
+      user?.id,
+    ]
+  );
 
-  const load = useCallback(async (range = applied) => {
+  const load = useCallback(async (range = applied, { silent = false } = {}) => {
     if (!range?.startDate || !range?.endDate) return;
     if (loadAbortRef.current) loadAbortRef.current.abort();
     if (breakdownAbortRef.current) breakdownAbortRef.current.abort();
@@ -404,8 +452,13 @@ export default function Roi() {
     loadAbortRef.current = controller;
     breakdownAbortRef.current = bdController;
 
-    setLoading(true);
-    setBreakdownLoading(true);
+    const hasCached = Boolean(dataRef.current?.summary)
+      || Boolean(dataRef.current?.countryTargetBreakdown?.length)
+      || Boolean(dataRef.current?.countryBreakdown?.length);
+    if (!silent && !hasCached) {
+      setLoading(true);
+      setBreakdownLoading(true);
+    }
     setError(null);
 
     const buildParams = (extra = {}) => {
@@ -437,6 +490,7 @@ export default function Roi() {
         summaryOk = true;
         setData((prev) => mergeRoiSummaryPayload(prev, fast));
         setLastUpdated(nowTimeInTZ());
+        setFetchedAt(Date.now());
         setThresholdBanners(evaluateRoiThresholds(fast?.summary || fast || {}));
         setLoading(false);
         return fast;
@@ -459,6 +513,7 @@ export default function Roi() {
         setBreakdownLoading(false);
         // Overview can paint from table totals immediately.
         setLoading(false);
+        setFetchedAt(Date.now());
         return breakdown;
       })
       .catch((err) => {
@@ -479,8 +534,10 @@ export default function Roi() {
           summaryErr || breakdownErr,
           'Could not load ROI summary.'
         ));
-        setData(null);
-        setThresholdBanners([]);
+        if (!hasCached) {
+          setData(null);
+          setThresholdBanners([]);
+        }
       } else if (!summaryOk && summaryErr) {
         setError(getUserFacingMessage(summaryErr, 'Could not load ROI overview cards.'));
       } else {
@@ -492,10 +549,73 @@ export default function Roi() {
     }
   }, [applied]);
 
-  useEffect(() => { load(); }, [loadKey, load]);
+  useEffect(() => {
+    if (skipLoadRef.current && loadKey === savedLoadKeyRef.current) {
+      skipLoadRef.current = false;
+      setLoading(false);
+      setBreakdownLoading(false);
+      return;
+    }
+    skipLoadRef.current = false;
+    if (staleSilentRoiRef.current && dataRef.current) {
+      staleSilentRoiRef.current = false;
+      load(applied, { silent: true });
+      return;
+    }
+    load();
+  }, [loadKey, load, applied]);
+
+  useEffect(() => {
+    if (!data) return;
+    dispatch(saveReportPage({
+      pageKey: 'roi',
+      payload: {
+        userId: user?.id,
+        data: slimRoiForCache(data),
+        applied,
+        loadKey,
+        fetchedAt: fetchedAt || Date.now(),
+        lastUpdated,
+        preset,
+        startDate,
+        endDate,
+        filterAccountIds,
+        filterCampaignIds,
+        filterAppKeys,
+        filterSiteKeys,
+        filterCountryCodes,
+        roiAccountOptions,
+        roiCampaignOptions,
+        roiAppOptions,
+        roiCountryOptions,
+        roiSiteOptions,
+      },
+    }));
+  }, [
+    dispatch, user?.id, data, applied, loadKey, fetchedAt, lastUpdated,
+    preset, startDate, endDate,
+    filterAccountIds, filterCampaignIds, filterAppKeys, filterSiteKeys, filterCountryCodes,
+    roiAccountOptions, roiCampaignOptions, roiAppOptions, roiCountryOptions, roiSiteOptions,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const health = await adsAPI.syncHealth();
+        if (!cancelled) setAdsSyncHealth(health);
+      } catch {
+        if (!cancelled) setAdsSyncHealth(null);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [user?.id, lastUpdated]);
 
   // Clear ROI payload when switching users so stale overview/table never linger.
+  const prevRoiUserIdRef = useRef(user?.id);
   useEffect(() => {
+    if (prevRoiUserIdRef.current === user?.id) return;
+    prevRoiUserIdRef.current = user?.id;
     setData(null);
     setPriorSummary(null);
     setRoiAccountOptions([]);
@@ -507,7 +627,9 @@ export default function Roi() {
     setThresholdBanners([]);
     setLoading(false);
     setBreakdownLoading(false);
-  }, [user?.id]);
+    setFetchedAt(null);
+    dispatch(saveReportPage({ pageKey: 'roi', payload: null }));
+  }, [user?.id, dispatch]);
 
   useEffect(() => {
     setCountryPage(1);
@@ -1489,6 +1611,39 @@ export default function Roi() {
           </div>
         )}
       </div>
+
+      {adsSyncHealth?.needsReconnect || (adsSyncHealth?.otherProblems || []).length > 0 ? (
+        <div className="warn-card warn-card-partial" role="alert" style={{ marginTop: 12 }}>
+          <div className="warn-card-main" style={{ gridTemplateColumns: '1fr' }}>
+            <div className="warn-card-left" style={{ borderRight: 'none' }}>
+              <div className="warn-card-icon-wrap"><span aria-hidden>!</span></div>
+              <div className="warn-card-body">
+                <div className="warn-card-title">
+                  {adsSyncHealth.needsReconnect
+                    ? 'Google Ads connection needs reconnect'
+                    : 'Google Ads sync reported errors'}
+                </div>
+                <div className="warn-card-desc">
+                  {adsSyncHealth.instruction || 'Open Google Ads accounts to review sync errors.'}
+                  {(adsSyncHealth.authProblems || adsSyncHealth.otherProblems || []).slice(0, 3).map((p) => (
+                    <div key={p.id} className="ads-sync-err" style={{ maxWidth: '100%', marginTop: 8 }} title={p.lastSyncError}>
+                      {p.descriptiveName || p.customerId}: {p.lastSyncError || 'Needs reconnect'}
+                    </div>
+                  ))}
+                </div>
+                <div className="warn-card-btns">
+                  <Link
+                    className="warn-btn-primary"
+                    to={adsSyncHealth.fixPath || (user?.role === 'domain_user' ? '/my-ads' : '/admin?tab=ads')}
+                  >
+                    {adsSyncHealth.needsReconnect ? 'Fix in Google Ads accounts' : 'Open Google Ads accounts'}
+                  </Link>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {error && <div className="login-error" style={{ marginTop: 12 }}>{error}</div>}
 

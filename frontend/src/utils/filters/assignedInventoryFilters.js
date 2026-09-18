@@ -30,11 +30,9 @@ export function hasInventoryFilterSelection(applied) {
 export function buildAssignedInventoryFilters(user) {
   if (isAdmin(user) || !hasAssignedInventory(user)) return { ...EMPTY_INVENTORY_FILTERS };
   const scope = getAssignedInventoryScope(user);
-  // Prefer sites over domains when both are assigned — sending both as AND filters
-  // empties Dashboard/Reporting. Apps stay separate (backend unions web|app).
-  const hasSites = scope.allowedSites.length > 0;
+  // Send full assignment — backend ORs domains∪sites and unions apps (never prefer sites-only).
   return {
-    domain: hasSites ? [] : [...scope.allowedDomains],
+    domain: [...scope.allowedDomains],
     site: [...scope.allowedSites],
     domainName: [],
     domainId: [...scope.allowedAppIds],

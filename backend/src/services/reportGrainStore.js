@@ -548,51 +548,7 @@ async function fetchGrainLeanRowsFromDB(startDate, endDate, opts = {}) {
   if ((opts.apps || []).length) await ensureAppAliasMapsWarm();
   const clientId = requireClientId();
   const params = [clientId, startDate, endDate];
-  let extra = '';
-
-  const { sanitizeInventoryFilters, MAX_INVENTORY_FILTER_VALUES } = require('../utils/inventoryFilters');
-  const safeOpts = sanitizeInventoryFilters({
-    domain: opts.domains,
-    site: opts.sites,
-    domainName: opts.adUnitNames,
-    domainId: opts.apps,
-  });
-
-  const adUnitNames = (safeOpts.domainName || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-  const domains = (safeOpts.domain || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-  const sites = (safeOpts.site || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-  const apps = (safeOpts.domainId || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-  const countryNames = (opts.countryNames || []).map((s) => String(s).trim().toLowerCase()).filter(Boolean);
-
-  if (adUnitNames.length) {
-    params.push(adUnitNames);
-    extra += ` AND LOWER(COALESCE(da.name, '')) = ANY($${params.length}::text[])`;
-  }
-  if (domains.length) {
-    params.push(domains);
-    extra += ` AND ${grainDomainExprSql()} = ANY($${params.length}::text[])`;
-  }
-  if (sites.length) {
-    params.push(sites);
-    extra += ` AND LOWER(COALESCE(ds.name, '')) = ANY($${params.length}::text[])`;
-  }
-  if (apps.length) {
-    const expanded = expandedAppFilterValues(apps);
-    if (expanded.length) {
-      params.push(expanded);
-      extra += ` AND (LOWER(COALESCE(g.app_id, '')) = ANY($${params.length}::text[])
-        OR LOWER(COALESCE(g.app_name, '')) = ANY($${params.length}::text[]))`;
-    } else {
-      extra += ' AND FALSE';
-    }
-  }
-  if (countryNames.length) {
-    params.push(countryNames);
-    extra += ` AND LOWER(COALESCE(dc.name, '')) = ANY($${params.length}::text[])`;
-  }
-  if (opts.kpiSliceOnly) {
-    extra += ` AND ${kpiSliceFilterSql('g')}`;
-  }
+  const extra = appendGrainInventoryFilters(params, '', opts);
 
   const leanSelect = `
        to_char(g.report_date, 'YYYY-MM-DD') AS report_date,
@@ -677,23 +633,20 @@ function appendGrainInventoryFilters(params, extra, opts = {}) {
     params.push(adUnitNames);
     clause += ` AND LOWER(COALESCE(da.name, '')) = ANY($${params.length}::text[])`;
   }
-  if (domains.length) {
-    params.push(domains);
-    // Match canonical domain, dim name, ad-unit root, or site-host root so
-    // mis-tagged DOMAIN rows for gamisco (etc.) still resolve correctly.
-    clause += ` AND (
-      ${domainExpr} = ANY($${params.length}::text[])
-      OR LOWER(COALESCE(dm.name, '')) = ANY($${params.length}::text[])
+
+  const domainMatchSql = (idx) => `(
+      ${domainExpr} = ANY($${idx}::text[])
+      OR LOWER(COALESCE(dm.name, '')) = ANY($${idx}::text[])
       OR LOWER(SPLIT_PART(REGEXP_REPLACE(COALESCE(da.name, ''), '\\s*\\(\\d+\\)\\s*$', ''), '_', 1))
-           = ANY($${params.length}::text[])
+           = ANY($${idx}::text[])
       OR NULLIF(LOWER(SUBSTRING(TRIM(COALESCE(ds.name, '')) FROM '[^.]+\\.[^.]+$')), '')
-           = ANY($${params.length}::text[])
+           = ANY($${idx}::text[])
     )`;
-  }
-  if (sites.length) {
+
+  const expandSites = (list) => {
     const expanded = [];
     const seen = new Set();
-    for (const raw of sites) {
+    for (const raw of list) {
       const s = String(raw || '').trim().toLowerCase();
       if (!s || seen.has(s)) continue;
       seen.add(s);
@@ -709,9 +662,27 @@ function appendGrainInventoryFilters(params, extra, opts = {}) {
         }
       }
     }
-    params.push(expanded);
-    clause += ` AND LOWER(COALESCE(ds.name, '')) = ANY($${params.length}::text[])`;
+    return expanded;
+  };
+
+  // Domain ∪ Site for scoped assignment (webInventoryOr); otherwise Domain ∩ Site.
+  const webParts = [];
+  if (domains.length) {
+    params.push(domains);
+    webParts.push(domainMatchSql(params.length));
   }
+  if (sites.length) {
+    params.push(expandSites(sites));
+    webParts.push(`LOWER(COALESCE(ds.name, '')) = ANY($${params.length}::text[])`);
+  }
+  if (webParts.length === 1) {
+    clause += ` AND ${webParts[0]}`;
+  } else if (webParts.length > 1) {
+    clause += opts.webInventoryOr
+      ? ` AND (${webParts.join(' OR ')})`
+      : ` AND ${webParts[0]} AND ${webParts[1]}`;
+  }
+
   if (apps.length) {
     const expanded = expandedAppFilterValues(apps);
     if (expanded.length) {

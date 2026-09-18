@@ -39,7 +39,11 @@ function formatAdsSyncError(err) {
   const first = err.errors?.[0];
   const authCode = first?.error_code?.authorization_error;
   const msg = first?.message || err.details || err.message;
+  const blob = `${msg || ''} ${err.reason || ''} ${err.response?.data?.error || ''} ${err.response?.data?.error_description || ''}`;
 
+  if (/invalid_grant|unauthorized_client|Token has been expired or revoked|invalid refresh token/i.test(blob)) {
+    return 'Google Ads refresh token is invalid or revoked (invalid_grant). Open Admin → Google Ads accounts (or My Ads), click Reconnect on the manager (MCC) account — do not remove the account (spend history is kept). Then Sync spend.';
+  }
   if (
     /only approved for use with test accounts|Basic or Standard access/i.test(String(msg || ''))
     || authCode === 10
@@ -72,6 +76,11 @@ function formatAdsSyncError(err) {
   } catch {
     return 'Ads sync failed';
   }
+}
+
+function isAdsAuthSyncError(message) {
+  return /invalid_grant|refresh token|reconnect|oauth disconnected|unauthorized_client|oauth scope|authentication|authorization_error|Needs token/i
+    .test(String(message || ''));
 }
 
 async function resolveRefreshForAccount(account) {
@@ -419,6 +428,7 @@ module.exports = {
   backfillAccountAppIds,
   resolveRefreshForAccount,
   formatAdsSyncError,
+  isAdsAuthSyncError,
   adsSyncRoiOnly,
   adsTodayAccountBatch,
 };

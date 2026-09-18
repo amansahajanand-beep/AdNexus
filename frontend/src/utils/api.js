@@ -254,6 +254,7 @@ export const clientsAPI = {
 
 export const adsAPI = {
   listAccounts: () => FAST_API.get('/ads/accounts'),
+  syncHealth: () => FAST_API.get('/ads/sync-health'),
   mccOauthUrl: () => FAST_API.post('/ads/accounts/mcc/oauth-url'),
   oauthPending: (id) => FAST_API.get(`/ads/oauth/pending/${id}`),
   oauthSelect: (id, payload) => FAST_API.post(`/ads/oauth/pending/${id}/select`, payload),

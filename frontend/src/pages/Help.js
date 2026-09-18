@@ -211,6 +211,7 @@ export default function Help() {
             <ul className="help-bullets">
               <li><strong>Admins:</strong> Admin → Google Ads accounts → Connect with Google → pick MCC or client → Sync spend. Toggle Include in ROI on partner accounts.</li>
               <li><strong>Domain users:</strong> Google Ads in the sidebar → Connect with Google → select account → Sync spend. Disconnect only removes it from your ROI view.</li>
+              <li><strong>invalid_grant / expired login:</strong> Click <strong>Reconnect</strong> on the manager (MCC) — do not remove the account. Disconnect OAuth clears login only; synced spend is kept.</li>
               <li>GAM network connection (Admin → client settings) is separate from Ads OAuth.</li>
             </ul>
           </section>

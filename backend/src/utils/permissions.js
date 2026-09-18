@@ -254,9 +254,11 @@ function listCoversScopeSet(values, set) {
  *
  * Rules:
  * - Clamp any request values to the user's assignment
- * - If the request is empty: sites > domains for web, plus apps (compat-union handles web|app)
- * - If request includes full assigned domains AND full assigned sites: keep sites only
- * - Drop oversized lists (LIKE ANY hangs); prefer sites, then capped domains
+ * - If the request is empty (or UI "All selected" collapsed to []): expand to full
+ *   assigned domains ∪ sites ∪ apps, with domain|site OR (webInventoryOr)
+ * - If both domain and site filters are present for a scoped child: OR them
+ *   (matches JS rowMatchesScopedInventoryFilter). Apps stay separate (compat-union).
+ * - Cap oversized lists (LIKE ANY hangs)
  */
 function resolveScopedSqlInventoryOpts(user, filters = {}) {
   const { MAX_INVENTORY_FILTER_VALUES } = require('./inventoryFilters');
@@ -284,21 +286,11 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
   let adUnitNames = reqAdUnits;
 
   if (!anyRequest) {
-    domains = [];
-    sites = [];
-    apps = [];
+    // Empty / "All selected" collapsed to [] → full assignment (domains ∪ sites ∪ apps).
+    domains = scope.domains?.size ? [...scope.domains] : [];
+    sites = scope.sites?.size ? [...scope.sites] : [];
+    apps = scope.appIds?.size ? [...scope.appIds] : [];
     adUnitNames = [];
-    if (scope.sites?.size) sites = [...scope.sites];
-    else if (scope.domains?.size) domains = [...scope.domains];
-    if (scope.appIds?.size) apps = [...scope.appIds];
-  } else if (
-    domains.length
-    && sites.length
-    && listCoversScopeSet(domains, scope.domains)
-    && listCoversScopeSet(sites, scope.sites)
-  ) {
-    // Full domain+site assignment applied together — prefer sites (more specific).
-    domains = [];
   }
 
   // Never leave apps unconstrained for children with App ID assignments — otherwise
@@ -307,12 +299,9 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
     apps = [...scope.appIds];
   }
 
-  // Domains/sites use LIKE ANY and hang when huge; prefer sites, cap domains.
-  // Apps use equality ANY — still cap so sanitizeInventoryFilters does not wipe them to []
-  // (oversized lists are treated as "All", which would leak network-wide SQL to children).
+  // Domains/sites use LIKE ANY and hang when huge; cap each list (keep both for OR).
   if (sites.length > max) sites = sites.slice(0, max);
-  if (!sites.length && domains.length > max) domains = domains.slice(0, max);
-  if (sites.length && domains.length > max) domains = [];
+  if (domains.length > max) domains = domains.slice(0, max);
   if (apps.length > max) apps = apps.slice(0, max);
 
   return {
@@ -320,9 +309,8 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
     sites,
     apps,
     adUnitNames,
-    // Explicit Domain+Site picks use GAM intersection (AND). OR only when expanding
-    // full assignment with no request (legacy empty-filter scope path).
-    webInventoryOr: !anyRequest && domains.length > 0 && sites.length > 0,
+    // Scoped Domain+Site → OR (same as JS scoped inventory matcher). Apps union separately.
+    webInventoryOr: domains.length > 0 && sites.length > 0,
     // Equality on inv_* — LIKE '%domain%' made Site filter equal Domain-wide.
     skipAdUnitLike: true,
   };

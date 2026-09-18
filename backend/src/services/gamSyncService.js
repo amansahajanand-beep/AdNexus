@@ -26,8 +26,27 @@ const { parseGamMetricValue, gamMoneyToDollars, coerceWarehouseRevenue, pickRowR
  *   report_archive_manifest — S3 cold storage index (365+ days)
  */
 const crypto  = require('crypto');
-const { query } = require('../db');
+const { query, isPoolSaturated, poolStats } = require('../db');
 const { requireClientId, tenantKey, getClientId } = require('../utils/clientContext');
+const { singleflight } = require('../utils/singleflight');
+
+/** Cap concurrent grain overview scans so they cannot empty the PG pool. */
+const GRAIN_OVERVIEW_MAX = Math.max(1, parseInt(process.env.GRAIN_OVERVIEW_MAX || '4', 10) || 4);
+const OVERVIEW_READ_TIMEOUT_MS = Math.max(
+  3000,
+  parseInt(process.env.OVERVIEW_STATEMENT_TIMEOUT_MS || '12000', 10) || 12000
+);
+let grainOverviewActive = 0;
+
+function beginGrainOverview() {
+  if (grainOverviewActive >= GRAIN_OVERVIEW_MAX || isPoolSaturated()) return false;
+  grainOverviewActive += 1;
+  return true;
+}
+
+function endGrainOverview() {
+  grainOverviewActive = Math.max(0, grainOverviewActive - 1);
+}
 const {
   redisDel, redisDelByPattern, bumpCacheGeneration, TTL, redisGet, redisSet, MAX_REDIS_ARRAY_ITEMS,
 } = require('../redisClient');
@@ -612,42 +631,53 @@ async function resolveGrainClientId() {
 async function fetchAppSliceOverviewFromGrain(startDate, endDate, opts = {}) {
   const apps = (opts.apps || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   if (!apps.length) return null;
-  const clientId = await resolveGrainClientId();
-  const params = [clientId, startDate, endDate];
-  let appClause = sqlAppMatchClause(
-    params,
-    apps,
-    `LOWER(COALESCE(NULLIF(g.app_id, ''), g.app_name, ''))`,
-    `LOWER(COALESCE(da.name, ''))`
-  );
-  if (!appClause) return null;
+  if (!beginGrainOverview()) {
+    logger.warn(
+      `Overview app grain skipped — pool busy active=${grainOverviewActive} ${JSON.stringify(poolStats())}`
+    );
+    return null;
+  }
+  try {
+    const clientId = await resolveGrainClientId();
+    const params = [clientId, startDate, endDate];
+    let appClause = sqlAppMatchClause(
+      params,
+      apps,
+      `LOWER(COALESCE(NULLIF(g.app_id, ''), g.app_name, ''))`,
+      `LOWER(COALESCE(da.name, ''))`
+    );
+    if (!appClause) return null;
 
-  const { rows } = await query(
-    `SELECT
-       COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
-       COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
-       COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
-       COUNT(*)::int AS row_count
-     ${require('./reportGrainStore').GRAIN_JOIN_SQL}
-     WHERE g.client_id = $1::uuid
-       AND g.report_date BETWEEN $2::date AND $3::date
-       AND g.slice_key = 'app_id'
-       ${appClause}`,
-    params
-  );
-  const t = rows[0] || {};
-  const impressions = Number(t.impressions) || 0;
-  const revenue = coerceWarehouseRevenue(t.revenue, impressions);
-  const viewableWeight = Number(t.viewable_weight) || 0;
-  const rowCount = Number(t.row_count) || 0;
-  if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
-  return {
-    impressions: Math.round(impressions),
-    revenue,
-    viewability: impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0,
-    rowCount,
-    source: 'grain-app',
-  };
+    const { rows } = await query(
+      `SELECT
+         COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+         COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+         COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
+         COUNT(*)::int AS row_count
+       ${require('./reportGrainStore').GRAIN_JOIN_SQL}
+       WHERE g.client_id = $1::uuid
+         AND g.report_date BETWEEN $2::date AND $3::date
+         AND g.slice_key = 'app_id'
+         ${appClause}`,
+      params,
+      { statementTimeoutMs: OVERVIEW_READ_TIMEOUT_MS }
+    );
+    const t = rows[0] || {};
+    const impressions = Number(t.impressions) || 0;
+    const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+    const viewableWeight = Number(t.viewable_weight) || 0;
+    const rowCount = Number(t.row_count) || 0;
+    if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
+    return {
+      impressions: Math.round(impressions),
+      revenue,
+      viewability: impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0,
+      rowCount,
+      source: 'grain-app',
+    };
+  } finally {
+    endGrainOverview();
+  }
 }
 
 /**
@@ -1005,53 +1035,64 @@ function mergeSiteOverviewTotals(rollupTotals, coreTotals, selectedSites = []) {
 async function fetchInventorySiteOverviewFromGrain(startDate, endDate, opts = {}) {
   const sites = (opts.sites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   if (!sites.length) return null;
-  const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
-  const countries = (opts.countryNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
-  const adUnits = (opts.adUnitNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
-  const clientId = await resolveGrainClientId();
-  const { GRAIN_JOIN_SQL, grainDomainExprSql } = require('./reportGrainStore');
-  const params = [clientId, startDate, endDate];
-  params.push(sites);
-  let clause = ` AND LOWER(TRIM(COALESCE(ds.name, ''))) = ANY($${params.length}::text[])`;
-  if (domains.length) {
-    params.push(domains);
-    clause += ` AND ${grainDomainExprSql()} = ANY($${params.length}::text[])`;
+  if (!beginGrainOverview()) {
+    logger.warn(
+      `Overview site grain skipped — pool busy active=${grainOverviewActive} ${JSON.stringify(poolStats())}`
+    );
+    return null;
   }
-  if (countries.length) {
-    params.push(countries);
-    clause += ` AND LOWER(TRIM(COALESCE(dc.name, ''))) = ANY($${params.length}::text[])`;
-  }
-  if (adUnits.length) {
-    params.push(adUnits);
-    clause += ` AND LOWER(TRIM(COALESCE(da.name, ''))) = ANY($${params.length}::text[])`;
-  }
+  try {
+    const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+    const countries = (opts.countryNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+    const adUnits = (opts.adUnitNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+    const clientId = await resolveGrainClientId();
+    const { GRAIN_JOIN_SQL, grainDomainExprSql } = require('./reportGrainStore');
+    const params = [clientId, startDate, endDate];
+    params.push(sites);
+    let clause = ` AND LOWER(TRIM(COALESCE(ds.name, ''))) = ANY($${params.length}::text[])`;
+    if (domains.length) {
+      params.push(domains);
+      clause += ` AND ${grainDomainExprSql()} = ANY($${params.length}::text[])`;
+    }
+    if (countries.length) {
+      params.push(countries);
+      clause += ` AND LOWER(TRIM(COALESCE(dc.name, ''))) = ANY($${params.length}::text[])`;
+    }
+    if (adUnits.length) {
+      params.push(adUnits);
+      clause += ` AND LOWER(TRIM(COALESCE(da.name, ''))) = ANY($${params.length}::text[])`;
+    }
 
-  const { rows } = await query(
-    `SELECT
-       COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
-       COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
-       COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
-       COUNT(*)::int AS row_count
-     ${GRAIN_JOIN_SQL}
-     WHERE g.client_id = $1::uuid
-       AND g.report_date BETWEEN $2::date AND $3::date
-       AND g.slice_key = 'inventory_core'
-       ${clause}`,
-    params
-  );
-  const t = rows[0] || {};
-  const impressions = Number(t.impressions) || 0;
-  const revenue = coerceWarehouseRevenue(t.revenue, impressions);
-  const viewableWeight = Number(t.viewable_weight) || 0;
-  const rowCount = Number(t.row_count) || 0;
-  if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
-  return {
-    impressions: Math.round(impressions),
-    revenue,
-    viewability: impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0,
-    rowCount,
-    source: 'grain-site',
-  };
+    const { rows } = await query(
+      `SELECT
+         COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
+         COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
+         COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
+         COUNT(*)::int AS row_count
+       ${GRAIN_JOIN_SQL}
+       WHERE g.client_id = $1::uuid
+         AND g.report_date BETWEEN $2::date AND $3::date
+         AND g.slice_key = 'inventory_core'
+         ${clause}`,
+      params,
+      { statementTimeoutMs: OVERVIEW_READ_TIMEOUT_MS }
+    );
+    const t = rows[0] || {};
+    const impressions = Number(t.impressions) || 0;
+    const revenue = coerceWarehouseRevenue(t.revenue, impressions);
+    const viewableWeight = Number(t.viewable_weight) || 0;
+    const rowCount = Number(t.row_count) || 0;
+    if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
+    return {
+      impressions: Math.round(impressions),
+      revenue,
+      viewability: impressions > 0 ? +(viewableWeight / impressions).toFixed(1) : 0,
+      rowCount,
+      source: 'grain-site',
+    };
+  } finally {
+    endGrainOverview();
+  }
 }
 
 /**
@@ -1165,34 +1206,38 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
   );
   const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const clientId = await resolveGrainClientId();
-  const ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains });
-  if (sites.length && !ids.siteIds.length) return [];
-  if ((opts.adUnitNames || []).length && !ids.adUnitIds.length) return [];
-  if ((opts.countryNames || []).length && !ids.countryIds.length) return [];
+  let ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains });
+  let effectiveOpts = { ...opts, sites, domains };
+  const soft = softenUnresolvedSiteFilters(effectiveOpts, ids);
+  effectiveOpts = soft.opts;
+  ids = soft.ids;
+  if ((effectiveOpts.sites || []).length && !ids.siteIds.length) return [];
+  if ((effectiveOpts.adUnitNames || []).length && !ids.adUnitIds.length) return [];
+  if ((effectiveOpts.countryNames || []).length && !ids.countryIds.length) return [];
 
   const dayCount = inclusiveDayCount(startDate, endDate);
   const tableLimit = Math.max(
     reportingTableLimit(startDate, endDate, opts.tableLimit),
-    dayCount * (sites.length ? Math.max(sites.length, 8) : 40),
+    dayCount * ((effectiveOpts.sites || []).length ? Math.max(effectiveOpts.sites.length, 8) : 40),
     500
   );
   const { params, whereRange, byApp, byAdUnit } = buildInventoryCoreWhere(
-    clientId, startDate, endDate, { ...opts, sites, domains }, ids
+    clientId, startDate, endDate, effectiveOpts, ids
   );
 
   // When filtering a handful of sites, return every day×site (no top-N truncation).
-  const siteFilterCount = sites.length;
-  const byCountry = Boolean(opts.groupByCountry || (opts.countryNames || []).length || ids.countryIds?.length);
-  const byDevice = Boolean(opts.groupByDevice);
+  const siteFilterCount = (effectiveOpts.sites || []).length;
+  const byCountry = Boolean(effectiveOpts.groupByCountry || (effectiveOpts.countryNames || []).length || ids.countryIds?.length);
+  const byDevice = Boolean(effectiveOpts.groupByDevice);
   // Country breakdowns: never apply per-day top-N — that kept only US/India.
   const fullCountryTable = byCountry;
   const countryPrimary = byCountry
     && !byApp
     && !byAdUnit
     && !siteFilterCount
-    && !(opts.domains || []).length
-    && !(opts.groupBySite)
-    && (opts.tableGrain === 'country' || (!opts.tableGrain && !opts.groupBySite && !opts.groupByApp));
+    && !(effectiveOpts.domains || []).length
+    && !(effectiveOpts.groupBySite)
+    && (effectiveOpts.tableGrain === 'country' || (!effectiveOpts.tableGrain && !effectiveOpts.groupBySite && !effectiveOpts.groupByApp));
   const perDay = fullCountryTable
     ? Math.max(250, Math.min(500, Math.ceil(tableLimit / Math.max(1, dayCount))))
     : siteFilterCount > 0 && siteFilterCount <= 50
@@ -1327,14 +1372,18 @@ async function fetchInventoryCoreDashboardBundle(startDate, endDate, opts = {}) 
   );
   const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const clientId = await resolveGrainClientId();
-  const ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains });
+  let ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains });
+  let effectiveOpts = { ...opts, sites, domains };
+  const soft = softenUnresolvedSiteFilters(effectiveOpts, ids);
+  effectiveOpts = soft.opts;
+  ids = soft.ids;
 
-  if (sites.length && !ids.siteIds.length) return null;
-  if ((opts.adUnitNames || []).length && !ids.adUnitIds.length) return null;
-  if ((opts.countryNames || []).length && !ids.countryIds.length) return null;
+  if ((effectiveOpts.sites || []).length && !ids.siteIds.length) return null;
+  if ((effectiveOpts.adUnitNames || []).length && !ids.adUnitIds.length) return null;
+  if ((effectiveOpts.countryNames || []).length && !ids.countryIds.length) return null;
 
   const { params, whereRange } = buildInventoryCoreWhere(
-    clientId, startDate, endDate, { ...opts, sites, domains }, ids
+    clientId, startDate, endDate, effectiveOpts, ids
   );
   const dayCount = inclusiveDayCount(startDate, endDate);
 
@@ -1361,7 +1410,7 @@ async function fetchInventoryCoreDashboardBundle(startDate, endDate, opts = {}) 
        ORDER BY g.report_date`,
       params
     ),
-    fetchInventoryCoreTableFast(startDate, endDate, { ...opts, sites, domains }),
+    fetchInventoryCoreTableFast(startDate, endDate, effectiveOpts),
   ]);
 
   const t = totalsRes.rows[0] || {};
@@ -1446,6 +1495,23 @@ async function fetchInventorySiteDashboardBundle(startDate, endDate, opts = {}) 
  * Returns null when no lean rows exist for the range.
  */
 async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
+  let clientKey = 'x';
+  try { clientKey = getClientId() || 'x'; } catch (_) { /* no tenant yet */ }
+  const flightKey = [
+    'lean-overview',
+    clientKey,
+    startDate,
+    endDate,
+    (opts.domains || []).join(','),
+    (opts.sites || []).join(','),
+    (opts.apps || []).join(','),
+    (opts.adUnitNames || []).join(','),
+    opts.webInventoryOr ? 'or' : 'and',
+  ].join('|');
+  return singleflight(flightKey, () => fetchLeanOverviewTotalsFromDBInner(startDate, endDate, opts));
+}
+
+async function fetchLeanOverviewTotalsFromDBInner(startDate, endDate, opts = {}) {
   const hasWeb = (opts.domains?.length || 0)
     || (opts.sites?.length || 0)
     || (opts.adUnitNames?.length || 0);
@@ -1473,8 +1539,8 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
   // Web + app assignment: OR semantics — two fast SUMs in parallel (never AND).
   if (hasWeb && hasApp) {
     const [web, app] = await Promise.all([
-      fetchLeanOverviewTotalsFromDB(startDate, endDate, { ...opts, apps: [] }),
-      fetchLeanOverviewTotalsFromDB(startDate, endDate, {
+      fetchLeanOverviewTotalsFromDBInner(startDate, endDate, { ...opts, apps: [] }),
+      fetchLeanOverviewTotalsFromDBInner(startDate, endDate, {
         ...opts,
         domains: [],
         sites: [],
@@ -1535,7 +1601,8 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
          COALESCE(SUM(grain_count), 0)::int AS row_count
        FROM rollup_kpi_daily
        WHERE TRUE${filterExtra}`,
-        filterParams
+        filterParams,
+        { statementTimeoutMs: OVERVIEW_READ_TIMEOUT_MS }
       );
       const t = rows[0] || {};
       const impressions = Number(t.impressions) || 0;
@@ -1554,38 +1621,52 @@ async function fetchLeanOverviewTotalsFromDB(startDate, endDate, opts = {}) {
       }
     } catch (e) {
       logger.warn('Overview rollup read failed, falling back to grain:', e.message);
+      // Lock / timeout under load — do not pile grain scans on a saturated pool.
+      if (/lock timeout|statement timeout|canceling statement/i.test(e.message) || isPoolSaturated()) {
+        return null;
+      }
     }
   }
 
-  const leanRows = await fetchLeanRowsFromDB(startDate, endDate, { ...opts, kpiSliceOnly: true });
-  if (!leanRows.length) return null;
-
-  let impressions = 0;
-  let revenue = 0;
-  let viewableWeight = 0;
-  let clicks = 0;
-  for (const r of leanRows) {
-    impressions += Number(r.impression) || 0;
-    revenue += Number(r.revenue) || 0;
-    clicks += Number(r.clicks) || 0;
-    viewableWeight += ((Number(r.viewableRate) || 0) / 100) * (Number(r.impression) || 0);
+  if (isPoolSaturated() || !beginGrainOverview()) {
+    logger.warn(
+      `Overview grain fallback skipped — pool busy ${JSON.stringify(poolStats())}`
+    );
+    return null;
   }
-  const rowCount = leanRows.length;
-  if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
+  try {
+    const leanRows = await fetchLeanRowsFromDB(startDate, endDate, { ...opts, kpiSliceOnly: true });
+    if (!leanRows.length) return null;
 
-  const viewability = impressions > 0 ? +(viewableWeight / impressions * 100).toFixed(1) : 0;
-  return {
-    impressions: Math.round(impressions),
-    revenue: +Number(revenue).toFixed(2),
-    clicks: Math.round(clicks),
-    ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
-    viewability,
-    rowCount,
-    source: 'grain',
-  };
+    let impressions = 0;
+    let revenue = 0;
+    let viewableWeight = 0;
+    let clicks = 0;
+    for (const r of leanRows) {
+      impressions += Number(r.impression) || 0;
+      revenue += Number(r.revenue) || 0;
+      clicks += Number(r.clicks) || 0;
+      viewableWeight += ((Number(r.viewableRate) || 0) / 100) * (Number(r.impression) || 0);
+    }
+    const rowCount = leanRows.length;
+    if (!rowCount || (impressions <= 0 && revenue <= 0)) return null;
+
+    const viewability = impressions > 0 ? +(viewableWeight / impressions * 100).toFixed(1) : 0;
+    return {
+      impressions: Math.round(impressions),
+      revenue: +Number(revenue).toFixed(2),
+      clicks: Math.round(clicks),
+      ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
+      viewability,
+      rowCount,
+      source: 'grain',
+    };
+  } finally {
+    endGrainOverview();
+  }
 }
 
-/** Shared metric SQL fragments for lean dashboard aggregates. */
+/** Shared metric SQL fragments for lean dashboard aggregates on rollup / legacy JSONB tables. */
 function leanMetricSql() {
   const impressionExpr = `COALESCE(
     NULLIF(metrics->>'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS','')::double precision,
@@ -1609,12 +1690,14 @@ function leanMetricSql() {
     NULLIF(metrics->>'total_line_item_level_clicks','')::double precision,
     0
   )`;
-  const domainExpr = `COALESCE(NULLIF(inv_domain,''), dimensions->>'domainName', dimensions->>'domain', dimensions->>'DOMAIN', '')`;
-  const siteExpr = `COALESCE(NULLIF(inv_site,''), dimensions->>'siteUrl', dimensions->>'gamSite', dimensions->>'siteName', dimensions->>'URL_NAME', dimensions->>'SITE_NAME', '')`;
-  const adUnitExpr = `COALESCE(NULLIF(inv_ad_unit,''), dimensions->>'AD_UNIT_NAME', dimensions->>'ad_unit_name', dimensions->>'site', '')`;
-  const appExpr = `COALESCE(NULLIF(inv_app,''), dimensions->>'appPackage', dimensions->>'appId', dimensions->>'MOBILE_APP_NAME', dimensions->>'mobile_app_name', '')`;
-  const countryExpr = `COALESCE(dimensions->>'COUNTRY_NAME', dimensions->>'country_name', dimensions->>'country', '')`;
-  const deviceExpr = `COALESCE(dimensions->>'DEVICE_CATEGORY_NAME', dimensions->>'device_category_name', dimensions->>'device', '')`;
+  // Prefer typed inv_* columns (rollups). Optional dimensions JSONB only when present
+  // (legacy report_daily / report_full_* — not typed report_grain).
+  const domainExpr = `COALESCE(NULLIF(inv_domain,''), '')`;
+  const siteExpr = `COALESCE(NULLIF(inv_site,''), '')`;
+  const adUnitExpr = `COALESCE(NULLIF(inv_ad_unit,''), '')`;
+  const appExpr = `COALESCE(NULLIF(inv_app,''), '')`;
+  const countryExpr = `''`;
+  const deviceExpr = `''`;
   return {
     impressionExpr,
     revenueExpr,
@@ -1831,8 +1914,8 @@ function appendLeanInventoryFilters(params, extra, opts = {}) {
   }
   if (countryNames.length) {
     params.push(countryNames);
+    // Legacy JSONB warehouses only (report_full_*). Typed grain uses appendGrainInventoryFilters + dim_country.
     clause += ` AND LOWER(TRIM(COALESCE(
-      dc.name,
       dimensions->>'COUNTRY_NAME',
       dimensions->>'country_name',
       dimensions->>'country',
@@ -2619,6 +2702,50 @@ async function resolveInventoryFilterIds(clientId, opts = {}) {
   };
 }
 
+/**
+ * Assigned site hosts often aren't in dim_site yet. Aborting the whole web leg then
+ * leaves only app×country totals (Domain/Site columns show "—" + false "incompatible").
+ * Soften: drop unresolved site filters and keep domain / Site×Country breakdown.
+ */
+function softenUnresolvedSiteFilters(opts = {}, ids = {}) {
+  const sites = opts.sites || [];
+  if (!sites.length || (ids.siteIds || []).length) {
+    return { opts, ids, softened: false };
+  }
+  const canContinue = Boolean(
+    (opts.domains || []).length
+    || opts.webInventoryOr
+    || opts.groupBySite
+    || opts.tableGrain === 'site'
+    || opts.tableGrain === 'domain'
+    || opts.groupByCountry
+  );
+  if (!canContinue) return { opts, ids, softened: false };
+  logger.info(
+    `inventory_core: ${sites.length} site filter(s) unresolved in dim_site — continuing with domain/site grain`
+  );
+  const keepSiteGrain = Boolean(
+    opts.groupBySite
+    || opts.tableGrain === 'site'
+    || opts.tableGrain === 'domain'
+    || opts.groupByCountry
+  );
+  return {
+    opts: {
+      ...opts,
+      sites: [],
+      // Keep web inventory intent so mixed web+app does not collapse to app_id only.
+      forceWebInventory: true,
+      groupBySite: keepSiteGrain ? true : opts.groupBySite,
+      tableGrain: keepSiteGrain && (opts.tableGrain === 'country' || !opts.tableGrain)
+        ? 'site'
+        : (opts.tableGrain || (keepSiteGrain ? 'site' : opts.tableGrain)),
+    },
+    ids: { ...ids, siteIds: [] },
+    softened: true,
+  };
+}
+
 async function hydrateGrainIdRows(rawRows) {
   if (!rawRows?.length) return [];
   const { rootDomainFromHost } = require('../utils/adUnit');
@@ -2757,12 +2884,30 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     }
   }
 
-  // Short ranges: inventory_core for GAM-accurate Site/Domain.
+  // Short ranges: inventory_core for GAM-accurate Site/Domain (incl. Site×Country).
+  // Only skip inventory_core for true country-only tables (DATE×country, no site/domain).
+  const countryOnlyGeo = wantsGeoTableDims(opts)
+    && !opts.groupBySite
+    && !opts.groupByApp
+    && !(opts.sites || []).length
+    && !(opts.domains || []).length
+    && (opts.tableGrain === 'country' || (!opts.tableGrain && !opts.groupBySite));
   if (
     dayCount <= DASHBOARD_ROLLUP_FIRST_DAYS
     && !hasAppsOnly
-    && !wantsGeoTableDims(opts)
-    && !opts.countryNames?.length
+    && !(
+      ((opts.apps || []).length > 0 || opts.groupByApp)
+      && (
+        (opts.domains || []).length > 0
+        || (opts.sites || []).length > 0
+        || (opts.adUnitNames || []).length > 0
+        || opts.groupBySite
+        || opts.tableGrain === 'site'
+        || opts.tableGrain === 'domain'
+      )
+    )
+    && !countryOnlyGeo
+    && !(opts.countryNames?.length && !opts.groupBySite && !opts.groupByApp)
   ) {
     try {
       const core = await fetchInventoryCoreDashboardBundle(startDate, endDate, {
@@ -2787,8 +2932,8 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
   if (
     dayCount > DASHBOARD_ROLLUP_FIRST_DAYS
     && !hasAppsOnly
-    && !wantsGeoTableDims(opts)
-    && !opts.countryNames?.length
+    && !countryOnlyGeo
+    && !(opts.countryNames?.length && !opts.groupBySite && !opts.groupByApp)
   ) {
     return null;
   }
@@ -2802,27 +2947,59 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
   const hasAppInv = (opts.apps || []).length > 0 || Boolean(opts.groupByApp);
 
   // Site/Domain + App ID AND'd on one slice empties app×country (app_id slice has no sites).
-  // Union web inventory_core rows with app_id×country rows — same idea as Dashboard compat.
+  // Use the same Dashboard lean legs as compat-union — Reporting id-grain often nulls the
+  // web leg when assigned site hosts don't resolve to dim_site ids, leaving only app_id
+  // totals (Domain/Site columns show "—").
   if (hasWebInv && hasAppInv) {
     const [webBundle, appBundle] = await Promise.all([
-      fetchReportingIdGrainFromDB(startDate, endDate, {
+      fetchLeanDashboardBundleFromDB(startDate, endDate, {
         ...opts,
         apps: [],
         groupByApp: false,
-      }, t0),
-      fetchReportingIdGrainFromDB(startDate, endDate, {
+        skipCharts: true,
+        reportingFast: true,
+      }).catch((e) => {
+        logger.warn('Reporting web lean leg failed:', e.message);
+        return null;
+      }),
+      fetchLeanDashboardBundleFromDB(startDate, endDate, {
         ...opts,
         domains: [],
         sites: [],
         adUnitNames: [],
         groupByApp: true,
         groupBySite: false,
-      }, t0),
+        tableGrain: 'app',
+        skipCharts: true,
+        reportingFast: true,
+      }).catch((e) => {
+        logger.warn('Reporting app lean leg failed:', e.message);
+        return null;
+      }),
     ]);
     const merged = mergeReportingBundles(webBundle, appBundle, opts);
     if (merged) {
+      const wantsSiteOrDomain = Boolean(
+        opts.groupBySite
+        || opts.tableGrain === 'site'
+        || opts.tableGrain === 'domain'
+        || (opts.domains || []).length
+        || (opts.sites || []).length
+      );
+      // Domain/Site columns need real hosts — app_id alone is not enough (shows "—").
+      const hasDomainSiteLabels = (merged.rows || []).some((r) => (
+        String(r.domainName || r.domain || r.gamDomain || '').trim()
+        || String(r.siteUrl || r.siteName || r.gamSite || '').trim()
+      ));
+      if (wantsSiteOrDomain && (merged.rows || []).length && !hasDomainSiteLabels) {
+        logger.info(
+          `Reporting web∪app lean incomplete ${startDate}..${endDate}`
+          + ` table=${merged.rows?.length || 0} (no domain/site labels) — falling through`
+        );
+        return null;
+      }
       logger.info(
-        `Reporting web∪app id-grain ${startDate}..${endDate}`
+        `Reporting web∪app lean ${startDate}..${endDate}`
         + ` table=${merged.rows?.length || 0} in ${Date.now() - t0}ms`
       );
       return { ...merged, source: 'reporting-id-grain-union' };
@@ -2932,34 +3109,41 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
   }
   const dayCount = inclusiveDayCount(startDate, endDate);
   const clientId = requireClientId();
-  const ids = await resolveInventoryFilterIds(clientId, opts);
+  const idsRaw = await resolveInventoryFilterIds(clientId, opts);
+  const soft = softenUnresolvedSiteFilters(opts, idsRaw);
+  const ids = soft.ids;
+  const grainOpts = soft.opts;
   // Filters were provided but nothing resolved — empty result, not a full scan.
   // Domain names can still match via ad-unit / site roots when dim_domain id is missing.
-  if ((opts.sites || []).length && !ids.siteIds.length) return null;
-  if ((opts.adUnitNames || []).length && !ids.adUnitIds.length) return null;
-  if ((opts.countryNames || []).length && !ids.countryIds.length) return null;
+  if ((grainOpts.sites || []).length && !ids.siteIds.length) return null;
+  if ((grainOpts.adUnitNames || []).length && !ids.adUnitIds.length) return null;
+  if ((grainOpts.countryNames || []).length && !ids.countryIds.length) return null;
 
-  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
+  const tableLimit = reportingTableLimit(startDate, endDate, grainOpts.tableLimit);
 
-  const hasWeb = (opts.domains || []).length > 0
-    || (opts.sites || []).length > 0
-    || (opts.adUnitNames || []).length > 0;
-  const byCountry = Boolean(opts.groupByCountry || ids.countryIds.length);
-  const byDevice = Boolean(opts.groupByDevice);
-  const byAdUnit = Boolean(ids.adUnitIds.length || (opts.adUnitNames || []).length);
+  const hasWeb = (grainOpts.domains || []).length > 0
+    || (grainOpts.sites || []).length > 0
+    || (grainOpts.adUnitNames || []).length > 0
+    || Boolean(grainOpts.forceWebInventory)
+    || Boolean(grainOpts.groupBySite)
+    || grainOpts.tableGrain === 'site'
+    || grainOpts.tableGrain === 'domain';
+  const byCountry = Boolean(grainOpts.groupByCountry || ids.countryIds.length);
+  const byDevice = Boolean(grainOpts.groupByDevice);
+  const byAdUnit = Boolean(ids.adUnitIds.length || (grainOpts.adUnitNames || []).length);
   // App reports (filter or App ID/name dimensions) must use app_id slice + group by app.
   // Never AND site filters onto app_id rows — that wipes country breakdowns.
   const byApp = Boolean(
-    opts.groupByApp
-    || ((opts.apps || []).length > 0 && !hasWeb)
+    grainOpts.groupByApp
+    || ((grainOpts.apps || []).length > 0 && !hasWeb)
   );
 
   // Site-level tables (incl. site × country): do not GROUP BY domain_id — the same
   // SITE_NAME often has domain_id=0 and a filled domain_id across grain rows, which
   // duplicated hosts in Reporting while the UI only showed date/site/country.
   const siteGrain = !byApp && !byAdUnit && Boolean(
-    opts.groupBySite
-    || (opts.sites || []).length
+    grainOpts.groupBySite
+    || (grainOpts.sites || []).length
     || ids.siteIds.length
   );
   // Country-wise (pre-AdX behavior): DATE × country only — do NOT expand domain×site
@@ -2968,9 +3152,9 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
     && !byApp
     && !siteGrain
     && !byAdUnit
-    && !(opts.domains || []).length
-    && !(opts.sites || []).length
-    && (opts.tableGrain === 'country' || (!opts.tableGrain && !opts.groupBySite && !opts.groupByApp));
+    && !(grainOpts.domains || []).length
+    && !(grainOpts.sites || []).length
+    && (grainOpts.tableGrain === 'country' || (!grainOpts.tableGrain && !grainOpts.groupBySite && !grainOpts.groupByApp));
 
   // Full country lists need high/no truncation (GAM-like). Inventory mixes stay capped.
   const perDay = countryPrimary
@@ -2984,8 +3168,8 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
   const params = [clientId, startDate, endDate];
   let whereCore = `g.client_id = $1::uuid AND g.slice_key = '${byApp ? 'app_id' : 'inventory_core'}'`;
 
-  if (!byApp && (opts.domains || []).length) {
-    const domainNames = (opts.domains || [])
+  if (!byApp && (grainOpts.domains || []).length) {
+    const domainNames = (grainOpts.domains || [])
       .map((s) => String(s || '').trim().toLowerCase())
       .filter(Boolean);
     params.push(domainNames);
@@ -3025,8 +3209,8 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
     params.push(ids.countryIds);
     whereCore += ` AND g.country_id = ANY($${params.length}::int[])`;
   }
-  if ((opts.apps || []).length) {
-    const appFilter = appendExpandedAppFilter(params, whereCore, opts.apps);
+  if ((grainOpts.apps || []).length) {
+    const appFilter = appendExpandedAppFilter(params, whereCore, grainOpts.apps);
     whereCore = appFilter.whereCore;
     if (!appFilter.matched) return null;
   }
@@ -3283,9 +3467,28 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
  * Returns null when lean tables have no metric rows for the range.
  */
 async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
+  // Soften unresolved site filters before routing — otherwise Site×Country never
+  // reaches inventory_core and the web∪app compat path marks Domain/Site skipped.
+  if ((opts.sites || []).length) {
+    try {
+      const clientId = await resolveGrainClientId();
+      const sites = expandSiteHostAliases(
+        (opts.sites || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean)
+      );
+      const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+      const ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains });
+      const soft = softenUnresolvedSiteFilters({ ...opts, sites, domains }, ids);
+      opts = soft.opts;
+    } catch (_) { /* keep original opts */ }
+  }
+
   const hasWeb = (opts.domains?.length || 0)
     || (opts.sites?.length || 0)
-    || (opts.adUnitNames?.length || 0);
+    || (opts.adUnitNames?.length || 0)
+    || Boolean(opts.forceWebInventory)
+    || Boolean(opts.groupBySite)
+    || opts.tableGrain === 'site'
+    || opts.tableGrain === 'domain';
   const hasApp = (opts.apps?.length || 0) > 0;
   const siteKind = classifySiteHostSelection(opts.sites);
   const wantsGeo = wantsGeoTableDims(opts);
@@ -3388,10 +3591,18 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
   }
 
   // Short unfiltered fallback: inventory_core daily (if inventory rollups missed).
-  if (!hasApp && !wantsGeo && !(opts.sites || []).length && dayCount <= DASHBOARD_ROLLUP_FIRST_DAYS) {
+  // Allow Site×Country / App×Country — only skip for country-only DATE×country tables.
+  const countryOnlyGeo = wantsGeo
+    && !opts.groupBySite
+    && !opts.groupByApp
+    && !(opts.sites || []).length
+    && !(opts.domains || []).length
+    && (opts.tableGrain === 'country' || (!opts.tableGrain && !opts.groupBySite));
+  if (!hasApp && !countryOnlyGeo && !(opts.sites || []).length && dayCount <= DASHBOARD_ROLLUP_FIRST_DAYS) {
     const useInventoryCore = (opts.domains || []).length > 0
       || opts.groupBySite
       || opts.tableGrain === 'site'
+      || opts.groupByCountry
       || resolveTableRollupGroup(opts) === 'site';
     if (useInventoryCore) {
       const core = await fetchInventoryCoreDashboardBundle(startDate, endDate, opts).catch((e) => {
@@ -3416,13 +3627,14 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
     return null;
   }
 
-  const { typedGrainMetricSql, GRAIN_JOIN_SQL, kpiSliceFilterSql } = require('./reportGrainStore');
+  const { typedGrainMetricSql, GRAIN_JOIN_SQL, kpiSliceFilterSql, appendGrainInventoryFilters } = require('./reportGrainStore');
   const tableLimit = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 2500, 50), 5000);
   const m = typedGrainMetricSql('g');
 
   const params = [startDate, endDate, requireClientId()];
   let extra = ` AND g.report_date BETWEEN $1::date AND $2::date AND g.client_id = $3::uuid AND ${kpiSliceFilterSql('g')}`;
-  extra = appendLeanInventoryFilters(params, extra, opts);
+  // Typed grain has dim_* joins — never reference legacy JSONB "dimensions" here.
+  extra = appendGrainInventoryFilters(params, extra, opts);
   const branches = [{ sql: `${GRAIN_JOIN_SQL} WHERE TRUE${extra}`, params }];
   if (!branches.length) return null;
 

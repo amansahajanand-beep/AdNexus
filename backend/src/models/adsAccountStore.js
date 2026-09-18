@@ -263,39 +263,117 @@ async function upsertChildUnderMcc(clientId, mccId, { customerId, descriptiveNam
   });
 }
 
+const OAUTH_DISCONNECT_MSG =
+  'Google Ads OAuth disconnected. Reconnect with Google on the manager (MCC) account to resume sync. Synced spend history was kept.';
+
 /**
- * Delete an Ads account. Deleting an MCC also deletes all child accounts under it
- * (FK ON DELETE CASCADE + explicit child delete for clarity/safety).
- * Children must never be left as orphaned "individual" accounts.
+ * Soft-disconnect an Ads account: clear OAuth tokens only.
+ * Keeps ads_accounts rows and all synced spend / campaign maps.
+ * For an MCC, also clears child OAuth tokens (children inherit MCC auth).
  */
 async function deleteAccount(id) {
   const account = await getAccountById(id);
-  if (!account) return { deleted: 0, childrenDeleted: 0 };
+  if (!account) return { deleted: 0, childrenUnlinked: 0, spendPreserved: true };
 
-  let childrenDeleted = 0;
+  let childrenUnlinked = 0;
   if (account.accountType === 'mcc') {
     const { rowCount } = await query(
-      `DELETE FROM ads_accounts WHERE parent_mcc_id = $1`,
-      [id]
+      `UPDATE ads_accounts SET
+         google_refresh_token_enc = NULL,
+         last_sync_error = $2,
+         updated_at = now()
+       WHERE parent_mcc_id = $1`,
+      [id, OAUTH_DISCONNECT_MSG]
     );
-    childrenDeleted = rowCount || 0;
+    childrenUnlinked = rowCount || 0;
   }
 
-  const { rowCount } = await query('DELETE FROM ads_accounts WHERE id = $1', [id]);
+  const { rowCount } = await query(
+    `UPDATE ads_accounts SET
+       google_refresh_token_enc = NULL,
+       last_sync_error = $2,
+       updated_at = now()
+     WHERE id = $1`,
+    [id, OAUTH_DISCONNECT_MSG]
+  );
   return {
     deleted: rowCount || 0,
-    childrenDeleted,
+    childrenDeleted: childrenUnlinked,
+    childrenUnlinked,
     accountType: account.accountType,
+    spendPreserved: true,
+    soft: true,
   };
 }
 
-/** Remove every Ads account for a GAM client (MCC + children + spend via FK cascade). */
+/**
+ * Soft-disconnect every Ads account for a GAM client.
+ * Clears OAuth only — spend rows and account/campaign map rows stay.
+ */
 async function deleteAllAccountsForClient(clientId) {
   const { rowCount } = await query(
-    `DELETE FROM ads_accounts WHERE client_id = $1`,
-    [clientId]
+    `UPDATE ads_accounts SET
+       google_refresh_token_enc = NULL,
+       last_sync_error = $2,
+       updated_at = now()
+     WHERE client_id = $1`,
+    [clientId, OAUTH_DISCONNECT_MSG]
   );
   return rowCount || 0;
+}
+
+/** Clear last_sync_error for an account and its MCC children (after successful reconnect). */
+async function clearSyncErrorsForAccountTree(accountId) {
+  const account = await getAccountById(accountId);
+  if (!account) return;
+  await query(
+    `UPDATE ads_accounts SET last_sync_error = NULL, updated_at = now() WHERE id = $1`,
+    [accountId]
+  );
+  if (account.accountType === 'mcc') {
+    await query(
+      `UPDATE ads_accounts SET last_sync_error = NULL, updated_at = now() WHERE parent_mcc_id = $1`,
+      [accountId]
+    );
+  } else if (account.parentMccId) {
+    await query(
+      `UPDATE ads_accounts SET last_sync_error = NULL, updated_at = now() WHERE id = $1 OR parent_mcc_id = $1`,
+      [account.parentMccId]
+    );
+  }
+}
+
+/** Accounts with sync/auth problems (for ROI + admin banners). */
+async function listAccountsWithSyncProblems(clientId, { accountIds = null } = {}) {
+  const params = [clientId];
+  let scope = '';
+  if (Array.isArray(accountIds)) {
+    if (accountIds.length === 0) return [];
+    params.push(accountIds);
+    scope = ` AND (
+      id = ANY($${params.length}::uuid[])
+      OR parent_mcc_id = ANY($${params.length}::uuid[])
+      OR id IN (
+        SELECT DISTINCT parent_mcc_id FROM ads_accounts
+        WHERE client_id = $1 AND parent_mcc_id IS NOT NULL AND id = ANY($${params.length}::uuid[])
+      )
+    )`;
+  }
+  const { rows } = await query(
+    `SELECT * FROM ads_accounts
+     WHERE client_id = $1
+       AND (
+         last_sync_error IS NOT NULL
+         OR (
+           google_refresh_token_enc IS NULL
+           AND (account_type = 'mcc' OR parent_mcc_id IS NULL)
+         )
+       )
+       ${scope}
+     ORDER BY account_type DESC, descriptive_name ASC`,
+    params
+  );
+  return rows.map(mapPublic);
 }
 
 async function listCampaignMaps(clientId) {
@@ -586,6 +664,8 @@ module.exports = {
   upsertChildUnderMcc,
   deleteAccount,
   deleteAllAccountsForClient,
+  clearSyncErrorsForAccountTree,
+  listAccountsWithSyncProblems,
   listCampaignMaps,
   upsertCampaignMap,
   upsertCampaignMapsBulk,

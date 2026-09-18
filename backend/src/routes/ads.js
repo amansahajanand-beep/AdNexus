@@ -20,12 +20,20 @@ const {
   listOtherExpenses,
   createOtherExpense,
   deleteOtherExpense,
+  clearSyncErrorsForAccountTree,
+  listAccountsWithSyncProblems,
 } = require('../models/adsAccountStore');
 const { getPendingSessionPublic, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const { listCampaigns, isAdsOAuthConfigured, resolveOAuthApp, adsRedirectUri } = require('../ads/client');
-const { resolveRefreshForAccount, syncAllAccountsForClient, syncAccountSpend, enqueueAdsSyncAccounts } = require('../services/adsSyncService');
+const {
+  resolveRefreshForAccount,
+  syncAllAccountsForClient,
+  syncAccountSpend,
+  enqueueAdsSyncAccounts,
+  isAdsAuthSyncError,
+} = require('../services/adsSyncService');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
-const { resolveAdsAccountIdsForUser, getAllowedAdsAccountIds, hasFlag } = require('../utils/permissions');
+const { resolveAdsAccountIdsForUser, getAllowedAdsAccountIds, hasFlag, isAdmin } = require('../utils/permissions');
 const { frontendBaseUrl } = require('../utils/frontendUrl');
 const {
   collectGrantIds,
@@ -77,6 +85,69 @@ router.get('/health', requireAdmin, (req, res) => {
     redirectUri: adsRedirectUri(),
     frontendUrl: frontendBaseUrl(),
   });
+});
+
+/**
+ * Sync/auth problems for ROI + Ads pages.
+ * Auth errors (invalid_grant etc.) are highlighted so users reconnect MCC without deleting spend.
+ */
+router.get('/sync-health', async (req, res) => {
+  try {
+    const clientId = req.client?.id || req.user?.clientId;
+    if (!clientId) return res.status(400).json({ error: 'No client context' });
+    const allowed = getAllowedAdsAccountIds(req.user);
+    const fixPath = isAdmin(req.user) ? '/admin?tab=ads' : '/my-ads';
+    const empty = {
+      ok: true,
+      needsReconnect: false,
+      fixPath,
+      instruction: null,
+      authProblems: [],
+      otherProblems: [],
+    };
+
+    let accountIds = null;
+    if (isAdmin(req.user)) {
+      accountIds = null;
+    } else if (!Array.isArray(allowed) || allowed.length === 0) {
+      return res.json(empty);
+    } else {
+      accountIds = allowed;
+    }
+
+    const problems = await listAccountsWithSyncProblems(clientId, { accountIds });
+    const authProblems = problems.filter(
+      (a) => isAdsAuthSyncError(a.lastSyncError) || !a.hasRefreshToken
+    );
+    const otherProblems = problems.filter((a) => !authProblems.some((p) => p.id === a.id));
+    res.json({
+      ok: authProblems.length === 0,
+      needsReconnect: authProblems.length > 0,
+      fixPath,
+      instruction: authProblems.length
+        ? 'Google Ads login expired or was revoked. Open Google Ads accounts, click Reconnect on the manager (MCC) — do not remove the account (spend history is kept). Then Sync spend.'
+        : null,
+      authProblems: authProblems.map((a) => ({
+        id: a.id,
+        accountType: a.accountType,
+        customerId: a.customerId,
+        descriptiveName: a.descriptiveName,
+        hasRefreshToken: a.hasRefreshToken,
+        lastSyncError: a.lastSyncError,
+        lastSyncAt: a.lastSyncAt,
+      })),
+      otherProblems: otherProblems.map((a) => ({
+        id: a.id,
+        accountType: a.accountType,
+        customerId: a.customerId,
+        descriptiveName: a.descriptiveName,
+        lastSyncError: a.lastSyncError,
+        lastSyncAt: a.lastSyncAt,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── Domain-user: My Google Ads ───────────────────────────────────────────────
@@ -187,6 +258,7 @@ router.post('/my/oauth/pending/:id/select', requireDomainUser, requireMyAdsAcces
         refreshToken: session.refreshToken,
       });
     }
+    if (rootAccount?.id) await clearSyncErrorsForAccountTree(rootAccount.id);
 
     const grantIds = await collectGrantIds(req.client.id, rootAccount);
     const updatedUser = await grantAdsAccountsToUser(req.user.id, grantIds);
@@ -215,14 +287,23 @@ router.get('/my/accounts/:id/oauth-url', requireDomainUser, requireMyAdsAccess, 
     if (!account || account.clientId !== req.client.id) {
       return res.status(404).json({ error: 'Account not found' });
     }
+    let target = account;
+    let mode = account.accountType === 'mcc' ? 'mcc' : 'individual';
+    if (account.parentMccId) {
+      const mcc = await getAccountById(account.parentMccId);
+      if (mcc) {
+        target = mcc;
+        mode = 'mcc';
+      }
+    }
     const url = buildAdsAuthUrl(req.client, {
       clientId: req.client.id,
-      mode: account.accountType === 'mcc' ? 'mcc' : 'individual',
-      adsAccountId: account.id,
+      mode,
+      adsAccountId: target.id,
       userId: req.user.id,
       returnTo: 'my-ads',
     });
-    res.json({ url });
+    res.json({ url, reconnectAccountId: target.id, reconnectMode: mode });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -391,6 +472,7 @@ router.post('/oauth/pending/:id/select', requireAdmin, async (req, res) => {
         descriptiveName: candidate.descriptiveName,
         refreshToken: session.refreshToken,
       });
+      if (mccAccount?.id) await clearSyncErrorsForAccountTree(mccAccount.id);
       await deletePendingSession(session.id);
       return res.json({
         ok: true,
@@ -405,6 +487,7 @@ router.post('/oauth/pending/:id/select', requireAdmin, async (req, res) => {
       descriptiveName: candidate.descriptiveName,
       refreshToken: session.refreshToken,
     });
+    if (account?.id) await clearSyncErrorsForAccountTree(account.id);
     await deletePendingSession(session.id);
     return res.json({ ok: true, accountType: 'client', account });
   } catch (err) {
@@ -581,12 +664,22 @@ router.get('/accounts/:id/oauth-url', requireAdmin, async (req, res) => {
     if (!account || account.clientId !== req.client.id) {
       return res.status(404).json({ error: 'Account not found' });
     }
+    // Child accounts sync with the MCC refresh token — reconnect the manager.
+    let target = account;
+    let mode = account.accountType === 'mcc' ? 'mcc' : 'individual';
+    if (account.parentMccId) {
+      const mcc = await getAccountById(account.parentMccId);
+      if (mcc) {
+        target = mcc;
+        mode = 'mcc';
+      }
+    }
     const url = buildAdsAuthUrl(req.client, {
       clientId: req.client.id,
-      mode: account.accountType === 'mcc' ? 'mcc' : 'individual',
-      adsAccountId: account.id,
+      mode,
+      adsAccountId: target.id,
     });
-    res.json({ url });
+    res.json({ url, reconnectAccountId: target.id, reconnectMode: mode });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -606,6 +699,7 @@ router.patch('/accounts/:id', requireAdmin, async (req, res) => {
       loginCustomerId,
       ...(refreshToken ? { refreshToken: String(refreshToken).trim() } : {}),
     });
+    if (refreshToken) await clearSyncErrorsForAccountTree(account.id);
     res.json({ account: updated });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -621,20 +715,29 @@ router.delete('/accounts/:id', requireAdmin, async (req, res) => {
     const result = await deleteAccount(account.id);
     res.json({
       ok: true,
+      soft: true,
+      spendPreserved: true,
       accountType: result.accountType,
-      childrenDeleted: result.childrenDeleted || 0,
+      childrenDeleted: result.childrenUnlinked || result.childrenDeleted || 0,
+      message: 'OAuth disconnected. Synced spend history was kept. Use Reconnect / Connect with Google to resume sync.',
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/** Admin: wipe all Ads accounts for this GAM client (MCC + children + linked spend). */
+/** Admin: soft-disconnect all Ads accounts for this GAM client (OAuth cleared; spend kept). */
 router.delete('/accounts', requireAdmin, async (req, res) => {
   try {
     const { deleteAllAccountsForClient } = require('../models/adsAccountStore');
     const deleted = await deleteAllAccountsForClient(req.client.id);
-    res.json({ ok: true, deleted });
+    res.json({
+      ok: true,
+      deleted,
+      soft: true,
+      spendPreserved: true,
+      message: 'OAuth cleared on all Ads accounts. Synced spend history was kept.',
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

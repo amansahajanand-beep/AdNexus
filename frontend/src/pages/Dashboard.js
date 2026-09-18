@@ -62,7 +62,7 @@ import { buildFilterDropdownOptions } from '../utils/catalogOptions';
 import { buildAppliedFilterChips, removeFilterChip } from '../utils/filterChips';
 import { normalizeInventorySelections, slimFiltersForPersist, isAllSelection, ALL_SENTINEL } from '../utils/inventorySelection';
 import { saveReportPage } from '../store/slices/reportSlice';
-import { isReportCacheFresh } from '../hooks/useReportPageCache';
+import { isReportCacheFresh, slimDetailForCache } from '../hooks/useReportPageCache';
 import { useMedia } from '../hooks/useMedia';
 import DynamicReportTable from '../components/ui/DynamicReportTable';
 import {
@@ -140,6 +140,8 @@ function SharePieLegend({ items = [], colors = SHARE_COLORS }) {
 
 const PAGE_SIZE = 50;
 const POLL_MS = 30 * 60 * 1000; // matches backend 30-min cache TTL
+/** Max rapid "building" polls before giving up (avoids endless domain-user spinner). */
+const BUILDING_POLL_MAX = 8;
 
 function money(v, currency = 'USD') {
   const sym = currency === 'INR' ? '\u20B9' : '$';
@@ -156,8 +158,29 @@ function toNumber(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-function inventoryQueryFromApplied(applied) {
-  const n = normalizeInventorySelections(applied || {}, {});
+function summaryHasMetrics(summary) {
+  return (toNumber(summary?.impressions) > 0) || (toNumber(summary?.revenue) > 0);
+}
+
+function overviewFiltersKey(filters = {}) {
+  const list = (v) => (Array.isArray(v) ? v : (v != null && v !== '' ? [v] : []))
+    .map((x) => String(x).trim().toLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join(',');
+  return [
+    String(filters.startDate || '').slice(0, 10),
+    String(filters.endDate || '').slice(0, 10),
+    list(filters.domain),
+    list(filters.site),
+    list(filters.domainName),
+    list(filters.domainId),
+    list(filters.country),
+  ].join('|');
+}
+
+function inventoryQueryFromApplied(applied, { expandAll = false, assignedScope = null, optionLists = {} } = {}) {
+  const n = normalizeInventorySelections(applied || {}, optionLists, { expandAll, assignedScope });
   return {
     domain: n.domain || [],
     site: n.site || [],
@@ -166,8 +189,8 @@ function inventoryQueryFromApplied(applied) {
   };
 }
 
-function priorQueryKey(startDate, endDate, applied, compareStart, compareEnd) {
-  const inv = inventoryQueryFromApplied(applied);
+function priorQueryKey(startDate, endDate, applied, compareStart, compareEnd, normalizeOpts) {
+  const inv = inventoryQueryFromApplied(applied, normalizeOpts);
   return [
     startDate || '',
     endDate || '',
@@ -447,7 +470,7 @@ export default function Dashboard() {
   const inventoryAssigned = hasAssignedInventory(user);
   const filterVisibility = getAssignedFilterVisibility(user);
   const savedRaw = useSelector((s) => s.reports?.dashboard);
-  const saved = savedRaw?.userId === user?.id ? savedRaw : null;
+  const saved = (!savedRaw?.userId || savedRaw.userId === user?.id) ? savedRaw : null;
   const { networkInfo } = useOutletContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const dateRestriction = useMemo(() => getDateRestriction(user), [user]);
@@ -466,7 +489,8 @@ export default function Dashboard() {
   const invDraft = initialInventoryDraft(user, savedInv);
   const scopedAutoLoad = shouldAutoLoadScopedInventory(user);
   const defaultApplied = { ...todayInit, ...EMPTY_INVENTORY_FILTERS };
-  const cacheFresh = isReportCacheFresh(saved, POLL_MS) && saved?.filterApplied;
+  // Restore Redux cache on remount (page switch) — do not require filterApplied.
+  const cacheFresh = isReportCacheFresh(saved, POLL_MS);
 
   const [preset, setPreset] = useState(() => saved?.preset ?? 'today');
   const [startDate, setStartDate] = useState(() => initDates.startDate);
@@ -506,21 +530,17 @@ export default function Dashboard() {
     return scopedAutoLoad;
   });
 
-  const [overviewData, setOverviewData] = useState(() => (
-    filterVisibility.isScopedUser ? null : (saved?.overviewData ?? null)
-  ));
-  const [detailData, setDetailData] = useState(() => (
-    filterVisibility.isScopedUser ? null : ((cacheFresh ? saved?.detailData : null) ?? null)
-  ));
+  // Always paint last known KPIs/table on remount — avoid loading flash when switching pages.
+  const [overviewData, setOverviewData] = useState(() => saved?.overviewData ?? null);
+  const [detailData, setDetailData] = useState(() => saved?.detailData ?? null);
   const [priorOverview, setPriorOverview] = useState(null);
   const [priorDetail, setPriorDetail] = useState(null);
-  const [overviewLoading, setOverviewLoading] = useState(() => (
-    filterVisibility.isScopedUser ? true : !saved?.overviewData
-  ));
+  const [overviewLoading, setOverviewLoading] = useState(() => !saved?.overviewData?.summary);
   const [detailLoading, setDetailLoading] = useState(() => {
-    if (filterVisibility.isScopedUser) return false;
-    if (cacheFresh && saved?.filterApplied) return true;
-    return scopedAutoLoad && canGenerate;
+    if (saved?.detailData?.summary || (Array.isArray(saved?.detailData?.rows) && saved.detailData.rows.length)) {
+      return false;
+    }
+    return Boolean(scopedAutoLoad && canGenerate);
   });
   const [error, setError] = useState(null);
   const [page, setPage] = useState(() => saved?.page ?? 1);
@@ -547,10 +567,27 @@ export default function Dashboard() {
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(true);
   const pollRef = useRef(null);
   const filterPanelRef = useRef(null);
-  const skipDetailRef = useRef(cacheFresh && saved?.filterApplied);
+  // Skip network on remount when Redux still has fresh data for this page.
+  const skipOverviewRef = useRef(Boolean(cacheFresh && saved?.overviewData?.summary));
+  const skipDetailRef = useRef(Boolean(
+    cacheFresh
+    && (saved?.detailData?.summary || (Array.isArray(saved?.detailData?.rows) && saved.detailData.rows.length))
+  ));
+  const staleSilentOverviewRef = useRef(Boolean(
+    saved?.fetchedAt && !cacheFresh && saved?.overviewData?.summary
+  ));
+  const staleSilentDetailRef = useRef(Boolean(
+    saved?.fetchedAt && !cacheFresh && saved?.detailData
+  ));
   const slowTimerRef = useRef(null);
   const detailAbortRef = useRef(null);
+  const detailInFlightRef = useRef(false);
+  const detailDataRef = useRef(detailData);
   const overviewAbortRef = useRef(null);
+  const overviewInFlightRef = useRef(false);
+  const overviewDataRef = useRef(overviewData);
+  const overviewFiltersKeyRef = useRef('');
+  const buildingPollCountRef = useRef(0);
   const shareHydratedRef = useRef(false);
   const undoSnapRef = useRef(null);
   const skipPrefsSaveRef = useRef(true);
@@ -698,6 +735,11 @@ export default function Dashboard() {
     || draftHasInventorySelection(inventoryDraft);
   const customDatesIncomplete = isCustomRangeIncomplete(preset, startDate, endDate);
 
+  const scopedNormOpts = useMemo(() => ({
+    expandAll: !!filterVisibility.isScopedUser,
+    assignedScope: inventoryScope,
+  }), [filterVisibility.isScopedUser, inventoryScope]);
+
   const buildOverviewFiltersForState = useCallback((appliedSnapshot, filterAppliedSnapshot) => {
     const dates = committedReportDates({
       preset,
@@ -710,50 +752,99 @@ export default function Dashboard() {
     if (!filterAppliedSnapshot || !hasInventoryFilterSelection(appliedSnapshot)) {
       return dates;
     }
-    const normalized = normalizeInventorySelections(appliedSnapshot || {}, {});
+    const normalized = normalizeInventorySelections(appliedSnapshot || {}, {}, scopedNormOpts);
     const { domain, site, domainName, domainId } = normalized;
     if (!domain?.length && !site?.length && !domainName?.length && !domainId?.length) {
       return dates;
     }
     return { ...dates, domain, site, domainName, domainId };
-  }, [preset, startDate, endDate, todayInit]);
+  }, [preset, startDate, endDate, todayInit, scopedNormOpts]);
 
   // Overview KPIs: full assigned scope by default; after Apply Filter, same inventory filters as chart/table.
   const overviewFilters = useMemo(
     () => buildOverviewFiltersForState(applied, filterApplied),
     [applied, filterApplied, buildOverviewFiltersForState]
   );
+  const overviewQueryKey = useMemo(() => overviewFiltersKey(overviewFilters), [overviewFilters]);
 
   const loadOverview = useCallback(async (filtersOverride, silent = false) => {
     const filters = filtersOverride ?? overviewFilters;
-    if (overviewAbortRef.current) overviewAbortRef.current.abort();
+    const key = overviewFiltersKey(filters);
+    // Coalesce: never stampede identical overview requests (domain-user remounts / Strict Mode).
+    if (overviewInFlightRef.current && overviewFiltersKeyRef.current === key) return;
+    // Range/filter change may abort; same-key background refresh must not.
+    if (!silent && overviewAbortRef.current && overviewFiltersKeyRef.current !== key) {
+      overviewAbortRef.current.abort();
+    } else if (!silent && overviewInFlightRef.current) {
+      return;
+    }
     const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
     overviewAbortRef.current = ac;
-    if (!silent) setOverviewLoading(true);
+    overviewInFlightRef.current = true;
+    overviewFiltersKeyRef.current = key;
+    // Keep showing existing KPIs while refreshing — only skeleton on first load.
+    const hasCached = summaryHasMetrics(overviewDataRef.current?.summary)
+      || overviewDataRef.current?.summary != null;
+    if (!silent && !hasCached) setOverviewLoading(true);
     setError(null);
     try {
       const res = await reportsAPI.getDashboardOverview(filters, ac ? { signal: ac.signal } : {});
       if (ac?.signal?.aborted) return;
-      setOverviewData(res);
+      setOverviewData((prev) => {
+        const nextHas = summaryHasMetrics(res?.summary);
+        const prevHas = summaryHasMetrics(prev?.summary);
+        // Empty/building race must not wipe KPIs already shown for this query.
+        if (!nextHas && prevHas && prev?._queryKey === key) {
+          if (res?.status === 'building' || res?.status === 'partial') {
+            return {
+              ...prev,
+              status: res.status,
+              coverage: res.coverage ?? prev.coverage,
+            };
+          }
+          // Transient miss (no status / skipped grain) — keep previous.
+          if (res?.status !== 'ready') return prev;
+        }
+        const next = { ...res, _queryKey: key };
+        overviewDataRef.current = next;
+        return next;
+      });
       setLastUpdated(nowTimeInTZ());
     } catch (err) {
       if (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError' || ac?.signal?.aborted) return;
       logErrorForDebug(err, 'Dashboard overview');
       setError(getUserFacingMessage(err, 'Could not load overview metrics. Please try again.'));
     } finally {
+      if (overviewAbortRef.current === ac) overviewInFlightRef.current = false;
       if (!silent && overviewAbortRef.current === ac) setOverviewLoading(false);
     }
   }, [overviewFilters]);
+
+  // Keep ref in sync for loadOverview coalesce / empty-overwrite guards.
+  useEffect(() => {
+    overviewDataRef.current = overviewData;
+  }, [overviewData]);
+
+  useEffect(() => {
+    detailDataRef.current = detailData;
+  }, [detailData]);
 
   const currency = overviewData?.summary?.currency || overviewData?.currency
     || detailData?.summary?.currency || networkInfo?.currencyCode || 'USD';
 
   /** Network + filtered charts — load for current dates; inventory filters refine. */
   const loadDetail = useCallback(async (silent = false) => {
-    if (detailAbortRef.current) detailAbortRef.current.abort();
+    if (silent && detailInFlightRef.current) return;
+    if (!silent && detailAbortRef.current) {
+      detailAbortRef.current.abort();
+      detailInFlightRef.current = false;
+    } else if (!silent && detailInFlightRef.current) {
+      return;
+    }
     const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
     detailAbortRef.current = ac;
-    if (!silent) {
+    detailInFlightRef.current = true;
+    if (!silent && !detailDataRef.current) {
       setDetailLoading(true);
       setSlowDetail(false);
       clearTimeout(slowTimerRef.current);
@@ -769,11 +860,12 @@ export default function Dashboard() {
       // wide ranges were shipping 100k–700k grain rows and freezing the UI.
       const res = await reportsAPI.getDashboard({
         ...dates,
-        ...normalizeInventorySelections(applied || {}, {}),
+        ...normalizeInventorySelections(applied || {}, {}, scopedNormOpts),
       }, ac ? { signal: ac.signal } : {});
       if (ac?.signal?.aborted) return;
       startTransition(() => {
         setDetailData(res);
+        detailDataRef.current = res;
         setLastUpdated(nowTimeInTZ());
         setFetchedAt(Date.now());
       });
@@ -820,13 +912,14 @@ export default function Dashboard() {
         });
       }
     } finally {
+      if (detailAbortRef.current === ac) detailInFlightRef.current = false;
       if (!silent && detailAbortRef.current === ac) {
         setDetailLoading(false);
         setSlowDetail(false);
         clearTimeout(slowTimerRef.current);
       }
     }
-  }, [applied, startDate, endDate]);
+  }, [applied, startDate, endDate, scopedNormOpts]);
 
   useEffect(() => () => {
     detailAbortRef.current?.abort();
@@ -836,19 +929,36 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (filterApplied && hasInventoryFilterSelection(applied)) return;
+    if (skipOverviewRef.current) {
+      skipOverviewRef.current = false;
+      setOverviewLoading(false);
+      return;
+    }
+    // Stale but present: refresh quietly — do not skeleton over cached KPIs.
+    if (staleSilentOverviewRef.current && overviewDataRef.current?.summary) {
+      staleSilentOverviewRef.current = false;
+      loadOverview(undefined, true);
+      return;
+    }
     loadOverview();
-  }, [loadOverview, filterApplied, applied]);
+  }, [loadOverview, filterApplied, overviewQueryKey]);
 
   useEffect(() => {
     if (!canGenerate) return;
     if (isCustomRangeIncomplete(preset, startDate, endDate)) return;
     if (skipDetailRef.current) {
       skipDetailRef.current = false;
+      setDetailLoading(false);
+      return;
+    }
+    if (staleSilentDetailRef.current && detailDataRef.current) {
+      staleSilentDetailRef.current = false;
+      loadDetail(true);
       return;
     }
     loadDetail();
     setPage(1);
-  }, [filterApplied, applied, loadDetail, canGenerate, preset, startDate, endDate]);
+  }, [filterApplied, overviewQueryKey, loadDetail, canGenerate, preset, startDate, endDate]);
 
   const compareRange = useMemo(
     () => resolveCompareRange(
@@ -866,7 +976,8 @@ export default function Dashboard() {
     applied?.endDate || endDate,
     applied,
     compareRange?.startDate,
-    compareRange?.endDate
+    compareRange?.endDate,
+    scopedNormOpts
   );
 
   useEffect(() => {
@@ -881,11 +992,15 @@ export default function Dashboard() {
       setPriorDetail(null);
       return undefined;
     }
+    // Wait for primary overview to settle so compare doesn't stampede PG / flicker cards.
+    if (overviewLoading && !summaryHasMetrics(overviewData?.summary)) {
+      return undefined;
+    }
     setPriorOverview(null);
     setPriorDetail(null);
     let cancelled = false;
     (async () => {
-      const inv = inventoryQueryFromApplied(applied);
+      const inv = inventoryQueryFromApplied(applied, scopedNormOpts);
       const priorFilters = {
         ...inv,
         startDate: prior.startDate,
@@ -908,7 +1023,10 @@ export default function Dashboard() {
       }
     })();
     return () => { cancelled = true; };
-  }, [canGenerate, compareKey, dateRestriction, compareRange, applied]);
+  }, [
+    canGenerate, compareKey, dateRestriction, compareRange, applied, scopedNormOpts,
+    overviewLoading, overviewData?.summary?.impressions, overviewData?.summary?.revenue,
+  ]);
 
   useEffect(() => {
     if (!overviewData && !detailData) return;
@@ -921,11 +1039,16 @@ export default function Dashboard() {
         userId: user?.id,
         applied: slimApplied,
         filterApplied,
-        // Do not persist huge row catalogs / detail payloads — they freeze sessionStorage.
         overviewData: overviewData
-          ? { summary: overviewData.summary, visibility: overviewData.visibility, isMock: overviewData.isMock }
+          ? {
+            summary: overviewData.summary,
+            visibility: overviewData.visibility,
+            isMock: overviewData.isMock,
+            status: overviewData.status,
+          }
           : null,
-        detailData: null,
+        // Cap rows so sessionStorage stays usable; enough to paint table on remount.
+        detailData: slimDetailForCache(detailData),
         catalog: [],
         fetchedAt,
         lastUpdated,
@@ -1030,20 +1153,19 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
-    const overviewEmpty = !(
-      (Number(overviewData?.summary?.impressions) || 0) > 0
-      || (Number(overviewData?.summary?.revenue) || 0) > 0
-    );
-    const detailEmpty = !(
-      (Number(detailData?.summary?.impressions) || 0) > 0
-      || (Number(detailData?.summary?.revenue) || 0) > 0
-    );
+    const overviewEmpty = !summaryHasMetrics(overviewData?.summary);
+    const detailEmpty = !summaryHasMetrics(detailData?.summary);
     const waitingOnSync = (
       (overviewData?.status === 'building' && overviewEmpty)
       || (detailData?.status === 'building' && detailEmpty)
     );
-    const intervalMs = waitingOnSync ? 12_000 : POLL_MS;
+    // Have KPIs already — don't spin every 12s; use normal TTL poll.
+    if (!waitingOnSync) buildingPollCountRef.current = 0;
+    const allowBuildingPoll = waitingOnSync
+      && buildingPollCountRef.current < BUILDING_POLL_MAX;
+    const intervalMs = allowBuildingPoll ? 12_000 : POLL_MS;
     pollRef.current = setInterval(() => {
+      if (allowBuildingPoll) buildingPollCountRef.current += 1;
       if (!(filterApplied && hasInventoryFilterSelection(applied))) {
         loadOverview(undefined, true);
       }
@@ -1082,7 +1204,10 @@ export default function Dashboard() {
     setPage(1);
     setChipsExpanded(false);
     setOverviewData(null);
+    overviewDataRef.current = null;
     setDetailData(null);
+    detailDataRef.current = null;
+    buildingPollCountRef.current = 0;
     if (scopedAutoLoad) {
       setApplied(buildScopedDashboardApplied(user, r));
       setFilterApplied(true);
@@ -1184,7 +1309,7 @@ export default function Dashboard() {
       siteOptions,
       adUnitOptions,
       appOptions,
-    });
+    }, scopedNormOpts);
     if (!hasInventoryFilterSelection(apiFilters) && isAdmin(user)) {
       loadOverview(buildOverviewFiltersForState(apiFilters, true));
     }
@@ -1495,11 +1620,14 @@ export default function Dashboard() {
 
   const overviewCardLoading = useMemo(() => {
     if (isScopedDashboardUser) {
-      if (hasInventoryFilter) return detailLoading || !detailData;
-      return overviewLoading || !overviewData?.summary;
+      if (hasInventoryFilter) return detailLoading && !detailData;
+      // Keep cards visible once we have a summary — background refresh must not skeleton.
+      if (overviewData?.summary) return false;
+      return overviewLoading;
     }
-    if (hasInventoryFilter) return detailLoading || !detailData;
-    return overviewLoading || !overviewData?.summary;
+    if (hasInventoryFilter) return detailLoading && !detailData;
+    if (overviewData?.summary) return false;
+    return overviewLoading;
   }, [
     isScopedDashboardUser,
     filterApplied,
@@ -1581,7 +1709,11 @@ export default function Dashboard() {
     return {
       revenue: buildRevenueDomainShare(
         enrichedRows,
-        normalizeInventorySelections({ domain: applied?.domain || [] }, {}).domain || []
+        normalizeInventorySelections(
+          { domain: applied?.domain || [] },
+          {},
+          scopedNormOpts
+        ).domain || []
       ),
       device: buildShareSeries(enrichedRows, [
         'device_category_name', 'mobile_device_name', 'device', 'DEVICE_CATEGORY_NAME', 'device_name', 'deviceType',
@@ -1590,7 +1722,7 @@ export default function Dashboard() {
         'country_name', 'country', 'COUNTRY_NAME', 'countryName', 'countryCode',
       ], 'revenue', { topN: 10 }),
     };
-  }, [enrichedRows, applied?.domain, detailData?.charts]);
+  }, [enrichedRows, applied?.domain, detailData?.charts, scopedNormOpts]);
 
   const dailyWithEcpm = useMemo(() => withDailyEcpm(dailySeries), [dailySeries]);
 
