@@ -1,7 +1,7 @@
 /**
  * Typed report_grain storage — upsert, read, rollup rebuild, partition management.
  */
-const { query, schemaQuery } = require('../db');
+const { query, schemaQuery, withTransaction, rollupAdvisoryKeys } = require('../db');
 const { requireClientId } = require('../utils/clientContext');
 const {
   normalizeRowToGrain,
@@ -365,72 +365,90 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
 
   for (const day of uniq) {
     try {
-      await query(
-        `DELETE FROM rollup_kpi_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
-        [day, clientId]
-      );
-      await query(
-        `DELETE FROM rollup_dim_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
-        [day, clientId]
-      );
+      const dayKpi = await withTransaction(async (q) => {
+        const [k1, k2] = rollupAdvisoryKeys(clientId, day);
+        await q(`SELECT pg_advisory_xact_lock($1, $2)`, [k1, k2]);
 
-      const kpiRes = await query(
-        `INSERT INTO rollup_kpi_daily (
-           client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
-           impressions, revenue, viewable_weight, clicks, grain_count, currency
-         )
-         SELECT
-           $2::uuid,
-           g.report_date,
-           COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.adUnitExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.appExpr}), ''), ''),
-           COALESCE(SUM(${m.impressionExpr}), 0),
-           COALESCE(SUM(${m.revenueExpr}), 0),
-           COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
-           COALESCE(SUM(${m.clickExpr}), 0),
-           COUNT(*)::int,
-           COALESCE(MAX(${m.currencyExpr}), 'USD')
-         ${GRAIN_JOIN_SQL}
-         WHERE g.client_id = $2::uuid AND g.report_date = $1::date
-           AND ${kpiSliceFilterSql('g')}
-         GROUP BY g.report_date,
-           COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.adUnitExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.appExpr}), ''), '')
-         HAVING COALESCE(SUM(${m.impressionExpr}), 0) > 0
-             OR COALESCE(SUM(${m.revenueExpr}), 0) > 0`,
-        [day, clientId]
-      );
-      totalKpi += kpiRes.rowCount || 0;
-
-      const dimInserts = [
-        ['domain', m.domainExpr],
-        ['ad_unit', m.adUnitExpr],
-        ['country', m.countryExpr],
-        ['device', m.deviceExpr],
-      ];
-      for (const [kind, expr] of dimInserts) {
-        await query(
-          `INSERT INTO rollup_dim_daily (client_id, report_date, dim_kind, dim_value, revenue, impressions)
-           SELECT
-             $3::uuid,
-             g.report_date,
-             $2::text,
-             NULLIF(TRIM(${expr}), ''),
-             COALESCE(SUM(${m.revenueExpr}), 0),
-             COALESCE(SUM(${m.impressionExpr}), 0)
-           ${GRAIN_JOIN_SQL}
-           WHERE g.client_id = $3::uuid AND g.report_date = $1::date
-             AND ${kpiSliceFilterSql('g')}
-           GROUP BY g.report_date, NULLIF(TRIM(${expr}), '')
-           HAVING NULLIF(TRIM(${expr}), '') IS NOT NULL
-             AND (COALESCE(SUM(${m.impressionExpr}), 0) > 0 OR COALESCE(SUM(${m.revenueExpr}), 0) > 0)`,
-          [day, kind, clientId]
+        await q(
+          `DELETE FROM rollup_kpi_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
+          [day, clientId]
         );
-      }
+        await q(
+          `DELETE FROM rollup_dim_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
+          [day, clientId]
+        );
+
+        const kpiRes = await q(
+          `INSERT INTO rollup_kpi_daily (
+             client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
+             impressions, revenue, viewable_weight, clicks, grain_count, currency
+           )
+           SELECT
+             $2::uuid,
+             g.report_date,
+             COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
+             COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
+             COALESCE(NULLIF(TRIM(${m.adUnitExpr}), ''), ''),
+             COALESCE(NULLIF(TRIM(${m.appExpr}), ''), ''),
+             COALESCE(SUM(${m.impressionExpr}), 0),
+             COALESCE(SUM(${m.revenueExpr}), 0),
+             COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
+             COALESCE(SUM(${m.clickExpr}), 0),
+             COUNT(*)::int,
+             COALESCE(MAX(${m.currencyExpr}), 'USD')
+           ${GRAIN_JOIN_SQL}
+           WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+             AND ${kpiSliceFilterSql('g')}
+           GROUP BY g.report_date,
+             COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
+             COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
+             COALESCE(NULLIF(TRIM(${m.adUnitExpr}), ''), ''),
+             COALESCE(NULLIF(TRIM(${m.appExpr}), ''), '')
+           HAVING COALESCE(SUM(${m.impressionExpr}), 0) > 0
+               OR COALESCE(SUM(${m.revenueExpr}), 0) > 0
+           ON CONFLICT (client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app)
+           DO UPDATE SET
+             impressions = EXCLUDED.impressions,
+             revenue = EXCLUDED.revenue,
+             viewable_weight = EXCLUDED.viewable_weight,
+             clicks = EXCLUDED.clicks,
+             grain_count = EXCLUDED.grain_count,
+             currency = EXCLUDED.currency`,
+          [day, clientId]
+        );
+
+        const dimInserts = [
+          ['domain', m.domainExpr],
+          ['ad_unit', m.adUnitExpr],
+          ['country', m.countryExpr],
+          ['device', m.deviceExpr],
+        ];
+        for (const [kind, expr] of dimInserts) {
+          await q(
+            `INSERT INTO rollup_dim_daily (client_id, report_date, dim_kind, dim_value, revenue, impressions)
+             SELECT
+               $3::uuid,
+               g.report_date,
+               $2::text,
+               NULLIF(TRIM(${expr}), ''),
+               COALESCE(SUM(${m.revenueExpr}), 0),
+               COALESCE(SUM(${m.impressionExpr}), 0)
+             ${GRAIN_JOIN_SQL}
+             WHERE g.client_id = $3::uuid AND g.report_date = $1::date
+               AND ${kpiSliceFilterSql('g')}
+             GROUP BY g.report_date, NULLIF(TRIM(${expr}), '')
+             HAVING NULLIF(TRIM(${expr}), '') IS NOT NULL
+               AND (COALESCE(SUM(${m.impressionExpr}), 0) > 0 OR COALESCE(SUM(${m.revenueExpr}), 0) > 0)
+             ON CONFLICT (client_id, report_date, dim_kind, dim_value)
+             DO UPDATE SET
+               revenue = EXCLUDED.revenue,
+               impressions = EXCLUDED.impressions`,
+            [day, kind, clientId]
+          );
+        }
+        return kpiRes.rowCount || 0;
+      });
+      totalKpi += dayKpi;
     } catch (e) {
       logger.warn(`[${syncType}] rollup rebuild failed for ${day}:`, e.message);
     }
@@ -454,40 +472,54 @@ async function rebuildInventoryRollupsFromGrain(dates, syncType = 'rollup') {
 
   for (const day of uniq) {
     try {
-      await query(
-        `DELETE FROM rollup_inventory_kpi_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
-        [day, clientId]
-      );
-      // Collapse to date × domain × site (no ad-unit) — Inventory Breakdown default grain.
-      const kpiRes = await query(
-        `INSERT INTO rollup_inventory_kpi_daily (
-           client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
-           impressions, revenue, viewable_weight, clicks, grain_count, currency
-         )
-         SELECT
-           $2::uuid,
-           g.report_date,
-           COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
-           '',
-           '',
-           COALESCE(SUM(${m.impressionExpr}), 0),
-           COALESCE(SUM(${m.revenueExpr}), 0),
-           COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
-           COALESCE(SUM(${m.clickExpr}), 0),
-           COUNT(*)::int,
-           COALESCE(MAX(${m.currencyExpr}), 'USD')
-         ${GRAIN_JOIN_SQL}
-         WHERE g.client_id = $2::uuid AND g.report_date = $1::date
-           AND g.slice_key = 'inventory_core'
-         GROUP BY g.report_date,
-           COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
-           COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), '')
-         HAVING COALESCE(SUM(${m.impressionExpr}), 0) > 0
-             OR COALESCE(SUM(${m.revenueExpr}), 0) > 0`,
-        [day, clientId]
-      );
-      totalKpi += kpiRes.rowCount || 0;
+      const dayKpi = await withTransaction(async (q) => {
+        const [k1, k2] = rollupAdvisoryKeys(`${clientId}:inv`, day);
+        await q(`SELECT pg_advisory_xact_lock($1, $2)`, [k1, k2]);
+
+        await q(
+          `DELETE FROM rollup_inventory_kpi_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
+          [day, clientId]
+        );
+        // Collapse to date × domain × site (no ad-unit) — Inventory Breakdown default grain.
+        const kpiRes = await q(
+          `INSERT INTO rollup_inventory_kpi_daily (
+             client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
+             impressions, revenue, viewable_weight, clicks, grain_count, currency
+           )
+           SELECT
+             $2::uuid,
+             g.report_date,
+             COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
+             COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), ''),
+             '',
+             '',
+             COALESCE(SUM(${m.impressionExpr}), 0),
+             COALESCE(SUM(${m.revenueExpr}), 0),
+             COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
+             COALESCE(SUM(${m.clickExpr}), 0),
+             COUNT(*)::int,
+             COALESCE(MAX(${m.currencyExpr}), 'USD')
+           ${GRAIN_JOIN_SQL}
+           WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+             AND g.slice_key = 'inventory_core'
+           GROUP BY g.report_date,
+             COALESCE(NULLIF(TRIM(${m.domainExpr}), ''), ''),
+             COALESCE(NULLIF(TRIM(${m.siteExpr}), ''), '')
+           HAVING COALESCE(SUM(${m.impressionExpr}), 0) > 0
+               OR COALESCE(SUM(${m.revenueExpr}), 0) > 0
+           ON CONFLICT (client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app)
+           DO UPDATE SET
+             impressions = EXCLUDED.impressions,
+             revenue = EXCLUDED.revenue,
+             viewable_weight = EXCLUDED.viewable_weight,
+             clicks = EXCLUDED.clicks,
+             grain_count = EXCLUDED.grain_count,
+             currency = EXCLUDED.currency`,
+          [day, clientId]
+        );
+        return kpiRes.rowCount || 0;
+      });
+      totalKpi += dayKpi;
     } catch (e) {
       logger.warn(`[${syncType}] inventory rollup rebuild failed for ${day}:`, e.message);
     }

@@ -26,10 +26,13 @@ export function useReportPageCache(pageKey, snapshot, { cacheTtlMs, onSkipLoad }
   return { saved, shouldSkipInitialLoad: () => skipOnce.current };
 }
 
-/** True when we have usable cached payload within TTL. */
-export function isReportCacheFresh(saved, ttlMs) {
+/** True when we have usable cached payload within TTL for this GAM network. */
+export function isReportCacheFresh(saved, ttlMs, { clientId = null } = {}) {
   if (!saved?.fetchedAt) return false;
   if (Date.now() - saved.fetchedAt >= ttlMs) return false;
+  // Always require a clientId tag — never paint another network's KPIs.
+  if (!saved.clientId) return false;
+  if (clientId == null || String(saved.clientId) !== String(clientId)) return false;
   return Boolean(
     saved.data
     || saved.progData

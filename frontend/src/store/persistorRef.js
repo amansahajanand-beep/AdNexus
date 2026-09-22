@@ -8,3 +8,8 @@ export function registerPersistor(p) {
 export function purgePersistedState() {
   return persistorInstance?.purge();
 }
+
+/** Wait until redux-persist has written the latest state (e.g. cleared reports). */
+export function flushPersistedState() {
+  return persistorInstance?.flush?.() || Promise.resolve();
+}

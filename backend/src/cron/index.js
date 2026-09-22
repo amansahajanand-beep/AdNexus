@@ -3,13 +3,14 @@
  * Only runs when SYNC_DISABLED !== 'true'.
  * All times are in Asia/Singapore timezone.
  *
- * Tuned for Upstash command budget + heap safety:
+ * Tuned so today stays healthy under multi-network load:
  *   - Hourly: lean today Totals only (GAM + 1 Ads job per client)
+ *   - Boot: today + yesterday only (no month/gap stampede)
+ *   - 2AM: drip complete-month (capped), not unlimited fan-out
  *   - Every ~90m: sync-extended (AdX + Ad Server + Active View → grain.metrics)
  *   - Every 6h: lean yesterday (GAM + Ads)
  *   - Hourly :30: GAM reconcile only (Ads reconcile opt-in via ADS_RECONCILE_CRON)
- *   - 2AM: one job per calendar month until every day has KPI grain
- *   - Boot: today + yesterday + recent gaps + incomplete months
+ *   - One in-flight sync-today per network (watchdog does not flood duplicates)
  */
 const cron   = require('node-cron');
 const logger = require('../utils/logger');
@@ -29,32 +30,195 @@ async function eachActiveClient(fn) {
   }
 }
 
-async function enqueueLeanToday({ reason } = {}) {
+/** Max calendar months to enqueue per complete-month run (2AM / drip). */
+function monthBackfillLimit() {
+  const n = parseInt(process.env.SYNC_MONTH_BACKFILL_LIMIT || '2', 10);
+  return Math.max(1, Math.min(12, Number.isFinite(n) ? n : 2));
+}
+
+/** Stable BullMQ job id — one per network per calendar day (no hour/minute suffixes). */
+function syncTodayJobId(clientId, today = todayInTZ()) {
+  return `sync-today-${String(clientId || '').slice(0, 8)}-${String(today || '').slice(0, 10)}`.slice(0, 120);
+}
+
+function isSyncTodayForClientDay(job, clientId, today) {
+  if (!job || job.name !== 'sync-today') return false;
+  const jobDay = job.data?.date ? String(job.data.date).slice(0, 10) : '';
+  if (jobDay !== String(today || '').slice(0, 10)) return false;
+  return String(job.data?.clientId || '') === String(clientId || '');
+}
+
+/**
+ * True when this network already has a live sync-today for calendar today
+ * (waiting / delayed / active / paused). Prevents watchdog/boot floods.
+ */
+async function hasLiveSyncTodayJob(clientId, today = todayInTZ()) {
+  if (gamSyncQueue.disabled || typeof gamSyncQueue.getJobs !== 'function') return false;
+  const cid = String(clientId || '');
+  const day = String(today || '').slice(0, 10);
+  if (!cid || !day) return false;
+  try {
+    const jobs = await gamSyncQueue.getJobs(['waiting', 'delayed', 'active', 'paused'], 0, 200);
+    return jobs.some((job) => isSyncTodayForClientDay(job, cid, day));
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Drop duplicate sync-today jobs for a network/day, keeping at most one live job.
+ * Legacy hour/minute jobId suffixes left zombies that starved the large network.
+ */
+async function purgeDuplicateSyncTodayJobs(clientId, today = todayInTZ()) {
+  if (gamSyncQueue.disabled || typeof gamSyncQueue.getJobs !== 'function') return 0;
+  const cid = String(clientId || '');
+  const day = String(today || '').slice(0, 10);
+  if (!cid || !day) return 0;
+  const keepId = syncTodayJobId(cid, day);
+  let removed = 0;
+  try {
+    const jobs = await gamSyncQueue.getJobs(
+      ['waiting', 'delayed', 'active', 'paused', 'completed', 'failed'],
+      0,
+      300
+    );
+    const matches = jobs.filter((job) => isSyncTodayForClientDay(job, cid, day));
+    // Prefer keeping the stable id if live; else the newest live job.
+    let keep = matches.find((j) => String(j.id) === keepId) || null;
+    if (keep) {
+      const st = await keep.getState().catch(() => null);
+      if (!['waiting', 'delayed', 'active', 'paused'].includes(st)) keep = null;
+    }
+    if (!keep) {
+      const live = [];
+      for (const j of matches) {
+        const st = await j.getState().catch(() => null);
+        if (['waiting', 'delayed', 'active', 'paused'].includes(st)) live.push(j);
+      }
+      live.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+      keep = live[0] || null;
+    }
+    for (const job of matches) {
+      if (keep && String(job.id) === String(keep.id)) continue;
+      try {
+        const st = await job.getState().catch(() => null);
+        if (st === 'active') {
+          try {
+            await job.moveToFailed(new Error('duplicate sync-today purged'), job.token || '0', true);
+          } catch (_) { /* lock may belong to dead worker */ }
+        }
+        await job.remove();
+        removed += 1;
+      } catch (_) { /* ignore stubborn locks — restart clears them */ }
+    }
+    if (removed) {
+      logger.info(
+        `Cron: purged ${removed} duplicate sync-today for client=${cid.slice(0, 8)} day=${day}`
+        + ` (kept=${keep ? keep.id : 'none'})`
+      );
+    }
+  } catch (e) {
+    logger.warn(`Cron: purge duplicate sync-today failed: ${e.message}`);
+  }
+  return removed;
+}
+
+/**
+ * Drop leftover sync-today jobs whose payload date is no longer calendar today.
+ * Incomplete past days are requeued as sync-day (reconcile / fill-gaps still cover the rest).
+ */
+async function purgeStaleSyncTodayJobs() {
+  if (gamSyncQueue.disabled || typeof gamSyncQueue.getJobs !== 'function') return 0;
   const today = todayInTZ();
-  const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
+  let removed = 0;
+  let demoted = 0;
+  try {
+    const jobs = await gamSyncQueue.getJobs(['waiting', 'delayed', 'paused', 'failed'], 0, 400);
+    for (const job of jobs) {
+      if (!job || job.name !== 'sync-today') continue;
+      const day = job.data?.date ? String(job.data.date).slice(0, 10) : '';
+      if (!day || day === today) continue;
+      const cid = job.data?.clientId;
+      if (cid) {
+        try {
+          await gamSyncQueue.add('sync-day', {
+            date: day,
+            includeFull: false,
+            clientId: cid,
+          }, {
+            jobId: `sync-day-${String(cid).slice(0, 8)}-${day}-from-stale-today`,
+            priority: 3,
+            attempts: 2,
+            backoff: { type: 'exponential', delay: 20000 },
+          });
+          demoted += 1;
+        } catch (e) {
+          if (!/JobId|already exists|duplicat/i.test(e.message || '')) {
+            logger.warn(`Cron: demote stale sync-today ${job.id} failed: ${e.message}`);
+          }
+        }
+      }
+      try {
+        await job.remove();
+        removed += 1;
+      } catch (e) {
+        logger.warn(`Cron: could not remove stale sync-today ${job.id}: ${e.message}`);
+      }
+    }
+    if (removed) {
+      logger.info(
+        `Cron: purged ${removed} stale sync-today job(s) (today=${today}, demoted=${demoted})`
+      );
+    }
+  } catch (e) {
+    logger.warn(`Cron: purge stale sync-today failed: ${e.message}`);
+  }
+  return removed;
+}
+
+/**
+ * Enqueue lean sync-today. Optional clientIds limits to specific networks
+ * (watchdog must not re-queue every network when one is stale).
+ */
+async function enqueueLeanToday({ reason, clientIds = null } = {}) {
+  const today = todayInTZ();
+  await purgeStaleSyncTodayJobs();
   const tag = reason ? ` (${reason})` : '';
-  // Watchdog / boot: unique suffix so a stuck same-hour jobId cannot block enqueue.
-  const forceSuffix = (reason === 'watchdog' || reason === 'boot')
-    ? `-${Math.floor(Date.now() / 60_000)}`
-    : '';
+  const only = Array.isArray(clientIds) && clientIds.length
+    ? new Set(clientIds.map((id) => String(id)))
+    : null;
 
   await eachActiveClient(async (client) => {
     const cid = client.id;
-    const baseId = `sync-today-${cid.slice(0, 8)}-${today}-${hourSlot}`;
-    const jobId = `${baseId}${forceSuffix}`.slice(0, 120);
+    if (only && !only.has(String(cid))) return;
+
+    await purgeDuplicateSyncTodayJobs(cid, today);
+
+    if (await hasLiveSyncTodayJob(cid, today)) {
+      logger.info(
+        `Cron: sync-today already live for ${today} client=${cid.slice(0, 8)} — skip enqueue${tag}`
+      );
+      return;
+    }
+
+    const jobId = syncTodayJobId(cid, today);
     try {
-      // Drop completed/failed leftovers with the base id so hourly re-add is reliable.
-      if (!forceSuffix) {
-        try {
-          const existing = await gamSyncQueue.getJob(baseId);
-          if (existing) {
-            const state = await existing.getState();
-            if (state === 'completed' || state === 'failed') {
-              await existing.remove();
-            }
+      // Drop completed/failed leftover with the stable id so re-add is reliable.
+      try {
+        const existing = await gamSyncQueue.getJob(jobId);
+        if (existing) {
+          const state = await existing.getState();
+          if (state === 'completed' || state === 'failed') {
+            await existing.remove();
+          } else {
+            logger.info(
+              `Cron: sync-today jobId=${jobId} still ${state} — skip enqueue${tag}`
+            );
+            return;
           }
-        } catch (_) { /* ignore */ }
-      }
+        }
+      } catch (_) { /* ignore */ }
+
       await gamSyncQueue.add('sync-today', {
         date: today,
         includeFull: false,
@@ -71,6 +235,12 @@ async function enqueueLeanToday({ reason } = {}) {
         `Cron: enqueued lean sync-today for ${today} client=${cid.slice(0, 8)}${tag}`
       );
     } catch (e) {
+      if (/JobId|already exists|duplicat/i.test(e.message || '')) {
+        logger.info(
+          `Cron: sync-today already queued for ${today} client=${cid.slice(0, 8)}${tag}`
+        );
+        return;
+      }
       logger.error('Cron: failed to enqueue sync-today:', e.message);
     }
   });
@@ -186,20 +356,21 @@ async function enqueueRecentGapFill({ reason, days = 30 } = {}) {
 }
 
 /**
- * One sync-backfill job per calendar month in the historical window.
- * Worker uses syncCompleteDateRangeFromGAM — skips months already fully covered,
- * otherwise fills missing days oldest-first until 1..N are present.
+ * One sync-backfill job per calendar month (newest first), capped so we never
+ * stampede the worker with a full year of months on every boot.
  */
-async function enqueueMonthCompleteBackfill({ reason } = {}) {
+async function enqueueMonthCompleteBackfill({ reason, maxMonths = null } = {}) {
   const range = historicalRangeForPresets();
   const months = listCalendarMonthsNewestFirst(range.startDate, range.endDate);
+  const limit = maxMonths != null ? maxMonths : monthBackfillLimit();
+  const slice = months.slice(0, limit);
   const tag = reason ? ` (${reason})` : '';
   const daySlot = todayInTZ();
 
   await eachActiveClient(async (client) => {
     const cid = client.id;
-    for (let i = 0; i < months.length; i += 1) {
-      const { startDate: ms, endDate: me } = months[i];
+    for (let i = 0; i < slice.length; i += 1) {
+      const { startDate: ms, endDate: me } = slice[i];
       try {
         await gamSyncQueue.add('sync-backfill', {
           startDate: ms,
@@ -208,7 +379,6 @@ async function enqueueMonthCompleteBackfill({ reason } = {}) {
           includeFull: false,
           clientId: cid,
         }, {
-          // Include day so boot + 2AM can both enqueue without colliding forever.
           jobId: `sync-month-${cid.slice(0, 8)}-${ms}-${me}-${daySlot}`,
           priority: 3 + i,
           attempts: 2,
@@ -219,8 +389,15 @@ async function enqueueMonthCompleteBackfill({ reason } = {}) {
           + ` priority=${3 + i}${tag}`
         );
       } catch (e) {
+        if (/JobId|already exists|duplicat/i.test(e.message || '')) continue;
         logger.error('Cron: failed to enqueue sync-month:', e.message);
       }
+    }
+    if (months.length > slice.length) {
+      logger.info(
+        `Cron: complete-month capped at ${slice.length}/${months.length}`
+        + ` for client=${cid.slice(0, 8)}${tag} (rest drip via later 2AM runs)`
+      );
     }
   });
 }
@@ -387,7 +564,7 @@ async function enqueueReconcileHistorical({ reason } = {}) {
   });
 }
 
-/** Re-enqueue sync-today if stale; keep draining historical gaps. */
+/** Re-enqueue sync-today if stale; keep draining historical gaps (only when today is healthy). */
 async function watchdogStaleSync() {
   const { query } = require('../db');
   const { listActiveClients } = require('../models/clientStore');
@@ -399,6 +576,7 @@ async function watchdogStaleSync() {
   } = require('../services/syncPriorityGate');
   const clients = await listActiveClients();
   const staleMs = 75 * 60 * 1000;
+  const today = todayInTZ();
   for (const client of clients) {
     try {
       const { rows } = await query(
@@ -408,20 +586,30 @@ async function watchdogStaleSync() {
         [client.id]
       );
       const last = rows[0]?.finished_at ? new Date(rows[0].finished_at).getTime() : 0;
-      if (Date.now() - last > staleMs) {
-        logger.warn(
-          `Cron watchdog: sync-today stale for client=${client.id.slice(0, 8)}`
-          + ` (last=${rows[0]?.finished_at || 'never'}) — re-enqueue with today-priority`
-        );
-        await runWithTodayPriority(async ({ startedAt, waitMs }) => {
-          await enqueueLeanToday({ reason: 'watchdog' });
-          await waitForSyncTodaySuccess(client.id, todayInTZ(), {
-            timeoutMs: waitMs,
-            sinceMs: startedAt - 5_000,
-          });
-        }, { reason: 'watchdog' });
+      const stale = Date.now() - last > staleMs;
+      if (stale) {
+        if (await hasLiveSyncTodayJob(client.id, today)) {
+          logger.info(
+            `Cron watchdog: sync-today already live for client=${client.id.slice(0, 8)} — skip re-enqueue`
+          );
+        } else {
+          logger.warn(
+            `Cron watchdog: sync-today stale for client=${client.id.slice(0, 8)}`
+            + ` (last=${rows[0]?.finished_at || 'never'}) — re-enqueue with today-priority`
+          );
+          await runWithTodayPriority(async ({ startedAt, waitMs }) => {
+            // Only this network — do not flood siblings.
+            await enqueueLeanToday({ reason: 'watchdog', clientIds: [client.id] });
+            await waitForSyncTodaySuccess(client.id, today, {
+              timeoutMs: Math.min(waitMs, 60_000),
+              sinceMs: startedAt - 5_000,
+            });
+          }, { reason: 'watchdog' });
+        }
+      } else {
+        // History drip only when today is fresh for this network.
+        await runWithClient(client, () => drainIncompleteHistory());
       }
-      await runWithClient(client, () => drainIncompleteHistory());
     } catch (e) {
       logger.warn('Cron watchdog check failed:', e.message);
     }
@@ -461,13 +649,12 @@ async function runHourlyTodayPrioritySync({ reason = 'hourly' } = {}) {
 
 async function enqueueHourlyLeanSync({ reason } = {}) {
   if (reason === 'boot') {
-    // Today first under priority gate, then historical drain. Skip Ads reconcile on boot
-    // (hourly today + 6h yesterday cover the same window without extra BullMQ fan-out).
+    // Today + yesterday only. History drips via 2AM complete-month + watchdog drain —
+    // never dump every incomplete month on restart (that starved sync-today).
     await runHourlyTodayPrioritySync({ reason: 'boot' });
     await enqueueLeanYesterdayAndFullToday({ reason: 'boot' });
     await enqueueAdsSyncYesterday({ reason: 'boot' });
-    await enqueueRecentGapFill({ reason: 'boot', days: 30 });
-    await enqueueMonthCompleteBackfill({ reason: 'boot' });
+    logger.info('Cron: boot kickoff done (today+yesterday only; history deferred to 2AM/drip)');
     return;
   }
   await runHourlyTodayPrioritySync({ reason: reason || 'hourly' });
@@ -603,8 +790,9 @@ function startCron() {
     'Cron jobs started: hourly today-priority (+ads 1 job/client), ~90m sync-extended '
     + '(AdX/AdServer/ActiveView), :30 GAM reconcile '
     + '(Ads reconcile off unless ADS_RECONCILE_CRON=true), 1AM reconcile-historical,'
-    + ' 6h yesterday (+ads), 2AM complete-month, 3AM archive, 4AM ads-full, '
-    + '3h ads-recent off unless ADS_RECENT_CRON=true, 15m watchdog, boot kickoff'
+    + ' 6h yesterday (+ads), 2AM complete-month (capped), 3AM archive, 4AM ads-full, '
+    + '3h ads-recent off unless ADS_RECENT_CRON=true, 15m watchdog (no flood), '
+    + 'boot=today+yesterday only'
   );
 
   // Don't wait until the next clock hour — fill today's present now.
@@ -628,6 +816,10 @@ function startCron() {
 module.exports = {
   startCron,
   enqueueHourlyLeanSync,
+  purgeStaleSyncTodayJobs,
+  purgeDuplicateSyncTodayJobs,
+  hasLiveSyncTodayJob,
+  syncTodayJobId,
   enqueueExtendedMetricsSync,
   runHourlyTodayPrioritySync,
   enqueueRecentGapFill,

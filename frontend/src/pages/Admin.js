@@ -94,7 +94,7 @@ export default function Admin() {
     setCatalogLoading(true);
     let picker = null;
     try {
-      picker = await usersAPI.getInventoryPicker().catch(() => null);
+      picker = await usersAPI.getInventoryPicker(user?.clientId).catch(() => null);
       if (picker) {
         setCatalogLists({
           siteHosts: picker.siteHosts || [],
@@ -115,7 +115,7 @@ export default function Admin() {
     }
 
     try {
-      const catalog = await reportsAPI.getFilterCatalog().catch(() => null);
+      const catalog = await reportsAPI.getFilterCatalog(user?.clientId).catch(() => null);
       if (catalog?.rows?.length) {
         setCatalogRows(catalog.rows);
         setCatalogLists((prev) => ({
@@ -143,8 +143,16 @@ export default function Admin() {
     } finally {
       setDomainsLoading(false);
     }
-  }, []);
+  }, [user?.clientId]);
   useEffect(() => { loadUsers(); loadDomains(); loadAdsAccounts(); }, [loadUsers, loadDomains, loadAdsAccounts]);
+
+  // After admin switches active GAM network, user.clientId changes — reload scoped lists (1B).
+  useEffect(() => {
+    if (!user?.clientId) return undefined;
+    loadUsers();
+    loadDomains();
+    return undefined;
+  }, [user?.clientId, loadUsers, loadDomains]);
 
   useEffect(() => {
     if (tab === 'user' || tab === 'domains') loadAdsAccounts();

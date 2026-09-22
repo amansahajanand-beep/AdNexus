@@ -1,7 +1,7 @@
 const express = require('express');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
-const { createClient, getClientByNetworkCode } = require('../models/clientStore');
+const { createClient, createPlaceholderClient, getClientByNetworkCode } = require('../models/clientStore');
 const { createUser, getUserByUsername } = require('../models/userStore');
 const { getGAMClient } = require('../gam/client');
 const { validatePassword } = require('../utils/passwordPolicy');
@@ -52,8 +52,47 @@ function validateOnboardAdminFields(body) {
 }
 
 /**
+ * Register account only (2A) — no Google / no network.
+ * Admin later connects GAM in Admin → GAM Connection.
+ */
+router.post('/register', async (req, res) => {
+  try {
+    const fields = validateOnboardAdminFields(req.body);
+    if (fields.error) return res.status(400).json({ error: fields.error });
+
+    const dupUser = await getUserByUsername(fields.username);
+    if (dupUser) {
+      return res.status(400).json({ error: 'Username already exists.' });
+    }
+
+    const client = await createPlaceholderClient({ name: fields.name });
+    const user = await createUser({
+      username: fields.username,
+      email: fields.email,
+      password: fields.password,
+      role: 'admin',
+      permissions: null,
+      createdBy: 'self-register',
+      clientId: client.id,
+    });
+
+    logger.info(`Account registered (pending GAM): ${client.name} admin=${user.username}`);
+    res.status(201).json({
+      ok: true,
+      client: { id: client.id, name: client.name, networkCode: null, isPending: true },
+      user: { id: user.id, username: user.username, role: user.role },
+      message: 'Account created. Sign in, then connect Google Ad Manager under Admin → GAM Connection.',
+    });
+  } catch (err) {
+    logger.error('Register failed:', err.message);
+    res.status(400).json({ error: err.message || 'Could not create account' });
+  }
+});
+
+/**
  * Start Connect with Google onboarding — no GAM credentials required.
  * Creates a short-lived pending session with admin form fields, returns Google OAuth URL.
+ * (Legacy path kept; prefer POST /register + Admin connect.)
  */
 router.post('/oauth-start', async (req, res) => {
   try {

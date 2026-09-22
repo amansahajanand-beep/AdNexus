@@ -267,18 +267,18 @@ async function startServer() {
           const today = todayInTZ();
           const hist = historicalRangeForPresets();
           const redisOk = process.env.REDIS_DISABLED !== 'true' && process.env.REDIS_URL;
-          const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
 
           const presentRich = await presentHasCountryAndDevice();
           if (!presentRich) {
             logger.info(`Present sync: today (${today}) missing from report_present — enqueue lean sync-today`);
             if (redisOk) {
+              const jobId = `sync-today-${client.id.slice(0, 8)}-${today}`.slice(0, 120);
               await gamSyncQueue.add('sync-today', {
                 date: today,
                 includeFull: false,
                 clientId: client.id,
               }, {
-                jobId: `sync-today-${client.id.slice(0, 8)}-${today}-${hourSlot}`,
+                jobId,
                 priority: 1,
                 attempts: 3,
                 backoff: { type: 'exponential', delay: 10000 },
@@ -335,12 +335,30 @@ async function startServer() {
       try {
         const { cache } = require('./gam/client');
         const { kvGet } = require('./utils/kvCache');
-        const { CATALOG_CACHE_KEY } = require('./utils/inventoryCatalog');
-        const hit = await kvGet(CATALOG_CACHE_KEY);
-        if (hit?.payload?.rows?.length) {
-          cache.set(CATALOG_CACHE_KEY, hit.payload, parseInt(process.env.CACHE_TTL, 10) || 3600);
-          logger.info(`Cache warm-up: filter catalog from Postgres (${hit.payload.rows.length} rows)`);
-        } else {
+        const { CATALOG_CACHE_KEY, catalogCacheKey } = require('./utils/inventoryCatalog');
+        const { listActiveClients } = require('./models/clientStore');
+        const { runWithClient } = require('./utils/clientContext');
+        const { redisDel } = require('./redisClient');
+        // Drop legacy shared key so networks cannot bleed across tenants.
+        try { await redisDel(CATALOG_CACHE_KEY); } catch (_) { /* ignore */ }
+        try { cache.del(CATALOG_CACHE_KEY); } catch (_) { /* ignore */ }
+
+        const clients = await listActiveClients();
+        let warmed = 0;
+        for (const client of clients) {
+          await runWithClient(client, async () => {
+            const hit = await kvGet(CATALOG_CACHE_KEY);
+            if (hit?.payload?.rows?.length) {
+              cache.set(catalogCacheKey(), hit.payload, parseInt(process.env.CACHE_TTL, 10) || 3600);
+              warmed += 1;
+              logger.info(
+                `Cache warm-up: filter catalog client=${String(client.id).slice(0, 8)}`
+                + ` (${hit.payload.rows.length} rows)`
+              );
+            }
+          });
+        }
+        if (!warmed) {
           logger.info('Cache warm-up: no persisted filter catalog yet (first GAM fetch will save it)');
         }
       } catch (e) {

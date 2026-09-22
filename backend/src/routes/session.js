@@ -8,7 +8,7 @@
 const express = require('express');
 const router = express.Router();
 const { verifyPassword, getUserById, getUserByUsername, updateUser, checkPasswordForUser } = require('../models/userStore');
-const { resolveClientForUser } = require('../models/clientStore');
+const { resolveClientForUser, isUsableGamClient } = require('../models/clientStore');
 const { generateTokens, requireAuth } = require('../middleware/auth');
 const { rotateUserSession, clearUserSession, stripSessionFields } = require('../utils/sessionManager');
 const { validatePassword } = require('../utils/passwordPolicy');
@@ -33,15 +33,23 @@ router.post('/login', async (req, res) => {
       });
     }
 
-    // Block login before creating a session if there is no usable GAM client.
-    // Avoids "signed in → immediate dashboard 403" when credentials are missing.
+    // Admins may sign in with a pending (not yet connected) client to reach Admin → GAM Connection.
+    // Domain users require a usable linked network.
     const client = await resolveClientForUser(user);
     if (!client) {
       logger.warn(`Login blocked (no GAM client): ${user.username}`);
       return res.status(403).json({
         error:
-          'No GAM client is linked to this account. Connect Google Ad Manager credentials (Admin → Client settings or /onboard) before signing in.',
+          'No account is linked. Create an account via /onboard, then connect Google Ad Manager in Admin.',
         code: 'NO_GAM_CLIENT',
+      });
+    }
+    if (user.role !== 'admin' && !isUsableGamClient(client)) {
+      logger.warn(`Login blocked (GAM not connected): ${user.username}`);
+      return res.status(403).json({
+        error:
+          'Google Ad Manager is not connected for this account. Ask your admin to connect GAM and assign you to a network.',
+        code: 'GAM_NOT_CONNECTED',
       });
     }
 
@@ -49,7 +57,12 @@ router.post('/login', async (req, res) => {
     const freshUser = await Promise.resolve(getUserById(user.id));
     const { accessToken } = generateTokens(freshUser, sessionId);
     logger.info(`User logged in: ${user.username} (${user.role}) — new session`);
-    res.json({ token: accessToken, user: stripSessionFields(freshUser) });
+    res.json({
+      token: accessToken,
+      user: stripSessionFields(freshUser),
+      gamConnected: isUsableGamClient(client),
+      gamPending: !!client.isPending,
+    });
   } catch (err) {
     logger.error('Login error:', err.message);
     res.status(500).json({ error: 'Login failed' });

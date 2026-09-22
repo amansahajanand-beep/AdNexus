@@ -14,6 +14,7 @@ import MyAds from './pages/MyAds';
 import Help from './pages/Help';
 import PrivacyPolicy from './pages/PrivacyPolicy';
 import TermsOfService from './pages/TermsOfService';
+import About from './pages/About';
 import ProtectedRoute from './components/routing/ProtectedRoute';
 import AdminRoute from './components/routing/AdminRoute';
 import PermissionRoute from './components/routing/PermissionRoute';
@@ -107,6 +108,7 @@ function AppRoutes() {
       {/* Public */}
       <Route path="/login" element={<PublicOnlyRoute><Login /></PublicOnlyRoute>} />
       <Route path="/onboard" element={<PublicOnlyRoute><Onboard /></PublicOnlyRoute>} />
+      <Route path="/about" element={<About />} />
       <Route path="/privacy" element={<PrivacyPolicy />} />
       <Route path="/terms" element={<TermsOfService />} />
 

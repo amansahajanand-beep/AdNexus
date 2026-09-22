@@ -37,7 +37,7 @@ const {
   findCachedInventoryRows,
   buildCatalogFilterOptions,
   rowsToDomainOptions,
-  CATALOG_CACHE_KEY,
+  catalogCacheKey,
 } = require('../utils/inventoryCatalog');
 const { appPackageForPicker, isLikelyAppPackage } = require('../utils/appIdentity');
 
@@ -98,7 +98,10 @@ router.use(requireAdmin);
 
 
 router.get('/inventory-picker', (req, res) => {
-  const cached = cache.get(CATALOG_CACHE_KEY);
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Vary', 'Authorization');
+  const cached = cache.get(catalogCacheKey());
   const rows = cached?.rows?.length
     ? cached.rows
     : (findCachedInventoryRows(cache) || []);

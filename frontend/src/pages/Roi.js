@@ -118,8 +118,13 @@ export default function Roi() {
   const dispatch = useDispatch();
   const { user } = useAuth();
   const savedRaw = useSelector((s) => s.reports?.roi);
-  const saved = (!savedRaw?.userId || savedRaw.userId === user?.id) ? savedRaw : null;
-  const cacheFresh = isReportCacheFresh(saved, ROI_POLL_MS);
+  const saved = (
+    (!savedRaw?.userId || savedRaw.userId === user?.id)
+    && user?.clientId
+    && savedRaw?.clientId
+    && String(savedRaw.clientId) === String(user.clientId)
+  ) ? savedRaw : null;
+  const cacheFresh = isReportCacheFresh(saved, ROI_POLL_MS, { clientId: user?.clientId });
   const outlet = useOutletContext() || {};
   const networkInfo = outlet.networkInfo;
   const [searchParams] = useSearchParams();
@@ -571,6 +576,7 @@ export default function Roi() {
       pageKey: 'roi',
       payload: {
         userId: user?.id,
+        clientId: user?.clientId || null,
         data: slimRoiForCache(data),
         applied,
         loadKey,

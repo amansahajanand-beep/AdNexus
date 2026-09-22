@@ -110,10 +110,12 @@ function isGamJobAllowedDuringTodayPriority(job) {
   const start = job?.data?.startDate ? String(job.data.startDate).slice(0, 10) : null;
   const end = job?.data?.endDate ? String(job.data.endDate).slice(0, 10) : null;
 
-  if (name === 'sync-today') return true;
+  // Leftover Redis jobs from a previous calendar day must not steal the today slot.
+  if (name === 'sync-today') return !date || date === today;
   if (name === 'sync-network-kpi' && (date === today || date === yesterday)) return true;
   if (name === 'reconcile-day' && (date === today || date === yesterday)) return true;
-  if (name === 'sync-day' && date === today) return true;
+  // Hot path: today + yesterday lean days (boot / 6h) must not wait out the gate.
+  if (name === 'sync-day' && (date === today || date === yesterday)) return true;
   // Single-day range that is today only
   if (start === today && end === today && (name === 'sync-day' || name === 'sync-today')) return true;
   // Hourly reconcile covers yesterday..today — let it run so "today" stays fresh.

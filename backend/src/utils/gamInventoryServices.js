@@ -17,9 +17,17 @@ const { cache } = require('../gam/client');
 const logger = require('./logger');
 const { isLikelyWebDomain, isLikelyAdUnitName } = require('./adUnit');
 
-const { getClient } = require('./clientContext');
+const { getClient, tenantKey } = require('./clientContext');
 const NETWORK_CODE = () => getClient()?.networkCode || process.env.GAM_NETWORK_CODE;
 const BASE = `https://ads.google.com/apis/ads/publisher/${GAM_API_VERSION}`;
+
+function invCacheKey(bare) {
+  try {
+    return tenantKey(bare);
+  } catch (_) {
+    return bare;
+  }
+}
 
 // ─── Shared SOAP helper ───────────────────────────────────────────────────────
 
@@ -106,7 +114,7 @@ function extractMobileAppPackage(block) {
  * Returns array of {id, url} or null if service is unavailable for this network.
  */
 async function fetchSitesBySiteService(token) {
-  const cacheKey = 'gam_sites_v3';
+  const cacheKey = invCacheKey('gam_sites_v3');
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
 
@@ -161,7 +169,7 @@ async function fetchSitesBySiteService(token) {
  * Returns {units, rootId, level2} where level2 = direct children of root.
  */
 async function fetchAdUnitHierarchy(token) {
-  const cacheKey = 'gam_ad_unit_hierarchy_v1';
+  const cacheKey = invCacheKey('gam_ad_unit_hierarchy_v1');
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
@@ -240,7 +248,7 @@ function buildSiteMapFromHierarchy({ units, rootId, level2 }, gamSites = null) {
  * Returns [{id, displayName, appStore, applicationId}] or null if unavailable.
  */
 async function fetchMobileApps(token) {
-  const cacheKey = 'gam_mobile_apps_v4';
+  const cacheKey = invCacheKey('gam_mobile_apps_v4');
   const cached = cache.get(cacheKey);
   if (cached !== undefined) return cached;
 
@@ -301,7 +309,7 @@ async function fetchMobileApps(token) {
  *   3. adUnitId→siteUrl map always comes from InventoryService hierarchy.
  */
 async function fetchGAMInventoryData(token) {
-  const cacheKey = 'gam_inventory_data_v5';
+  const cacheKey = invCacheKey('gam_inventory_data_v5');
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 

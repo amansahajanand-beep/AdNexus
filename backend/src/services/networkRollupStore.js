@@ -2,7 +2,7 @@
  * Network-wide daily totals — one row per client × date (GAM Totals only).
  * Primary source for dashboard overview KPIs across any date range.
  */
-const { query } = require('../db');
+const { query, withTransaction, rollupAdvisoryKeys } = require('../db');
 const logger = require('../utils/logger');
 const { requireClientId } = require('../utils/clientContext');
 
@@ -15,68 +15,87 @@ async function rebuildNetworkRollupsFromGrain(dates, syncType = 'network-rollup'
 
   for (const day of uniq) {
     try {
-      await query(
-        `DELETE FROM rollup_network_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
-        [day, clientId]
-      );
+      const dayRows = await withTransaction(async (q) => {
+        const [k1, k2] = rollupAdvisoryKeys(`${clientId}:net`, day);
+        await q(`SELECT pg_advisory_xact_lock($1, $2)`, [k1, k2]);
 
-      const res = await query(
-        `INSERT INTO rollup_network_daily (
-           client_id, report_date, impressions, revenue, ecpm, viewability, currency, synced_at
-         )
-         SELECT
-           $2::uuid,
-           g.report_date,
-           COALESCE(SUM(g.impressions), 0)::bigint,
-           COALESCE(SUM(g.revenue), 0)::float8,
-           CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
-             THEN (COALESCE(SUM(g.revenue), 0) / COALESCE(SUM(g.impressions), 0) * 1000)::real
-             ELSE NULL END,
-           CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
-             THEN (COALESCE(SUM(g.impressions * COALESCE(g.viewable_pct, 0)), 0)
-                   / COALESCE(SUM(g.impressions), 0))::real
-             ELSE NULL END,
-           COALESCE(MAX(g.currency), 'USD'),
-           NOW()
-         FROM report_grain g
-         WHERE g.client_id = $2::uuid AND g.report_date = $1::date
-           AND g.slice_key = 'network_kpi'
-         GROUP BY g.report_date
-         HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0`,
-        [day, clientId]
-      );
-      if (res.rowCount > 0) {
-        total += res.rowCount;
-        continue;
-      }
+        await q(
+          `DELETE FROM rollup_network_daily WHERE client_id = $2::uuid AND report_date = $1::date`,
+          [day, clientId]
+        );
 
-      // Fallback: aggregate inventory_core when network_kpi slice not yet synced.
-      const fallback = await query(
-        `INSERT INTO rollup_network_daily (
-           client_id, report_date, impressions, revenue, ecpm, viewability, currency, synced_at
-         )
-         SELECT
-           $2::uuid,
-           g.report_date,
-           COALESCE(SUM(g.impressions), 0)::bigint,
-           COALESCE(SUM(g.revenue), 0)::float8,
-           CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
-             THEN (COALESCE(SUM(g.revenue), 0) / COALESCE(SUM(g.impressions), 0) * 1000)::real
-             ELSE NULL END,
-           CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
-             THEN (COALESCE(SUM(g.impressions * COALESCE(g.viewable_pct, 0)), 0)
-                   / COALESCE(SUM(g.impressions), 0))::real
-             ELSE NULL END,
-           COALESCE(MAX(g.currency), 'USD'),
-           NOW()
-         FROM report_grain g
-         WHERE g.client_id = $2::uuid AND g.report_date = $1::date
-           AND g.slice_key = 'inventory_core'
-         GROUP BY g.report_date
-         HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0`,
-        [day, clientId]
-      );
-      total += fallback.rowCount || 0;
+        const res = await q(
+          `INSERT INTO rollup_network_daily (
+             client_id, report_date, impressions, revenue, ecpm, viewability, currency, synced_at
+           )
+           SELECT
+             $2::uuid,
+             g.report_date,
+             COALESCE(SUM(g.impressions), 0)::bigint,
+             COALESCE(SUM(g.revenue), 0)::float8,
+             CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+               THEN (COALESCE(SUM(g.revenue), 0) / COALESCE(SUM(g.impressions), 0) * 1000)::real
+               ELSE NULL END,
+             CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+               THEN (COALESCE(SUM(g.impressions * COALESCE(g.viewable_pct, 0)), 0)
+                     / COALESCE(SUM(g.impressions), 0))::real
+               ELSE NULL END,
+             COALESCE(MAX(g.currency), 'USD'),
+             NOW()
+           FROM report_grain g
+           WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+             AND g.slice_key = 'network_kpi'
+           GROUP BY g.report_date
+           HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+           ON CONFLICT (client_id, report_date)
+           DO UPDATE SET
+             impressions = EXCLUDED.impressions,
+             revenue = EXCLUDED.revenue,
+             ecpm = EXCLUDED.ecpm,
+             viewability = EXCLUDED.viewability,
+             currency = EXCLUDED.currency,
+             synced_at = EXCLUDED.synced_at`,
+          [day, clientId]
+        );
+        if (res.rowCount > 0) return res.rowCount;
+
+        // Fallback: aggregate inventory_core when network_kpi slice not yet synced.
+        const fallback = await q(
+          `INSERT INTO rollup_network_daily (
+             client_id, report_date, impressions, revenue, ecpm, viewability, currency, synced_at
+           )
+           SELECT
+             $2::uuid,
+             g.report_date,
+             COALESCE(SUM(g.impressions), 0)::bigint,
+             COALESCE(SUM(g.revenue), 0)::float8,
+             CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+               THEN (COALESCE(SUM(g.revenue), 0) / COALESCE(SUM(g.impressions), 0) * 1000)::real
+               ELSE NULL END,
+             CASE WHEN COALESCE(SUM(g.impressions), 0) > 0
+               THEN (COALESCE(SUM(g.impressions * COALESCE(g.viewable_pct, 0)), 0)
+                     / COALESCE(SUM(g.impressions), 0))::real
+               ELSE NULL END,
+             COALESCE(MAX(g.currency), 'USD'),
+             NOW()
+           FROM report_grain g
+           WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+             AND g.slice_key = 'inventory_core'
+           GROUP BY g.report_date
+           HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0
+           ON CONFLICT (client_id, report_date)
+           DO UPDATE SET
+             impressions = EXCLUDED.impressions,
+             revenue = EXCLUDED.revenue,
+             ecpm = EXCLUDED.ecpm,
+             viewability = EXCLUDED.viewability,
+             currency = EXCLUDED.currency,
+             synced_at = EXCLUDED.synced_at`,
+          [day, clientId]
+        );
+        return fallback.rowCount || 0;
+      });
+      total += dayRows;
     } catch (e) {
       logger.warn(`[${syncType}] network rollup rebuild failed for ${day}:`, e.message);
     }

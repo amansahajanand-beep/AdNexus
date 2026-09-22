@@ -99,6 +99,54 @@ async function query(sql, params = [], opts = {}) {
   }
 }
 
+/**
+ * Run work on one pooled connection inside BEGIN/COMMIT.
+ * fn receives (q) where q(sql, params) uses the same client (and tenant GUC).
+ */
+async function withTransaction(fn, opts = {}) {
+  const client = await pool.connect();
+  const timeoutMs = parseInt(opts.statementTimeoutMs, 10) || 0;
+  const q = (sql, params = []) => client.query(sql, params);
+  try {
+    let clientId = null;
+    try {
+      clientId = require('./utils/clientContext').getClientId();
+    } catch (_) { /* ignore */ }
+    if (clientId) {
+      await q(`SELECT set_config('app.client_id', $1, false)`, [String(clientId)]);
+    } else {
+      await q(`SELECT set_config('app.client_id', '', false)`);
+    }
+    if (timeoutMs > 0) {
+      await q(`SET statement_timeout = ${timeoutMs}`);
+    }
+    await q('BEGIN');
+    try {
+      const result = await fn(q, client);
+      await q('COMMIT');
+      return result;
+    } catch (e) {
+      try { await q('ROLLBACK'); } catch (_) { /* ignore */ }
+      throw e;
+    }
+  } finally {
+    if (timeoutMs > 0) {
+      try { await q('SET statement_timeout = 0'); } catch (_) { /* ignore */ }
+    }
+    try {
+      await q(`SELECT set_config('app.client_id', '', false)`);
+    } catch (_) { /* ignore */ }
+    client.release();
+  }
+}
+
+/** Stable two-int advisory lock key for clientId + day (used during rollup rebuild). */
+function rollupAdvisoryKeys(clientId, day) {
+  const crypto = require('crypto');
+  const buf = crypto.createHash('md5').update(`rollup:${clientId}:${day}`).digest();
+  return [buf.readInt32BE(0), buf.readInt32BE(4)];
+}
+
 /** DDL / backfill — bypasses tenant session so FORCE RLS cannot hide rows. */
 async function schemaQuery(sql, params = []) {
   return pool.query(sql, params);
@@ -345,8 +393,12 @@ async function initSchema() {
   try {
     await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS grain_retention_days INT DEFAULT 365`);
     await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS rollup_retention_days INT DEFAULT 365`);
+    // Groups multiple network rows (1 UUID per network) under one Google/account login.
+    await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS account_id UUID`);
+    await schemaQuery(`UPDATE gam_clients SET account_id = id WHERE account_id IS NULL`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_gam_clients_account_id ON gam_clients (account_id)`);
   } catch (e) {
-    logger.warn('gam_clients retention columns:', e.message);
+    logger.warn('gam_clients retention/account columns:', e.message);
   }
 
   // report_grain.metrics / slice_key ALTERs run after listen (ensureGrainMetricsColumn)
@@ -893,6 +945,8 @@ async function ensureGrainMetricsColumn() {
 
 module.exports = {
   query,
+  withTransaction,
+  rollupAdvisoryKeys,
   schemaQuery,
   initSchema,
   finishTenantBackfill,

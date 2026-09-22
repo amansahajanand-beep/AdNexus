@@ -12,8 +12,11 @@ const {
   updateClientCredentials,
   createClient,
   getClientByNetworkCode,
+  getAccountIdForClient,
+  isPendingNetworkCode,
+  isUsableGamClient,
 } = require('../models/clientStore');
-const { createUser, getUserByUsername } = require('../models/userStore');
+const { createUser, getUserByUsername, updateUser } = require('../models/userStore');
 const { createPendingSession, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const {
   isGamOAuthConfigured,
@@ -72,6 +75,7 @@ async function commitGamNetwork({
   displayName,
   refreshToken,
   onboardPayload = null,
+  switchUserId = null,
 }) {
   const code = String(networkCode || '').trim();
   if (!code) throw new Error('networkCode is required');
@@ -83,6 +87,7 @@ async function commitGamNetwork({
     throw new Error('GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET must be set in .env');
   }
 
+  // Legacy self-onboard that still creates client+admin in one OAuth step.
   if (onboardPayload) {
     const dupNet = await getClientByNetworkCode(code);
     if (dupNet) throw new Error('A client with this network code already exists.');
@@ -113,20 +118,68 @@ async function commitGamNetwork({
   }
 
   if (!clientId) throw new Error('clientId required');
-  const other = await getClientByNetworkCode(code);
-  if (other && other.id !== clientId) {
-    throw new Error('Network code is already used by another client.');
+  const current = await getClientById(clientId);
+  if (!current) throw new Error('Client not found');
+
+  const accountId = current.accountId || (await getAccountIdForClient(clientId)) || clientId;
+  const existing = await getClientByNetworkCode(code);
+
+  // Network already belongs to this account → refresh credentials + activate that UUID.
+  if (existing && (existing.accountId === accountId || existing.id === accountId)) {
+    const next = await updateClientCredentials(existing.id, {
+      name: displayName ? String(displayName).trim() : existing.name,
+      googleClientId,
+      googleClientSecret,
+      refreshToken,
+      redirectUri: envApp.redirectUri || null,
+      accountId,
+    });
+    if (switchUserId) {
+      await updateUser(switchUserId, { clientId: next.id });
+    }
+    if (isUsableGamClient(next)) await kickGamInventorySync(next);
+    return { client: next, created: false, switched: true };
   }
 
-  const next = await updateClientCredentials(clientId, {
+  if (existing) {
+    throw new Error('Network code is already used by another account.');
+  }
+
+  // First connect on a pending placeholder → upgrade in place (keep UUID + existing grain).
+  if (isPendingNetworkCode(current.networkCode) || current.isPending) {
+    const next = await updateClientCredentials(clientId, {
+      name: displayName
+        ? String(displayName).trim()
+        : (current.name || `Network ${code}`),
+      networkCode: code,
+      googleClientId,
+      googleClientSecret,
+      refreshToken,
+      redirectUri: envApp.redirectUri || null,
+      accountId,
+    });
+    if (switchUserId) {
+      await updateUser(switchUserId, { clientId: next.id });
+    }
+    await kickGamInventorySync(next);
+    return { client: next, created: false, upgraded: true };
+  }
+
+  // Additional network under same account → new client_id (UUID).
+  const next = await createClient({
+    name: String(displayName || `Network ${code}`).trim(),
     networkCode: code,
     googleClientId,
     googleClientSecret,
     refreshToken,
     redirectUri: envApp.redirectUri || null,
+    accountId,
   });
+  if (switchUserId) {
+    await updateUser(switchUserId, { clientId: next.id });
+  }
   await kickGamInventorySync(next);
-  return { client: next, created: false };
+  return { client: next, created: true };
 }
 
 // Legacy bookmark / helper: start Google consent for the bootstrap (env-migrated) client.

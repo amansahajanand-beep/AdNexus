@@ -46,7 +46,7 @@ import {
   compareLabelFor,
 } from '../utils/periodCompare';
 import { evaluateRevenueDropThreshold } from '../utils/thresholdAlerts';
-import { getLastPageFilters, saveLastPageFilters, LAST_FILTER_PAGES } from '../utils/lastPageFilters';
+import { getLastPageFilters, saveLastPageFilters, clearLastPageFilters, LAST_FILTER_PAGES } from '../utils/lastPageFilters';
 import {
   DASH_CHARTS,
   loadHiddenDashCharts,
@@ -91,6 +91,7 @@ import {
   draftHasInventorySelection,
   getAssignedFilterVisibility,
   hasInventoryFilterSelection,
+  hasConcreteInventoryFilterSelection,
   initialInventoryDraft,
   shouldAutoLoadScopedInventory,
   buildScopedDashboardApplied,
@@ -470,7 +471,13 @@ export default function Dashboard() {
   const inventoryAssigned = hasAssignedInventory(user);
   const filterVisibility = getAssignedFilterVisibility(user);
   const savedRaw = useSelector((s) => s.reports?.dashboard);
-  const saved = (!savedRaw?.userId || savedRaw.userId === user?.id) ? savedRaw : null;
+  // Require matching clientId — never hydrate KPIs from another GAM network.
+  const saved = (
+    (!savedRaw?.userId || savedRaw.userId === user?.id)
+    && user?.clientId
+    && savedRaw?.clientId
+    && String(savedRaw.clientId) === String(user.clientId)
+  ) ? savedRaw : null;
   const { networkInfo } = useOutletContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const dateRestriction = useMemo(() => getDateRestriction(user), [user]);
@@ -490,7 +497,7 @@ export default function Dashboard() {
   const scopedAutoLoad = shouldAutoLoadScopedInventory(user);
   const defaultApplied = { ...todayInit, ...EMPTY_INVENTORY_FILTERS };
   // Restore Redux cache on remount (page switch) — do not require filterApplied.
-  const cacheFresh = isReportCacheFresh(saved, POLL_MS);
+  const cacheFresh = isReportCacheFresh(saved, POLL_MS, { clientId: user?.clientId });
 
   const [preset, setPreset] = useState(() => saved?.preset ?? 'today');
   const [startDate, setStartDate] = useState(() => initDates.startDate);
@@ -794,6 +801,12 @@ export default function Dashboard() {
         const nextHas = summaryHasMetrics(res?.summary);
         const prevHas = summaryHasMetrics(prev?.summary);
         // Empty/building race must not wipe KPIs already shown for this query.
+        // Never keep prev when the response has real metrics (network switch / fresh rollup).
+        if (nextHas) {
+          const next = { ...res, _queryKey: key };
+          overviewDataRef.current = next;
+          return next;
+        }
         if (!nextHas && prevHas && prev?._queryKey === key) {
           if (res?.status === 'building' || res?.status === 'partial') {
             return {
@@ -832,6 +845,8 @@ export default function Dashboard() {
   const currency = overviewData?.summary?.currency || overviewData?.currency
     || detailData?.summary?.currency || networkInfo?.currencyCode || 'USD';
 
+  const detailGenRef = useRef(0);
+
   /** Network + filtered charts — load for current dates; inventory filters refine. */
   const loadDetail = useCallback(async (silent = false) => {
     if (silent && detailInFlightRef.current) return;
@@ -841,6 +856,8 @@ export default function Dashboard() {
     } else if (!silent && detailInFlightRef.current) {
       return;
     }
+    const gen = ++detailGenRef.current;
+    const expectedClientId = user?.clientId || null;
     const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
     detailAbortRef.current = ac;
     detailInFlightRef.current = true;
@@ -863,14 +880,35 @@ export default function Dashboard() {
         ...normalizeInventorySelections(applied || {}, {}, scopedNormOpts),
       }, ac ? { signal: ac.signal } : {});
       if (ac?.signal?.aborted) return;
+      // Drop late responses after Reset / network switch.
+      if (gen !== detailGenRef.current) return;
+      if (expectedClientId && user?.clientId && String(expectedClientId) !== String(user.clientId)) return;
+      // Reject poisoned cross-network dashboard cache: overview is tenant-correct (~$26)
+      // while a stale /dashboard body can still carry the other network (~$15k).
+      const ovRev = Number(overviewDataRef.current?.summary?.revenue
+        ?? overviewDataRef.current?.summary?.selectRange ?? 0) || 0;
+      const detailRev = Number(res?.summary?.revenue ?? res?.summary?.selectRange ?? 0) || 0;
+      const concrete = hasConcreteInventoryFilterSelection(applied);
+      if (!concrete && ovRev > 0 && detailRev > 0 && detailRev > ovRev * 5) {
+        logErrorForDebug(
+          { message: `Discarded dashboard detail revenue=${detailRev} vs overview=${ovRev}` },
+          'Dashboard detail tenant mismatch'
+        );
+        startTransition(() => {
+          setDetailData(null);
+          detailDataRef.current = null;
+        });
+        return;
+      }
       startTransition(() => {
-        setDetailData(res);
+        setDetailData({ ...res, _clientId: expectedClientId });
         detailDataRef.current = res;
         setLastUpdated(nowTimeInTZ());
         setFetchedAt(Date.now());
       });
     } catch (err) {
       if (err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError' || ac?.signal?.aborted) return;
+      if (gen !== detailGenRef.current) return;
       logErrorForDebug(err, 'Dashboard detail');
       const status = err?.status ?? err?.response?.status ?? null;
       // Auth/permission / timeout / server errors — show error. Only treat empty
@@ -906,6 +944,7 @@ export default function Dashboard() {
             charts: { revenue: [], device: [], country: [], performance: [] },
             reportWarning: 'incompatible',
             reportWarningSkipped: skipped,
+            _clientId: expectedClientId,
           });
           setLastUpdated(nowTimeInTZ());
           setFetchedAt(Date.now());
@@ -919,7 +958,7 @@ export default function Dashboard() {
         clearTimeout(slowTimerRef.current);
       }
     }
-  }, [applied, startDate, endDate, scopedNormOpts]);
+  }, [applied, startDate, endDate, scopedNormOpts, user?.clientId]);
 
   useEffect(() => () => {
     detailAbortRef.current?.abort();
@@ -927,8 +966,32 @@ export default function Dashboard() {
     clearTimeout(slowTimerRef.current);
   }, []);
 
+  // Network switch: drop in-memory KPIs immediately so the other network cannot linger on screen.
+  const activeClientIdRef = useRef(user?.clientId);
   useEffect(() => {
-    if (filterApplied && hasInventoryFilterSelection(applied)) return;
+    const nextId = user?.clientId || null;
+    const prevId = activeClientIdRef.current;
+    activeClientIdRef.current = nextId;
+    if (!prevId || !nextId || String(prevId) === String(nextId)) return;
+    overviewAbortRef.current?.abort();
+    detailAbortRef.current?.abort();
+    detailGenRef.current += 1;
+    setOverviewData(null);
+    setDetailData(null);
+    overviewDataRef.current = null;
+    detailDataRef.current = null;
+    setPriorOverview(null);
+    setPriorDetail(null);
+    setCatalog([]);
+    skipOverviewRef.current = false;
+    skipDetailRef.current = false;
+    setOverviewLoading(true);
+    loadOverview();
+    if (canGenerate) loadDetail();
+  }, [user?.clientId, loadOverview, loadDetail, canGenerate]);
+
+  useEffect(() => {
+    if (filterApplied && hasConcreteInventoryFilterSelection(applied)) return;
     if (skipOverviewRef.current) {
       skipOverviewRef.current = false;
       setOverviewLoading(false);
@@ -1037,6 +1100,7 @@ export default function Dashboard() {
       pageKey: 'dashboard',
       payload: {
         userId: user?.id,
+        clientId: user?.clientId || null,
         applied: slimApplied,
         filterApplied,
         overviewData: overviewData
@@ -1063,7 +1127,7 @@ export default function Dashboard() {
       },
     }));
   }, [
-    dispatch, user?.id, applied, filterApplied, overviewData, detailData, catalog, fetchedAt, lastUpdated,
+    dispatch, user?.id, user?.clientId, applied, filterApplied, overviewData, detailData, catalog, fetchedAt, lastUpdated,
     preset, startDate, endDate, domain, site, domainName, domainId,
     search, page, breakdownOpen, chipsExpanded, canGenerate,
   ]);
@@ -1091,11 +1155,11 @@ export default function Dashboard() {
     if (!force && catalog.length) return;
     setCatalogLoading(true);
     try {
-      const res = await reportsAPI.getFilterCatalog();
+      const res = await reportsAPI.getFilterCatalog(user?.clientId);
       applyCatalogResponse(res);
     } catch (_) { /* filter options optional until opened */ }
     finally { setCatalogLoading(false); }
-  }, [catalog.length, applyCatalogResponse, filterVisibility.isScopedUser]);
+  }, [catalog.length, applyCatalogResponse, filterVisibility.isScopedUser, user?.clientId]);
 
   useEffect(() => {
     if (!canGenerate) return;
@@ -1103,8 +1167,10 @@ export default function Dashboard() {
       setCatalogLoading(false);
       return;
     }
+    setCatalog([]);
+    setCatalogLists({ domainRoots: [], siteHosts: [], sitesByDomain: {}, adUnitsByHost: {}, appIds: [] });
     loadCatalog(true);
-  }, [canGenerate, loadCatalog, filterVisibility.isScopedUser]);
+  }, [canGenerate, user?.clientId, filterVisibility.isScopedUser]);
 
   const selections = useMemo(
     () => ({
@@ -1417,16 +1483,24 @@ export default function Dashboard() {
     setBreakdownOpen(filterVisibility.isScopedUser);
     setChipsExpanded(false);
     setFilterApplied(false);
+    detailAbortRef.current?.abort();
+    detailGenRef.current += 1;
     setDetailData(null);
     setOverviewData(null);
+    overviewDataRef.current = null;
+    detailDataRef.current = null;
     setPriorOverview(null);
     setPriorDetail(null);
     setFetchedAt(null);
     clearRecentFilters(user?.id);
     setRecentFilters([]);
+    clearLastPageFilters(LAST_FILTER_PAGES.dashboard, user?.id);
     dispatch(saveReportPage({ pageKey: 'dashboard', payload: null }));
-    setApplied({ ...r, ...EMPTY_INVENTORY_FILTERS });
+    const nextApplied = { ...r, ...EMPTY_INVENTORY_FILTERS };
+    setApplied(nextApplied);
     setSearchParams({}, { replace: true });
+    // Force fresh overview for the active network (do not wait on effect races).
+    loadOverview(buildOverviewFiltersForState(nextApplied, false));
     showToast({
       message: 'Filters cleared',
       actionLabel: 'Undo',
@@ -1476,6 +1550,8 @@ export default function Dashboard() {
   });
 
   const hasInventoryFilter = filterApplied && hasInventoryFilterSelection(applied);
+  // Select-All is network-wide — keep overview cards on tenant network_rollup, not detail.
+  const hasConcreteInventoryFilter = filterApplied && hasConcreteInventoryFilterSelection(applied);
   const isScopedDashboardUser = !isAdmin(user);
 
   const mapDetailSummary = useCallback((s) => {
@@ -1514,6 +1590,16 @@ export default function Dashboard() {
     const hasConcreteSite = applied?.site?.length && !isAllSelection(applied.site);
     const truncated = detailData?.pagination?.truncated;
     const fromRows = tableRows.length ? summarizeRowsForOverview(tableRows, currency) : null;
+    // Network-wide table: prefer overview KPIs so a poisoned detail cache cannot show $15k.
+    if (!hasConcreteInventoryFilter && overviewData?.summary) {
+      const s = overviewData.summary;
+      return {
+        total_line_item_level_all_revenue: Number(s.revenue ?? s.selectRange ?? 0) || 0,
+        total_line_item_level_impressions: Number(s.impressions ?? 0) || 0,
+        total_line_item_level_without_cpd_average_ecpm: Number(s.ecpm ?? 0) || 0,
+        total_active_view_viewable_impressions_rate: s.viewability ?? 0,
+      };
+    }
     const s = detailData?.summary;
     // Prefer summing table rows for site filters so Total matches the breakdown.
     // Only fall back to API summary when the table was capped (incomplete).
@@ -1565,41 +1651,52 @@ export default function Dashboard() {
     applied?.site,
     tableRows,
     currency,
+    hasConcreteInventoryFilter,
+    overviewData?.summary,
   ]);
 
   const overviewSummary = useMemo(() => {
-    const fromDetail = mapDetailSummary(detailData?.summary);
-    const fromRows = tableRows.length ? summarizeRowsForOverview(tableRows, currency) : null;
+    // Ignore detail payloads stamped for a different GAM network.
+    const detailOk = !detailData?._clientId
+      || !user?.clientId
+      || String(detailData._clientId) === String(user.clientId);
+    const fromDetail = detailOk ? mapDetailSummary(detailData?.summary) : null;
+    const fromRows = (detailOk && tableRows.length)
+      ? summarizeRowsForOverview(tableRows, currency)
+      : null;
     let base = {};
 
     if (isScopedDashboardUser) {
-      if (hasInventoryFilter) {
+      if (hasConcreteInventoryFilter) {
         if (fromDetail && !detailLoading) base = fromDetail;
         else if (fromDetail) base = fromDetail;
         else if (fromRows) base = fromRows;
         else base = {};
       } else {
+        // Network-wide / Select-All: always trust overview API (tenant network_rollup).
         base = overviewData?.summary || {};
       }
-    } else if (hasInventoryFilter && fromDetail && !detailLoading) {
+    } else if (hasConcreteInventoryFilter && fromDetail && !detailLoading) {
       base = fromDetail;
-    } else if (hasInventoryFilter && detailData) {
+    } else if (hasConcreteInventoryFilter && detailOk && detailData) {
       base = fromDetail || fromRows || {};
     } else {
       base = overviewData?.summary || {};
     }
 
-    // If API summary was mangled (tiny revenue / $0 eCPM) while table rows look sane, prefer rows.
-    const apiRev = Number(base.revenue ?? base.selectRange ?? 0) || 0;
-    const apiEcpm = Number(base.ecpm ?? 0) || 0;
-    if (
-      fromRows
-      && fromRows.revenue > 0
-      && apiRev > 0
-      && apiRev < fromRows.revenue * 0.01
-      && (apiEcpm <= 0 || apiRev < 100)
-    ) {
-      base = { ...base, ...fromRows };
+    // Only reconcile mangled filtered summaries against table rows.
+    // Never let stale/wrong detail rows overwrite a correct network overview (~$26 → $15k leak).
+    if (hasConcreteInventoryFilter && fromRows) {
+      const apiRev = Number(base.revenue ?? base.selectRange ?? 0) || 0;
+      const apiEcpm = Number(base.ecpm ?? 0) || 0;
+      if (
+        fromRows.revenue > 0
+        && apiRev > 0
+        && apiRev < fromRows.revenue * 0.01
+        && (apiEcpm <= 0 || apiRev < 100)
+      ) {
+        base = { ...base, ...fromRows };
+      }
     }
 
     const priorSum = priorDetail?.summary || priorOverview?.summary || null;
@@ -1608,6 +1705,7 @@ export default function Dashboard() {
     isScopedDashboardUser,
     filterApplied,
     hasInventoryFilter,
+    hasConcreteInventoryFilter,
     detailLoading,
     detailData,
     tableRows,
@@ -1616,22 +1714,24 @@ export default function Dashboard() {
     mapDetailSummary,
     priorOverview,
     priorDetail,
+    user?.clientId,
   ]);
 
   const overviewCardLoading = useMemo(() => {
     if (isScopedDashboardUser) {
-      if (hasInventoryFilter) return detailLoading && !detailData;
+      if (hasConcreteInventoryFilter) return detailLoading && !detailData;
       // Keep cards visible once we have a summary — background refresh must not skeleton.
       if (overviewData?.summary) return false;
       return overviewLoading;
     }
-    if (hasInventoryFilter) return detailLoading && !detailData;
+    if (hasConcreteInventoryFilter) return detailLoading && !detailData;
     if (overviewData?.summary) return false;
     return overviewLoading;
   }, [
     isScopedDashboardUser,
     filterApplied,
     hasInventoryFilter,
+    hasConcreteInventoryFilter,
     detailLoading,
     detailData,
     overviewLoading,

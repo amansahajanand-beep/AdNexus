@@ -1,35 +1,61 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { useDispatch } from 'react-redux';
 import { TextField } from '../ui/Field';
 import Button from '../ui/Button';
-import { clientsAPI } from '../../utils/api';
+import { clientsAPI, setToken } from '../../utils/api';
+import { authSuccess } from '../../store/actions/authActions';
+import { clearReportPages } from '../../store/slices/reportSlice';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 
 const MASK = '••••••••';
 
+function applySessionFromResponse(dispatch, data) {
+  if (data?.token && data?.user) {
+    setToken(data.token);
+    dispatch(clearReportPages());
+    dispatch(authSuccess(data.user));
+  }
+}
+
+async function flushReportsBeforeReload() {
+  try {
+    const { flushPersistedState, purgePersistedState } = await import('../../store/persistorRef');
+    await flushPersistedState();
+    // Drop sessionStorage report snapshot so reload cannot resurrect the other network.
+    await purgePersistedState();
+  } catch (_) { /* ignore */ }
+}
+
 export default function ClientSettings() {
+  const dispatch = useDispatch();
   const [info, setInfo] = useState(null);
+  const [networks, setNetworks] = useState([]);
+  const [activeClientId, setActiveClientId] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [okMsg, setOkMsg] = useState(null);
   const [connecting, setConnecting] = useState(false);
+  const [switchingId, setSwitchingId] = useState(null);
   const [picker, setPicker] = useState(null);
   const [pickingCode, setPickingCode] = useState(null);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
       const data = await clientsAPI.me();
       setInfo(data);
+      setNetworks(Array.isArray(data?.networks) ? data.networks : []);
+      setActiveClientId(data?.activeClientId || data?.id || null);
     } catch (err) {
       logErrorForDebug(err, 'Client settings');
       setError(getUserFacingMessage(err, 'Could not load client settings.'));
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [load]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -62,7 +88,7 @@ export default function ClientSettings() {
       const tab = params.get('tab') || 'client';
       window.history.replaceState({}, '', `${window.location.pathname}?tab=${tab}${window.location.hash || ''}`);
     }
-  }, []);
+  }, [load]);
 
   const selectNetwork = async (networkCode) => {
     if (!picker?.sessionId) return;
@@ -70,10 +96,11 @@ export default function ClientSettings() {
     setError(null);
     try {
       const result = await clientsAPI.oauthSelect(picker.sessionId, { networkCode });
+      applySessionFromResponse(dispatch, result);
+      await flushReportsBeforeReload();
       setPicker(null);
-      setInfo(result.client || info);
-      setOkMsg('GAM network connected. Inventory sync started — domains, sites, and app IDs will appear after sync.');
-      await load();
+      setOkMsg('GAM network connected. Inventory sync started — reloading for this network…');
+      window.location.assign('/dashboard');
     } catch (err) {
       setError(getUserFacingMessage(err, 'Could not select network.'));
     } finally {
@@ -81,16 +108,44 @@ export default function ClientSettings() {
     }
   };
 
+  const switchNetwork = async (clientId) => {
+    if (!clientId || clientId === activeClientId) return;
+    setSwitchingId(clientId);
+    setError(null);
+    try {
+      const result = await clientsAPI.setActiveNetwork(clientId);
+      applySessionFromResponse(dispatch, result);
+      await flushReportsBeforeReload();
+      setOkMsg(`Switched to network ${result.client?.networkCode || clientId}. Reloading dashboard for this network…`);
+      // Hard navigation + purged persist so the other network's KPIs cannot linger.
+      window.location.assign('/dashboard');
+    } catch (err) {
+      setError(getUserFacingMessage(err, 'Could not switch network.'));
+      setSwitchingId(null);
+    }
+  };
+
+  const startConnect = async () => {
+    setConnecting(true);
+    setError(null);
+    try {
+      const { url } = await clientsAPI.oauthUrl();
+      window.location.href = url;
+    } catch (err) {
+      logErrorForDebug(err, 'Connect Google');
+      setError(getUserFacingMessage(err, 'Could not start Google OAuth.'));
+      setConnecting(false);
+    }
+  };
+
   if (loading) return <div className="spinner" />;
+
+  const connectedNetworks = (networks || []).filter((n) => !n.isPending);
+  const gamConnected = Boolean(info?.gamConnected) || connectedNetworks.length > 0;
 
   return (
     <div className="client-settings-wrap">
-      <div className="client-settings-card">
-        <p className="reporting-sub">
-          Connection: {info?.hasRefreshToken ? 'Configured' : 'Not connected'}
-          {info?.isMock ? ' · mock / not live' : ' · live'}
-          {info?.networkCode ? ` · network ${info.networkCode}` : ''}
-        </p>
+      <div className="client-settings-card" style={{ maxWidth: 960 }}>
         {error && <div className="login-error">{error}</div>}
         {okMsg && <div className="client-settings-ok">{okMsg}</div>}
 
@@ -122,7 +177,7 @@ export default function ClientSettings() {
                           disabled={!!pickingCode}
                           onClick={() => selectNetwork(n.networkCode)}
                         >
-                          Select
+                          Connect
                         </Button>
                       </td>
                     </tr>
@@ -133,30 +188,81 @@ export default function ClientSettings() {
           </div>
         )}
 
-        <TextField label="Publisher name" value={info?.name || ''} readOnly />
-        <TextField label="GAM network code" value={info?.networkCode || ''} readOnly />
-        <TextField label="Google client ID" value={info?.googleClientId || MASK} readOnly />
-        <TextField label="Google client secret" value={MASK} readOnly />
-        <TextField label="Google refresh token" value={info?.hasRefreshToken ? MASK : 'Not set'} readOnly />
-        <Button
-          type="button"
-          variant="primary"
-          loading={connecting}
-          onClick={async () => {
-            setConnecting(true);
-            setError(null);
-            try {
-              const { url } = await clientsAPI.oauthUrl();
-              window.location.href = url;
-            } catch (err) {
-              logErrorForDebug(err, 'Connect Google');
-              setError(getUserFacingMessage(err, 'Could not start Google OAuth.'));
-              setConnecting(false);
-            }
-          }}
-        >
-          Connect with Google
-        </Button>
+        {!gamConnected && !picker && (
+          <div className="ads-empty" style={{ marginBottom: 20 }}>
+            <p className="ads-empty-title">No Ad Manager connected</p>
+            <p className="ads-empty-desc">
+              Connect with Google to list your GAM network codes, then choose which network to use.
+              Each network gets its own data. Domain users you create stay locked to the active network.
+            </p>
+            <Button type="button" variant="primary" loading={connecting} onClick={startConnect}>
+              Connect with Google
+            </Button>
+          </div>
+        )}
+
+        {gamConnected && !picker && (
+          <>
+            <p className="reporting-sub" style={{ marginBottom: 12 }}>
+              Status: Connected
+              {info?.networkCode ? ` · active network ${info.networkCode}` : ''}
+              {info?.isMock ? ' · mock' : ' · live'}
+            </p>
+
+            <div className="filter-card ads-form-card" style={{ marginBottom: 16 }}>
+              <div className="filter-card-head">
+                <span className="filter-card-title">Linked networks</span>
+                <Button type="button" variant="secondary" loading={connecting} onClick={startConnect}>
+                  Connect another / refresh
+                </Button>
+              </div>
+              <div className="table-wrap">
+                <table className="data-table report-table report-table--comfortable">
+                  <thead>
+                    <tr>
+                      <th>Network</th>
+                      <th>Name</th>
+                      <th>Status</th>
+                      <th style={{ textAlign: 'right' }}>Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {connectedNetworks.map((n) => {
+                      const isActive = n.id === activeClientId;
+                      return (
+                        <tr key={n.id}>
+                          <td className="td-mono">{n.networkCode || '—'}</td>
+                          <td>{n.name}</td>
+                          <td>{isActive ? 'Active' : (n.hasRefreshToken ? 'Linked' : 'Needs reconnect')}</td>
+                          <td style={{ textAlign: 'right' }}>
+                            {isActive ? (
+                              <span className="reporting-sub">Current</span>
+                            ) : (
+                              <Button
+                                type="button"
+                                variant="primary"
+                                loading={switchingId === n.id}
+                                disabled={!!switchingId}
+                                onClick={() => switchNetwork(n.id)}
+                              >
+                                Switch
+                              </Button>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <TextField label="Publisher name" value={info?.name || ''} readOnly />
+            <TextField label="Active GAM network code" value={info?.networkCode || ''} readOnly />
+            <TextField label="Google client ID" value={info?.googleClientId || MASK} readOnly />
+            <TextField label="Google refresh token" value={info?.hasRefreshToken ? MASK : 'Not set'} readOnly />
+          </>
+        )}
       </div>
     </div>
   );

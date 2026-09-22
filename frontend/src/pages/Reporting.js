@@ -170,7 +170,12 @@ export default function Reporting() {
     assignedScope: inventoryScope,
   }), [filterVisibility.isScopedUser, inventoryScope]);
   const savedRaw = useSelector((s) => s.reports?.reporting);
-  const saved = (!savedRaw?.userId || savedRaw.userId === user?.id) ? savedRaw : null;
+  const saved = (
+    (!savedRaw?.userId || savedRaw.userId === user?.id)
+    && user?.clientId
+    && savedRaw?.clientId
+    && String(savedRaw.clientId) === String(user.clientId)
+  ) ? savedRaw : null;
   const { networkInfo } = useOutletContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const shareHydratedRef = useRef(false);
@@ -193,7 +198,7 @@ export default function Reporting() {
     ...dates,
     ...buildAssignedInventoryFilters(user),
   });
-  const cacheFresh = isReportCacheFresh(saved, POLL_MS)
+  const cacheFresh = isReportCacheFresh(saved, POLL_MS, { clientId: user?.clientId })
     && Boolean(resolveReportingQuery(saved?.applied));
 
   const savedInv = saved ? {
@@ -732,6 +737,7 @@ export default function Reporting() {
       pageKey: 'reporting',
       payload: {
         userId: user?.id,
+        clientId: user?.clientId || null,
         applied, data, progData, catalog, fetchedAt, lastUpdated,
         preset, startDate, endDate, country, domain, site, domainName, domainId,
         search, page, filtersOpen, breakdownOpen, chipsExpanded,
@@ -777,7 +783,7 @@ export default function Reporting() {
     if (!force && catalog.length) return;
     setCatalogLoading(true);
     try {
-      const res = await reportsAPI.getFilterCatalog();
+      const res = await reportsAPI.getFilterCatalog(user?.clientId);
       applyCatalogResponse(res);
     } catch (err) {
       logErrorForDebug(err, 'Reporting filter catalog');
@@ -793,7 +799,7 @@ export default function Reporting() {
     }
     let cancelled = false;
     setCatalogLoading(true);
-    reportsAPI.getFilterCatalog()
+    reportsAPI.getFilterCatalog(user?.clientId)
       .then((res) => { if (!cancelled) applyCatalogResponse(res); })
       .catch((err) => {
         if (!cancelled) {
