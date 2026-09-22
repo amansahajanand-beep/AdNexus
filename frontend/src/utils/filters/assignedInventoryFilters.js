@@ -26,6 +26,21 @@ export function hasInventoryFilterSelection(applied) {
   return draftHasInventorySelection(applied);
 }
 
+/**
+ * True only for concrete domain/site/ad-unit/app picks.
+ * Select-All (`__ALL__`) is network-wide — KPIs must use overview (tenant rollup),
+ * not the filtered dashboard path (which previously could leak another network).
+ */
+export function hasConcreteInventoryFilterSelection(applied) {
+  const a = applied || {};
+  const concrete = (key) => {
+    const list = Array.isArray(a[key]) ? a[key] : [];
+    if (!list.length || isAllSelection(list)) return false;
+    return list.some((v) => v != null && v !== '' && v !== '__ALL__');
+  };
+  return concrete('domain') || concrete('site') || concrete('domainName') || concrete('domainId');
+}
+
 /** Admin-assigned inventory as dashboard/report filter values. */
 export function buildAssignedInventoryFilters(user) {
   if (isAdmin(user) || !hasAssignedInventory(user)) return { ...EMPTY_INVENTORY_FILTERS };

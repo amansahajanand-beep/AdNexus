@@ -12,16 +12,25 @@ function slugify(name) {
   return base;
 }
 
+function isPendingNetworkCode(networkCode) {
+  return String(networkCode || '').trim().toLowerCase().startsWith('pending-');
+}
+
 function mapPublic(row) {
   if (!row) return null;
+  const networkCode = row.network_code;
+  const pending = isPendingNetworkCode(networkCode) || !row.google_refresh_token_enc;
   return {
     id: row.id,
+    accountId: row.account_id || row.id,
     name: row.name,
     slug: row.slug,
-    networkCode: row.network_code,
+    networkCode: pending && isPendingNetworkCode(networkCode) ? null : networkCode,
+    rawNetworkCode: networkCode,
     googleClientId: row.google_client_id,
     redirectUri: row.redirect_uri || null,
     isActive: row.is_active !== false,
+    isPending: pending,
     hasRefreshToken: !!row.google_refresh_token_enc,
     hasClientSecret: !!row.google_client_secret_enc,
     createdAt: row.created_at,
@@ -33,6 +42,7 @@ function mapRuntime(row) {
   if (!row) return null;
   return {
     id: row.id,
+    accountId: row.account_id || row.id,
     name: row.name,
     slug: row.slug,
     networkCode: row.network_code,
@@ -41,6 +51,7 @@ function mapRuntime(row) {
     refreshToken: row.google_refresh_token_enc ? decryptSecret(row.google_refresh_token_enc) : null,
     redirectUri: row.redirect_uri || process.env.GOOGLE_REDIRECT_URI || null,
     isActive: row.is_active !== false,
+    isPending: isPendingNetworkCode(row.network_code) || !row.google_refresh_token_enc,
   };
 }
 
@@ -64,7 +75,7 @@ async function getClientByNetworkCode(networkCode) {
 /** Row lookup without decrypt — needed so SYNC can overwrite even if old ciphertext is unreadable. */
 async function findClientRowByNetworkCode(networkCode) {
   const { rows } = await query(
-    'SELECT id, name, network_code FROM gam_clients WHERE network_code = $1',
+    'SELECT id, name, network_code, account_id FROM gam_clients WHERE network_code = $1',
     [String(networkCode).trim()]
   );
   return rows[0] || null;
@@ -80,7 +91,10 @@ function envFlagTrue(name) {
 
 async function listActiveClients() {
   const { rows } = await query(
-    `SELECT * FROM gam_clients WHERE is_active = true AND google_refresh_token_enc IS NOT NULL
+    `SELECT * FROM gam_clients
+     WHERE is_active = true
+       AND google_refresh_token_enc IS NOT NULL
+       AND network_code NOT ILIKE 'pending-%'
      ORDER BY created_at ASC`
   );
   const out = [];
@@ -102,7 +116,31 @@ async function listAllClientsPublic() {
   return rows.map(mapPublic);
 }
 
+/** All network rows under the same account (for Admin switcher). */
+async function listClientsByAccountId(accountId) {
+  if (!accountId) return [];
+  const { rows } = await query(
+    `SELECT * FROM gam_clients
+     WHERE account_id = $1::uuid OR id = $1::uuid
+     ORDER BY
+       CASE WHEN network_code ILIKE 'pending-%' THEN 1 ELSE 0 END,
+       created_at ASC`,
+    [accountId]
+  );
+  return rows.map(mapPublic);
+}
+
+async function getAccountIdForClient(clientId) {
+  if (!clientId) return null;
+  const { rows } = await query(
+    'SELECT COALESCE(account_id, id) AS account_id FROM gam_clients WHERE id = $1::uuid',
+    [clientId]
+  );
+  return rows[0]?.account_id || null;
+}
+
 async function createClient({
+  id: providedId = null,
   name,
   networkCode,
   googleClientId,
@@ -110,30 +148,55 @@ async function createClient({
   refreshToken,
   redirectUri,
   isActive = true,
+  accountId = null,
 }) {
-  const id = crypto.randomUUID();
+  const id = providedId || crypto.randomUUID();
   let slug = slugify(name);
   const existingSlug = await query('SELECT 1 FROM gam_clients WHERE slug = $1', [slug]);
   if (existingSlug.rowCount) slug = `${slug}-${id.slice(0, 8)}`;
 
+  const resolvedAccountId = accountId || id;
+
   await query(
     `INSERT INTO gam_clients (
-       id, name, slug, network_code, google_client_id,
+       id, account_id, name, slug, network_code, google_client_id,
        google_client_secret_enc, google_refresh_token_enc, redirect_uri, is_active
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
     [
       id,
+      resolvedAccountId,
       String(name).trim(),
       slug,
       String(networkCode).trim(),
-      String(googleClientId).trim(),
-      encryptSecret(googleClientSecret),
-      encryptSecret(refreshToken),
+      String(googleClientId || 'pending').trim(),
+      encryptSecret(googleClientSecret || 'pending'),
+      refreshToken ? encryptSecret(refreshToken) : null,
       redirectUri || null,
       isActive !== false,
     ]
   );
   return getClientById(id);
+}
+
+/**
+ * Register (2A): publisher row with no GAM network yet.
+ * Uses a unique pending-* network_code until Connect with Google upgrades it.
+ */
+async function createPlaceholderClient({ name }) {
+  const id = crypto.randomUUID();
+  const pendingCode = `pending-${id.replace(/-/g, '').slice(0, 16)}`;
+  const envId = String(process.env.GOOGLE_CLIENT_ID || '').trim() || 'pending';
+  const envSecret = String(process.env.GOOGLE_CLIENT_SECRET || '').trim() || 'pending';
+  return createClient({
+    id,
+    name: String(name || 'Publisher').trim(),
+    networkCode: pendingCode,
+    googleClientId: envId,
+    googleClientSecret: envSecret,
+    refreshToken: null,
+    redirectUri: process.env.GOOGLE_REDIRECT_URI || null,
+    accountId: id,
+  });
 }
 
 async function updateClientCredentials(id, {
@@ -144,6 +207,7 @@ async function updateClientCredentials(id, {
   refreshToken,
   redirectUri,
   isActive,
+  accountId,
 }) {
   const fields = ['updated_at = NOW()'];
   const params = [];
@@ -159,6 +223,7 @@ async function updateClientCredentials(id, {
   if (refreshToken) add('google_refresh_token_enc', encryptSecret(refreshToken));
   if (redirectUri !== undefined) add('redirect_uri', redirectUri || null);
   if (typeof isActive === 'boolean') add('is_active', isActive);
+  if (accountId != null) add('account_id', accountId);
   params.push(id);
   await query(`UPDATE gam_clients SET ${fields.join(', ')} WHERE id = $${i}`, params);
   return getClientById(id);
@@ -170,16 +235,19 @@ function isUsableGamClient(client) {
     client
     && client.isActive !== false
     && String(client.networkCode || '').trim()
+    && !isPendingNetworkCode(client.networkCode)
     && String(client.googleClientId || '').trim()
+    && client.googleClientId !== 'pending'
     && String(client.googleClientSecret || '').trim()
+    && client.googleClientSecret !== 'pending'
     && String(client.refreshToken || '').trim()
   );
 }
 
 /**
- * Resolve the GAM client for a portal user (same rules as requireAuth):
- * linked client_id first, then env bootstrap fallback.
- * Returns null when nothing usable is available.
+ * Resolve the GAM client for a portal user.
+ * Returns the linked row even when pending (so Admin can Connect with Google).
+ * Child users stay locked to their users.client_id (1B).
  */
 async function resolveClientForUser(user) {
   let client = null;
@@ -191,15 +259,15 @@ async function resolveClientForUser(user) {
     );
     client = null;
   }
-  if (!isUsableGamClient(client)) {
-    try {
-      client = await ensureBootstrapFromEnv();
-    } catch (e) {
-      logger.warn(`[tenancy] Bootstrap fallback failed: ${e.message}`);
-      client = null;
-    }
+  if (client) return client;
+
+  try {
+    client = await ensureBootstrapFromEnv();
+  } catch (e) {
+    logger.warn(`[tenancy] Bootstrap fallback failed: ${e.message}`);
+    client = null;
   }
-  return isUsableGamClient(client) ? client : null;
+  return client || null;
 }
 
 async function ensureBootstrapFromEnv() {
@@ -292,9 +360,13 @@ module.exports = {
   getClientByNetworkCode,
   listActiveClients,
   listAllClientsPublic,
+  listClientsByAccountId,
+  getAccountIdForClient,
   createClient,
+  createPlaceholderClient,
   updateClientCredentials,
   ensureBootstrapFromEnv,
   isUsableGamClient,
+  isPendingNetworkCode,
   resolveClientForUser,
 };

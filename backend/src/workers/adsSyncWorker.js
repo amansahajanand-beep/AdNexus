@@ -108,10 +108,14 @@ function startAdsWorker() {
     return null;
   }
 
-  const worker = new Worker('ads-sync', processJob, {
+  const { bullmqPrefix } = require('../queues/gamSync');
+  const prefix = bullmqPrefix();
+  const workerOpts = {
     connection: createBullmqConnection('BullMQ ads-sync worker'),
     concurrency: 1,
-  });
+  };
+  if (prefix) workerOpts.prefix = prefix;
+  const worker = new Worker('ads-sync', processJob, workerOpts);
 
   worker.on('failed', (job, err) => {
     if (isTransientRedisError(err)) {
@@ -121,7 +125,7 @@ function startAdsWorker() {
     logger.error(`[ads-sync] job ${job?.id} failed:`, err.message);
   });
 
-  logger.info('[ads-sync] worker started');
+  logger.info(`[ads-sync] worker started${prefix ? ` (prefix=${prefix})` : ''}`);
   return worker;
 }
 

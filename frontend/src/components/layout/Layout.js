@@ -100,7 +100,7 @@ export default function Layout() {
           });
         }
       });
-  }, []);
+  }, [user?.clientId]);
 
   useEffect(() => {
     const onClick = (e) => {
@@ -229,7 +229,10 @@ export default function Layout() {
           <div className="sidebar-top">
             <BrandLogo showTitle={!focusMode} markSize={focusMode ? 26 : 28} />
             {!focusMode && networkInfo && (
-              <span className="network-label">{networkInfo.displayName}</span>
+              <span className="network-label" title={networkInfo.networkCode ? `Network ${networkInfo.networkCode}` : undefined}>
+                {networkInfo.displayName}
+                {networkInfo.networkCode ? ` · ${networkInfo.networkCode}` : ''}
+              </span>
             )}
             {!focusMode && (
               <span className="context-chip context-chip--sidebar" title={`Currency ${currencyCode} · ${APP_TIMEZONE}`}>

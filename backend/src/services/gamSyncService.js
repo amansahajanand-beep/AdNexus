@@ -1782,7 +1782,9 @@ function appendRollupInventoryFilters(params, extra, opts = {}) {
   const domainExpr = rollupInvDomainExprSql();
   const siteExpr = `LOWER(TRIM(COALESCE(inv_site, '')))`;
 
-  let clause = extra || '';
+  // Always scope rollups to the active GAM network — never sum another network's rows.
+  params.push(requireClientId());
+  let clause = `${extra || ''} AND client_id = $${params.length}::uuid`;
   if (adUnitNames.length) {
     params.push(adUnitNames);
     clause += ` AND LOWER(inv_ad_unit) = ANY($${params.length}::text[])`;
@@ -2557,11 +2559,12 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
   let deviceShare = [];
   let countryShare = [];
   if (!hasRollupInventoryOpts(opts)) {
-    const dimParams = [startDate, endDate];
+    const dimParams = [requireClientId(), startDate, endDate];
     const { rows: deviceRaw } = await query(
       `SELECT dim_value AS name, COALESCE(SUM(revenue), 0)::float8 AS value
        FROM rollup_dim_daily
-       WHERE report_date BETWEEN $1::date AND $2::date AND dim_kind = 'device'
+       WHERE client_id = $1::uuid
+         AND report_date BETWEEN $2::date AND $3::date AND dim_kind = 'device'
        GROUP BY dim_value`,
       dimParams
     );
@@ -2580,7 +2583,8 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
     const { rows: countryRaw } = await query(
       `SELECT dim_value AS name, COALESCE(SUM(revenue), 0)::float8 AS value
        FROM rollup_dim_daily
-       WHERE report_date BETWEEN $1::date AND $2::date AND dim_kind = 'country'
+       WHERE client_id = $1::uuid
+         AND report_date BETWEEN $2::date AND $3::date AND dim_kind = 'country'
        GROUP BY dim_value
        ORDER BY value DESC
        LIMIT 10`,

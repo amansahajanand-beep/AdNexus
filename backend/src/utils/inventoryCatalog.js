@@ -22,16 +22,27 @@ const {
 /** Reuse rows from any cached full report to avoid extra GAM jobs. */
 const CATALOG_CACHE_KEY = 'filter_catalog_inventory_v25';
 
+/** Memory/Redis key — must include active network (client_id). Postgres kv already tenant-scopes. */
+function catalogCacheKey() {
+  const { tenantKey } = require('./clientContext');
+  return tenantKey(CATALOG_CACHE_KEY);
+}
+
 function findCachedInventoryRows(cache) {
   if (!cache?.keys) return null;
+  const catalogKey = catalogCacheKey();
   // Prefer specifically-fetched catalog (has URL_NAME subdomain data)
-  const catalog = cache.get(CATALOG_CACHE_KEY);
+  const catalog = cache.get(catalogKey);
   if (catalog?.rows?.length) return catalog.rows;
   if (Array.isArray(catalog) && catalog.length) return catalog;
-  // Fallback: use any cached full report rows (domain list still works)
+  // Fallback: only this tenant's cached full-report rows (never another network).
+  const { getClientId } = require('./clientContext');
+  const tenantPrefix = `c:${getClientId() || 'none'}:`;
   const keys = cache.keys();
   for (const key of keys) {
-    if (!key.startsWith('report_') || !key.includes('full')) continue;
+    if (!String(key).startsWith(tenantPrefix)) continue;
+    const bare = String(key).slice(tenantPrefix.length);
+    if (!bare.startsWith('report_') || !bare.includes('full')) continue;
     const data = cache.get(key);
     if (data?.rows?.length) return data.rows;
   }
@@ -539,7 +550,7 @@ function augmentAdUnitsByHost(adUnitsByHost = {}) {
 
 /** Read adUnitsByHost from cached filter-catalog payload. */
 function findCachedAdUnitsByHost(cache) {
-  const catalog = cache.get(CATALOG_CACHE_KEY);
+  const catalog = cache.get(catalogCacheKey());
   return catalog?.adUnitsByHost || {};
 }
 
@@ -669,6 +680,7 @@ function buildCatalogFilterOptions(rows = [], extra = {}) {
 
 module.exports = {
   CATALOG_CACHE_KEY,
+  catalogCacheKey,
   findCachedInventoryRows,
   rowsToDomainOptions,
   readRootDomain,

@@ -1,6 +1,6 @@
 const { Queue } = require('bullmq');
 const { createBullmqConnection } = require('../redisClient');
-const { isSyncQueueEnabled } = require('./gamSync');
+const { isSyncQueueEnabled, bullmqPrefix } = require('./gamSync');
 
 function createDisabledQueue(name) {
   return {
@@ -13,17 +13,20 @@ function createDisabledQueue(name) {
 }
 
 const queueEnabled = isSyncQueueEnabled();
+const prefix = bullmqPrefix();
+const adsOpts = {
+  connection: createBullmqConnection('BullMQ ads-sync queue'),
+  defaultJobOptions: {
+    attempts: 2,
+    backoff: { type: 'exponential', delay: 30000 },
+    removeOnComplete: { count: 20 },
+    removeOnFail: { count: 40 },
+  },
+};
+if (prefix) adsOpts.prefix = prefix;
 
 const adsSyncQueue = queueEnabled
-  ? new Queue('ads-sync', {
-      connection: createBullmqConnection('BullMQ ads-sync queue'),
-      defaultJobOptions: {
-        attempts: 2,
-        backoff: { type: 'exponential', delay: 30000 },
-        removeOnComplete: { count: 20 },
-        removeOnFail: { count: 40 },
-      },
-    })
+  ? new Queue('ads-sync', adsOpts)
   : createDisabledQueue('ads-sync');
 
 module.exports = { adsSyncQueue };

@@ -230,7 +230,8 @@ function expandAppFilterAliases(apps = [], mapsInput = null) {
 function loadCachedAppPackageMaps() {
   try {
     const { cache } = require('../gam/client');
-    const catalog = cache.get('filter_catalog_inventory_v25');
+    const { catalogCacheKey } = require('./inventoryCatalog');
+    const catalog = cache.get(catalogCacheKey());
     const fromCatalog = rehydrateAppPackageMaps(catalog?.appPackageMaps);
     if (fromCatalog.byPackage.size || fromCatalog.byResolvedId.size || fromCatalog.byName.size) {
       return fromCatalog;
@@ -308,9 +309,11 @@ async function warmAppPackageMapsFromGrain() {
     _grainAppMapsCache = { at: Date.now(), maps };
     try {
       const { cache } = require('../gam/client');
-      const catalog = cache.get('filter_catalog_inventory_v25') || {};
+      const { catalogCacheKey } = require('./inventoryCatalog');
+      const key = catalogCacheKey();
+      const catalog = cache.get(key) || {};
       if (!catalog.appPackageMaps || !Object.keys(catalog.appPackageMaps.byPackage || {}).length) {
-        cache.set('filter_catalog_inventory_v25', {
+        cache.set(key, {
           ...catalog,
           appPackageMaps: mapsToPlain(maps),
         }, 3600);

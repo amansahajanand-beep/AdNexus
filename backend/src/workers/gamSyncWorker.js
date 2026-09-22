@@ -32,6 +32,8 @@ const { getClientById, ensureBootstrapFromEnv } = require('../models/clientStore
 /** In-process guards so extended never stampedes the PG pool alongside sync-today. */
 let syncTodayRunning = 0;
 let syncExtendedRunning = 0;
+/** One in-flight sync-today per network in this process (duplicates wait). */
+const syncTodayByClient = new Map();
 
 async function deferJob(job, delayMs, reason) {
   const ms = Math.max(15_000, delayMs | 0);
@@ -91,8 +93,44 @@ async function processJob(job) {
   return runWithClient(client, () => processJobInner(job));
 }
 
+async function demoteStaleSyncToday(job) {
+  const today = todayInTZ();
+  const day = job.data?.date ? String(job.data.date).slice(0, 10) : '';
+  if (!day || day === today) return false;
+
+  logger.warn(
+    `[gam-sync] stale sync-today id=${job.id} date=${day} (today=${today}) — demoting to sync-day`
+  );
+  const cid = job.data?.clientId;
+  if (cid) {
+    try {
+      const { gamSyncQueue } = require('../queues/gamSync');
+      await gamSyncQueue.add('sync-day', {
+        date: day,
+        includeFull: false,
+        clientId: cid,
+      }, {
+        jobId: `sync-day-${String(cid).slice(0, 8)}-${day}-from-stale-today`,
+        priority: 3,
+        attempts: 2,
+        backoff: { type: 'exponential', delay: 20000 },
+      });
+    } catch (e) {
+      if (!/JobId|already exists|duplicat/i.test(e.message || '')) {
+        logger.warn(`[gam-sync] failed to requeue stale day ${day}: ${e.message}`);
+      }
+    }
+  }
+  await logSync(job.name, 'skipped', 0, `stale date ${day} (today=${today})`);
+  return true;
+}
+
 async function processJobInner(job) {
   logger.info(`[gam-sync] Processing job "${job.name}" id=${job.id}`);
+
+  if (job.name === 'sync-today' && await demoteStaleSyncToday(job)) {
+    return;
+  }
 
   // Hourly window: only today (and light reconcile) jobs run; backfill yields/defers.
   if (await isTodayPriorityActive() && !isGamJobAllowedDuringTodayPriority(job)) {
@@ -219,12 +257,34 @@ async function processJobInner(job) {
     }
 
     if (job.name === 'sync-today') {
-      const day = targetDates[targetDates.length - 1];
+      const day = todayInTZ();
+      const cid = String(job.data?.clientId || '');
+      // Drop legacy/duplicate job ids — only the stable per-day id may run.
+      try {
+        const { syncTodayJobId } = require('../cron');
+        const expected = syncTodayJobId(cid, day);
+        if (expected && String(job.id) !== expected) {
+          logger.info(
+            `[gam-sync] skip duplicate sync-today id=${job.id} (canonical=${expected})`
+          );
+          await logSync(job.name, 'skipped', 0, `duplicate id ${job.id}`);
+          return;
+        }
+      } catch (_) { /* cron helpers optional */ }
+      if (cid && syncTodayByClient.has(cid) && syncTodayByClient.get(cid) !== String(job.id)) {
+        await deferJob(job, 120_000, `sync-today already running for client=${cid.slice(0, 8)}`);
+      }
+      // Prefer finishing one network before starting another when concurrency>1.
+      if (syncTodayRunning > 0 && (!cid || !syncTodayByClient.has(cid))) {
+        await deferJob(job, 90_000, 'another sync-today in progress');
+      }
       const timeoutMs = Math.max(
         5 * 60_000,
-        parseInt(process.env.SYNC_TODAY_JOB_TIMEOUT_MS || String(15 * 60_000), 10) || 15 * 60_000
+        // Large networks often need >20m under multi-tenant DB + GAM load.
+        parseInt(process.env.SYNC_TODAY_JOB_TIMEOUT_MS || String(30 * 60_000), 10) || 30 * 60_000
       );
       syncTodayRunning += 1;
+      if (cid) syncTodayByClient.set(cid, String(job.id));
       try {
         totalUpserted = await Promise.race([
           streamSyncFromGAM(day, day, job.name),
@@ -238,6 +298,9 @@ async function processJobInner(job) {
         ]);
       } finally {
         syncTodayRunning = Math.max(0, syncTodayRunning - 1);
+        if (cid && syncTodayByClient.get(cid) === String(job.id)) {
+          syncTodayByClient.delete(cid);
+        }
       }
       await invalidateCacheForDate(day);
     } else if (job.name === 'sync-extended') {
@@ -318,7 +381,9 @@ async function drainAfterJob(job) {
     logger.info(`[gam-sync] skip drain after ${job.name} — today-priority active`);
     return;
   }
-  if (job.name === 'sync-extended') return;
+  // Only drip history after hot-path jobs. Draining after every backfill/month job
+  // re-floods the queue and starves sync-today.
+  if (job.name !== 'sync-today' && job.name !== 'sync-day') return;
   let client = null;
   try {
     if (job.data?.clientId) client = await getClientById(job.data.clientId);
@@ -337,13 +402,21 @@ function startWorker() {
 
   // Default 2 — leave PG pool headroom for Dashboard/Reporting during sync.
   const syncConcurrency = Math.min(5, Math.max(1, parseInt(process.env.GAM_SYNC_CONCURRENCY || '2', 10) || 2));
-  const worker = new Worker('gam-sync', processJob, {
+  const { bullmqPrefix } = require('../queues/gamSync');
+  const prefix = bullmqPrefix();
+  const workerOpts = {
     connection: createBullmqConnection('BullMQ gam-sync worker'),
     concurrency: syncConcurrency,
-    lockDuration: 45 * 60 * 1000,
-    stalledInterval: 5 * 60 * 1000,
+    // Align lock with sync-today timeout so dead workers release zombies faster.
+    lockDuration: Math.max(
+      10 * 60 * 1000,
+      parseInt(process.env.SYNC_TODAY_JOB_TIMEOUT_MS || String(30 * 60_000), 10) || 30 * 60_000
+    ) + 60_000,
+    stalledInterval: 2 * 60 * 1000,
     maxStalledCount: 1,
-  });
+  };
+  if (prefix) workerOpts.prefix = prefix;
+  const worker = new Worker('gam-sync', processJob, workerOpts);
 
   worker.on('completed', (job) => {
     const ms = job.finishedOn - job.processedOn;
@@ -368,7 +441,10 @@ function startWorker() {
     logger.error('[gam-sync] Worker error:', err.message);
   });
 
-  logger.info(`BullMQ gam-sync worker started (concurrency=${syncConcurrency}, stalledInterval=5m)`);
+  logger.info(
+    `BullMQ gam-sync worker started (concurrency=${syncConcurrency}, stalledInterval=2m`
+    + `${prefix ? `, prefix=${prefix}` : ''})`
+  );
   return worker;
 }
 
@@ -378,6 +454,16 @@ function startReportWorker() {
     return null;
   }
 
+  const { bullmqPrefix } = require('../queues/gamSync');
+  const prefix = bullmqPrefix();
+  const reportOpts = {
+    connection: createBullmqConnection('BullMQ gam-report worker'),
+    concurrency: 1,
+    lockDuration: 15 * 60 * 1000,
+    stalledInterval: 5 * 60 * 1000,
+    maxStalledCount: 1,
+  };
+  if (prefix) reportOpts.prefix = prefix;
   const reportWorker = new Worker('gam-report', async (job) => {
     let client = null;
     try {
@@ -391,13 +477,7 @@ function startReportWorker() {
       return;
     }
     return runWithClient(client, () => processReportJob(job));
-  }, {
-    connection: createBullmqConnection('BullMQ gam-report worker'),
-    concurrency: 1,
-    lockDuration: 15 * 60 * 1000,
-    stalledInterval: 5 * 60 * 1000,
-    maxStalledCount: 1,
-  });
+  }, reportOpts);
 
   reportWorker.on('completed', (job) => logger.info(`[gam-report] Job ${job.id} completed`));
   reportWorker.on('failed', (job, err) => logger.error(`[gam-report] Job ${job.id} failed: ${err.message}`));

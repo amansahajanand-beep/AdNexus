@@ -27,32 +27,45 @@ function isSyncQueueEnabled() {
 
 const queueEnabled = isSyncQueueEnabled();
 
+/** Isolate local/dev from other machines sharing the same Upstash Redis. */
+function bullmqPrefix() {
+  const p = String(process.env.BULLMQ_PREFIX || '').trim();
+  return p || undefined;
+}
+
+const bullOpts = {
+  connection: createBullmqConnection('BullMQ gam-sync queue'),
+  defaultJobOptions: {
+    attempts: 2,
+    backoff: { type: 'exponential', delay: 20000 },
+    removeOnComplete: { count: 20 },
+    removeOnFail:     { count: 40 },
+  },
+};
+const prefix = bullmqPrefix();
+if (prefix) bullOpts.prefix = prefix;
+
 // One queue for all background GAM sync jobs.
 // Workers read from this same queue name.
 const gamSyncQueue = queueEnabled
-  ? new Queue('gam-sync', {
-      connection: createBullmqConnection('BullMQ gam-sync queue'),
-      defaultJobOptions: {
-        attempts: 2,
-        backoff: { type: 'exponential', delay: 20000 },
-        removeOnComplete: { count: 20 },
-        removeOnFail:     { count: 40 },
-      },
-    })
+  ? new Queue('gam-sync', bullOpts)
   : createDisabledQueue('gam-sync');
+
+const reportOpts = {
+  connection: createBullmqConnection('BullMQ gam-report queue'),
+  defaultJobOptions: {
+    attempts: 1,
+    backoff: { type: 'fixed', delay: 30000 },
+    removeOnComplete: { count: 20 },
+    removeOnFail:     { count: 40 },
+  },
+};
+if (prefix) reportOpts.prefix = prefix;
 
 // Separate queue for on-demand user report jobs (Reporting page custom queries).
 // Lower concurrency — user is waiting for result.
 const gamReportQueue = queueEnabled
-  ? new Queue('gam-report', {
-      connection: createBullmqConnection('BullMQ gam-report queue'),
-      defaultJobOptions: {
-        attempts: 1,
-        backoff: { type: 'fixed', delay: 30000 },
-        removeOnComplete: { count: 20 },
-        removeOnFail:     { count: 40 },
-      },
-    })
+  ? new Queue('gam-report', reportOpts)
   : createDisabledQueue('gam-report');
 
-module.exports = { gamSyncQueue, gamReportQueue, isSyncQueueEnabled };
+module.exports = { gamSyncQueue, gamReportQueue, isSyncQueueEnabled, bullmqPrefix };

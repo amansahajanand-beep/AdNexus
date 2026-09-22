@@ -13,6 +13,7 @@ export default function LegalPage({ title, children }) {
             <span className="login-brand-name">AdNexus</span>
           </Link>
           <nav className="legal-nav">
+            <Link to="/about">About</Link>
             <Link to="/privacy">Privacy Policy</Link>
             <Link to="/terms">Terms of Service</Link>
             <Link to="/login">Sign in</Link>

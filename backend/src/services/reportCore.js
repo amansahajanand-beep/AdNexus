@@ -19,6 +19,7 @@ const {
   dedupeCatalogRows,
   enrichCatalogRow,
   CATALOG_CACHE_KEY,
+  catalogCacheKey,
   mapGamRowInventory,
   buildAdUnitNameToIdMap,
   buildReportSiteMap,
@@ -397,18 +398,33 @@ function buildCountryFilter(country) {
 }
 
 // Stable cache key for a filter set (arrays sorted so order doesn't matter).
-let _cacheGenMemo = { value: 0, at: 0 };
+let _cacheGenMemo = { clientId: null, value: 0, at: 0 };
+
+/** Prefix memory/Redis keys with active network client_id (never share across networks). */
+function withTenantCacheKey(key) {
+  try {
+    const { tenantKey } = require('../utils/clientContext');
+    return tenantKey(String(key || ''));
+  } catch (_) {
+    return String(key || '');
+  }
+}
+
 async function currentCacheGen() {
-  if (Date.now() - _cacheGenMemo.at < 5000) return _cacheGenMemo.value;
+  const { getClientId, tenantKey } = require('../utils/clientContext');
+  const cid = getClientId() || 'none';
+  if (_cacheGenMemo.clientId === cid && Date.now() - _cacheGenMemo.at < 5000) {
+    return _cacheGenMemo.value;
+  }
   try {
     const { getCacheGeneration } = require('../redisClient');
-    const { tenantKey } = require('../utils/clientContext');
     _cacheGenMemo = {
+      clientId: cid,
       value: await getCacheGeneration(tenantKey('')) || 0,
       at: Date.now(),
     };
   } catch (_) {
-    _cacheGenMemo = { value: 0, at: Date.now() };
+    _cacheGenMemo = { clientId: cid, value: 0, at: Date.now() };
   }
   return _cacheGenMemo.value;
 }
@@ -1282,7 +1298,7 @@ async function runDetailedReport({
 
     const catalogRows = findCachedInventoryRows(cache);
     if (catalogRows?.length) {
-      const catalogCache = cache.get(CATALOG_CACHE_KEY);
+      const catalogCache = cache.get(catalogCacheKey());
       const adUnitsByHost = catalogCache?.adUnitsByHost || findCachedAdUnitsByHost(cache);
       const siteHosts = buildCatalogFilterOptions(catalogRows, catalogCache?.rawHosts || {}).siteHosts || [];
       rows = applyCatalogSiteHosts(rows, catalogRows, adUnitsByHost, siteHosts);
@@ -1291,7 +1307,7 @@ async function runDetailedReport({
     // Resolve numeric MOBILE_APP_RESOLVED_ID → store package BEFORE filtering by app.
     // Without this, app rows whose resolved id isn't package-like never match the
     // selected App ID and get dropped — which drops whole apps and halves revenue.
-    const appPackageMaps = rehydrateAppPackageMaps(cache.get(CATALOG_CACHE_KEY)?.appPackageMaps);
+    const appPackageMaps = rehydrateAppPackageMaps(cache.get(catalogCacheKey())?.appPackageMaps);
     if (appPackageMaps.byPackage.size || appPackageMaps.byResolvedId.size) {
       rows = enrichRowsWithAppPackages(rows, appPackageMaps);
     }
@@ -1723,10 +1739,10 @@ function deriveScopedOverviewSummary(rows = [], currency, isMock = false) {
 
 /** Shared cache key for line-item reports (overview + domain user use the same raw rows). */
 function sharedDetailedCacheKey(filters) {
-  return `report_domain_user_${filterCacheKey({
+  return withTenantCacheKey(`report_domain_user_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
-  })}`;
+  })}`);
 }
 
 /** Warm filter catalog so scoped users can resolve ad-unit → site host before scope filter. */
@@ -1735,7 +1751,7 @@ async function ensureInventoryCatalog(token) {
     return await getFilterCatalog(token, { allowStale: true });
   } catch (err) {
     logger.warn('Inventory catalog warmup failed:', err.message);
-    return cache.get(CATALOG_CACHE_KEY) || {};
+    return cache.get(catalogCacheKey()) || {};
   }
 }
 
@@ -1744,15 +1760,37 @@ const CATALOG_STALE_MS = 60 * 60 * 1000; // refresh from GAM in background after
 
 function scheduleCatalogBackgroundRefresh(token) {
   if (!token || catalogBgRefresh) return;
+  const { getClient, runWithClient } = require('../utils/clientContext');
+  const startedFor = getClient();
+  if (!startedFor?.id) return;
+  const startedId = startedFor.id;
   catalogBgRefresh = (async () => {
     try {
-      logger.info('Filter catalog: background GAM refresh…');
+      try {
+        const { isTodayPriorityActive } = require('./syncPriorityGate');
+        if (await isTodayPriorityActive()) {
+          logger.info(
+            `Filter catalog: background refresh deferred — today-priority active`
+            + ` client=${String(startedId).slice(0, 8)}`
+          );
+          return;
+        }
+      } catch (_) { /* gate optional */ }
+      logger.info(
+        `Filter catalog: background GAM refresh… client=${String(startedId).slice(0, 8)}`
+      );
       const fresh = await runCatalogReport(token);
-      cache.set(CATALOG_CACHE_KEY, fresh, REPORT_CACHE_TTL);
-      await kvSet(CATALOG_CACHE_KEY, fresh);
-      const r = getRedis();
-      if (r?.redisSet) await r.redisSet(CATALOG_CACHE_KEY, fresh, r.TTL?.INVENTORY || 3600);
-      logger.info(`Filter catalog: background refresh saved (${fresh.rows?.length || 0} rows)`);
+      // Always save under the client that started this refresh (ALS may be gone by then).
+      await runWithClient(startedFor, async () => {
+        cache.set(catalogCacheKey(), fresh, REPORT_CACHE_TTL);
+        await kvSet(CATALOG_CACHE_KEY, fresh);
+        const r = getRedis();
+        if (r?.redisSet) await r.redisSet(catalogCacheKey(), fresh, r.TTL?.INVENTORY || 3600);
+      });
+      logger.info(
+        `Filter catalog: background refresh saved (${fresh.rows?.length || 0} rows)`
+        + ` client=${String(startedId).slice(0, 8)}`
+      );
     } catch (err) {
       logger.warn('Filter catalog background refresh failed:', err.message);
     } finally {
@@ -1767,15 +1805,15 @@ function scheduleCatalogBackgroundRefresh(token) {
  */
 async function getFilterCatalog(token, { allowStale = true, forceRefresh = false } = {}) {
   if (!forceRefresh) {
-    const mem = cache.get(CATALOG_CACHE_KEY);
+    const mem = cache.get(catalogCacheKey());
     if (mem?.rows?.length) return mem;
 
     const r = getRedis();
     if (r?.redisGet) {
       try {
-        const redisData = await r.redisGet(CATALOG_CACHE_KEY);
+        const redisData = await r.redisGet(catalogCacheKey());
         if (redisData?.rows?.length) {
-          cache.set(CATALOG_CACHE_KEY, redisData, REPORT_CACHE_TTL);
+          cache.set(catalogCacheKey(), redisData, REPORT_CACHE_TTL);
           logger.info(`Filter catalog served from Redis (${redisData.rows.length} rows)`);
           return redisData;
         }
@@ -1785,9 +1823,9 @@ async function getFilterCatalog(token, { allowStale = true, forceRefresh = false
     if (allowStale) {
       const db = await kvGet(CATALOG_CACHE_KEY);
       if (db?.payload?.rows?.length) {
-        cache.set(CATALOG_CACHE_KEY, db.payload, REPORT_CACHE_TTL);
+        cache.set(catalogCacheKey(), db.payload, REPORT_CACHE_TTL);
         if (r?.redisSet) {
-          try { await r.redisSet(CATALOG_CACHE_KEY, db.payload, r.TTL?.INVENTORY || 3600); } catch (_) { /* ignore */ }
+          try { await r.redisSet(catalogCacheKey(), db.payload, r.TTL?.INVENTORY || 3600); } catch (_) { /* ignore */ }
         }
         const ageMs = db.updatedAt ? (Date.now() - new Date(db.updatedAt).getTime()) : 0;
         logger.info(
@@ -1801,13 +1839,13 @@ async function getFilterCatalog(token, { allowStale = true, forceRefresh = false
     }
   }
 
-  if (!token) return cache.get(CATALOG_CACHE_KEY) || { rows: [] };
+  if (!token) return cache.get(catalogCacheKey()) || { rows: [] };
 
-  const fresh = await fetchWithDedup(CATALOG_CACHE_KEY, () => runCatalogReport(token));
+  const fresh = await fetchWithDedup(catalogCacheKey(), () => runCatalogReport(token));
   await kvSet(CATALOG_CACHE_KEY, fresh);
   const r = getRedis();
   if (r?.redisSet) {
-    try { await r.redisSet(CATALOG_CACHE_KEY, fresh, r.TTL?.INVENTORY || 3600); } catch (_) { /* ignore */ }
+    try { await r.redisSet(catalogCacheKey(), fresh, r.TTL?.INVENTORY || 3600); } catch (_) { /* ignore */ }
   }
   logger.info(`Filter catalog fetched from GAM and saved to Postgres (${fresh.rows?.length || 0} rows)`);
   return fresh;
@@ -1815,7 +1853,7 @@ async function getFilterCatalog(token, { allowStale = true, forceRefresh = false
 
 /** Site-resolution context for scoped child users (catalog + assigned sites). */
 function buildScopeSiteContextForUser(user) {
-  const catalogPayload = cache.get(CATALOG_CACHE_KEY) || {};
+  const catalogPayload = cache.get(catalogCacheKey()) || {};
   const catalogRows = findCachedInventoryRows(cache) || catalogPayload.rows || [];
   const ctx = buildDomainUserSiteContext(catalogPayload);
   const scope = getUserInventoryScope(user);
@@ -1837,7 +1875,7 @@ function buildScopeSiteContextForUser(user) {
 /** Catalog enrichment before inventory scope — must match across overview and domain user. */
 function enrichRowsForInventoryScope(allRows, user = null) {
   let rows = normalizeReportRows(allRows);
-  const catalogCache = cache.get(CATALOG_CACHE_KEY);
+  const catalogCache = cache.get(catalogCacheKey());
   const catalogRows = findCachedInventoryRows(cache);
   const scope = user ? getUserInventoryScope(user) : null;
   const assignedSites = scope?.sites ? [...scope.sites] : [];
@@ -1874,7 +1912,7 @@ function prepareScopedReportRows(allRows, filters, user) {
       const selectedSites = toFilterArray(filters.site);
       let adUnitToHost = null;
       if (selectedSites.length) {
-        const catalogPayload = cache.get(CATALOG_CACHE_KEY) || {};
+        const catalogPayload = cache.get(catalogCacheKey()) || {};
         const catalogRows = findCachedInventoryRows(cache) || [];
         adUnitToHost = buildFilterAdUnitHostMap({
           catalogRows,
@@ -1899,7 +1937,7 @@ function prepareScopedReportRows(allRows, filters, user) {
     const selectedSites = toFilterArray(filters.site);
     let adUnitToHost = null;
     if (selectedSites.length) {
-      const catalogPayload = cache.get(CATALOG_CACHE_KEY) || {};
+      const catalogPayload = cache.get(catalogCacheKey()) || {};
       const catalogRows = findCachedInventoryRows(cache) || [];
       adUnitToHost = buildFilterAdUnitHostMap({
         catalogRows,
@@ -2016,7 +2054,7 @@ async function loadDashboardRawReportRows(filters, token, user = null) {
 }
 
 function reportRowsCacheKey(filters, prefix = 'report_rows_v1') {
-  return `${prefix}_${filterCacheKey({
+  return withTenantCacheKey(`${prefix}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -2026,7 +2064,7 @@ function reportRowsCacheKey(filters, prefix = 'report_rows_v1') {
     domainId: filters.domainId,
     reportDimensions: filters.reportDimensions,
     reportMetrics: filters.reportMetrics,
-  })}`;
+  })}`);
 }
 
 function rowsToPersistShape(rows, fallbackDate, currency = 'USD') {
@@ -3330,7 +3368,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = `report_dashboard_resp_v22_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v24_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3338,11 +3376,14 @@ async function handleDashboard(req, res) {
     site: filters.site,
     domainName: filters.domainName,
     domainId: filters.domainId,
-  })}`;
+  })}`);
   try {
     const hit = cache.get(dashRespKey);
     if (hit?.summary) {
-      logger.info(`Dashboard from memory response cache ${filters.startDate}..${filters.endDate}`);
+      logger.info(
+        `Dashboard from memory response cache ${filters.startDate}..${filters.endDate}`
+        + ` revenue=${hit.summary?.revenue ?? hit.summary?.selectRange ?? '?'} rows=${hit.rows?.length ?? 0}`
+      );
       return res.json(hit);
     }
     const r = getRedis();
@@ -3350,7 +3391,10 @@ async function handleDashboard(req, res) {
       const rHit = await r.redisGet(dashRespKey);
       if (rHit?.summary) {
         cache.set(dashRespKey, rHit, REPORT_CACHE_TTL);
-        logger.info(`Dashboard from Redis response cache ${filters.startDate}..${filters.endDate}`);
+        logger.info(
+          `Dashboard from Redis response cache ${filters.startDate}..${filters.endDate}`
+          + ` revenue=${rHit.summary?.revenue ?? rHit.summary?.selectRange ?? '?'} rows=${rHit.rows?.length ?? 0}`
+        );
         return res.json(rHit);
       }
     }
@@ -3428,6 +3472,7 @@ async function handleDashboard(req, res) {
         logger.info(
           `Dashboard ${bundle.source === 'rollup' ? 'rollup' : (bundle.source || 'lean SQL')} bundle ${filters.startDate}..${filters.endDate}`
           + ` grain≈${bundle.grainCount} table=${scopedRows.length}`
+          + ` revenue=${scopedSummary?.revenue ?? scopedSummary?.selectRange ?? '?'}`
           + (isScopedChild ? ` user=${req.user.username}` : '')
           + (compat.skipped?.length ? ` compatSkipped=[${compat.skipped.join(', ')}]` : '')
           + ` in ${Date.now() - t0}ms`
@@ -3644,7 +3689,7 @@ async function handleDomainUserReport(req, res) {
 
   try {
     const token = await getToken();
-    let catalogPayload = cache.get(CATALOG_CACHE_KEY);
+    let catalogPayload = cache.get(catalogCacheKey());
     if (!catalogPayload?.adUnitsByHost || !Object.keys(catalogPayload.adUnitsByHost).length) {
       try {
         catalogPayload = await getFilterCatalog(token, { allowStale: true });
@@ -3666,6 +3711,10 @@ async function handleFilterCatalog(req, res) {
   if (!canAccessPage(req.user, 'dashboard') && !canAccessPage(req.user, 'reporting')) {
     return res.status(403).json({ error: 'You do not have permission to load filter options.' });
   }
+  // Never let the browser reuse another network's catalog after Switch (304 with stale body).
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Vary', 'Authorization');
 
   // Domain/child users: return granted domain/site/app IDs from user.permissions instantly.
   // Do not wait on the full network GAM/Redis catalog (admin path).
@@ -3739,6 +3788,8 @@ async function handleFilterCatalog(req, res) {
       appPackages: result.appPackages || scoped.appPackages || [],
       startDate: result.startDate,
       endDate: result.endDate,
+      clientId: req.client?.id || null,
+      networkCode: req.client?.networkCode || null,
     });
   } catch (err) {
     logger.error('Filter catalog error:', err.message);
@@ -3895,7 +3946,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = `report_detailed_resp_v30_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v31_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3908,7 +3959,7 @@ async function handleDetailedReport(req, res) {
     // Include original metrics so Ad Exchange → Total compose gets its own cache entry.
     originalMetrics: originalMetIds,
     allRows: wantAllRows ? '1' : '0',
-  })}_${pageKey}`;
+  })}_${pageKey}`);
 
   try {
     const hit = cache.get(detailedRespKey);
@@ -4508,7 +4559,9 @@ async function handleProgrammaticReport(req, res) {
     return res.json(applyProgrammaticVisibility({ ...base, currency: 'USD' }, req.user));
   }
 
-  const cacheKey = `report_programmatic_resp_v1_${startDate}_${endDate}_${asArray(country).slice().sort().join('|') || 'all'}`;
+  const cacheKey = withTenantCacheKey(
+    `report_programmatic_resp_v1_${startDate}_${endDate}_${asArray(country).slice().sort().join('|') || 'all'}`
+  );
   const currency = process.env.GAM_CURRENCY || null;
   const cached = cache.get(cacheKey);
   if (cached?.rows?.length || cached?.status === 'building' || cached?.empty) {
@@ -4633,7 +4686,7 @@ async function handleSummary(req, res) {
   }
 
   const days = req.query.days || 30;
-  const cacheKey = `report_summary_${days}d`;
+  const cacheKey = withTenantCacheKey(`report_summary_${days}d`);
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
 
@@ -4683,7 +4736,7 @@ async function handleTrend(req, res) {
 
   if (isMockClient()) return res.json(mockTrend(days, metric));
 
-  const cacheKey = `trend_${days}_${metric}`;
+  const cacheKey = withTenantCacheKey(`trend_${days}_${metric}`);
   const cached = cache.get(cacheKey);
   if (cached) return res.json(cached);
 

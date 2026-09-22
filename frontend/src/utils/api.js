@@ -196,7 +196,11 @@ export const reportsAPI = {
 
   getCountries: () => FAST_API.get('/reports/countries'),
 
-  getFilterCatalog: () => API.get('/reports/filter-catalog'),
+  getFilterCatalog: (clientId) => API.get('/reports/filter-catalog', {
+    // Bust browser HTTP cache when the active GAM network changes.
+    params: clientId ? { _cid: String(clientId).slice(0, 8) } : undefined,
+    headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
+  }),
 
   getProgrammatic: (filters = {}) =>
     reportRequest('/reports/programmatic', filters),
@@ -241,12 +245,15 @@ export const sessionAPI = {
 
 // ─── User management (admin) ────────────────────────────────────────────────────
 export const clientsAPI = {
+  register: (payload) => FAST_API.post('/onboard/register', payload),
   onboard: (payload) => FAST_API.post('/onboard', payload),
   onboardOauthStart: (payload) => FAST_API.post('/onboard/oauth-start', payload),
   onboardOauthPending: (id) => FAST_API.get(`/onboard/oauth/pending/${id}`),
   onboardOauthSelect: (payload) => FAST_API.post('/onboard/oauth/select', payload),
   me: () => FAST_API.get('/clients/me'),
   updateMe: (payload) => FAST_API.put('/clients/me', payload),
+  networks: () => FAST_API.get('/clients/me/networks'),
+  setActiveNetwork: (clientId) => FAST_API.post('/clients/me/active-network', { clientId }),
   oauthUrl: () => FAST_API.get('/clients/me/oauth-url'),
   oauthPending: (id) => FAST_API.get(`/clients/oauth/pending/${id}`),
   oauthSelect: (id, payload) => FAST_API.post(`/clients/oauth/pending/${id}/select`, payload),
@@ -296,7 +303,10 @@ export const roiAPI = {
 
 export const usersAPI = {
   getAll: () => FAST_API.get('/users'),
-  getInventoryPicker: () => FAST_API.get('/users/inventory-picker'),
+  getInventoryPicker: (clientId) => FAST_API.get('/users/inventory-picker', {
+    params: clientId ? { _cid: String(clientId).slice(0, 8) } : undefined,
+    headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
+  }),
   create: (payload) => FAST_API.post('/users', payload),
   update: (id, payload) => FAST_API.put(`/users/${id}`, payload),
   updatePermissions: (id, payload) => FAST_API.put(`/users/${id}/permissions`, payload),
