@@ -144,6 +144,22 @@ async function getUsersByClientId(clientId) {
   return rows.map((row) => toAdminSafeUser(mapDbRowToUser(row)));
 }
 
+/** Users for any of the given GAM client ids (multi-network account). */
+async function getUsersByClientIds(clientIds = []) {
+  const ids = [...new Set((clientIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  if (!ids.length) return [];
+  if (ids.length === 1) return getUsersByClientId(ids[0]);
+  const { rows } = await query(
+    `SELECT id, username, email, role, client_id, permissions, active_session_id,
+            last_login, is_active, created_by, created_at, password_hash, password_encrypted
+     FROM users
+     WHERE client_id = ANY($1::uuid[])
+     ORDER BY created_at ASC NULLS LAST, username ASC`,
+    [ids]
+  );
+  return rows.map((row) => toAdminSafeUser(mapDbRowToUser(row)));
+}
+
 async function createUser({ id, username, email, password, passwordHash, role, permissions, createdBy, clientId }) {
   const uid = id || `user-${Date.now()}`;
   const plain = password || null;
@@ -283,6 +299,7 @@ module.exports = {
   initUsersSchema,
   getAllUsers,
   getUsersByClientId,
+  getUsersByClientIds,
   getUserById,
   getUserByUsername,
   createUser,

@@ -30,6 +30,22 @@ function tenantKey(key) {
   return `c:${id}:${key}`;
 }
 
+/**
+ * Express wrapper — re-enter ALS around the full async handler so tenant
+ * override (X-Gam-Client-Id) cannot leak back to the admin's default network.
+ */
+function bindRequestClient(handler) {
+  return function boundRequestClient(req, res, next) {
+    const client = req.client || null;
+    Promise.resolve()
+      .then(() => runWithClient(client, () => handler(req, res, next)))
+      .catch((err) => {
+        if (typeof next === 'function') next(err);
+        else throw err;
+      });
+  };
+}
+
 module.exports = {
   runWithClient,
   getClient,
@@ -37,4 +53,5 @@ module.exports = {
   requireClientId,
   isMockClient,
   tenantKey,
+  bindRequestClient,
 };

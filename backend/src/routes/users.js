@@ -14,6 +14,8 @@ const {
 
   getUsersByClientId,
 
+  getUsersByClientIds,
+
   getUserById,
 
   createUser,
@@ -25,6 +27,14 @@ const {
   toAdminSafeUser,
 
 } = require('../models/userStore');
+
+const {
+
+  getAccountIdForClient,
+
+  listClientsByAccountId,
+
+} = require('../models/clientStore');
 
 const logger = require('../utils/logger');
 
@@ -186,21 +196,70 @@ router.get('/permissions/catalog', (req, res) => {
 
 
 
-function assertSameClient(req, user) {
-  const cid = req.user.clientId || req.client?.id;
-  if (!user || !cid || user.clientId !== cid) return false;
-  return true;
+async function accountNetworksFor(req) {
+  const accountId = await getAccountIdForClient(req.client?.id || req.user?.clientId);
+  const networks = await listClientsByAccountId(accountId);
+  return (networks || []).filter((n) => !n.isPending);
+}
+
+/** Resolve allowed network UUIDs from body; must belong to this account. */
+function resolveAllowedClientIds(body, networks, fallbackId) {
+  const networkIds = new Set((networks || []).map((n) => n.id));
+  const raw = body?.allowedClientIds;
+  let ids = [];
+  if (Array.isArray(raw)) {
+    ids = raw.map((id) => String(id || '').trim()).filter((id) => networkIds.has(id));
+  }
+  if (!ids.length) {
+    const single = String(body?.clientId || '').trim();
+    if (single && networkIds.has(single)) ids = [single];
+  }
+  if (!ids.length && fallbackId && networkIds.has(fallbackId)) {
+    ids = [fallbackId];
+  } else if (!ids.length && fallbackId) {
+    ids = [fallbackId];
+  }
+  return [...new Set(ids)];
+}
+
+async function assertSameAccount(req, user) {
+  if (!user?.clientId) return false;
+  const networks = await accountNetworksFor(req);
+  return networks.some((n) => n.id === user.clientId);
 }
 
 router.get('/', async (req, res) => {
   try {
-    const cid = req.user.clientId || req.client?.id;
-    res.json(await getUsersByClientId(cid));
+    const networks = await accountNetworksFor(req);
+    const ids = networks.map((n) => n.id);
+    const fallbackId = req.user.clientId || req.client?.id;
+    const users = ids.length
+      ? await getUsersByClientIds(ids)
+      : await getUsersByClientId(fallbackId);
+    const byId = Object.fromEntries(networks.map((n) => [n.id, n]));
+    res.json(users.map((u) => {
+      const net = byId[u.clientId];
+      const allowedRaw = u.permissions?.allowedClientIds;
+      const allowedIds = Array.isArray(allowedRaw) && allowedRaw.length
+        ? [...new Set(allowedRaw.map((id) => String(id || '').trim()).filter(Boolean))]
+        : (u.clientId ? [u.clientId] : []);
+      const networkNames = allowedIds
+        .map((id) => byId[id]?.name || byId[id]?.networkCode)
+        .filter(Boolean);
+      return {
+        ...u,
+        networkName: networkNames.length
+          ? networkNames.join(', ')
+          : (net?.name || null),
+        networkCode: net?.networkCode || null,
+        allowedClientIds: allowedIds,
+        networkNames,
+      };
+    }));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
 
 
 router.post('/', async (req, res) => {
@@ -229,23 +288,25 @@ router.post('/', async (req, res) => {
   const userRole = role === 'admin' ? 'admin' : 'child';
 
   try {
+    const networks = await accountNetworksFor(req);
+    const fallbackId = req.user.clientId || req.client?.id;
+    const allowedIds = userRole === 'admin'
+      ? []
+      : resolveAllowedClientIds(req.body, networks, fallbackId);
+    const primaryClientId = allowedIds[0] || fallbackId;
+
+    const bodyForPerms = userRole === 'admin'
+      ? req.body
+      : { ...req.body, allowedClientIds: allowedIds };
 
     const user = await createUser({
-
       username: username.trim(),
-
       email: email || `${username.trim()}@local`,
-
       password,
-
       role: userRole,
-
-      permissions: buildFromBody(userRole, req.body),
-
+      permissions: buildFromBody(userRole, bodyForPerms),
       createdBy: req.user.username,
-
-      clientId: req.user.clientId || req.client?.id,
-
+      clientId: primaryClientId,
     });
 
     logger.info(`User created: ${user.username} by ${req.user.username}`);
@@ -268,7 +329,7 @@ router.put('/:id', async (req, res) => {
 
   const existing = await getUserById(req.params.id);
 
-  if (!existing || !assertSameClient(req, existing)) return res.status(404).json({ error: 'User not found' });
+  if (!existing || !await assertSameAccount(req, existing)) return res.status(404).json({ error: 'User not found' });
 
 
 
@@ -307,11 +368,27 @@ router.put('/:id', async (req, res) => {
 
 
   const permsTouched = permissionsTouched(req.body || {});
+  const networksTouched = Array.isArray(req.body?.allowedClientIds) || ('clientId' in (req.body || {}));
 
   if (nextRole === 'admin') {
     updates.permissions = null;
-  } else if (permsTouched || (role && nextRole === 'child')) {
-    updates.permissions = mergePermissionsFromBody(existing.permissions, req.body);
+  } else if (permsTouched || networksTouched || (role && nextRole === 'child')) {
+    let bodyForPerms = req.body || {};
+    if (networksTouched) {
+      const networks = await accountNetworksFor(req);
+      const allowedIds = resolveAllowedClientIds(
+        req.body,
+        networks,
+        existing.clientId || req.user.clientId || req.client?.id
+      );
+      bodyForPerms = { ...req.body, allowedClientIds: allowedIds };
+      if (allowedIds[0] && allowedIds[0] !== existing.clientId) {
+        updates.clientId = allowedIds[0];
+      } else if (allowedIds[0]) {
+        updates.clientId = allowedIds[0];
+      }
+    }
+    updates.permissions = mergePermissionsFromBody(existing.permissions, bodyForPerms);
   }
 
 
@@ -345,7 +422,7 @@ router.put('/:id/permissions', async (req, res) => {
 
   const existing = await getUserById(req.params.id);
 
-  if (!existing || !assertSameClient(req, existing)) return res.status(404).json({ error: 'User not found' });
+  if (!existing || !await assertSameAccount(req, existing)) return res.status(404).json({ error: 'User not found' });
 
 
 
@@ -376,7 +453,7 @@ router.delete('/:id', async (req, res) => {
 
   try {
     const existing = await getUserById(req.params.id);
-    if (!existing || !assertSameClient(req, existing)) {
+    if (!existing || !await assertSameAccount(req, existing)) {
       return res.status(404).json({ error: 'User not found' });
     }
 

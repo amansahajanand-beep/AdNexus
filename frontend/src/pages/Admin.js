@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useLocation } from 'react-router-dom';
-import { usersAPI, domainsAPI, reportsAPI, adsAPI } from '../utils/api';
+import { usersAPI, domainsAPI, reportsAPI, adsAPI, clientsAPI } from '../utils/api';
 import { useAuth } from '../store/useAuth';
 import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions, normalizeDomainPickerOptions } from '../utils/domainCatalog';
 import { isLikelyAppPackage } from '../utils/appPackage';
@@ -59,6 +59,7 @@ export default function Admin() {
   const [catalogLoading, setCatalogLoading] = useState(true);
   const [adsAccountOptions, setAdsAccountOptions] = useState([]);
   const [adsAccountsLoading, setAdsAccountsLoading] = useState(true);
+  const [networks, setNetworks] = useState([]);
 
   const [permSaving, setPermSaving] = useState(false);
   const [permError, setPermError] = useState(null);
@@ -73,6 +74,15 @@ export default function Admin() {
       setUsersError(getUserFacingMessage(err, 'Could not load users. Please refresh the page.'));
     } finally {
       setUsersLoading(false);
+    }
+  }, []);
+
+  const loadNetworks = useCallback(async () => {
+    try {
+      const data = await clientsAPI.networks();
+      setNetworks((data?.networks || []).filter((n) => !n.isPending && n.networkCode));
+    } catch {
+      setNetworks([]);
     }
   }, []);
 
@@ -92,9 +102,11 @@ export default function Admin() {
   const loadDomains = useCallback(async () => {
     setDomainsLoading(true);
     setCatalogLoading(true);
+    const networkIds = networks.map((n) => n.id).filter(Boolean);
+    const primaryClientId = networkIds[0] || user?.clientId;
     let picker = null;
     try {
-      picker = await usersAPI.getInventoryPicker(user?.clientId).catch(() => null);
+      picker = await usersAPI.getInventoryPicker(primaryClientId).catch(() => null);
       if (picker) {
         setCatalogLists({
           siteHosts: picker.siteHosts || [],
@@ -115,7 +127,9 @@ export default function Admin() {
     }
 
     try {
-      const catalog = await reportsAPI.getFilterCatalog(user?.clientId).catch(() => null);
+      const catalog = networkIds.length > 1
+        ? await reportsAPI.getMergedFilterCatalog(networkIds).catch(() => null)
+        : await reportsAPI.getFilterCatalog(primaryClientId).catch(() => null);
       if (catalog?.rows?.length) {
         setCatalogRows(catalog.rows);
         setCatalogLists((prev) => ({
@@ -143,16 +157,17 @@ export default function Admin() {
     } finally {
       setDomainsLoading(false);
     }
-  }, [user?.clientId]);
-  useEffect(() => { loadUsers(); loadDomains(); loadAdsAccounts(); }, [loadUsers, loadDomains, loadAdsAccounts]);
+  }, [user?.clientId, networks]);
+  useEffect(() => { loadUsers(); loadNetworks(); loadAdsAccounts(); }, [loadUsers, loadNetworks, loadAdsAccounts]);
+  useEffect(() => { loadDomains(); }, [loadDomains]);
 
-  // After admin switches active GAM network, user.clientId changes — reload scoped lists (1B).
+  // After admin connects another GAM network, reload scoped lists.
   useEffect(() => {
     if (!user?.clientId) return undefined;
     loadUsers();
-    loadDomains();
+    loadNetworks();
     return undefined;
-  }, [user?.clientId, loadUsers, loadDomains]);
+  }, [user?.clientId, loadUsers, loadNetworks]);
 
   useEffect(() => {
     if (tab === 'user' || tab === 'domains') loadAdsAccounts();
@@ -229,6 +244,7 @@ export default function Admin() {
           catalogLists={catalogLists}
           adsAccountOptions={adsAccountOptions}
           adsAccountsLoading={adsAccountsLoading}
+          networks={networks}
           onCreate={onCreate}
           onUpdate={onUpdate}
           onSavePermissions={onSavePermissions}

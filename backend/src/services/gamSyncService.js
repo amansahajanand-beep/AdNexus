@@ -1524,8 +1524,14 @@ async function fetchLeanOverviewTotalsFromDBInner(startDate, endDate, opts = {})
     if (appTotals) return appTotals;
   }
 
-  // Site filter: grain SITE_NAME for request hosts; rollups only for d1.* slot hosts.
-  if ((opts.sites || []).length) {
+  // Domains + sites (assignment OR request with webInventoryOr): never return
+  // site-only totals — that undercounts domain-level revenue vs dashboard union.
+  // Fall through to web∪app / domain paths below.
+  const webOrSites = Boolean(opts.webInventoryOr)
+    || (((opts.domains || []).length > 0) && ((opts.sites || []).length > 0));
+
+  // Site-only filter: grain SITE_NAME for request hosts; rollups for d1.* slot hosts.
+  if (!webOrSites && (opts.sites || []).length) {
     const siteTotals = await fetchInventorySiteOverviewFromGrain(startDate, endDate, opts);
     if (siteKind === 'request') {
       if (siteTotals) return siteTotals;
@@ -1536,15 +1542,24 @@ async function fetchLeanOverviewTotalsFromDBInner(startDate, endDate, opts = {})
     }
   }
 
+  // Domains ∪ sites (OR): do NOT sum domain grain + site grain separately —
+  // overlapping hosts would double-count. Fall through to rollup/grain with
+  // webInventoryOr so SQL uses a single (domain OR site) predicate.
+
   // Web + app assignment: OR semantics — two fast SUMs in parallel (never AND).
   if (hasWeb && hasApp) {
+    const webOpts = webOrSites
+      ? { ...opts, apps: [], webInventoryOr: true }
+      : { ...opts, apps: [] };
     const [web, app] = await Promise.all([
-      fetchLeanOverviewTotalsFromDBInner(startDate, endDate, { ...opts, apps: [] }),
+      // Avoid re-entering site-only early return: clear apps; keep domains/sites for OR.
+      fetchLeanOverviewTotalsFromDBInner(startDate, endDate, webOpts),
       fetchLeanOverviewTotalsFromDBInner(startDate, endDate, {
         ...opts,
         domains: [],
         sites: [],
         adUnitNames: [],
+        webInventoryOr: false,
       }),
     ]);
     if (!web && !app) return null;

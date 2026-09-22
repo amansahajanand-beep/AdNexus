@@ -13,9 +13,15 @@ function mergePostFilters(req, res, next) {
   next();
 }
 
+function bindHandler(handler) {
+  const { bindRequestClient } = require('../../utils/clientContext');
+  return bindRequestClient(handler);
+}
+
 function registerFilterReportRoute(router, path, handler) {
-  router.get(path, handler);
-  router.post(path, mergePostFilters, handler);
+  const wrapped = bindHandler(handler);
+  router.get(path, wrapped);
+  router.post(path, mergePostFilters, wrapped);
 }
 
 module.exports = { mergePostFilters, registerFilterReportRoute };

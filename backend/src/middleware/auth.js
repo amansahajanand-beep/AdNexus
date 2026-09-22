@@ -97,7 +97,60 @@ async function requireAuth(req, res, next) {
   if (!client) {
     return sendAuthError(res, 403, 'No GAM client is linked to this account', AUTH_CODES.USER_INACTIVE);
   }
+
+  // Admin (any account network) or domain user (allowedClientIds) may scope a
+  // request via X-Gam-Client-Id or ?clientId= for multi-network dashboards.
+  // Skip body.clientId on active-network — that field is the switch target, not report scope.
+  const path = String(req.originalUrl || req.url || '');
+  const skipBodyClientOverride = /\/clients\/me\/active-network(?:\?|$)/.test(path);
+  const overrideId = String(
+    req.headers['x-gam-client-id']
+    || req.query?.clientId
+    || (!skipBodyClientOverride && req.body?.clientId)
+    || ''
+  ).trim();
+  if (overrideId) {
+    try {
+      const {
+        getAccountIdForClient,
+        listClientsByAccountId,
+        getClientById,
+      } = require('../models/clientStore');
+      const { getAllowedClientIds } = require('../utils/permissions');
+      const accountId = await getAccountIdForClient(client.id);
+      const networks = await listClientsByAccountId(accountId);
+      const target = networks.find((n) => n.id === overrideId);
+      const allowedIds = getAllowedClientIds(user);
+      const permitted = user.role === 'admin'
+        || (Array.isArray(allowedIds) && allowedIds.includes(overrideId));
+      if (!target) {
+        require('../utils/logger').warn(
+          `[tenancy] X-Gam-Client-Id ${overrideId.slice(0, 8)} not under account ${String(accountId).slice(0, 8)}`
+        );
+      } else if (target.isPending) {
+        require('../utils/logger').warn(
+          `[tenancy] override refused — network ${target.networkCode || overrideId.slice(0, 8)} still pending`
+        );
+      } else if (!permitted) {
+        require('../utils/logger').warn(
+          `[tenancy] override refused — user ${user.username} not allowed ${overrideId.slice(0, 8)}`
+        );
+      } else if (overrideId !== client.id) {
+        const runtime = await getClientById(overrideId);
+        if (runtime) {
+          require('../utils/logger').info(
+            `[tenancy] override ${client.networkCode || client.id?.slice?.(0, 8)} → ${runtime.networkCode || overrideId.slice(0, 8)}`
+          );
+          client = runtime;
+        }
+      }
+    } catch (e) {
+      require('../utils/logger').warn(`[tenancy] override failed: ${e.message}`);
+    }
+  }
+
   req.client = client;
+  // Sync next() still runs inside ALS; report routes also re-bind via bindRequestClient.
   return runWithClient(client, () => next());
 }
 

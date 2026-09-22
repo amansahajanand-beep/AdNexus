@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { requireAdmin } = require('../middleware/auth');
+const { requireAuth, requireAdmin } = require('../middleware/auth');
 const {
   getClientPublicById,
   updateClientCredentials,
@@ -19,9 +19,8 @@ const { stripSessionFields } = require('../utils/sessionManager');
 const { isGamOAuthConfigured } = require('../services/gamNetworkDiscovery');
 const { getPendingSessionPublic, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const { decryptSecret } = require('../utils/credentialsCrypto');
+const { getAllowedClientIds } = require('../utils/permissions');
 const logger = require('../utils/logger');
-
-router.use(requireAdmin);
 
 async function assertSessionSameAccount(req, session) {
   if (!session.clientId) return true;
@@ -36,6 +35,108 @@ async function issueTokenForUser(req, userId) {
   const { accessToken } = generateTokens(freshUser, req.sessionId);
   return { token: accessToken, user: stripSessionFields(freshUser) };
 }
+
+/** Networks the signed-in user may open on Dashboard / Reporting. */
+router.get('/me/accessible-networks', requireAuth, async (req, res) => {
+  try {
+    const accountId = await getAccountIdForClient(req.client.id);
+    let networks = await listClientsByAccountId(accountId);
+    networks = (networks || []).filter((n) => !n.isPending && n.networkCode);
+    if (req.user.role !== 'admin') {
+      const allowed = new Set(getAllowedClientIds(req.user) || []);
+      networks = networks.filter((n) => allowed.has(n.id));
+    }
+    res.json({
+      networks: networks.map((n) => ({
+        id: n.id,
+        name: n.name,
+        networkCode: n.networkCode,
+        isPrimary: n.id === (req.user.clientId || req.client.id),
+      })),
+      activeClientId: req.user.clientId || req.client.id,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Switch active network (users.client_id) among networks this user may access.
+ * Must stay before requireAdmin — domain users with allowedClientIds need this too.
+ * Admin: any network under the account. Domain user: permissions.allowedClientIds.
+ */
+router.post('/me/active-network', requireAuth, async (req, res) => {
+  try {
+    const targetId = String(req.body?.clientId || '').trim();
+    if (!targetId) return res.status(400).json({ error: 'clientId is required' });
+
+    // Use session primary for account lookup — body.clientId is the switch target,
+    // not a report tenancy override (auth middleware skips body override on this path).
+    const sessionClientId = req.user.clientId || req.client.id;
+    const accountId = await getAccountIdForClient(sessionClientId);
+    const networks = await listClientsByAccountId(accountId);
+    const target = networks.find((n) => n.id === targetId);
+    if (!target) {
+      return res.status(404).json({ error: 'Network is not part of your account.' });
+    }
+    if (target.isPending) {
+      return res.status(400).json({ error: 'Connect this network with Google before activating it.' });
+    }
+
+    if (req.user.role !== 'admin') {
+      const allowed = getAllowedClientIds(req.user) || [];
+      // Legacy domain users (no allowedClientIds): only their linked client_id.
+      // Users with allowedClientIds: any network in that list (+ primary already merged).
+      const ok = allowed.length
+        ? allowed.includes(targetId)
+        : targetId === String(req.user.clientId || '');
+      if (!ok) {
+        return res.status(403).json({ error: 'You do not have permission for this network.' });
+      }
+    }
+
+    await updateUser(req.user.id, { clientId: targetId });
+    const runtime = await getClientById(targetId);
+    const pub = await getClientPublicById(targetId);
+    // Drop response caches for BOTH networks so UI cannot show the previous network's table.
+    try {
+      const { runWithClient } = require('../utils/clientContext');
+      const { bumpCacheGeneration } = require('../redisClient');
+      const { tenantKey } = require('../utils/clientContext');
+      const { cache } = require('../gam/client');
+      if (typeof cache?.flushAll === 'function') cache.flushAll();
+      const prevId = String(sessionClientId || '');
+      if (prevId && prevId !== targetId) {
+        const prev = await getClientById(prevId);
+        if (prev) {
+          await runWithClient(prev, async () => {
+            await bumpCacheGeneration(tenantKey(''));
+          });
+        }
+      }
+      if (runtime) {
+        await runWithClient(runtime, async () => {
+          await bumpCacheGeneration(tenantKey(''));
+        });
+      }
+    } catch (e) {
+      logger.warn(`active-network cache bump failed: ${e.message}`);
+    }
+    const sessionPayload = await issueTokenForUser(req, req.user.id);
+    res.json({
+      ok: true,
+      client: { ...pub, isMock: isMockClient(runtime) },
+      activeClientId: targetId,
+      networks,
+      ...(sessionPayload || {}),
+    });
+  } catch (err) {
+    logger.error('Switch active network failed:', err.message);
+    res.status(400).json({ error: err.message || 'Could not switch network' });
+  }
+});
+
+router.use(requireAdmin);
 
 router.get('/me/oauth-url', (req, res) => {
   try {
@@ -141,63 +242,6 @@ router.get('/me/networks', async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Switch admin's active network (users.client_id).
- * Domain users stay locked (1B) — only the calling admin moves.
- */
-router.post('/me/active-network', async (req, res) => {
-  try {
-    const targetId = String(req.body?.clientId || '').trim();
-    if (!targetId) return res.status(400).json({ error: 'clientId is required' });
-
-    const accountId = await getAccountIdForClient(req.client.id);
-    const networks = await listClientsByAccountId(accountId);
-    const target = networks.find((n) => n.id === targetId);
-    if (!target) {
-      return res.status(404).json({ error: 'Network is not part of your account.' });
-    }
-    if (target.isPending) {
-      return res.status(400).json({ error: 'Connect this network with Google before activating it.' });
-    }
-
-    await updateUser(req.user.id, { clientId: targetId });
-    const runtime = await getClientById(targetId);
-    const pub = await getClientPublicById(targetId);
-    // Drop response caches for BOTH networks so UI cannot show the previous network's table.
-    try {
-      const { runWithClient } = require('../utils/clientContext');
-      const { bumpCacheGeneration } = require('../redisClient');
-      const { tenantKey } = require('../utils/clientContext');
-      const { cache } = require('../gam/client');
-      if (typeof cache?.flushAll === 'function') cache.flushAll();
-      const prev = req.client;
-      if (prev) {
-        await runWithClient(prev, async () => {
-          await bumpCacheGeneration(tenantKey(''));
-        });
-      }
-      if (runtime) {
-        await runWithClient(runtime, async () => {
-          await bumpCacheGeneration(tenantKey(''));
-        });
-      }
-    } catch (e) {
-      logger.warn(`active-network cache bump failed: ${e.message}`);
-    }
-    const sessionPayload = await issueTokenForUser(req, req.user.id);
-    res.json({
-      ok: true,
-      client: { ...pub, isMock: isMockClient(runtime) },
-      activeClientId: targetId,
-      networks,
-      ...(sessionPayload || {}),
-    });
-  } catch (err) {
-    logger.error('Switch active network failed:', err.message);
-    res.status(400).json({ error: err.message || 'Could not switch network' });
   }
 });
 

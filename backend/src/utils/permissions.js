@@ -485,6 +485,7 @@ const DEFAULT_CHILD_PERMISSIONS = {
   allowedSites: [],
   allowedAppIds: [],
   allowedAdUnits: [],
+  allowedClientIds: [],
   dateRestriction: null,
 };
 
@@ -500,6 +501,7 @@ const INVENTORY_SCOPE_KEYS = [
   'allowedSites',
   'allowedAppIds',
   'allowedAdsAccountIds',
+  'allowedClientIds',
 ];
 
 /** Never-matching UUID — forces Ads SQL filters to return no rows when scope is empty. */
@@ -507,6 +509,22 @@ const NO_ADS_ACCOUNT_SCOPE_ID = '00000000-0000-0000-0000-000000000000';
 
 function isAdmin(user) {
   return user?.role === 'admin';
+}
+
+/**
+ * GAM client UUIDs a domain user may access.
+ * - admin → null (all networks under account)
+ * - child → unique list from permissions.allowedClientIds + primary users.client_id
+ */
+function getAllowedClientIds(user) {
+  if (isAdmin(user)) return null;
+  const primary = user?.clientId ? String(user.clientId).trim() : '';
+  const raw = user?.permissions?.allowedClientIds;
+  const fromPerms = Array.isArray(raw)
+    ? raw.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+  const ids = [...new Set([...(primary ? [primary] : []), ...fromPerms])];
+  return ids;
 }
 
 /**
@@ -559,6 +577,11 @@ function normalizePermissions(role, input = {}) {
   if (Array.isArray(input.allowedDomains)) base.allowedDomains = input.allowedDomains;
   if (Array.isArray(input.allowedSites)) base.allowedSites = input.allowedSites;
   if (Array.isArray(input.allowedAppIds)) base.allowedAppIds = input.allowedAppIds;
+  if (Array.isArray(input.allowedClientIds)) {
+    base.allowedClientIds = [...new Set(
+      input.allowedClientIds.map((id) => String(id || '').trim()).filter(Boolean)
+    )];
+  }
   if (Array.isArray(input.allowedAdsAccountIds)) {
     base.allowedAdsAccountIds = input.allowedAdsAccountIds
       .map((id) => String(id || '').trim())
@@ -646,6 +669,7 @@ module.exports = {
   buildVisibility,
   getDefaultHomePage,
   isAdmin,
+  getAllowedClientIds,
   getAllowedAdsAccountIds,
   resolveAdsAccountIdsForUser,
   scopeRowsToUser,
