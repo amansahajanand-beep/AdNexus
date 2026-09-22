@@ -464,6 +464,13 @@ function formatMetricValue(key, value, currency = 'USD') {
 }
 
 export default function Dashboard() {
+  const outlet = useOutletContext() || {};
+  const networks = Array.isArray(outlet.accountNetworks) ? outlet.accountNetworks : [];
+  const viewClientId = outlet.viewClientId || null;
+  return <DashboardSingle networks={networks} viewClientId={viewClientId} />;
+}
+
+function DashboardSingle({ networks = [], viewClientId = null }) {
   const dispatch = useDispatch();
   const { has, visibility: clientVis, user } = usePermissions();
   const canGenerate = has('canGenerateReports');
@@ -503,39 +510,49 @@ export default function Dashboard() {
   const [startDate, setStartDate] = useState(() => initDates.startDate);
   const [endDate, setEndDate] = useState(() => initDates.endDate);
   const [domainName, setDomainName] = useState(() => (
-    filterVisibility.isScopedUser ? invDraft.domainName : (saved?.domainName ?? invDraft.domainName)
+    saved?.domainName ?? invDraft.domainName
   ));
   const [domainId, setDomainId] = useState(() => (
-    filterVisibility.isScopedUser ? invDraft.domainId : (saved?.domainId ?? invDraft.domainId)
+    saved?.domainId ?? invDraft.domainId
   ));
   const [domain, setDomain] = useState(() => (
-    filterVisibility.isScopedUser ? invDraft.domain : (saved?.domain ?? invDraft.domain)
+    saved?.domain ?? invDraft.domain
   ));
   const [site, setSite] = useState(() => (
-    filterVisibility.isScopedUser ? invDraft.site : (saved?.site ?? invDraft.site)
+    saved?.site ?? invDraft.site
   ));
   const [catalog, setCatalog] = useState([]);
   const [catalogLists, setCatalogLists] = useState({ domainRoots: [], siteHosts: [], sitesByDomain: {}, adUnitsByHost: {}, appIds: [] });
   const [noDomainsAssigned, setNoDomainsAssigned] = useState(false);
   const [catalogLoading, setCatalogLoading] = useState(false);
   const [applied, setApplied] = useState(() => {
-    // Domain user: dates only — never restore auto-applied full inventory assignment.
-    if (filterVisibility.isScopedUser) {
-      return {
-        ...defaultApplied,
+    if (scopedAutoLoad) {
+      const dates = {
         startDate: saved?.applied?.startDate || saved?.startDate || todayInit.startDate,
         endDate: saved?.applied?.endDate || saved?.endDate || todayInit.endDate,
       };
+      if (saved?.applied && draftHasInventorySelection(saved.applied)) {
+        return { ...buildScopedDashboardApplied(user, dates), ...saved.applied, ...dates };
+      }
+      return buildScopedDashboardApplied(user, dates);
     }
     if (saved?.applied) return saved.applied;
-    if (scopedAutoLoad) return buildScopedDashboardApplied(user, todayInit);
     return defaultApplied;
   });
   const [filterApplied, setFilterApplied] = useState(() => {
-    if (filterVisibility.isScopedUser) return false;
+    // Domain users always start with assigned inventory applied (overview + table).
+    if (scopedAutoLoad) return true;
     if (saved?.filterApplied != null) return saved.filterApplied;
-    return scopedAutoLoad;
+    // Admin / unscoped: date range is enough — load table on open (no Reset needed).
+    return true;
   });
+
+  const isMultiNetwork = networks.length > 1;
+  const activeClientId = viewClientId || user?.clientId || null;
+  const overviewClientId = activeClientId;
+  const tableClientId = activeClientId;
+  const overviewCacheRef = useRef(new Map());
+  const detailCacheRef = useRef(new Map());
 
   // Always paint last known KPIs/table on remount — avoid loading flash when switching pages.
   const [overviewData, setOverviewData] = useState(() => saved?.overviewData ?? null);
@@ -547,7 +564,8 @@ export default function Dashboard() {
     if (saved?.detailData?.summary || (Array.isArray(saved?.detailData?.rows) && saved.detailData.rows.length)) {
       return false;
     }
-    return Boolean(scopedAutoLoad && canGenerate);
+    // Always show table loading for anyone who can generate reports.
+    return Boolean(canGenerate);
   });
   const [error, setError] = useState(null);
   const [page, setPage] = useState(() => saved?.page ?? 1);
@@ -574,11 +592,18 @@ export default function Dashboard() {
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(true);
   const pollRef = useRef(null);
   const filterPanelRef = useRef(null);
-  // Skip network on remount when Redux still has fresh data for this page.
-  const skipOverviewRef = useRef(Boolean(cacheFresh && saved?.overviewData?.summary));
+  // Skip network on remount only when Redux has real table rows for this page.
+  const skipOverviewRef = useRef(Boolean(cacheFresh && summaryHasMetrics(saved?.overviewData?.summary)));
   const skipDetailRef = useRef(Boolean(
     cacheFresh
-    && (saved?.detailData?.summary || (Array.isArray(saved?.detailData?.rows) && saved.detailData.rows.length))
+    && (
+      summaryHasMetrics(saved?.detailData?.summary)
+      || (Array.isArray(saved?.detailData?.rows) && saved.detailData.rows.some((r) => {
+        const impressions = Number(r?.impression ?? r?.impressions ?? 0) || 0;
+        const revenue = Number(r?.revenue ?? 0) || 0;
+        return impressions > 0 || revenue > 0;
+      }))
+    )
   ));
   const staleSilentOverviewRef = useRef(Boolean(
     saved?.fetchedAt && !cacheFresh && saved?.overviewData?.summary
@@ -776,7 +801,7 @@ export default function Dashboard() {
 
   const loadOverview = useCallback(async (filtersOverride, silent = false) => {
     const filters = filtersOverride ?? overviewFilters;
-    const key = overviewFiltersKey(filters);
+    const key = `${overviewFiltersKey(filters)}|${overviewClientId || ''}`;
     // Coalesce: never stampede identical overview requests (domain-user remounts / Strict Mode).
     if (overviewInFlightRef.current && overviewFiltersKeyRef.current === key) return;
     // Range/filter change may abort; same-key background refresh must not.
@@ -795,7 +820,10 @@ export default function Dashboard() {
     if (!silent && !hasCached) setOverviewLoading(true);
     setError(null);
     try {
-      const res = await reportsAPI.getDashboardOverview(filters, ac ? { signal: ac.signal } : {});
+      const res = await reportsAPI.getDashboardOverview(filters, {
+        ...(ac ? { signal: ac.signal } : {}),
+        ...(overviewClientId ? { clientId: overviewClientId } : {}),
+      });
       if (ac?.signal?.aborted) return;
       setOverviewData((prev) => {
         const nextHas = summaryHasMetrics(res?.summary);
@@ -803,8 +831,9 @@ export default function Dashboard() {
         // Empty/building race must not wipe KPIs already shown for this query.
         // Never keep prev when the response has real metrics (network switch / fresh rollup).
         if (nextHas) {
-          const next = { ...res, _queryKey: key };
+          const next = { ...res, _queryKey: key, _clientId: overviewClientId };
           overviewDataRef.current = next;
+          if (overviewClientId) overviewCacheRef.current.set(String(overviewClientId), next);
           return next;
         }
         if (!nextHas && prevHas && prev?._queryKey === key) {
@@ -818,8 +847,9 @@ export default function Dashboard() {
           // Transient miss (no status / skipped grain) — keep previous.
           if (res?.status !== 'ready') return prev;
         }
-        const next = { ...res, _queryKey: key };
+        const next = { ...res, _queryKey: key, _clientId: overviewClientId };
         overviewDataRef.current = next;
+        if (overviewClientId) overviewCacheRef.current.set(String(overviewClientId), next);
         return next;
       });
       setLastUpdated(nowTimeInTZ());
@@ -831,7 +861,7 @@ export default function Dashboard() {
       if (overviewAbortRef.current === ac) overviewInFlightRef.current = false;
       if (!silent && overviewAbortRef.current === ac) setOverviewLoading(false);
     }
-  }, [overviewFilters]);
+  }, [overviewFilters, overviewClientId]);
 
   // Keep ref in sync for loadOverview coalesce / empty-overwrite guards.
   useEffect(() => {
@@ -857,7 +887,7 @@ export default function Dashboard() {
       return;
     }
     const gen = ++detailGenRef.current;
-    const expectedClientId = user?.clientId || null;
+    const expectedClientId = tableClientId || user?.clientId || null;
     const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
     detailAbortRef.current = ac;
     detailInFlightRef.current = true;
@@ -878,18 +908,31 @@ export default function Dashboard() {
       const res = await reportsAPI.getDashboard({
         ...dates,
         ...normalizeInventorySelections(applied || {}, {}, scopedNormOpts),
-      }, ac ? { signal: ac.signal } : {});
+      }, {
+        ...(ac ? { signal: ac.signal } : {}),
+        ...(expectedClientId ? { clientId: expectedClientId } : {}),
+      });
       if (ac?.signal?.aborted) return;
       // Drop late responses after Reset / network switch.
       if (gen !== detailGenRef.current) return;
-      if (expectedClientId && user?.clientId && String(expectedClientId) !== String(user.clientId)) return;
-      // Reject poisoned cross-network dashboard cache: overview is tenant-correct (~$26)
-      // while a stale /dashboard body can still carry the other network (~$15k).
+      if (
+        expectedClientId
+        && tableClientId
+        && String(expectedClientId) !== String(tableClientId)
+      ) return;
+      // Do NOT reject when viewClientId (sidebar) differs from JWT user.clientId —
+      // multi-network view uses X-Gam-Client-Id on purpose.
       const ovRev = Number(overviewDataRef.current?.summary?.revenue
         ?? overviewDataRef.current?.summary?.selectRange ?? 0) || 0;
       const detailRev = Number(res?.summary?.revenue ?? res?.summary?.selectRange ?? 0) || 0;
       const concrete = hasConcreteInventoryFilterSelection(applied);
-      if (!concrete && ovRev > 0 && detailRev > 0 && detailRev > ovRev * 5) {
+      if (
+        !concrete
+        && ovRev > 0
+        && detailRev > 0
+        && detailRev > ovRev * 5
+        && String(overviewClientId || '') === String(expectedClientId || '')
+      ) {
         logErrorForDebug(
           { message: `Discarded dashboard detail revenue=${detailRev} vs overview=${ovRev}` },
           'Dashboard detail tenant mismatch'
@@ -901,8 +944,10 @@ export default function Dashboard() {
         return;
       }
       startTransition(() => {
-        setDetailData({ ...res, _clientId: expectedClientId });
-        detailDataRef.current = res;
+        const next = { ...res, _clientId: expectedClientId };
+        setDetailData(next);
+        detailDataRef.current = next;
+        if (expectedClientId) detailCacheRef.current.set(String(expectedClientId), next);
         setLastUpdated(nowTimeInTZ());
         setFetchedAt(Date.now());
       });
@@ -958,7 +1003,7 @@ export default function Dashboard() {
         clearTimeout(slowTimerRef.current);
       }
     }
-  }, [applied, startDate, endDate, scopedNormOpts, user?.clientId]);
+  }, [applied, startDate, endDate, scopedNormOpts, user?.clientId, tableClientId, overviewClientId, isMultiNetwork]);
 
   useEffect(() => () => {
     detailAbortRef.current?.abort();
@@ -966,45 +1011,78 @@ export default function Dashboard() {
     clearTimeout(slowTimerRef.current);
   }, []);
 
-  // Network switch: drop in-memory KPIs immediately so the other network cannot linger on screen.
-  const activeClientIdRef = useRef(user?.clientId);
+  const loadOverviewRef = useRef(loadOverview);
+  const loadDetailRef = useRef(loadDetail);
+  loadOverviewRef.current = loadOverview;
+  loadDetailRef.current = loadDetail;
+
+  // Soft network switch from sidebar — keep scroll, swap cache if present, refresh silently.
+  // Skip when prev is null (first paint): avoid wiping the initial overview load.
+  const viewClientIdRef = useRef(activeClientId);
+  const filterAppliedRef = useRef(filterApplied);
+  filterAppliedRef.current = filterApplied;
   useEffect(() => {
-    const nextId = user?.clientId || null;
-    const prevId = activeClientIdRef.current;
-    activeClientIdRef.current = nextId;
-    if (!prevId || !nextId || String(prevId) === String(nextId)) return;
+    const nextId = activeClientId;
+    const prev = viewClientIdRef.current;
+    viewClientIdRef.current = nextId;
+    if (!prev || !nextId || String(prev) === String(nextId)) return;
     overviewAbortRef.current?.abort();
     detailAbortRef.current?.abort();
     detailGenRef.current += 1;
-    setOverviewData(null);
-    setDetailData(null);
-    overviewDataRef.current = null;
-    detailDataRef.current = null;
+    const ovCached = overviewCacheRef.current.get(String(nextId));
+    const detCached = detailCacheRef.current.get(String(nextId));
+    if (ovCached) {
+      setOverviewData(ovCached);
+      overviewDataRef.current = ovCached;
+      setOverviewLoading(false);
+    } else {
+      setOverviewData(null);
+      overviewDataRef.current = null;
+      setOverviewLoading(true);
+    }
+    if (detCached) {
+      setDetailData(detCached);
+      detailDataRef.current = detCached;
+      setDetailLoading(false);
+    } else {
+      setDetailData(null);
+      detailDataRef.current = null;
+      if (canGenerate) setDetailLoading(true);
+    }
     setPriorOverview(null);
     setPriorDetail(null);
     setCatalog([]);
     skipOverviewRef.current = false;
     skipDetailRef.current = false;
-    setOverviewLoading(true);
-    loadOverview();
-    if (canGenerate) loadDetail();
-  }, [user?.clientId, loadOverview, loadDetail, canGenerate]);
+    loadOverviewRef.current(undefined, !!ovCached);
+    if (canGenerate) loadDetailRef.current(!!detCached);
+  }, [activeClientId, canGenerate]);
 
+  // Legacy user.clientId change (session) — clear caches when JWT tenant moves.
+  const sessionClientIdRef = useRef(user?.clientId);
   useEffect(() => {
-    if (filterApplied && hasConcreteInventoryFilterSelection(applied)) return;
+    const nextId = user?.clientId || null;
+    const prevId = sessionClientIdRef.current;
+    sessionClientIdRef.current = nextId;
+    if (!prevId || !nextId || String(prevId) === String(nextId)) return;
+    overviewCacheRef.current.clear();
+    detailCacheRef.current.clear();
+  }, [user?.clientId]);
+
+  // Overview always loads for the active dates/network (server applies domain-user scope).
+  useEffect(() => {
     if (skipOverviewRef.current) {
       skipOverviewRef.current = false;
       setOverviewLoading(false);
       return;
     }
-    // Stale but present: refresh quietly — do not skeleton over cached KPIs.
     if (staleSilentOverviewRef.current && overviewDataRef.current?.summary) {
       staleSilentOverviewRef.current = false;
-      loadOverview(undefined, true);
+      loadOverviewRef.current(undefined, true);
       return;
     }
-    loadOverview();
-  }, [loadOverview, filterApplied, overviewQueryKey]);
+    loadOverviewRef.current();
+  }, [overviewQueryKey, overviewClientId]);
 
   useEffect(() => {
     if (!canGenerate) return;
@@ -1016,12 +1094,12 @@ export default function Dashboard() {
     }
     if (staleSilentDetailRef.current && detailDataRef.current) {
       staleSilentDetailRef.current = false;
-      loadDetail(true);
+      loadDetailRef.current(true);
       return;
     }
-    loadDetail();
+    loadDetailRef.current();
     setPage(1);
-  }, [filterApplied, overviewQueryKey, loadDetail, canGenerate, preset, startDate, endDate]);
+  }, [filterApplied, overviewQueryKey, canGenerate, preset, startDate, endDate, tableClientId]);
 
   const compareRange = useMemo(
     () => resolveCompareRange(
@@ -1056,11 +1134,9 @@ export default function Dashboard() {
       return undefined;
     }
     // Wait for primary overview to settle so compare doesn't stampede PG / flicker cards.
-    if (overviewLoading && !summaryHasMetrics(overviewData?.summary)) {
+    if (overviewLoading && !summaryHasMetrics(overviewDataRef.current?.summary)) {
       return undefined;
     }
-    setPriorOverview(null);
-    setPriorDetail(null);
     let cancelled = false;
     (async () => {
       const inv = inventoryQueryFromApplied(applied, scopedNormOpts);
@@ -1070,13 +1146,17 @@ export default function Dashboard() {
         endDate: prior.endDate,
       };
       try {
-        const ov = await reportsAPI.getDashboardOverview(priorFilters);
+        const ov = await reportsAPI.getDashboardOverview(priorFilters, {
+          ...(overviewClientId ? { clientId: overviewClientId } : {}),
+        });
         if (!cancelled) setPriorOverview(ov);
       } catch {
         /* keep last successful compare if this retry fails */
       }
       try {
-        const dash = await reportsAPI.getDashboard(priorFilters);
+        const dash = await reportsAPI.getDashboard(priorFilters, {
+          ...(tableClientId ? { clientId: tableClientId } : {}),
+        });
         if (!cancelled) {
           setPriorDetail(dash);
           if (dash?.summary) setPriorOverview((prev) => prev || { summary: dash.summary });
@@ -1086,10 +1166,8 @@ export default function Dashboard() {
       }
     })();
     return () => { cancelled = true; };
-  }, [
-    canGenerate, compareKey, dateRestriction, compareRange, applied, scopedNormOpts,
-    overviewLoading, overviewData?.summary?.impressions, overviewData?.summary?.revenue,
-  ]);
+  // Intentionally omit overview summary numbers — they were recreating this effect in a loop.
+  }, [canGenerate, compareKey, dateRestriction, overviewClientId, tableClientId]);
 
   useEffect(() => {
     if (!overviewData && !detailData) return;
@@ -1155,11 +1233,11 @@ export default function Dashboard() {
     if (!force && catalog.length) return;
     setCatalogLoading(true);
     try {
-      const res = await reportsAPI.getFilterCatalog(user?.clientId);
+      const res = await reportsAPI.getFilterCatalog(activeClientId || user?.clientId);
       applyCatalogResponse(res);
     } catch (_) { /* filter options optional until opened */ }
     finally { setCatalogLoading(false); }
-  }, [catalog.length, applyCatalogResponse, filterVisibility.isScopedUser, user?.clientId]);
+  }, [catalog.length, applyCatalogResponse, filterVisibility.isScopedUser, user?.clientId, activeClientId]);
 
   useEffect(() => {
     if (!canGenerate) return;
@@ -1170,7 +1248,7 @@ export default function Dashboard() {
     setCatalog([]);
     setCatalogLists({ domainRoots: [], siteHosts: [], sitesByDomain: {}, adUnitsByHost: {}, appIds: [] });
     loadCatalog(true);
-  }, [canGenerate, user?.clientId, filterVisibility.isScopedUser]);
+  }, [canGenerate, user?.clientId, activeClientId, filterVisibility.isScopedUser]);
 
   const selections = useMemo(
     () => ({
@@ -1225,31 +1303,23 @@ export default function Dashboard() {
       (overviewData?.status === 'building' && overviewEmpty)
       || (detailData?.status === 'building' && detailEmpty)
     );
-    // Have KPIs already — don't spin every 12s; use normal TTL poll.
     if (!waitingOnSync) buildingPollCountRef.current = 0;
     const allowBuildingPoll = waitingOnSync
       && buildingPollCountRef.current < BUILDING_POLL_MAX;
     const intervalMs = allowBuildingPoll ? 12_000 : POLL_MS;
     pollRef.current = setInterval(() => {
       if (allowBuildingPoll) buildingPollCountRef.current += 1;
-      if (!(filterApplied && hasInventoryFilterSelection(applied))) {
-        loadOverview(undefined, true);
-      }
-      if (canGenerate && filterApplied) loadDetail(true);
+      loadOverview(undefined, true);
+      if (canGenerate && filterAppliedRef.current) loadDetail(true);
     }, intervalMs);
     return () => clearInterval(pollRef.current);
+  // Do not depend on impression/revenue — that recreated the interval on every KPI update.
   }, [
     loadOverview,
     loadDetail,
-    filterApplied,
-    applied,
     canGenerate,
     overviewData?.status,
-    overviewData?.summary?.impressions,
-    overviewData?.summary?.revenue,
     detailData?.status,
-    detailData?.summary?.impressions,
-    detailData?.summary?.revenue,
   ]);
 
   const applyPreset = (p) => {
@@ -1668,10 +1738,18 @@ export default function Dashboard() {
 
     if (isScopedDashboardUser) {
       if (hasConcreteInventoryFilter) {
-        if (fromDetail && !detailLoading) base = fromDetail;
-        else if (fromDetail) base = fromDetail;
-        else if (fromRows) base = fromRows;
-        else base = {};
+        // Show overview KPIs immediately; refine from detail once it has metrics.
+        if (fromDetail && !detailLoading && summaryHasMetrics(detailData?.summary)) {
+          base = fromDetail;
+        } else if (summaryHasMetrics(overviewData?.summary)) {
+          base = overviewData.summary;
+        } else if (fromDetail) {
+          base = fromDetail;
+        } else if (fromRows) {
+          base = fromRows;
+        } else {
+          base = overviewData?.summary || {};
+        }
       } else {
         // Network-wide / Select-All: always trust overview API (tenant network_rollup).
         base = overviewData?.summary || {};
@@ -2420,7 +2498,7 @@ export default function Dashboard() {
               <span className="filter-section-title">Inventory filters</span>
               <span className="filter-section-hint">
                 {filterVisibility.isScopedUser
-                  ? 'Pick from your assigned list — overview KPIs update when you apply filters'
+                  ? 'Assigned inventory loads by default — narrow filters and Apply to refine'
                   : 'Domain, site, ad unit, app & custom dates'}
                 {catalogBusy ? ' · Loading options…' : ''}
               </span>
@@ -3171,7 +3249,7 @@ export default function Dashboard() {
         </div>
       )}
 
-      {!detailLoading && hasChartReportData && <DynamicReportTable
+      {(detailLoading || hasChartReportData || detailData) && canGenerate && <DynamicReportTable
         title="Inventory Breakdown"
         rows={tableRows}
         dimensions={tableConfig.dimensions}
@@ -3191,21 +3269,23 @@ export default function Dashboard() {
         density={tableDensity}
         freezeFirst
         headerExtra={(
-          <div className="table-density-toggle" role="group" aria-label="Table density">
-            <button
-              type="button"
-              className={`table-density-btn${tableDensity === 'compact' ? ' active' : ''}`}
-              onClick={() => setTableDensity('compact')}
-            >
-              Compact
-            </button>
-            <button
-              type="button"
-              className={`table-density-btn${tableDensity === 'comfortable' ? ' active' : ''}`}
-              onClick={() => setTableDensity('comfortable')}
-            >
-              Comfortable
-            </button>
+          <div className="multi-network-table-tools">
+            <div className="table-density-toggle" role="group" aria-label="Table density">
+              <button
+                type="button"
+                className={`table-density-btn${tableDensity === 'compact' ? ' active' : ''}`}
+                onClick={() => setTableDensity('compact')}
+              >
+                Compact
+              </button>
+              <button
+                type="button"
+                className={`table-density-btn${tableDensity === 'comfortable' ? ' active' : ''}`}
+                onClick={() => setTableDensity('comfortable')}
+              >
+                Comfortable
+              </button>
+            </div>
           </div>
         )}
         noReportMessage="No data available for this period"

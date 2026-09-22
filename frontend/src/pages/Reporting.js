@@ -165,6 +165,11 @@ export default function Reporting() {
   const inventoryScope = getAssignedInventoryScope(user);
   const inventoryAssigned = hasAssignedInventory(user);
   const filterVisibility = getAssignedFilterVisibility(user);
+  const outlet = useOutletContext() || {};
+  const { networkInfo } = outlet;
+  const reportClientId = outlet.viewClientId || user?.clientId || null;
+  const reportCacheRef = useRef(new Map());
+
   const scopedNormOpts = useMemo(() => ({
     expandAll: !!filterVisibility.isScopedUser,
     assignedScope: inventoryScope,
@@ -176,7 +181,6 @@ export default function Reporting() {
     && savedRaw?.clientId
     && String(savedRaw.clientId) === String(user.clientId)
   ) ? savedRaw : null;
-  const { networkInfo } = useOutletContext();
   const [searchParams, setSearchParams] = useSearchParams();
   const shareHydratedRef = useRef(false);
   const undoSnapRef = useRef(null);
@@ -531,10 +535,11 @@ export default function Reporting() {
 
   const load = useCallback(async (silent = false) => {
     if (!canGenerate) return;
+    if (!reportClientId) return;
     const query = resolveReportingQuery(applied);
     if (!query) return;
     const { dims, mets } = query;
-    const key = reportingAppliedKey(applied);
+    const key = `${reportingAppliedKey(applied)}|${reportClientId || ''}`;
     // Coalesce identical in-flight loads (Strict Mode / applied object churn).
     if (loadInFlightRef.current && loadKeyRef.current === key) return;
     if (silent && loadInFlightRef.current) return;
@@ -557,7 +562,7 @@ export default function Reporting() {
           }
           if (payload?.status !== 'ready' && payload?.status !== 'empty') return prev;
         }
-        const next = payload ? { ...payload, _queryKey: key } : payload;
+        const next = payload ? { ...payload, _queryKey: key, _clientId: reportClientId } : payload;
         dataRef.current = next;
         return next;
       });
@@ -571,7 +576,7 @@ export default function Reporting() {
           }
           if (payload?.status !== 'ready' && payload?.status !== 'empty') return prev;
         }
-        const next = payload ? { ...payload, _queryKey: key } : payload;
+        const next = payload ? { ...payload, _queryKey: key, _clientId: reportClientId } : payload;
         progDataRef.current = next;
         return next;
       });
@@ -599,13 +604,21 @@ export default function Reporting() {
       // Always request the full SQL-capped sample (fair per-day). Sending
       // limit:100 + allRows:false sorted DESC made 30d/3m/6m look like "today only".
       const reportFilters = { ...dateFilters, allRows: true };
+      const clientCfg = reportClientId ? { clientId: reportClientId } : {};
       const [detailed, programmatic] = await Promise.all([
-        cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters) : Promise.resolve(null),
-        cfg.mode === 'programmatic' ? reportsAPI.getProgrammatic(reportFilters).catch(() => null) : Promise.resolve(null),
+        cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters, clientCfg) : Promise.resolve(null),
+        cfg.mode === 'programmatic' ? reportsAPI.getProgrammatic(reportFilters, clientCfg).catch(() => null) : Promise.resolve(null),
       ]);
       if (loadGen !== loadGenRef.current) return;
       applyDetailed(detailed);
       applyProg(programmatic);
+      if (reportClientId) {
+        reportCacheRef.current.set(String(reportClientId), {
+          data: detailed ? { ...detailed, _queryKey: key, _clientId: reportClientId } : null,
+          progData: programmatic ? { ...programmatic, _queryKey: key, _clientId: reportClientId } : null,
+          key,
+        });
+      }
       setLastUpdated(nowTimeInTZ());
       setFetchedAt(Date.now());
       // Only poll when we truly have no usable data yet (don't flash building over good rows).
@@ -631,9 +644,9 @@ export default function Reporting() {
           if (buildingPollId !== buildingPollRef.current) return;
           try {
             const [againDetailed, againProg] = await Promise.all([
-              cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters) : Promise.resolve(null),
+              cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters, clientCfg) : Promise.resolve(null),
               cfg.mode === 'programmatic'
-                ? reportsAPI.getProgrammatic(reportFilters).catch(() => null)
+                ? reportsAPI.getProgrammatic(reportFilters, clientCfg).catch(() => null)
                 : Promise.resolve(null),
             ]);
             if (buildingPollId !== buildingPollRef.current) return;
@@ -706,9 +719,11 @@ export default function Reporting() {
         }
       }
     }
-  }, [applied, todayInit.startDate, todayInit.endDate, canGenerate, scopedNormOpts]);
+  }, [applied, todayInit.startDate, todayInit.endDate, canGenerate, scopedNormOpts, reportClientId]);
 
   const appliedQueryKey = useMemo(() => reportingAppliedKey(applied), [applied]);
+  const loadRef = useRef(load);
+  loadRef.current = load;
 
   useEffect(() => {
     dataRef.current = data;
@@ -725,10 +740,34 @@ export default function Reporting() {
       skipInitialLoadRef.current = false;
       return;
     }
-    load();
+    reportCacheRef.current.clear();
+    loadRef.current();
     setPage(1);
-  }, [load, canGenerate, appliedQueryKey, hasApplied]);
+  }, [canGenerate, appliedQueryKey, hasApplied]);
 
+  // Soft network switch from sidebar — keep scroll, swap cache, refresh silently.
+  const reportClientIdRef = useRef(reportClientId);
+  useEffect(() => {
+    if (!hasApplied) return;
+    const prev = reportClientIdRef.current;
+    reportClientIdRef.current = reportClientId;
+    if (!reportClientId || String(prev) === String(reportClientId)) return;
+    setCatalog([]);
+    const cached = reportCacheRef.current.get(String(reportClientId));
+    if (cached && cached.key?.startsWith(reportingAppliedKey(applied))) {
+      setData(cached.data);
+      dataRef.current = cached.data;
+      setProgData(cached.progData);
+      progDataRef.current = cached.progData;
+      setLoading(false);
+    } else {
+      setData(null);
+      dataRef.current = null;
+      setProgData(null);
+      progDataRef.current = null;
+    }
+    loadRef.current(true);
+  }, [reportClientId, hasApplied, applied]);
   useEffect(() => {
     if (!canGenerate) return;
     if (!data || !fetchedAt) return;
@@ -737,7 +776,7 @@ export default function Reporting() {
       pageKey: 'reporting',
       payload: {
         userId: user?.id,
-        clientId: user?.clientId || null,
+        clientId: reportClientId || user?.clientId || null,
         applied, data, progData, catalog, fetchedAt, lastUpdated,
         preset, startDate, endDate, country, domain, site, domainName, domainId,
         search, page, filtersOpen, breakdownOpen, chipsExpanded,
@@ -745,7 +784,7 @@ export default function Reporting() {
       },
     }));
   }, [
-    dispatch, user?.id, applied, data, progData, catalog, fetchedAt, lastUpdated,
+    dispatch, user?.id, reportClientId, applied, data, progData, catalog, fetchedAt, lastUpdated,
     preset, startDate, endDate, country, domain, site, domainName, domainId,
     search, page, filtersOpen, breakdownOpen, chipsExpanded,
     reportDimensions, reportMetrics, reportSettings,
@@ -783,13 +822,13 @@ export default function Reporting() {
     if (!force && catalog.length) return;
     setCatalogLoading(true);
     try {
-      const res = await reportsAPI.getFilterCatalog(user?.clientId);
+      const res = await reportsAPI.getFilterCatalog(reportClientId || user?.clientId);
       applyCatalogResponse(res);
     } catch (err) {
       logErrorForDebug(err, 'Reporting filter catalog');
       setError(getUserFacingMessage(err, 'Could not load filter options. Please refresh the page.'));
     } finally { setCatalogLoading(false); }
-  }, [catalog.length, applyCatalogResponse, filterVisibility.isScopedUser]);
+  }, [catalog.length, applyCatalogResponse, filterVisibility.isScopedUser, user?.clientId, reportClientId]);
 
   useEffect(() => {
     if (!canGenerate) return;
@@ -799,7 +838,7 @@ export default function Reporting() {
     }
     let cancelled = false;
     setCatalogLoading(true);
-    reportsAPI.getFilterCatalog(user?.clientId)
+    reportsAPI.getFilterCatalog(reportClientId || user?.clientId)
       .then((res) => { if (!cancelled) applyCatalogResponse(res); })
       .catch((err) => {
         if (!cancelled) {
@@ -809,8 +848,7 @@ export default function Reporting() {
       })
       .finally(() => { if (!cancelled) setCatalogLoading(false); });
     return () => { cancelled = true; };
-  }, [applyCatalogResponse, canGenerate, filterVisibility.isScopedUser]);
-
+  }, [applyCatalogResponse, canGenerate, filterVisibility.isScopedUser, user?.clientId, reportClientId]);
   // Selections keyed by filter field; drives bidirectional cascading so picking
   // any filter instantly narrows the other three (no Generate needed).
   const selections = useMemo(
@@ -1984,7 +2022,7 @@ export default function Reporting() {
         density={tableDensity}
         freezeFirst
         headerExtra={(
-          <>
+          <div className="multi-network-table-tools">
             <div className="table-density-toggle" role="group" aria-label="Table density">
               <button
                 type="button"
@@ -2004,7 +2042,7 @@ export default function Reporting() {
             {applied.startDate && applied.endDate
               ? <span className="report-range">{applied.startDate} → {applied.endDate}</span>
               : null}
-          </>
+          </div>
         )}
         noReportMessage="Select at least one metric to run a report"
         emptyMessage={segmentFilter ? 'No rows match this chart segment' : 'No data available'}

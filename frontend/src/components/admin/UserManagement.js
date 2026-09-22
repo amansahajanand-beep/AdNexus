@@ -111,6 +111,7 @@ export default function UserManagement({
   users = [], loading, error,
   domains = [], domainsLoading, catalogLoading = false, catalogRows = [], catalogLists = {},
   adsAccountOptions = [], adsAccountsLoading = false,
+  networks = [],
   onCreate, onUpdate, onSavePermissions, onDelete,
   currentUserId,
   onLoadDomains,
@@ -155,6 +156,7 @@ export default function UserManagement({
   const filteredUsers = useMemo(
     () => filterRowsBySearch(users, search, (u) => [
       u.username, u.role, u.id, u.password,
+      u.networkName, u.networkCode,
       ...(u.permissions?.allowedDomains || []),
       ...(u.permissions?.allowedSites || []),
       ...(u.permissions?.allowedAppIds || []),
@@ -336,6 +338,7 @@ export default function UserManagement({
               <th>ID No.</th>
               <th>User Name</th>
               <th>Role</th>
+              <th>Networks</th>
               <th>Password</th>
               <th>Permissions</th>
               <th>Domains</th>
@@ -345,12 +348,12 @@ export default function UserManagement({
           <tbody>
             {loading ? (
               Array.from({ length: 5 }).map((_, i) => (
-                <tr key={i}>{Array.from({ length: 7 }).map((_, j) => (
+                <tr key={i}>{Array.from({ length: 8 }).map((_, j) => (
                   <td key={j} data-label=""><div className="skeleton" style={{ height: 16 }} /></td>
                 ))}</tr>
               ))
             ) : filteredUsers.length === 0 ? (
-              <tr><td colSpan="7" style={{ textAlign: 'center', color: '#888', padding: 30 }}>
+              <tr><td colSpan="8" style={{ textAlign: 'center', color: '#888', padding: 30 }}>
                 {search.trim() ? 'No users match your search' : 'No users'}
               </td></tr>
             ) : filteredUsers.map((u, i) => (
@@ -361,6 +364,17 @@ export default function UserManagement({
                   <span className={`role-badge ${u.role === 'admin' ? 'admin' : 'child'}`}>
                     {u.role === 'admin' ? 'Admin' : 'Domain User'}
                   </span>
+                </td>
+                <td data-label="Networks">
+                  {u.role === 'admin' ? (
+                    <span className="reporting-sub">All</span>
+                  ) : (
+                    <span title={(u.networkNames || []).join(', ') || u.networkCode || ''}>
+                      {(Array.isArray(u.networkNames) && u.networkNames.length)
+                        ? u.networkNames.join(', ')
+                        : (u.networkName || u.networkCode || '—')}
+                    </span>
+                  )}
                 </td>
                 <td data-label="Password">
                   <DomainUserPasswordCell
@@ -409,6 +423,7 @@ export default function UserManagement({
         catalogLists={catalogLists}
         adsAccountOptions={adsAccountOptions}
         adsAccountsLoading={adsAccountsLoading}
+        networks={networks}
       />
 
       <EditChannelsModal

@@ -1,7 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { networkAPI } from '../../utils/api';
+import { useDispatch } from 'react-redux';
+import { networkAPI, clientsAPI, setToken } from '../../utils/api';
 import { useAuth } from '../../store/useAuth';
+import { authSuccess } from '../../store/actions/authActions';
+import { clearReportPages } from '../../store/slices/reportSlice';
 import { usePermissions } from '../../hooks/usePermissions';
 import { NO_DOMAINS_MSG, NO_DOMAINS_TITLE, hasAssignedInventory } from '../../utils/permissions';
 import BrandLogo from '../ui/BrandLogo';
@@ -13,6 +16,7 @@ import { rememberLastRoute } from '../../utils/lastRoute';
 import { APP_TIMEZONE } from '../../utils/datetime';
 import { buildFreshnessLabel } from '../../utils/dataFreshness';
 import { applyTheme, isDarkTheme, readStoredTheme } from '../../utils/theme';
+import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 import {
   NavIcon,
   Sun,
@@ -54,13 +58,31 @@ function readFocusMode() {
   }
 }
 
+function pickDefaultNetworkId(networks = [], preferredId = null) {
+  const list = Array.isArray(networks) ? networks : [];
+  if (!list.length) return null;
+  if (preferredId && list.some((n) => n.id === preferredId)) return preferredId;
+  const media = list.find((n) => /mediamonetix/i.test(String(n.name || n.slug || '')));
+  return (media || list[0])?.id || null;
+}
+
+function networkOptionLabel(n) {
+  if (!n) return '';
+  const name = n.name || n.displayName || 'Network';
+  return n.networkCode ? `${name} · ${n.networkCode}` : name;
+}
+
 export default function Layout() {
   const { user, isAdmin, logout } = useAuth();
   const { canPage, hasAnyPage } = usePermissions();
+  const dispatch = useDispatch();
   const navigate = useNavigate();
   const location = useLocation();
   const [networkInfo, setNetworkInfo] = useState(null);
   const [isMock, setIsMock] = useState(false);
+  const [accountNetworks, setAccountNetworks] = useState([]);
+  const [viewClientId, setViewClientId] = useState(null);
+  const [switchingNetwork, setSwitchingNetwork] = useState(false);
   const [verDismissed, setVerDismissed] = useState(false);
   const [userOpen, setUserOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -85,22 +107,114 @@ export default function Layout() {
     setDarkMode(next === 'dark');
   }, []);
 
+  const refreshNetworkInfo = useCallback(async (clientId) => {
+    try {
+      const info = await networkAPI.getInfo(clientId || undefined);
+      setNetworkInfo(info);
+      setIsMock(!!info.isMock);
+    } catch (err) {
+      const data = err?.response?.data;
+      setIsMock(!!data?.isMock);
+      if (data?.error) {
+        setNetworkInfo({
+          displayName: 'Connection issue',
+          isMock: false,
+          authError: data.error,
+          authCode: data.code,
+        });
+      }
+    }
+  }, []);
+
+  // Load networks once per user. Domain users must stay on accessible-networks
+  // (never fall back to /me which lists every account network).
   useEffect(() => {
-    networkAPI.getInfo()
-      .then(info => { setNetworkInfo(info); setIsMock(!!info.isMock); })
-      .catch((err) => {
-        const data = err?.response?.data;
-        setIsMock(!!data?.isMock);
-        if (data?.error) {
-          setNetworkInfo({
-            displayName: 'Connection issue',
-            isMock: false,
-            authError: data.error,
-            authCode: data.code,
-          });
-        }
+    let cancelled = false;
+    const applyList = (list, activeId) => {
+      if (cancelled) return;
+      const networks = (list || []).filter((n) => !n.isPending && n.networkCode && n.id);
+      setAccountNetworks(networks);
+      setViewClientId((prev) => {
+        if (prev && networks.some((n) => n.id === prev)) return prev;
+        const preferred = user?.clientId || activeId;
+        if (preferred && networks.some((n) => n.id === preferred)) return preferred;
+        return pickDefaultNetworkId(networks, preferred);
       });
-  }, [user?.clientId]);
+    };
+
+    (async () => {
+      try {
+        const d = await clientsAPI.accessibleNetworks();
+        applyList(d?.networks, d?.activeClientId || user?.clientId);
+        return;
+      } catch (_) {
+        /* fall through */
+      }
+      if (isAdmin) {
+        try {
+          const d = await clientsAPI.networks();
+          applyList(d?.networks, d?.activeClientId || user?.clientId);
+          return;
+        } catch (_) { /* try me */ }
+        try {
+          const d = await clientsAPI.me();
+          applyList(d?.networks, d?.activeClientId || d?.id);
+          return;
+        } catch (_) { /* empty */ }
+      } else {
+        // Domain user: only their linked client — never the full account list.
+        try {
+          const d = await clientsAPI.me();
+          const self = d?.id || user?.clientId;
+          const fromMe = (d?.networks || []).filter((n) => n.id === self);
+          applyList(fromMe.length ? fromMe : (self ? [{
+            id: self,
+            name: d?.name || d?.displayName,
+            networkCode: d?.networkCode,
+          }] : []), self);
+          return;
+        } catch (_) { /* empty */ }
+      }
+      if (!cancelled) setAccountNetworks([]);
+    })();
+
+    return () => { cancelled = true; };
+  }, [user?.id, isAdmin]);
+
+  useEffect(() => {
+    const id = viewClientId || user?.clientId;
+    if (!id) return undefined;
+    refreshNetworkInfo(id);
+    return undefined;
+  }, [viewClientId, user?.clientId, refreshNetworkInfo]);
+
+  const switchNetwork = useCallback(async (clientId) => {
+    const nextId = String(clientId || '').trim();
+    if (!nextId || nextId === String(viewClientId || '')) return;
+    if (!accountNetworks.some((n) => n.id === nextId)) return;
+    setSwitchingNetwork(true);
+    // Update view immediately so Dashboard/Reporting follow the select even if
+    // session persist fails (domain users may only have header override).
+    setViewClientId(nextId);
+    try {
+      const data = await clientsAPI.setActiveNetwork(nextId);
+      if (data?.activeClientId) setViewClientId(data.activeClientId);
+      if (data?.token && data?.user) {
+        setToken(data.token);
+        dispatch(clearReportPages());
+        dispatch(authSuccess(data.user));
+      }
+      await refreshNetworkInfo(data?.activeClientId || nextId);
+    } catch (err) {
+      logErrorForDebug(err, 'Switch network');
+      // Keep local viewClientId — X-Gam-Client-Id still scopes API calls.
+      try {
+        await refreshNetworkInfo(nextId);
+      } catch (_) { /* ignore */ }
+    } finally {
+      setSwitchingNetwork(false);
+    }
+  }, [accountNetworks, viewClientId, dispatch, refreshNetworkInfo]);
 
   useEffect(() => {
     const onClick = (e) => {
@@ -183,6 +297,16 @@ export default function Layout() {
     return `Heads up: Ad network API ${gv.version} will be deprecated in ${gv.deprecationDate} and stop working in ${gv.sunsetDate}. Plan to update GAM_API_VERSION in .env.`;
   })();
 
+  const canSwitchNetwork = accountNetworks.length > 1;
+  const activeNetwork = accountNetworks.find((n) => n.id === viewClientId)
+    || accountNetworks.find((n) => n.id === user?.clientId)
+    || null;
+  const networkLabelText = activeNetwork
+    ? networkOptionLabel(activeNetwork)
+    : (networkInfo
+      ? `${networkInfo.displayName || 'Network'}${networkInfo.networkCode ? ` · ${networkInfo.networkCode}` : ''}`
+      : '');
+
   return (
     <div className={`app app-shell${focusMode ? ' is-focus-mode' : ''}`}>
       {isMock && (
@@ -228,11 +352,29 @@ export default function Layout() {
         <aside className={`app-sidebar ${menuOpen ? 'open' : ''}${focusMode ? ' is-collapsed' : ''}`}>
           <div className="sidebar-top">
             <BrandLogo showTitle={!focusMode} markSize={focusMode ? 26 : 28} />
-            {!focusMode && networkInfo && (
-              <span className="network-label" title={networkInfo.networkCode ? `Network ${networkInfo.networkCode}` : undefined}>
-                {networkInfo.displayName}
-                {networkInfo.networkCode ? ` · ${networkInfo.networkCode}` : ''}
-              </span>
+            {!focusMode && (networkInfo || accountNetworks.length > 0) && (
+              canSwitchNetwork ? (
+                <label className="network-switch-wrap" title="Switch network for Dashboard & Reporting">
+                  <span className="sr-only">Active network</span>
+                  <select
+                    className="network-label network-switch"
+                    value={viewClientId || activeNetwork?.id || ''}
+                    disabled={switchingNetwork}
+                    onChange={(e) => switchNetwork(e.target.value)}
+                    aria-label="Switch network"
+                  >
+                    {accountNetworks.map((n) => (
+                      <option key={n.id} value={n.id}>{networkOptionLabel(n)}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                <span className="network-label" title={networkInfo?.networkCode ? `Network ${networkInfo.networkCode}` : undefined}>
+                  {networkLabelText || (networkInfo?.displayName
+                    ? `${networkInfo.displayName}${networkInfo.networkCode ? ` · ${networkInfo.networkCode}` : ''}`
+                    : '')}
+                </span>
+              )
             )}
             {!focusMode && (
               <span className="context-chip context-chip--sidebar" title={`Currency ${currencyCode} · ${APP_TIMEZONE}`}>
@@ -385,7 +527,17 @@ export default function Layout() {
                 </div>
               </div>
             ) : (
-              <Outlet key={darkMode ? 'dark' : 'light'} context={{ networkInfo, isMock }} />
+              <Outlet
+                key={darkMode ? 'dark' : 'light'}
+                context={{
+                  networkInfo,
+                  isMock,
+                  viewClientId: viewClientId || user?.clientId || null,
+                  accountNetworks,
+                  switchNetwork,
+                  switchingNetwork,
+                }}
+              />
             )}
           </main>
           <ToastStack />

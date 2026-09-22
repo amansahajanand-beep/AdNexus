@@ -1671,7 +1671,7 @@ function applyVisibility(payload, user, opts = {}) {
   }
 
   payload.visibility = vis;
-  return payload;
+  return attachClientMeta(payload);
 }
 
 // GAM Home overview — programmatic channels (impressions, revenue, eCPM, viewability).
@@ -2720,6 +2720,20 @@ async function enqueueAdhocReportJob(filters, cacheKey) {
   }
 }
 
+function attachClientMeta(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  try {
+    const { getClient } = require('../utils/clientContext');
+    const client = getClient();
+    payload._client = {
+      id: client?.id || null,
+      networkCode: client?.networkCode || null,
+      name: client?.name || null,
+    };
+  } catch (_) { /* ignore */ }
+  return payload;
+}
+
 function applyOverviewVisibility(payload, user) {
   const vis = buildVisibility(user);
   const s = payload.summary;
@@ -2734,7 +2748,7 @@ function applyOverviewVisibility(payload, user) {
     }
   }
   payload.visibility = vis;
-  return payload;
+  return attachClientMeta(payload);
 }
 
 // Derive the dashboard summary cards from detailed rows + daily trend

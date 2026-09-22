@@ -2,11 +2,16 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import Modal from '../ui/Modal';
 import Button from '../ui/Button';
 import { TextField, SelectField } from '../ui/Field';
+import MultiSelect from '../ui/MultiSelect';
 import PermissionsPanel from './PermissionsPanel';
 import { validatePassword, PASSWORD_RULES_HINT } from '../../utils/passwordPolicy';
 import { validateUsername, USERNAME_RULES_HINT } from '../../utils/namePolicy';
 import { readDateRestrictionFromUser, dateRestrictionPayload } from '../../utils/adminDateRestriction';
 import { PERMISSION_SECTIONS } from '../../utils/permissions';
+import { isAllSelection } from '../../utils/inventorySelection';
+import { reportsAPI, usersAPI } from '../../utils/api';
+import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions } from '../../utils/domainCatalog';
+import { isLikelyAppPackage } from '../../utils/appPackage';
 
 const ROLE_OPTIONS = [
   { value: 'admin', label: 'Admin' },
@@ -42,18 +47,43 @@ function flagsFromUser(user) {
   return f;
 }
 
+function allowedClientIdsFromUser(user, linkedNetworks) {
+  const fromPerms = user?.permissions?.allowedClientIds;
+  if (Array.isArray(fromPerms) && fromPerms.length) {
+    return fromPerms.map((id) => String(id)).filter(Boolean);
+  }
+  if (Array.isArray(user?.allowedClientIds) && user.allowedClientIds.length) {
+    return user.allowedClientIds.map((id) => String(id)).filter(Boolean);
+  }
+  if (user?.clientId) return [String(user.clientId)];
+  return linkedNetworks[0]?.id ? [linkedNetworks[0].id] : [];
+}
+
 export default function UserFormModal({
   open, onClose, onSave, saving, error, user,
   domains = [], domainsLoading, catalogLoading = false, catalogRows = [], catalogLists = {},
   adsAccountOptions = [], adsAccountsLoading = false,
+  networks = [],
 }) {
   const isEdit = !!user;
   const editingAdmin = isEdit && isAdminRole(user);
+  const linkedNetworks = useMemo(
+    () => (networks || []).filter((n) => !n.isPending && n.networkCode),
+    [networks]
+  );
+  const networkOptions = useMemo(
+    () => linkedNetworks.map((n) => ({
+      value: n.id,
+      label: n.name ? `${n.name} (${n.networkCode})` : n.networkCode,
+    })),
+    [linkedNetworks]
+  );
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [role, setRole] = useState('child');
+  const [allowedClientIds, setAllowedClientIds] = useState([]);
   const [flags, setFlags] = useState(defaultFlags);
   const [allowedDomains, setAllowedDomains] = useState([]);
   const [allowedSites, setAllowedSites] = useState([]);
@@ -64,6 +94,12 @@ export default function UserFormModal({
   const [localError, setLocalError] = useState(null);
   const [successMsg, setSuccessMsg] = useState(null);
   const errorRef = useRef(null);
+  const [scopeDomains, setScopeDomains] = useState(domains);
+  const [scopeCatalogRows, setScopeCatalogRows] = useState(catalogRows);
+  const [scopeCatalogLists, setScopeCatalogLists] = useState(catalogLists);
+  const [scopeCatalogLoading, setScopeCatalogLoading] = useState(false);
+  const [scopeDomainsLoading, setScopeDomainsLoading] = useState(false);
+  const networksKey = allowedClientIds.slice().sort().join(',');
 
   useEffect(() => {
     if (!open) return;
@@ -74,6 +110,7 @@ export default function UserFormModal({
     setLocalError(null);
     setSuccessMsg(null);
     setRole(isAdminRole(user) ? 'admin' : (user?.role || 'child'));
+    setAllowedClientIds(allowedClientIdsFromUser(user, linkedNetworks));
     setFlags(flagsFromUser(user));
     setAllowedDomains(user?.permissions?.allowedDomains || []);
     setAllowedSites(user?.permissions?.allowedSites || []);
@@ -82,7 +119,86 @@ export default function UserFormModal({
     const dr = readDateRestrictionFromUser(user);
     setDateRestrictionStart(dr.start);
     setDateRestrictionEnd(dr.end);
-  }, [open, user]);
+  }, [open, user, linkedNetworks]);
+
+  // Inventory catalog follows selected network permissions (one network or merged).
+  useEffect(() => {
+    if (!open || role === 'admin') return undefined;
+    const ids = (allowedClientIds || []).map(String).filter(Boolean);
+    if (!ids.length) {
+      setScopeDomains([]);
+      setScopeCatalogRows([]);
+      setScopeCatalogLists({ siteHosts: [], appIds: [], sitesByDomain: {}, adUnitsByHost: {} });
+      setScopeCatalogLoading(false);
+      setScopeDomainsLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setScopeCatalogLoading(true);
+    setScopeDomainsLoading(true);
+    (async () => {
+      try {
+        const [catalog, picker] = await Promise.all([
+          reportsAPI.getMergedFilterCatalog(ids).catch(() => null),
+          usersAPI.getMergedInventoryPicker(ids).catch(() => null),
+        ]);
+        if (cancelled) return;
+        if (catalog?.rows?.length) {
+          setScopeCatalogRows(catalog.rows);
+          setScopeCatalogLists({
+            siteHosts: catalog.siteHosts?.length ? catalog.siteHosts : (picker?.siteHosts || []),
+            appIds: catalog.appPackages?.length
+              ? catalog.appPackages.filter(isLikelyAppPackage)
+              : (picker?.appIds || catalogRowsToAppIdOptions(catalog.rows).map((o) => o.id)),
+            sitesByDomain: catalog.sitesByDomain || {},
+            adUnitsByHost: catalog.adUnitsByHost || {},
+          });
+          setScopeDomains(catalogRowsToDomainOptions(catalog.rows));
+        } else if (picker) {
+          setScopeCatalogRows([]);
+          setScopeCatalogLists({
+            siteHosts: picker.siteHosts || [],
+            appIds: picker.appIds || [],
+            sitesByDomain: picker.sitesByDomain || {},
+            adUnitsByHost: picker.adUnitsByHost || {},
+          });
+          if (picker.domains?.length) setScopeDomains(picker.domains);
+          else if (picker.domainRoots?.length) {
+            setScopeDomains(picker.domainRoots.map((d) => ({ id: d, label: d, domainName: d })));
+          } else setScopeDomains([]);
+        } else {
+          setScopeDomains(domains);
+          setScopeCatalogRows(catalogRows);
+          setScopeCatalogLists(catalogLists);
+        }
+      } finally {
+        if (!cancelled) {
+          setScopeCatalogLoading(false);
+          setScopeDomainsLoading(false);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [open, role, networksKey]);
+
+  // Drop assigned inventory that is no longer in the scoped catalog.
+  useEffect(() => {
+    if (!open || role === 'admin' || scopeCatalogLoading) return;
+    const domainSet = new Set(
+      (scopeDomains || []).map((d) => String(d.id || d.domainName || d.label || d).toLowerCase())
+    );
+    const siteSet = new Set((scopeCatalogLists.siteHosts || []).map((s) => String(s).toLowerCase()));
+    const appSet = new Set((scopeCatalogLists.appIds || []).map((a) => String(a).toLowerCase()));
+    if (domainSet.size) {
+      setAllowedDomains((prev) => prev.filter((d) => domainSet.has(String(d).toLowerCase())));
+    }
+    if (siteSet.size) {
+      setAllowedSites((prev) => prev.filter((s) => siteSet.has(String(s).toLowerCase())));
+    }
+    if (appSet.size) {
+      setAllowedAppIds((prev) => prev.filter((a) => appSet.has(String(a).toLowerCase())));
+    }
+  }, [open, role, scopeCatalogLoading, networksKey, scopeDomains, scopeCatalogLists]);
 
   const handleDateRestrictionChange = (start, end) => {
     setDateRestrictionStart(start);
@@ -137,11 +253,18 @@ export default function UserFormModal({
     };
 
     if (effectiveRole !== 'admin') {
+      if (!allowedClientIds.length) {
+        setLocalError('Select at least one network for this domain user.');
+        scrollToError();
+        return;
+      }
       if (dateRestrictionStart && dateRestrictionEnd && dateRestrictionStart > dateRestrictionEnd) {
         setLocalError('Allowed date range: start date must be on or before end date.');
         scrollToError();
         return;
       }
+      payload.allowedClientIds = allowedClientIds;
+      payload.clientId = allowedClientIds[0];
       Object.assign(payload, flags, {
         allowedDomains,
         allowedSites,
@@ -155,6 +278,7 @@ export default function UserFormModal({
   };
 
   const displayError = localError || error;
+  const showNetworkPicker = !editingAdmin && role !== 'admin' && linkedNetworks.length > 0;
 
   const footer = (
     <>
@@ -178,6 +302,28 @@ export default function UserFormModal({
       <TextField label="Username" value={username} onChange={setUsername} placeholder="Enter username" autoFocus />
       <p className="form-note" style={{ marginTop: -8 }}>{USERNAME_RULES_HINT}</p>
       <TextField label="Email" type="email" value={email} onChange={setEmail} placeholder="user@example.com" />
+      {showNetworkPicker && (
+        <div className="ui-field" style={{ marginBottom: 14 }}>
+          <span className="ui-field-label">Network permissions</span>
+          <MultiSelect
+            options={networkOptions}
+            value={allowedClientIds}
+            onChange={(next) => {
+              if (isAllSelection(next)) {
+                setAllowedClientIds(linkedNetworks.map((n) => n.id));
+                return;
+              }
+              setAllowedClientIds((Array.isArray(next) ? next : []).map(String).filter(Boolean));
+            }}
+            placeholder="Select networks…"
+            showSelectAll={linkedNetworks.length > 1}
+            selectAllLabel="All networks"
+          />
+          <p className="form-note" style={{ marginTop: 6 }}>
+            Domain user can open Dashboard / Reporting for the selected networks only.
+          </p>
+        </div>
+      )}
       <TextField
         label="Password"
         type="password"
@@ -221,11 +367,11 @@ export default function UserFormModal({
           dateRestrictionStart={dateRestrictionStart}
           dateRestrictionEnd={dateRestrictionEnd}
           onDateRestrictionChange={handleDateRestrictionChange}
-          domains={domains}
-          domainsLoading={domainsLoading}
-          catalogLoading={catalogLoading}
-          catalogRows={catalogRows}
-          catalogLists={catalogLists}
+          domains={scopeDomains}
+          domainsLoading={scopeDomainsLoading || domainsLoading}
+          catalogLoading={scopeCatalogLoading || catalogLoading}
+          catalogRows={scopeCatalogRows}
+          catalogLists={scopeCatalogLists}
           adsAccountOptions={adsAccountOptions}
           adsAccountsLoading={adsAccountsLoading}
         />

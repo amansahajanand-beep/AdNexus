@@ -151,15 +151,30 @@ const MAX_REPORT_GET_QUERY_LEN = 1800;
 const DASHBOARD_REQUEST_TIMEOUT_MS = 60000;
 
 function reportRequest(path, filters = {}, axiosConfig = {}) {
-  const qs = buildFilterQuery(filters);
+  const clientId = axiosConfig.clientId || filters.clientId;
+  const { clientId: _dropClientId, ...restConfig } = axiosConfig;
+  const filterPayload = { ...(filters || {}) };
+  delete filterPayload.clientId;
+  // Scope + cache-bust: same date filters must not share a cached response across networks.
+  if (clientId) {
+    filterPayload._cid = String(clientId).replace(/-/g, '').slice(0, 12);
+    filterPayload.clientId = String(clientId);
+  }
+  const qs = buildFilterQuery(filterPayload);
+  const headers = {
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+    ...(restConfig.headers || {}),
+  };
+  if (clientId) headers['X-Gam-Client-Id'] = String(clientId);
   const noCache = {
-    headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
-    ...axiosConfig,
+    ...restConfig,
+    headers,
   };
   if (qs.length <= MAX_REPORT_GET_QUERY_LEN) {
     return API.get(`${path}?${qs}`, noCache);
   }
-  return API.post(path, filters, noCache);
+  return API.post(path, filterPayload, noCache);
 }
 
 // ─── Reports ──────────────────────────────────────────────────────────────────
@@ -176,8 +191,8 @@ export const reportsAPI = {
   getTopAdvertisers: () =>
     API.get('/reports/top-advertisers'),
 
-  getDetailed: (filters = {}) =>
-    reportRequest('/reports/detailed', filters),
+  getDetailed: (filters = {}, axiosConfig = {}) =>
+    reportRequest('/reports/detailed', filters, axiosConfig),
 
   getDashboard: (filters = {}, axiosConfig = {}) =>
     reportRequest('/reports/dashboard', filters, {
@@ -185,8 +200,8 @@ export const reportsAPI = {
       ...axiosConfig,
     }),
 
-  getDomainUserReport: (filters = {}) =>
-    reportRequest('/reports/domain-user', filters),
+  getDomainUserReport: (filters = {}, axiosConfig = {}) =>
+    reportRequest('/reports/domain-user', filters, axiosConfig),
 
   getDashboardOverview: (filters = {}, axiosConfig = {}) =>
     reportRequest('/reports/dashboard/overview', filters, {
@@ -199,15 +214,101 @@ export const reportsAPI = {
   getFilterCatalog: (clientId) => API.get('/reports/filter-catalog', {
     // Bust browser HTTP cache when the active GAM network changes.
     params: clientId ? { _cid: String(clientId).slice(0, 8) } : undefined,
-    headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
+    headers: {
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+      ...(clientId ? { 'X-Gam-Client-Id': String(clientId) } : {}),
+    },
   }),
 
-  getProgrammatic: (filters = {}) =>
-    reportRequest('/reports/programmatic', filters),
+  /** Merge filter catalogs from multiple GAM networks (unique option lists). */
+  getMergedFilterCatalog: async (clientIds = []) => {
+    const ids = [...new Set((clientIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+    if (!ids.length) return reportsAPI.getFilterCatalog();
+    if (ids.length === 1) return reportsAPI.getFilterCatalog(ids[0]);
+    const results = (await Promise.all(
+      ids.map((id) => reportsAPI.getFilterCatalog(id).catch(() => null))
+    )).filter(Boolean);
+    if (!results.length) return {};
+
+    const uniqStrings = (lists) => {
+      const seen = new Set();
+      const out = [];
+      for (const list of lists) {
+        for (const item of (Array.isArray(list) ? list : [])) {
+          const s = String(item || '').trim();
+          if (!s) continue;
+          const k = s.toLowerCase();
+          if (seen.has(k)) continue;
+          seen.add(k);
+          out.push(item);
+        }
+      }
+      return out;
+    };
+
+    const mergeMapOfLists = (maps) => {
+      const out = {};
+      for (const map of maps) {
+        if (!map || typeof map !== 'object') continue;
+        for (const [key, vals] of Object.entries(map)) {
+          if (!out[key]) out[key] = [];
+          const seen = new Set(out[key].map((v) => String(v).toLowerCase()));
+          for (const v of (Array.isArray(vals) ? vals : [])) {
+            const k = String(v || '').toLowerCase();
+            if (!k || seen.has(k)) continue;
+            seen.add(k);
+            out[key].push(v);
+          }
+        }
+      }
+      return out;
+    };
+
+    const mergeRows = (rowLists) => {
+      const seen = new Set();
+      const out = [];
+      for (const rows of rowLists) {
+        for (const row of (Array.isArray(rows) ? rows : [])) {
+          const key = [
+            row?.domain || row?.domainName || '',
+            row?.site || row?.siteName || '',
+            row?.adUnit || row?.adUnitName || '',
+            row?.appId || row?.appPackage || '',
+          ].join('|').toLowerCase();
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(row);
+        }
+      }
+      return out;
+    };
+
+    return {
+      ...results[0],
+      domainRoots: uniqStrings(results.map((r) => r.domainRoots)),
+      siteHosts: uniqStrings(results.map((r) => r.siteHosts)),
+      appPackages: uniqStrings(results.map((r) => r.appPackages)),
+      domains: uniqStrings(results.map((r) => r.domains)),
+      sites: uniqStrings(results.map((r) => r.sites)),
+      countries: uniqStrings(results.map((r) => r.countries)),
+      devices: uniqStrings(results.map((r) => r.devices)),
+      apps: uniqStrings(results.map((r) => r.apps)),
+      adUnits: uniqStrings(results.map((r) => r.adUnits)),
+      sitesByDomain: mergeMapOfLists(results.map((r) => r.sitesByDomain)),
+      adUnitsByHost: mergeMapOfLists(results.map((r) => r.adUnitsByHost)),
+      rows: mergeRows(results.map((r) => r.rows)),
+      noDomainsAssigned: results.every((r) => r.noDomainsAssigned === true),
+      mergedFrom: ids.length,
+    };
+  },
+
+  getProgrammatic: (filters = {}, axiosConfig = {}) =>
+    reportRequest('/reports/programmatic', filters, axiosConfig),
 
   // On-demand range endpoint (may return 202 when queued)
-  getReportRange: (filters = {}) =>
-    reportRequest('/reports/range', filters),
+  getReportRange: (filters = {}, axiosConfig = {}) =>
+    reportRequest('/reports/range', filters, axiosConfig),
 };
 
 // ─── Orders ───────────────────────────────────────────────────────────────────
@@ -221,7 +322,10 @@ export const ordersAPI = {
 
 // ─── Network ──────────────────────────────────────────────────────────────────
 export const networkAPI = {
-  getInfo: () => API.get('/network/info'),
+  getInfo: (clientId) => API.get('/network/info', {
+    params: clientId ? { _cid: String(clientId).replace(/-/g, '').slice(0, 12), clientId: String(clientId) } : undefined,
+    headers: clientId ? { 'X-Gam-Client-Id': String(clientId) } : undefined,
+  }),
 };
 
 // ─── Inventory ────────────────────────────────────────────────────────────────
@@ -253,6 +357,7 @@ export const clientsAPI = {
   me: () => FAST_API.get('/clients/me'),
   updateMe: (payload) => FAST_API.put('/clients/me', payload),
   networks: () => FAST_API.get('/clients/me/networks'),
+  accessibleNetworks: () => FAST_API.get('/clients/me/accessible-networks'),
   setActiveNetwork: (clientId) => FAST_API.post('/clients/me/active-network', { clientId }),
   oauthUrl: () => FAST_API.get('/clients/me/oauth-url'),
   oauthPending: (id) => FAST_API.get(`/clients/oauth/pending/${id}`),
@@ -305,8 +410,59 @@ export const usersAPI = {
   getAll: () => FAST_API.get('/users'),
   getInventoryPicker: (clientId) => FAST_API.get('/users/inventory-picker', {
     params: clientId ? { _cid: String(clientId).slice(0, 8) } : undefined,
-    headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' },
+    headers: {
+      'Cache-Control': 'no-cache',
+      Pragma: 'no-cache',
+      ...(clientId ? { 'X-Gam-Client-Id': String(clientId) } : {}),
+    },
   }),
+  /** Merge inventory pickers for selected networks (domain-user scope UI). */
+  getMergedInventoryPicker: async (clientIds = []) => {
+    const ids = [...new Set((clientIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+    if (!ids.length) return usersAPI.getInventoryPicker();
+    if (ids.length === 1) return usersAPI.getInventoryPicker(ids[0]);
+    const results = (await Promise.all(
+      ids.map((id) => usersAPI.getInventoryPicker(id).catch(() => null))
+    )).filter(Boolean);
+    if (!results.length) return {};
+    const uniq = (lists) => {
+      const seen = new Set();
+      const out = [];
+      for (const list of lists) {
+        for (const item of (Array.isArray(list) ? list : [])) {
+          const s = String(item?.id || item?.label || item || '').trim();
+          if (!s) continue;
+          const k = s.toLowerCase();
+          if (seen.has(k)) continue;
+          seen.add(k);
+          out.push(item);
+        }
+      }
+      return out;
+    };
+    const uniqStrings = (lists) => {
+      const seen = new Set();
+      const out = [];
+      for (const list of lists) {
+        for (const item of (Array.isArray(list) ? list : [])) {
+          const s = String(item || '').trim();
+          if (!s) continue;
+          const k = s.toLowerCase();
+          if (seen.has(k)) continue;
+          seen.add(k);
+          out.push(item);
+        }
+      }
+      return out;
+    };
+    return {
+      ...results[0],
+      siteHosts: uniqStrings(results.map((r) => r.siteHosts)),
+      appIds: uniqStrings(results.map((r) => r.appIds)),
+      domainRoots: uniqStrings(results.map((r) => r.domainRoots)),
+      domains: uniq(results.map((r) => r.domains)),
+    };
+  },
   create: (payload) => FAST_API.post('/users', payload),
   update: (id, payload) => FAST_API.put(`/users/${id}`, payload),
   updatePermissions: (id, payload) => FAST_API.put(`/users/${id}/permissions`, payload),

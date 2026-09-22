@@ -55,12 +55,10 @@ export function buildAssignedInventoryFilters(user) {
 }
 
 /**
- * Do not auto-fill or auto-apply assigned inventory in the UI.
- * Overview uses assignment on the server when no filter is applied;
- * chart/table waits until the user picks filters and clicks Apply.
+ * Domain users: auto-apply full assigned inventory so overview + table load on login.
  */
-export function shouldAutoLoadScopedInventory() {
-  return false;
+export function shouldAutoLoadScopedInventory(user) {
+  return !isAdmin(user) && hasAssignedInventory(user);
 }
 
 /** Default applied filters for scoped dashboard (date range + full assigned inventory). */
@@ -95,7 +93,7 @@ export function getAssignedFilterVisibility(user) {
   };
 }
 
-/** Initial picker state — empty until user selects; restore only explicit saved picks. */
+/** Initial picker state — restore saved picks, else full assignment for scoped auto-load. */
 export function initialInventoryDraft(user, saved = {}) {
   if (isAdmin(user) || !hasAssignedInventory(user)) {
     return {
@@ -105,9 +103,16 @@ export function initialInventoryDraft(user, saved = {}) {
       domainId: saved.domainId ?? [],
     };
   }
-  // Domain users: never restore a previous full assignment into the pickers.
-  // They must choose filters themselves; overview still uses assignment on the server.
-  return { ...EMPTY_INVENTORY_FILTERS };
+  const hasSaved = draftHasInventorySelection(saved);
+  if (hasSaved) {
+    return {
+      domain: saved.domain ?? [],
+      site: saved.site ?? [],
+      domainName: saved.domainName ?? [],
+      domainId: saved.domainId ?? [],
+    };
+  }
+  return buildAssignedInventoryFilters(user);
 }
 
 export function resetInventoryDraft(user) {

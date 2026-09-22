@@ -11,6 +11,7 @@ if (usePg) {
     initDB: async () => await pg.initUsersSchema(),
     getAllUsers: async () => await pg.getAllUsers(),
     getUsersByClientId: async (clientId) => await pg.getUsersByClientId(clientId),
+    getUsersByClientIds: async (clientIds) => await pg.getUsersByClientIds(clientIds),
     getUserById: async (id) => await pg.getUserById(id),
     getUserByUsername: async (username) => await pg.getUserByUsername(username),
     createUser: async (opts) => await pg.createUser(opts),
@@ -94,6 +95,12 @@ if (usePg) {
 
   function getUsersByClientId(clientId) {
     return getAllUsers().filter((u) => u.clientId === clientId);
+  }
+
+  function getUsersByClientIds(clientIds = []) {
+    const ids = new Set((clientIds || []).map((id) => String(id || '').trim()).filter(Boolean));
+    if (!ids.size) return [];
+    return getAllUsers().filter((u) => ids.has(String(u.clientId || '')));
   }
 
   function getUserById(id) {
@@ -205,6 +212,7 @@ if (usePg) {
     initDB,
     getAllUsers,
     getUsersByClientId,
+    getUsersByClientIds,
     getUserById,
     getUserByUsername,
     createUser,
