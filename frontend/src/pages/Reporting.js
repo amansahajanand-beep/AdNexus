@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useDispatch, useSelector } from 'react-redux';
 import { useOutletContext, useSearchParams } from 'react-router-dom';
 import { reportsAPI } from '../utils/api';
+import { mergeDashboardResponses } from '../utils/report/mergeNetworkReports';
 import { nowTimeInTZ } from '../utils/datetime';
 import {
   getDateRestriction,
@@ -167,7 +168,21 @@ export default function Reporting() {
   const filterVisibility = getAssignedFilterVisibility(user);
   const outlet = useOutletContext() || {};
   const { networkInfo } = outlet;
-  const reportClientId = outlet.viewClientId || user?.clientId || null;
+  const accountNetworks = Array.isArray(outlet.accountNetworks) ? outlet.accountNetworks : [];
+  const mergeIds = useMemo(() => {
+    if (isAdmin(user)) return null;
+    const ids = (Array.isArray(outlet.mergeNetworkIds) && outlet.mergeNetworkIds.length
+      ? outlet.mergeNetworkIds
+      : accountNetworks.map((n) => n.id)
+    ).map((id) => String(id || '').trim()).filter(Boolean);
+    return ids.length > 1 ? [...new Set(ids)] : null;
+  }, [user, outlet.mergeNetworkIds, accountNetworks]);
+  const mergeCacheKey = mergeIds ? `merge:${[...mergeIds].sort().join(',')}` : null;
+  // Admin: sidebar network. Domain multi-network: merge key. Else primary client.
+  const reportClientId = mergeCacheKey
+    || outlet.viewClientId
+    || user?.clientId
+    || null;
   const reportCacheRef = useRef(new Map());
 
   const scopedNormOpts = useMemo(() => ({
@@ -604,11 +619,31 @@ export default function Reporting() {
       // Always request the full SQL-capped sample (fair per-day). Sending
       // limit:100 + allRows:false sorted DESC made 30d/3m/6m look like "today only".
       const reportFilters = { ...dateFilters, allRows: true };
-      const clientCfg = reportClientId ? { clientId: reportClientId } : {};
-      const [detailed, programmatic] = await Promise.all([
-        cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters, clientCfg) : Promise.resolve(null),
-        cfg.mode === 'programmatic' ? reportsAPI.getProgrammatic(reportFilters, clientCfg).catch(() => null) : Promise.resolve(null),
-      ]);
+      const singleClientId = reportClientId && !String(reportClientId).startsWith('merge:')
+        ? reportClientId
+        : null;
+      let detailed;
+      let programmatic;
+      if (mergeIds?.length) {
+        const detailParts = cfg.mode === 'inventory'
+          ? await Promise.all(
+            mergeIds.map((id) => reportsAPI.getDetailed(reportFilters, { clientId: id }).catch(() => null))
+          )
+          : [];
+        const progParts = cfg.mode === 'programmatic'
+          ? await Promise.all(
+            mergeIds.map((id) => reportsAPI.getProgrammatic(reportFilters, { clientId: id }).catch(() => null))
+          )
+          : [];
+        detailed = cfg.mode === 'inventory' ? mergeDashboardResponses(detailParts) : null;
+        programmatic = cfg.mode === 'programmatic' ? mergeDashboardResponses(progParts) : null;
+      } else {
+        const clientCfg = singleClientId ? { clientId: singleClientId } : {};
+        [detailed, programmatic] = await Promise.all([
+          cfg.mode === 'inventory' ? reportsAPI.getDetailed(reportFilters, clientCfg) : Promise.resolve(null),
+          cfg.mode === 'programmatic' ? reportsAPI.getProgrammatic(reportFilters, clientCfg).catch(() => null) : Promise.resolve(null),
+        ]);
+      }
       if (loadGen !== loadGenRef.current) return;
       applyDetailed(detailed);
       applyProg(programmatic);
@@ -719,7 +754,7 @@ export default function Reporting() {
         }
       }
     }
-  }, [applied, todayInit.startDate, todayInit.endDate, canGenerate, scopedNormOpts, reportClientId]);
+  }, [applied, todayInit.startDate, todayInit.endDate, canGenerate, scopedNormOpts, reportClientId, mergeIds]);
 
   const appliedQueryKey = useMemo(() => reportingAppliedKey(applied), [applied]);
   const loadRef = useRef(load);
