@@ -292,11 +292,14 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
     apps = scope.appIds?.size ? [...scope.appIds] : [];
     adUnitNames = [];
   }
+  // When the request already picks domains/sites/ad units, do NOT auto-union every
+  // assigned app — that injected app×country / blank Domain·Site rows (~$628 "—")
+  // into site-filtered Dashboard/Reporting and inflated overview vs the 6-site table.
 
-  // Never leave apps unconstrained for children with App ID assignments — otherwise
-  // rollup/groupByApp returns every network package (Reporting leak).
-  if (!apps.length && scope.appIds?.size) {
-    apps = [...scope.appIds];
+  // Mirror rowMatchesWebScope: if sites are listed under a domain, do NOT OR the
+  // whole domain into SQL (that pulled sister-site + blank inventory into KPIs).
+  if (sites.length && domains.length) {
+    domains = domains.filter((d) => !sites.some((s) => siteHostUnderDomain(s, d)));
   }
 
   // Domains/sites use LIKE ANY and hang when huge; cap each list (keep both for OR).
@@ -309,7 +312,8 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
     sites,
     apps,
     adUnitNames,
-    // Scoped Domain+Site → OR (same as JS scoped inventory matcher). Apps union separately.
+    // Remaining domain+site pairs are disjoint grants → OR. Sister sites under the
+    // same root were already dropped above.
     webInventoryOr: domains.length > 0 && sites.length > 0,
     // Equality on inv_* — LIKE '%domain%' made Site filter equal Domain-wide.
     skipAdUnitLike: true,

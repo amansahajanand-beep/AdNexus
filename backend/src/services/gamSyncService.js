@@ -1191,6 +1191,22 @@ function buildInventoryCoreWhere(clientId, startDate, endDate, opts = {}, ids = 
   }
 
   const whereRange = `${whereCore} AND g.report_date BETWEEN $2::date AND $3::date`;
+  // Site/domain breakdown must not surface uncategorized grain (domain_id=0 & site_id=0):
+  // those rows are usually app/channel leftovers and render as Domain/Site "—" with large revenue.
+  if (!byApp && (
+    (opts.sites || []).length
+    || (ids.siteIds || []).length
+    || opts.groupBySite
+    || opts.tableGrain === 'site'
+    || opts.tableGrain === 'domain'
+  )) {
+    return {
+      params,
+      whereRange: `${whereRange} AND NOT (COALESCE(g.domain_id, 0) = 0 AND COALESCE(g.site_id, 0) = 0)`,
+      byApp,
+      byAdUnit: Boolean(ids.adUnitIds?.length || (opts.adUnitNames || []).length),
+    };
+  }
   return { params, whereRange, byApp, byAdUnit: Boolean(ids.adUnitIds?.length || (opts.adUnitNames || []).length) };
 }
 
@@ -1206,8 +1222,10 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
   );
   const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const clientId = await resolveGrainClientId();
-  let ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains });
-  let effectiveOpts = { ...opts, sites, domains };
+  // Site/domain breakdown cannot attribute app traffic (domain_id=site_id=0 → "—").
+  // Drop apps from this path; app totals belong on the app grain / web∪app overview union.
+  let ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains, apps: [] });
+  let effectiveOpts = { ...opts, sites, domains, apps: [] };
   const soft = softenUnresolvedSiteFilters(effectiveOpts, ids);
   effectiveOpts = soft.opts;
   ids = soft.ids;
@@ -1372,8 +1390,9 @@ async function fetchInventoryCoreDashboardBundle(startDate, endDate, opts = {}) 
   );
   const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const clientId = await resolveGrainClientId();
-  let ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains });
-  let effectiveOpts = { ...opts, sites, domains };
+  // Same as table path: site/domain bundle must not pull app leftovers as "—" rows.
+  let ids = await resolveInventoryFilterIds(clientId, { ...opts, sites, domains, apps: [] });
+  let effectiveOpts = { ...opts, sites, domains, apps: [] };
   const soft = softenUnresolvedSiteFilters(effectiveOpts, ids);
   effectiveOpts = soft.opts;
   ids = soft.ids;
@@ -2722,47 +2741,21 @@ async function resolveInventoryFilterIds(clientId, opts = {}) {
 }
 
 /**
- * Assigned site hosts often aren't in dim_site yet. Aborting the whole web leg then
- * leaves only app×country totals (Domain/Site columns show "—" + false "incompatible").
- * Soften: drop unresolved site filters and keep domain / Site×Country breakdown.
+ * Assigned site hosts sometimes aren't in dim_site yet.
+ * NEVER clear an explicit site filter to "continue with domain grain" — that widened
+ * results to whole-domain / blank Domain·Site rows (e.g. ~$628 with "—") and made
+ * domain-user site filters disagree with admin site totals.
+ * Callers already return [] when sites were requested but siteIds stayed empty.
  */
 function softenUnresolvedSiteFilters(opts = {}, ids = {}) {
   const sites = opts.sites || [];
   if (!sites.length || (ids.siteIds || []).length) {
     return { opts, ids, softened: false };
   }
-  const canContinue = Boolean(
-    (opts.domains || []).length
-    || opts.webInventoryOr
-    || opts.groupBySite
-    || opts.tableGrain === 'site'
-    || opts.tableGrain === 'domain'
-    || opts.groupByCountry
-  );
-  if (!canContinue) return { opts, ids, softened: false };
   logger.info(
-    `inventory_core: ${sites.length} site filter(s) unresolved in dim_site — continuing with domain/site grain`
+    `inventory_core: ${sites.length} site filter(s) unresolved in dim_site — keeping site filter (no widen)`
   );
-  const keepSiteGrain = Boolean(
-    opts.groupBySite
-    || opts.tableGrain === 'site'
-    || opts.tableGrain === 'domain'
-    || opts.groupByCountry
-  );
-  return {
-    opts: {
-      ...opts,
-      sites: [],
-      // Keep web inventory intent so mixed web+app does not collapse to app_id only.
-      forceWebInventory: true,
-      groupBySite: keepSiteGrain ? true : opts.groupBySite,
-      tableGrain: keepSiteGrain && (opts.tableGrain === 'country' || !opts.tableGrain)
-        ? 'site'
-        : (opts.tableGrain || (keepSiteGrain ? 'site' : opts.tableGrain)),
-    },
-    ids: { ...ids, siteIds: [] },
-    softened: true,
-  };
+  return { opts, ids, softened: false };
 }
 
 async function hydrateGrainIdRows(rawRows) {
