@@ -181,12 +181,23 @@ export default function Layout() {
     return () => { cancelled = true; };
   }, [user?.id, isAdmin]);
 
+  // Domain users: never switch session network — combined view uses headers only.
   useEffect(() => {
+    if (!isAdmin) return undefined;
     const id = viewClientId || user?.clientId;
     if (!id) return undefined;
     refreshNetworkInfo(id);
     return undefined;
-  }, [viewClientId, user?.clientId, refreshNetworkInfo]);
+  }, [isAdmin, viewClientId, user?.clientId, refreshNetworkInfo]);
+
+  // Domain / single-tenant: currency chip from linked primary client only.
+  useEffect(() => {
+    if (isAdmin) return undefined;
+    const id = user?.clientId;
+    if (!id) return undefined;
+    refreshNetworkInfo(id);
+    return undefined;
+  }, [isAdmin, user?.clientId, refreshNetworkInfo]);
 
   const switchNetwork = useCallback(async (clientId) => {
     const nextId = String(clientId || '').trim();
@@ -297,7 +308,9 @@ export default function Layout() {
     return `Heads up: Ad network API ${gv.version} will be deprecated in ${gv.deprecationDate} and stop working in ${gv.sunsetDate}. Plan to update GAM_API_VERSION in .env.`;
   })();
 
-  const canSwitchNetwork = accountNetworks.length > 1;
+  const canSwitchNetwork = isAdmin && accountNetworks.length > 1;
+  // Domain users never see network chrome — they get a combined multi-network view.
+  const showNetworkChrome = isAdmin && (networkInfo || accountNetworks.length > 0);
   const activeNetwork = accountNetworks.find((n) => n.id === viewClientId)
     || accountNetworks.find((n) => n.id === user?.clientId)
     || null;
@@ -352,7 +365,7 @@ export default function Layout() {
         <aside className={`app-sidebar ${menuOpen ? 'open' : ''}${focusMode ? ' is-collapsed' : ''}`}>
           <div className="sidebar-top">
             <BrandLogo showTitle={!focusMode} markSize={focusMode ? 26 : 28} />
-            {!focusMode && (networkInfo || accountNetworks.length > 0) && (
+            {!focusMode && showNetworkChrome && (
               canSwitchNetwork ? (
                 <label className="network-switch-wrap" title="Switch network for Dashboard & Reporting">
                   <span className="sr-only">Active network</span>
@@ -532,10 +545,14 @@ export default function Layout() {
                 context={{
                   networkInfo,
                   isMock,
-                  viewClientId: viewClientId || user?.clientId || null,
+                  // Admin: active sidebar network. Domain: null → pages merge all accessible networks.
+                  viewClientId: isAdmin ? (viewClientId || user?.clientId || null) : null,
                   accountNetworks,
-                  switchNetwork,
-                  switchingNetwork,
+                  switchNetwork: isAdmin ? switchNetwork : undefined,
+                  switchingNetwork: isAdmin ? switchingNetwork : false,
+                  mergeNetworkIds: isAdmin
+                    ? null
+                    : accountNetworks.map((n) => n.id).filter(Boolean),
                 }}
               />
             )}
