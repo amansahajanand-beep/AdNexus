@@ -11,7 +11,7 @@ import {
   mergeDashboardResponses,
   mergeOverviewResponses,
 } from '../utils/report/mergeNetworkReports';
-import { nowTimeInTZ } from '../utils/datetime';
+import { nowTimeInTZ, todayInTZ } from '../utils/datetime';
 import {
   getDateRestriction,
   clampDateRange,
@@ -753,6 +753,17 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
       domainName: last.domainName?.length ? last.domainName : prev.domainName,
       domainId: last.domainId?.length ? last.domainId : prev.domainId,
     }));
+    if (
+      last.domain?.length
+      || last.site?.length
+      || last.domainName?.length
+      || last.domainId?.length
+    ) {
+      setFilterApplied(true);
+      // Last filters may differ from Redux-painted KPIs — force a network refresh.
+      skipOverviewRef.current = false;
+      skipDetailRef.current = false;
+    }
   }, [searchParams, user?.id, dateRestriction]);
 
   useEffect(() => {
@@ -785,6 +796,7 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
     [domain, site, domainName, domainId]
   );
   const canApplyInventory = !filterVisibility.isScopedUser
+    || scopedAutoLoad
     || draftHasInventorySelection(inventoryDraft);
   const customDatesIncomplete = isCustomRangeIncomplete(preset, startDate, endDate);
 
@@ -1148,6 +1160,8 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
     if (skipOverviewRef.current) {
       skipOverviewRef.current = false;
       setOverviewLoading(false);
+      // Paint cache immediately, then silent-refresh so refresh never sticks on stale KPIs.
+      loadOverviewRef.current(undefined, true);
       return;
     }
     if (staleSilentOverviewRef.current && overviewDataRef.current?.summary) {
@@ -1164,6 +1178,7 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
     if (skipDetailRef.current) {
       skipDetailRef.current = false;
       setDetailLoading(false);
+      loadDetailRef.current(true);
       return;
     }
     if (staleSilentDetailRef.current && detailDataRef.current) {
@@ -1440,16 +1455,15 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
     setDetailData(null);
     detailDataRef.current = null;
     buildingPollCountRef.current = 0;
-    if (scopedAutoLoad) {
-      setApplied(buildScopedDashboardApplied(user, r));
+    // Keep current inventory filters (App ID / Domain / Site) — only swap dates.
+    // Rebuilding scoped "all assigned" wiped narrowed App ID until Apply again.
+    setApplied((prev) => ({
+      ...prev,
+      startDate: r.startDate,
+      endDate: r.endDate,
+    }));
+    if (scopedAutoLoad || filterApplied || draftHasInventorySelection(inventoryDraft)) {
       setFilterApplied(true);
-    } else {
-      setApplied(prev => ({ ...prev, startDate: r.startDate, endDate: r.endDate }));
-      if (!filterVisibility.isScopedUser) {
-        setFilterApplied(true);
-      } else if (filterApplied && draftHasInventorySelection(inventoryDraft)) {
-        setFilterApplied(true);
-      }
     }
   };
 
@@ -1511,16 +1525,35 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
   }, [startDate, endDate]);
 
   const applyFilter = () => {
-    if (!canApplyInventory) return;
-    if (customDatesIncomplete) return;
-    const dates = clampDateRange(startDate, endDate, dateRestriction);
+    if (!canFilter) return;
+    // Custom range: keep Apply enabled; fill any missing date with today (or the other bound).
+    let sd = startDate;
+    let ed = endDate;
+    if (preset === 'custom') {
+      const today = todayInTZ();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(sd || ''))) sd = /^\d{4}-\d{2}-\d{2}$/.test(String(ed || '')) ? ed : today;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ed || ''))) ed = /^\d{4}-\d{2}-\d{2}$/.test(String(sd || '')) ? sd : today;
+      if (sd > ed) { const t = sd; sd = ed; ed = t; }
+    }
+    const dates = clampDateRange(sd, ed, dateRestriction);
     setStartDate(dates.startDate);
     setEndDate(dates.endDate);
     setPage(1);
     setDetailData(null);
     setOverviewData(null);
     // Keep Select-All sentinel in UI state; API calls normalize it to [] (no filter).
-    const nextApplied = { ...dates, domainName, domainId, domain, site };
+    // Scoped users with empty draft: apply full assigned inventory (matches "loads by default").
+    let nextInv = { domainName, domainId, domain, site };
+    if (scopedAutoLoad && !draftHasInventorySelection(nextInv)) {
+      const scoped = buildScopedDashboardApplied(user, dates);
+      nextInv = {
+        domain: scoped.domain || [],
+        site: scoped.site || [],
+        domainName: scoped.domainName || [],
+        domainId: scoped.domainId || [],
+      };
+    }
+    const nextApplied = { ...dates, ...nextInv };
     setApplied(nextApplied);
     setFilterApplied(true);
     persistRecentFilter();
@@ -1528,10 +1561,10 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
       preset,
       startDate: dates.startDate,
       endDate: dates.endDate,
-      domain,
-      site,
-      domainName,
-      domainId,
+      domain: nextInv.domain,
+      site: nextInv.site,
+      domainName: nextInv.domainName,
+      domainId: nextInv.domainId,
     }, user?.id);
     setBreakdownOpen(true);
     setChipsExpanded(false);
@@ -1558,7 +1591,7 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
     const rangeLabel = dates.startDate === dates.endDate
       ? dates.startDate
       : `${dates.startDate} → ${dates.endDate}`;
-    showToast({ message: `Loaded ${rangeLabel}` });
+    showToast({ message: `Loaded ${rangeLabel}`, replaceKey: 'filter-loaded' });
   };
 
   const appliedChips = useMemo(
@@ -1669,6 +1702,7 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
     loadOverview(buildOverviewFiltersForState(nextApplied, false));
     showToast({
       message: 'Filters cleared',
+      replaceKey: 'filter-status',
       actionLabel: 'Undo',
       onAction: () => {
         const snap = undoSnapRef.current;
@@ -1708,8 +1742,6 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
   useReportHotkeys({
     enabled: canGenerate && canFilter,
     onApply: () => {
-      if (customDatesIncomplete) return;
-      if (!canApplyInventory) return;
       applyFilter();
     },
     onReset: reset,
@@ -2380,7 +2412,7 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
             filterPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
           }}
           onApply={() => {
-            if (!customDatesIncomplete && canApplyInventory) applyFilter();
+            applyFilter();
           }}
         />
       )}
@@ -2407,10 +2439,8 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
           </div>
           <div className="filter-actions filter-actions--desktop">
             <button className="btn-generate" onClick={applyFilter}
-              disabled={!canFilter || !canApplyInventory || customDatesIncomplete}
-              title={customDatesIncomplete
-                ? 'Select both start and end dates, then click Apply Filter'
-                : (!canApplyInventory ? 'Select at least one domain, site, or app ID from your assigned list' : '')}>✓ Apply Filter</button>
+              disabled={!canFilter}
+              title={!canFilter ? 'You do not have permission to apply filters' : ''}>✓ Apply Filter</button>
             <SavedFiltersBar
               page={SAVED_FILTERS_PAGES.dashboard}
               userId={user?.id}
@@ -2651,7 +2681,7 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
         {breakdownOpen && canFilter && (
           <div className="filter-actions-foot">
             <button className="btn-generate" onClick={applyFilter}
-              disabled={!canApplyInventory || customDatesIncomplete}>✓ Apply Filter</button>
+              disabled={!canFilter}>✓ Apply Filter</button>
             <button className="btn-reset" onClick={reset}>↺ Reset</button>
           </div>
         )}
@@ -3411,7 +3441,6 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
             <button
               className="btn-generate"
               onClick={applyFilter}
-              disabled={!canApplyInventory || customDatesIncomplete}
             >✓ Apply Filter</button>
             <button type="button" className="btn-reset-link" onClick={reset}>Reset</button>
           </div>

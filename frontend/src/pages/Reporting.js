@@ -3,7 +3,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { useOutletContext, useSearchParams } from 'react-router-dom';
 import { reportsAPI } from '../utils/api';
 import { mergeDashboardResponses } from '../utils/report/mergeNetworkReports';
-import { nowTimeInTZ } from '../utils/datetime';
+import { nowTimeInTZ, todayInTZ } from '../utils/datetime';
 import {
   getDateRestriction,
   clampDateRange,
@@ -71,7 +71,7 @@ import SavePresetButton from '../components/ui/SavePresetButton';
 import DataFreshness from '../components/ui/DataFreshness';
 import { SAVED_FILTERS_PAGES, getSavedFilters } from '../utils/savedFilters';
 import { PRESET_PAGES, filtersOnlySnapshot } from '../utils/reportPresets';
-import { getLastPageFilters, saveLastPageFilters, LAST_FILTER_PAGES } from '../utils/lastPageFilters';
+import { getLastPageFilters, saveLastPageFilters, clearLastPageFilters, LAST_FILTER_PAGES } from '../utils/lastPageFilters';
 import { downloadCsv, downloadExcel, exportCellValue } from '../utils/tableExport';
 
 const PAGE_SIZE = 50;
@@ -439,6 +439,26 @@ export default function Reporting() {
     if (last.reportSettings && Object.keys(last.reportSettings).length) {
       setReportSettings(last.reportSettings);
     }
+    const nextApplied = {
+      ...r,
+      domain: last.domain?.length ? last.domain : [],
+      site: last.site?.length ? last.site : [],
+      domainName: last.domainName?.length ? last.domainName : [],
+      domainId: last.domainId?.length ? last.domainId : [],
+      country: last.country?.length ? last.country : [],
+      reportDimensions: last.reportDimensions?.length
+        ? last.reportDimensions
+        : [...DEFAULT_REPORT_DIMENSIONS],
+      reportMetrics: last.reportMetrics?.length
+        ? last.reportMetrics
+        : [...DEFAULT_REPORT_METRICS],
+      reportSettings: last.reportSettings && Object.keys(last.reportSettings).length
+        ? last.reportSettings
+        : DEFAULT_REPORT_SETTINGS,
+    };
+    setApplied((prev) => ({ ...prev, ...nextApplied }));
+    setHasApplied(true);
+    skipInitialLoadRef.current = false;
   }, [searchParams, user?.id, dateRestriction]);
 
   useEffect(() => {
@@ -773,6 +793,8 @@ export default function Reporting() {
     if (!hasApplied) return;
     if (skipInitialLoadRef.current) {
       skipInitialLoadRef.current = false;
+      // Paint cache, then refresh so F5 never sticks on stale report rows.
+      loadRef.current(true);
       return;
     }
     reportCacheRef.current.clear();
@@ -1030,17 +1052,28 @@ export default function Reporting() {
       setData(null);
       setProgData(null);
     }
-    if (scopedAutoLoad) {
-      setApplied(buildScopedApplied(r));
-    } else {
-      setApplied((prev) => ({ ...prev, startDate: r.startDate, endDate: r.endDate }));
+    // Keep inventory + dims/metrics — only update dates (do not rebuild full scoped inventory).
+    setApplied((prev) => ({
+      ...prev,
+      startDate: r.startDate,
+      endDate: r.endDate,
+    }));
+    if (scopedAutoLoad || hasApplied) {
+      setHasApplied(true);
     }
   };
 
   const applyFilter = () => {
     if (!canRunReport) return;
-    if (customDatesIncomplete) return;
-    const dates = clampDateRange(startDate, endDate, dateRestriction);
+    let sd = startDate;
+    let ed = endDate;
+    if (preset === 'custom') {
+      const today = todayInTZ();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(sd || ''))) sd = /^\d{4}-\d{2}-\d{2}$/.test(String(ed || '')) ? ed : today;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ed || ''))) ed = /^\d{4}-\d{2}-\d{2}$/.test(String(sd || '')) ? sd : today;
+      if (sd > ed) { const t = sd; sd = ed; ed = t; }
+    }
+    const dates = clampDateRange(sd, ed, dateRestriction);
     setStartDate(dates.startDate);
     setEndDate(dates.endDate);
     setPage(1);
@@ -1094,7 +1127,7 @@ export default function Reporting() {
     const rangeLabel = dates.startDate === dates.endDate
       ? dates.startDate
       : `${dates.startDate} → ${dates.endDate}`;
-    showToast({ message: `Loaded ${rangeLabel}` });
+    showToast({ message: `Loaded ${rangeLabel}`, replaceKey: 'filter-loaded' });
   };
 
   const applyQuickView = (view) => {
@@ -1517,6 +1550,7 @@ export default function Reporting() {
     setRecentFilters([]);
     setActiveQuickView(null);
     setSegmentFilter(null);
+    clearLastPageFilters(LAST_FILTER_PAGES.reporting, user?.id);
     dispatch(saveReportPage({ pageKey: 'reporting', payload: null }));
     setApplied({
       ...r,
@@ -1529,6 +1563,7 @@ export default function Reporting() {
     setSearchParams({}, { replace: true });
     showToast({
       message: 'Filters cleared',
+      replaceKey: 'filter-status',
       actionLabel: 'Undo',
       onAction: () => {
         const snap = undoSnapRef.current;
@@ -1569,7 +1604,7 @@ export default function Reporting() {
   useReportHotkeys({
     enabled: canGenerate && canFilter,
     onApply: () => {
-      if (!canRunReport || customDatesIncomplete) return;
+      if (!canRunReport) return;
       applyFilter();
     },
     onReset: reset,
@@ -1683,10 +1718,8 @@ export default function Reporting() {
             Historical report {filtersOpen ? '▾' : '▸'}
           </button>
           <div className="filter-actions filter-actions--desktop">
-            <button className="btn-generate" onClick={applyFilter} disabled={!canFilter || !canRunReport || customDatesIncomplete}
-              title={customDatesIncomplete
-                ? 'Select both start and end dates, then click Apply Filter'
-                : (!canRunReport ? 'Select at least one dimension, metric, or inventory filter' : (canFilter ? '' : 'You do not have permission to apply filters'))}>✓ Apply Filter</button>
+            <button className="btn-generate" onClick={applyFilter} disabled={!canFilter || !canRunReport}
+              title={!canRunReport ? 'Select at least one dimension, metric, or inventory filter' : (canFilter ? '' : 'You do not have permission to apply filters')}>✓ Apply Filter</button>
             <SavedFiltersBar
               page={SAVED_FILTERS_PAGES.reporting}
               userId={user?.id}
@@ -1853,10 +1886,8 @@ export default function Reporting() {
         )}
         {filtersOpen && canFilter && (
           <div className="filter-actions-foot">
-            <button className="btn-generate" onClick={applyFilter} disabled={!canRunReport || customDatesIncomplete}
-              title={customDatesIncomplete
-                ? 'Select both start and end dates, then click Apply Filter'
-                : (!canRunReport ? 'Select at least one dimension, metric, or inventory filter' : '')}>
+            <button className="btn-generate" onClick={applyFilter} disabled={!canRunReport}
+              title={!canRunReport ? 'Select at least one dimension, metric, or inventory filter' : ''}>
               ✓ Apply Filter
             </button>
             <button className="btn-reset" onClick={reset}>↺ Reset</button>
@@ -2125,10 +2156,8 @@ export default function Reporting() {
             <button
               className="btn-generate"
               onClick={applyFilter}
-              disabled={!canRunReport || customDatesIncomplete}
-              title={customDatesIncomplete
-                ? 'Select both start and end dates, then click Apply Filter'
-                : (!canRunReport ? 'Select at least one dimension, metric, or inventory filter' : '')}
+              disabled={!canRunReport}
+              title={!canRunReport ? 'Select at least one dimension, metric, or inventory filter' : ''}
             >
               ✓ Apply Filter
             </button>

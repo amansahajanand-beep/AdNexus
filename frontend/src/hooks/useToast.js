@@ -2,16 +2,23 @@ import { useCallback, useEffect, useState } from 'react';
 
 const TOAST_EVENT = 'adnexus-toast';
 
+/**
+ * Show a toast. Pass replaceKey (or reuse the same message) to replace an
+ * existing toast instead of stacking duplicates on rapid Apply/Reset.
+ */
 export function showToast({
   message,
   actionLabel,
   onAction,
   timeout = 4200,
+  replaceKey = null,
 } = {}) {
   if (!message) return;
+  const key = replaceKey || message;
   window.dispatchEvent(new CustomEvent(TOAST_EVENT, {
     detail: {
-      id: `t_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      id: `t_${key}_${Date.now()}`,
+      replaceKey: key,
       message,
       actionLabel: actionLabel || null,
       onAction: onAction || null,
@@ -27,7 +34,11 @@ export function useToasts() {
     const onToast = (e) => {
       const t = e.detail;
       if (!t?.message) return;
-      setToasts((prev) => [...prev.slice(-2), t]);
+      setToasts((prev) => {
+        const key = t.replaceKey || t.message;
+        const without = prev.filter((x) => (x.replaceKey || x.message) !== key);
+        return [...without.slice(-2), t];
+      });
     };
     window.addEventListener(TOAST_EVENT, onToast);
     return () => window.removeEventListener(TOAST_EVENT, onToast);
