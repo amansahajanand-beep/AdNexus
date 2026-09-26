@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
 import { useDispatch } from 'react-redux';
-import { networkAPI, clientsAPI, setToken } from '../../utils/api';
+import { networkAPI, clientsAPI, setToken, admobAPI, adsenseAPI } from '../../utils/api';
 import { useAuth } from '../../store/useAuth';
 import { authSuccess } from '../../store/actions/authActions';
 import { clearReportPages } from '../../store/slices/reportSlice';
@@ -11,12 +11,19 @@ import BrandLogo from '../ui/BrandLogo';
 import ToastStack from '../ui/ToastStack';
 import CommandPalette from '../ui/CommandPalette';
 import DataFreshness from '../ui/DataFreshness';
+import ProductSwitcher from '../ui/ProductSwitcher';
 import { ConfirmDialogHost } from '../../hooks/useConfirmDialog';
 import { rememberLastRoute } from '../../utils/lastRoute';
 import { APP_TIMEZONE } from '../../utils/datetime';
-import { buildFreshnessLabel } from '../../utils/dataFreshness';
+import { buildFreshnessLabel, buildPublisherFreshnessLabel, relativeFreshness } from '../../utils/dataFreshness';
 import { applyTheme, isDarkTheme, readStoredTheme } from '../../utils/theme';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
+import {
+  resolveActiveProduct,
+  writeStoredProduct,
+  getProduct,
+  navItemsForProduct,
+} from '../../utils/productWorkspace';
 import {
   NavIcon,
   Sun,
@@ -32,17 +39,33 @@ import {
 } from '../ui/Icon';
 
 const FOCUS_KEY = 'adnexus.focusMode';
+const ADMOB_ACCOUNT_KEY = 'adnexus.admobViewAccountId';
 
-const NAV_ITEMS = [
-  { to: '/dashboard', label: 'Dashboard', page: 'dashboard' },
-  { to: '/reporting', label: 'Reporting', page: 'reporting' },
-  { to: '/roi', label: 'ROI', page: 'roi' },
-  { to: '/my-ads', label: 'Google Ads', page: 'my-ads' },
-  { to: '/presets', label: 'Presets', page: 'presets' },
-  { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
-  { to: '/domain-user', label: 'Domain User', page: 'domain-user' },
-  { to: '/help', label: 'Help', page: 'help', always: true },
-];
+function readStoredAdmobAccountId() {
+  try {
+    return localStorage.getItem(ADMOB_ACCOUNT_KEY) || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredAdmobAccountId(id) {
+  try {
+    if (id) localStorage.setItem(ADMOB_ACCOUNT_KEY, id);
+    else localStorage.removeItem(ADMOB_ACCOUNT_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function admobAccountLabel(a) {
+  if (!a) return 'AdMob';
+  const name = a.descriptiveName || a.accountId || 'AdMob account';
+  if (a.accountId && a.descriptiveName && a.descriptiveName !== a.accountId) {
+    return `${a.descriptiveName} · ${a.accountId}`;
+  }
+  return name;
+}
 
 function statusLabel(isMock, authError) {
   if (isMock) return 'Mock';
@@ -74,7 +97,7 @@ function networkOptionLabel(n) {
 
 export default function Layout() {
   const { user, isAdmin, logout } = useAuth();
-  const { canPage, hasAnyPage } = usePermissions();
+  const { canPage, hasAnyPage, visibility } = usePermissions();
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const location = useLocation();
@@ -88,6 +111,12 @@ export default function Layout() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [focusMode, setFocusMode] = useState(readFocusMode);
   const [darkMode, setDarkMode] = useState(() => readStoredTheme() === 'dark');
+  const [publisherFreshness, setPublisherFreshness] = useState(null);
+  const [publisherAccountLabel, setPublisherAccountLabel] = useState(null);
+  const [admobAccounts, setAdmobAccounts] = useState([]);
+  const [viewAdmobAccountId, setViewAdmobAccountId] = useState(() => (
+    isAdmin ? readStoredAdmobAccountId() : null
+  ));
   const userRef = useRef(null);
 
   const toggleFocusMode = useCallback(() => {
@@ -266,23 +295,134 @@ export default function Layout() {
     if (profileRoute) go(profileRoute);
   };
 
+  const activeProduct = resolveActiveProduct(location.pathname);
+  const productMeta = getProduct(activeProduct);
+
+  const allowedProducts = React.useMemo(() => {
+    const ids = [];
+    const pages = visibility?.pages || {};
+    if (isAdmin || pages.dashboard || pages.reporting || pages.roi || pages.myAds || pages.domainUser) {
+      ids.push('gam');
+    }
+    if (isAdmin || pages.admob !== false) ids.push('admob');
+    if (isAdmin || pages.adsense !== false) ids.push('adsense');
+    return ids.length ? ids : ['gam'];
+  }, [visibility, isAdmin]);
+
+  const handleProductChange = useCallback((nextId) => {
+    writeStoredProduct(nextId);
+    const home = getProduct(nextId).home;
+    navigate(home);
+    setMenuOpen(false);
+  }, [navigate]);
+
+  useEffect(() => {
+    writeStoredProduct(activeProduct);
+    document.documentElement.setAttribute('data-product', activeProduct);
+    return () => {
+      document.documentElement.removeAttribute('data-product');
+    };
+  }, [activeProduct]);
+
+  useEffect(() => {
+    if (activeProduct !== 'admob' && activeProduct !== 'adsense') {
+      setPublisherFreshness(null);
+      setPublisherAccountLabel(null);
+      return undefined;
+    }
+    let cancelled = false;
+    const api = activeProduct === 'admob' ? admobAPI : adsenseAPI;
+    const freshParams = activeProduct === 'admob' && isAdmin && viewAdmobAccountId
+      ? { accountId: viewAdmobAccountId }
+      : undefined;
+    (async () => {
+      try {
+        const fresh = await api.freshness(freshParams).catch(() => null);
+        if (cancelled) return;
+        setPublisherFreshness(fresh);
+        if (activeProduct === 'admob' && isAdmin && admobAccounts.length) {
+          const selected = admobAccounts.find((a) => a.id === viewAdmobAccountId) || admobAccounts[0];
+          setPublisherAccountLabel(admobAccountLabel(selected) || fresh?.accountLabel || 'AdMob');
+        } else {
+          setPublisherAccountLabel(
+            fresh?.accountLabel
+            || (fresh?.accountCount
+              ? `${fresh.accountCount} account${fresh.accountCount === 1 ? '' : 's'}`
+              : (activeProduct === 'admob' ? 'No AdMob account' : 'No AdSense account'))
+          );
+        }
+      } catch {
+        if (!cancelled) {
+          setPublisherFreshness(null);
+          setPublisherAccountLabel(null);
+        }
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeProduct, isAdmin, viewAdmobAccountId, admobAccounts]);
+
+  // Admin: load AdMob accounts for switcher (scoped to current GAM client).
+  useEffect(() => {
+    if (!isAdmin || activeProduct !== 'admob') {
+      if (activeProduct !== 'admob') setAdmobAccounts([]);
+      return undefined;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await admobAPI.listAccounts();
+        if (cancelled) return;
+        const list = (res?.accounts || []).filter((a) => a.hasRefreshToken && a.isActive !== false);
+        setAdmobAccounts(list);
+        setViewAdmobAccountId((prev) => {
+          const stored = prev || readStoredAdmobAccountId();
+          if (stored && list.some((a) => a.id === stored)) {
+            writeStoredAdmobAccountId(stored);
+            return stored;
+          }
+          const next = list[0]?.id || null;
+          writeStoredAdmobAccountId(next);
+          return next;
+        });
+      } catch (err) {
+        logErrorForDebug(err, 'admob accounts');
+        if (!cancelled) setAdmobAccounts([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [isAdmin, activeProduct, viewClientId]);
+
+  const switchAdmobAccount = useCallback((accountId) => {
+    if (!accountId) return;
+    setViewAdmobAccountId(accountId);
+    writeStoredAdmobAccountId(accountId);
+    const selected = admobAccounts.find((a) => a.id === accountId);
+    if (selected) setPublisherAccountLabel(admobAccountLabel(selected));
+  }, [admobAccounts]);
+
   const initial = (user?.username || 'U').charAt(0).toUpperCase();
-  const navItems = NAV_ITEMS.filter((i) => {
+  const navItems = navItemsForProduct(activeProduct).filter((i) => {
     if (i.adminOnly) return isAdmin;
     if (i.always) return true;
     if (i.page) return canPage(i.page);
     return true;
   });
 
-  const noInventoryAssigned = !!user && user.role !== 'admin' && !hasAssignedInventory(user);
+  const noInventoryAssigned = !!user && user.role !== 'admin' && !hasAssignedInventory(user)
+    && activeProduct === 'gam';
   const noAccess = !!user && !isAdmin && (!hasAnyPage || noInventoryAssigned);
-  const authError = !isMock && networkInfo?.authError;
+  const authError = activeProduct === 'gam' && !isMock && networkInfo?.authError;
   const liveText = statusLabel(isMock, authError);
   const liveClass = `live-dot header-live${isMock ? ' is-mock' : ''}${authError ? ' is-auth-error' : ''}`;
   const currencyCode = networkInfo?.currencyCode || 'USD';
   const tzShort = APP_TIMEZONE === 'Asia/Singapore' ? 'SGT' : APP_TIMEZONE;
-  const freshnessTitle = buildFreshnessLabel(networkInfo, { tzLabel: tzShort })
-    || liveText;
+  const publisherSyncAt = publisherFreshness?.lastSyncAt || null;
+  const freshnessTitle = activeProduct === 'gam'
+    ? (buildFreshnessLabel(networkInfo, { tzLabel: tzShort }) || liveText)
+    : (buildPublisherFreshnessLabel(publisherSyncAt, {
+      productLabel: productMeta.label,
+      tzLabel: tzShort,
+    }) || liveText);
 
   const gv = networkInfo?.gamVersion;
   const verStatus = gv?.status;
@@ -298,6 +438,8 @@ export default function Layout() {
   })();
 
   const canSwitchNetwork = accountNetworks.length > 1;
+  const canSwitchAdmobAccount = isAdmin && admobAccounts.length > 1;
+  const activeAdmobAccount = admobAccounts.find((a) => a.id === viewAdmobAccountId) || admobAccounts[0] || null;
   const activeNetwork = accountNetworks.find((n) => n.id === viewClientId)
     || accountNetworks.find((n) => n.id === user?.clientId)
     || null;
@@ -349,10 +491,16 @@ export default function Layout() {
       )}
 
       <div className="app-shell-body">
-        <aside className={`app-sidebar ${menuOpen ? 'open' : ''}${focusMode ? ' is-collapsed' : ''}`}>
+        <aside className={`app-sidebar app-sidebar--${activeProduct} ${menuOpen ? 'open' : ''}${focusMode ? ' is-collapsed' : ''}`}>
           <div className="sidebar-top">
             <BrandLogo showTitle={!focusMode} markSize={focusMode ? 26 : 28} />
-            {!focusMode && (networkInfo || accountNetworks.length > 0) && (
+            <ProductSwitcher
+              productId={activeProduct}
+              onChange={handleProductChange}
+              compact={focusMode}
+              allowedProductIds={allowedProducts}
+            />
+            {!focusMode && activeProduct === 'gam' && (networkInfo || accountNetworks.length > 0) && (
               canSwitchNetwork ? (
                 <label className="network-switch-wrap" title="Switch network for Dashboard & Reporting">
                   <span className="sr-only">Active network</span>
@@ -376,8 +524,34 @@ export default function Layout() {
                 </span>
               )
             )}
+            {!focusMode && activeProduct === 'admob' && (
+              canSwitchAdmobAccount ? (
+                <label className="network-switch-wrap" title="Switch AdMob account (admin)">
+                  <span className="sr-only">Active AdMob account</span>
+                  <select
+                    className="network-label network-switch"
+                    value={viewAdmobAccountId || activeAdmobAccount?.id || ''}
+                    onChange={(e) => switchAdmobAccount(e.target.value)}
+                    aria-label="Switch AdMob account"
+                  >
+                    {admobAccounts.map((a) => (
+                      <option key={a.id} value={a.id}>{admobAccountLabel(a)}</option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                <span className="network-label" title="AdMob account">
+                  {admobAccountLabel(activeAdmobAccount) || publisherAccountLabel || 'AdMob'}
+                </span>
+              )
+            )}
+            {!focusMode && activeProduct === 'adsense' && (
+              <span className="network-label" title="AdSense account">
+                {publisherAccountLabel || 'AdSense'}
+              </span>
+            )}
             {!focusMode && (
-              <span className="context-chip context-chip--sidebar" title={`Currency ${currencyCode} · ${APP_TIMEZONE}`}>
+              <span className="context-chip context-chip--sidebar" title={`${productMeta.fullLabel} · ${currencyCode} · ${APP_TIMEZONE}`}>
                 {currencyCode} · {tzShort}
               </span>
             )}
@@ -430,8 +604,18 @@ export default function Layout() {
             <div className={liveClass} title={freshnessTitle}>
               <span className="dot-pulse" />
               <span className="live-dot-label">{liveText}</span>
-              {!focusMode && !authError && networkInfo && (networkInfo.gamLastSyncedAt || networkInfo.adsLastSyncedAt) && (
+              {!focusMode && !authError && activeProduct === 'gam' && networkInfo
+                && (networkInfo.gamLastSyncedAt || networkInfo.adsLastSyncedAt) && (
                 <DataFreshness networkInfo={networkInfo} tzLabel={tzShort} compact className="live-dot-fresh" />
+              )}
+              {!focusMode && !authError && (activeProduct === 'admob' || activeProduct === 'adsense')
+                && publisherSyncAt && (
+                <span
+                  className="data-freshness data-freshness--compact live-dot-fresh"
+                  title={new Date(publisherSyncAt).toLocaleString()}
+                >
+                  Synced {relativeFreshness(publisherSyncAt) || '—'}
+                </span>
               )}
             </div>
             <div className="user-menu" ref={userRef}>
@@ -536,6 +720,11 @@ export default function Layout() {
                   accountNetworks,
                   switchNetwork,
                   switchingNetwork,
+                  activeProduct,
+                  viewAdmobAccountId: isAdmin ? (viewAdmobAccountId || null) : null,
+                  admobAccounts,
+                  switchAdmobAccount,
+                  canSwitchAdmobAccount,
                 }}
               />
             )}

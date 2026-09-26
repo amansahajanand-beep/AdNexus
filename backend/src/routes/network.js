@@ -130,7 +130,14 @@ router.get('/info', async (req, res) => {
     cache.set(tenantKey('network_info'), info, 3600);
     res.json({ ...info, gamVersion, ...networkMeta });
   } catch (err) {
-    logger.error('Network info error:', err.message);
+    const soapSnippet = typeof err?.response?.data === 'string'
+      ? String(err.response.data).replace(/\s+/g, ' ').slice(0, 240)
+      : '';
+    logger.error(
+      'Network info error:',
+      err.message,
+      soapSnippet ? `| ${soapSnippet}` : ''
+    );
     const classified = classifyGoogleAuthError(err);
     if (classified) {
       return res.status(classified.status).json({ ...classified, gamVersion, ...networkMeta });

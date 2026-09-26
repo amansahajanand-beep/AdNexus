@@ -475,7 +475,7 @@ async function initSchema() {
 
     CREATE TABLE IF NOT EXISTS oauth_pending_sessions (
       id UUID PRIMARY KEY,
-      product TEXT NOT NULL CHECK (product IN ('ads', 'gam')),
+      product TEXT NOT NULL CHECK (product IN ('ads', 'gam', 'admob', 'adsense')),
       mode TEXT NOT NULL DEFAULT 'connect',
       client_id UUID REFERENCES gam_clients(id) ON DELETE CASCADE,
       refresh_token_enc TEXT,
@@ -551,6 +551,169 @@ async function initSchema() {
       updated_at TIMESTAMPTZ DEFAULT now()
     );
   `);
+
+  // AdMob + AdSense publisher accounts & daily reports
+  await schemaQuery(`
+    CREATE TABLE IF NOT EXISTS admob_accounts (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id TEXT NOT NULL DEFAULT '',
+      descriptive_name TEXT NOT NULL DEFAULT '',
+      currency_code CHAR(3) NOT NULL DEFAULT 'USD',
+      google_refresh_token_enc TEXT,
+      is_active BOOLEAN DEFAULT true,
+      last_sync_at TIMESTAMPTZ,
+      last_sync_error TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (client_id, account_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS adsense_accounts (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id TEXT NOT NULL DEFAULT '',
+      descriptive_name TEXT NOT NULL DEFAULT '',
+      currency_code CHAR(3) NOT NULL DEFAULT 'USD',
+      google_refresh_token_enc TEXT,
+      is_active BOOLEAN DEFAULT true,
+      last_sync_at TIMESTAMPTZ,
+      last_sync_error TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (client_id, account_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS admob_report_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id UUID NOT NULL REFERENCES admob_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      earnings DOUBLE PRECISION NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      clicks BIGINT NOT NULL DEFAULT 0,
+      ad_requests BIGINT NOT NULL DEFAULT 0,
+      matched_requests BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, account_id, report_date)
+    );
+
+    CREATE TABLE IF NOT EXISTS adsense_report_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id UUID NOT NULL REFERENCES adsense_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      earnings DOUBLE PRECISION NOT NULL DEFAULT 0,
+      page_views BIGINT NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      clicks BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, account_id, report_date)
+    );
+
+    -- Precomputed daily KPIs (fast dashboard reads)
+    CREATE TABLE IF NOT EXISTS admob_rollup_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id UUID NOT NULL REFERENCES admob_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      earnings DOUBLE PRECISION NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      clicks BIGINT NOT NULL DEFAULT 0,
+      ad_requests BIGINT NOT NULL DEFAULT 0,
+      matched_requests BIGINT NOT NULL DEFAULT 0,
+      ctr REAL,
+      ecpm REAL,
+      match_rate REAL,
+      currency CHAR(3) NOT NULL DEFAULT 'USD',
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (client_id, account_id, report_date)
+    );
+
+    CREATE TABLE IF NOT EXISTS adsense_rollup_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id UUID NOT NULL REFERENCES adsense_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      earnings DOUBLE PRECISION NOT NULL DEFAULT 0,
+      page_views BIGINT NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      clicks BIGINT NOT NULL DEFAULT 0,
+      ctr REAL,
+      rpm REAL,
+      ecpm REAL,
+      currency CHAR(3) NOT NULL DEFAULT 'USD',
+      synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (client_id, account_id, report_date)
+    );
+
+    -- Dimension breakdowns (app/format/country/… and site/country/…)
+    CREATE TABLE IF NOT EXISTS admob_dim_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id UUID NOT NULL REFERENCES admob_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      dim_kind TEXT NOT NULL,
+      dim_value TEXT NOT NULL DEFAULT '',
+      earnings DOUBLE PRECISION NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      clicks BIGINT NOT NULL DEFAULT 0,
+      ad_requests BIGINT NOT NULL DEFAULT 0,
+      matched_requests BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, account_id, report_date, dim_kind, dim_value)
+    );
+
+    CREATE TABLE IF NOT EXISTS adsense_dim_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id UUID NOT NULL REFERENCES adsense_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      dim_kind TEXT NOT NULL,
+      dim_value TEXT NOT NULL DEFAULT '',
+      earnings DOUBLE PRECISION NOT NULL DEFAULT 0,
+      page_views BIGINT NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      clicks BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, account_id, report_date, dim_kind, dim_value)
+    );
+  `);
+
+  try {
+    await schemaQuery(`ALTER TABLE admob_accounts ADD COLUMN IF NOT EXISTS reporting_time_zone TEXT`);
+    await schemaQuery(`ALTER TABLE adsense_accounts ADD COLUMN IF NOT EXISTS reporting_time_zone TEXT`);
+  } catch (e) {
+    logger.warn('publisher reporting_time_zone column:', e.message);
+  }
+
+  try {
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_admob_accounts_client ON admob_accounts (client_id)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_adsense_accounts_client ON adsense_accounts (client_id)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_admob_report_client_date ON admob_report_daily (client_id, report_date)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_adsense_report_client_date ON adsense_report_daily (client_id, report_date)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_admob_rollup_client_date ON admob_rollup_daily (client_id, report_date DESC)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_adsense_rollup_client_date ON adsense_rollup_daily (client_id, report_date DESC)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_admob_dim_kind ON admob_dim_daily (client_id, account_id, dim_kind, report_date)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_adsense_dim_kind ON adsense_dim_daily (client_id, account_id, dim_kind, report_date)`);
+  } catch (e) {
+    logger.warn('admob/adsense indexes:', e.message);
+  }
+
+  // Widen oauth_pending product check for AdMob / AdSense
+  try {
+    await schemaQuery(`
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.table_constraints
+          WHERE table_name = 'oauth_pending_sessions'
+            AND constraint_name = 'oauth_pending_sessions_product_check'
+        ) THEN
+          ALTER TABLE oauth_pending_sessions DROP CONSTRAINT oauth_pending_sessions_product_check;
+        END IF;
+        ALTER TABLE oauth_pending_sessions
+          ADD CONSTRAINT oauth_pending_sessions_product_check
+          CHECK (product IN ('ads', 'gam', 'admob', 'adsense'));
+      END $$;
+    `);
+  } catch (e) {
+    logger.warn('oauth_pending product check migrate:', e.message);
+  }
 
   try {
     // Existing installs may have created_by as UUID; app user ids are TEXT (e.g. user-…).
@@ -722,6 +885,14 @@ const TENANT_TABLES = [
   'ads_campaign_map',
   'ads_spend_daily',
   'roi_other_expenses',
+  'admob_accounts',
+  'adsense_accounts',
+  'admob_report_daily',
+  'adsense_report_daily',
+  'admob_rollup_daily',
+  'adsense_rollup_daily',
+  'admob_dim_daily',
+  'adsense_dim_daily',
 ];
 
 function safeIdent(name) {

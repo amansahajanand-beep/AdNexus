@@ -469,6 +469,8 @@ const DEFAULT_CHILD_PERMISSIONS = {
   canAccessRoi: true,
   canAccessDomainUser: true,
   canAccessMyAds: true,
+  canAccessAdMob: true,
+  canAccessAdSense: true,
   canLogin: true,
   canGenerateReports: true,
   canDownloadReports: true,
@@ -491,6 +493,7 @@ const DEFAULT_CHILD_PERMISSIONS = {
 
 const FLAG_KEYS = [
   'canAccessDashboard', 'canAccessReporting', 'canAccessRoi', 'canAccessDomainUser', 'canAccessMyAds',
+  'canAccessAdMob', 'canAccessAdSense',
   'canLogin', 'canGenerateReports', 'canDownloadReports', 'canUseFilters', 'canUseReportBuilder',
   'canSeeRevenue', 'canSeeImpressions', 'canSeeCTR', 'canSeeECPM', 'canSeeProgrammatic',
   'canSeeOrders', 'canSeeInventory',
@@ -608,6 +611,12 @@ function canAccessPage(user, page) {
     roi: 'canAccessRoi',
     'domain-user': 'canAccessDomainUser',
     'my-ads': 'canAccessMyAds',
+    'admob-dashboard': 'canAccessAdMob',
+    'admob-reporting': 'canAccessAdMob',
+    'adsense-dashboard': 'canAccessAdSense',
+    'adsense-sites': 'canAccessAdSense',
+    'adsense-ad-units': 'canAccessAdSense',
+    'adsense-reporting': 'canAccessAdSense',
     admin: null,
   };
   if ((page === 'domain-user' || page === 'my-ads') && isAdmin(user)) return false;
@@ -620,7 +629,15 @@ function canAccessPage(user, page) {
 function buildVisibility(user) {
   if (isAdmin(user)) {
     return {
-      pages: { dashboard: true, reporting: true, roi: true, domainUser: false, myAds: false },
+      pages: {
+        dashboard: true,
+        reporting: true,
+        roi: true,
+        domainUser: false,
+        myAds: false,
+        admob: true,
+        adsense: true,
+      },
       revenue: true, impressions: true, ctr: true, ecpm: true, programmatic: true,
       generate: true, download: true, filters: true, reportBuilder: true,
       orders: true, inventory: true,
@@ -634,6 +651,8 @@ function buildVisibility(user) {
       roi: p.canAccessRoi !== false,
       domainUser: p.canAccessDomainUser !== false,
       myAds: p.canAccessMyAds !== false,
+      admob: p.canAccessAdMob !== false,
+      adsense: p.canAccessAdSense !== false,
     },
     revenue: p.canSeeRevenue !== false,
     impressions: p.canSeeImpressions !== false,

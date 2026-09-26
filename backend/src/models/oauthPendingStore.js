@@ -11,7 +11,7 @@ async function ensureTable() {
   await schemaQuery(`
     CREATE TABLE IF NOT EXISTS oauth_pending_sessions (
       id UUID PRIMARY KEY,
-      product TEXT NOT NULL CHECK (product IN ('ads', 'gam')),
+      product TEXT NOT NULL CHECK (product IN ('ads', 'gam', 'admob', 'adsense')),
       mode TEXT NOT NULL DEFAULT 'connect',
       client_id UUID REFERENCES gam_clients(id) ON DELETE CASCADE,
       refresh_token_enc TEXT,

@@ -402,6 +402,46 @@ export const adsAPI = {
   mySync: (payload) => FAST_API.post('/ads/my/sync', payload || {}),
 };
 
+export const admobAPI = {
+  health: () => FAST_API.get('/admob/health'),
+  listAccounts: () => FAST_API.get('/admob/accounts'),
+  oauthUrl: () => FAST_API.post('/admob/accounts/oauth-url'),
+  accountOauthUrl: (id) => FAST_API.get(`/admob/accounts/${id}/oauth-url`),
+  oauthPending: (id) => FAST_API.get(`/admob/oauth/pending/${id}`),
+  oauthSelect: (id, payload) => FAST_API.post(`/admob/oauth/pending/${id}/select`, payload),
+  updateAccount: (id, payload) => FAST_API.patch(`/admob/accounts/${id}`, payload),
+  deleteAccount: (id) => FAST_API.delete(`/admob/accounts/${id}`),
+  syncAll: (payload) => FAST_API.post('/admob/sync', payload || {}),
+  syncAccount: (id, payload) => FAST_API.post(`/admob/accounts/${id}/sync`, payload || {}),
+  kpis: (params) => FAST_API.get('/admob/kpis', { params }),
+  trend: (params) => FAST_API.get('/admob/trend', { params }),
+  overview: (params) => FAST_API.get('/admob/overview', { params }),
+  filters: (params) => FAST_API.get('/admob/filters', { params }),
+  breakdowns: (params) => FAST_API.get('/admob/breakdowns', { params }),
+  table: (params) => FAST_API.get('/admob/table', { params }),
+  freshness: (params) => FAST_API.get('/admob/freshness', { params }),
+};
+
+export const adsenseAPI = {
+  health: () => FAST_API.get('/adsense/health'),
+  listAccounts: () => FAST_API.get('/adsense/accounts'),
+  oauthUrl: () => FAST_API.post('/adsense/accounts/oauth-url'),
+  accountOauthUrl: (id) => FAST_API.get(`/adsense/accounts/${id}/oauth-url`),
+  oauthPending: (id) => FAST_API.get(`/adsense/oauth/pending/${id}`),
+  oauthSelect: (id, payload) => FAST_API.post(`/adsense/oauth/pending/${id}/select`, payload),
+  updateAccount: (id, payload) => FAST_API.patch(`/adsense/accounts/${id}`, payload),
+  deleteAccount: (id) => FAST_API.delete(`/adsense/accounts/${id}`),
+  syncAll: (payload) => FAST_API.post('/adsense/sync', payload || {}),
+  syncAccount: (id, payload) => FAST_API.post(`/adsense/accounts/${id}/sync`, payload || {}),
+  kpis: (params) => FAST_API.get('/adsense/kpis', { params }),
+  trend: (params) => FAST_API.get('/adsense/trend', { params }),
+  overview: (params) => FAST_API.get('/adsense/overview', { params }),
+  filters: (params) => FAST_API.get('/adsense/filters', { params }),
+  breakdowns: (params) => FAST_API.get('/adsense/breakdowns', { params }),
+  table: (params) => FAST_API.get('/adsense/table', { params }),
+  freshness: () => FAST_API.get('/adsense/freshness'),
+};
+
 export const roiAPI = {
   summary: (params, config) => FAST_API.get('/roi/summary', { params, ...config }),
 };

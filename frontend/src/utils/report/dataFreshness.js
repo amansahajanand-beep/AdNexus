@@ -55,6 +55,16 @@ export function buildFreshnessLabel(info, { fetchedAt = null, tzLabel = 'SGT' } 
   return parts.join(' · ') || null;
 }
 
+/** Short sync label for AdMob / AdSense (or any single lastSyncAt). */
+export function buildPublisherFreshnessLabel(lastSyncAt, {
+  productLabel = 'Sync',
+  tzLabel = 'SGT',
+} = {}) {
+  if (!lastSyncAt) return null;
+  const rel = relativeFreshness(lastSyncAt);
+  return `${productLabel} sync ${rel || formatFreshnessTime(lastSyncAt, tzLabel)}`;
+}
+
 function formatRelativeTime(iso) {
   if (!iso) return null;
   const ts = new Date(iso).getTime();

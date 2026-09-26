@@ -8,6 +8,8 @@ const logger = require('./utils/logger');
 
 const authRoutes = require('./routes/auth');
 const authAdsRoutes = require('./routes/authAds');
+const authAdmobRoutes = require('./routes/authAdmob');
+const authAdsenseRoutes = require('./routes/authAdsense');
 const sessionRoutes = require('./routes/session');
 const usersRoutes = require('./routes/users');
 const domainsRoutes = require('./routes/domains');
@@ -16,6 +18,8 @@ const ordersRoutes = require('./routes/orders');
 const inventoryRoutes = require('./routes/inventory');
 const networkRoutes = require('./routes/network');
 const adsRoutes = require('./routes/ads');
+const admobRoutes = require('./routes/admob');
+const adsenseRoutes = require('./routes/adsense');
 const roiRoutes = require('./routes/roi');
 const { initDB } = require('./models/userStore');
 const onboardRoutes = require('./routes/onboard');
@@ -110,9 +114,13 @@ async function startServer() {
   // Routes
   app.use('/auth', authRoutes);              // GAM Google OAuth helper
   app.use('/auth/ads', authAdsRoutes);       // Google Ads OAuth
+  app.use('/auth/admob', authAdmobRoutes);   // AdMob OAuth
+  app.use('/auth/adsense', authAdsenseRoutes); // AdSense OAuth
   app.use('/api/onboard', onboardRoutes);    // Public client self-onboard
   app.use('/api/clients', clientsRoutes);    // Client admin credential settings
   app.use('/api/ads', adsRoutes);            // Google Ads accounts / mapping / expenses
+  app.use('/api/admob', admobRoutes);        // AdMob accounts / overview
+  app.use('/api/adsense', adsenseRoutes);    // AdSense accounts / overview
   app.use('/api/roi', roiRoutes);            // ROI summary
   app.use('/api/auth', sessionRoutes);       // Dashboard user login/session
   app.use('/api/users', usersRoutes);        // Admin user management
@@ -207,9 +215,12 @@ async function startServer() {
       try {
         const { startWorker, startReportWorker } = require('./workers/gamSyncWorker');
         const { startAdsWorker } = require('./workers/adsSyncWorker');
+        const { startAdMobWorker, startAdSenseWorker } = require('./workers/publisherSyncWorker');
         startWorker();
         startReportWorker();
         startAdsWorker();
+        startAdMobWorker();
+        startAdSenseWorker();
       } catch (e) {
         logger.error('BullMQ worker failed to start — hourly sync jobs will NOT run:', e.message);
       }

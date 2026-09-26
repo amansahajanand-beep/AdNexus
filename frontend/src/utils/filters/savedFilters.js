@@ -20,6 +20,10 @@ export const SAVED_FILTER_NAME_MAX = 20;
 export const SAVED_FILTERS_PAGES = Object.freeze({
   dashboard: 'dashboard',
   reporting: 'reporting',
+  admob: 'admob',
+  adsense: 'adsense',
+  admobReporting: 'admob-reporting',
+  adsenseReporting: 'adsense-reporting',
 });
 
 function currentUserId() {
@@ -55,6 +59,11 @@ export function normalizeSavedSnapshot(f = {}) {
     reportSettings: f.reportSettings && typeof f.reportSettings === 'object'
       ? { ...f.reportSettings }
       : {},
+    apps: toArray(f.apps),
+    formats: toArray(f.formats),
+    countries: toArray(f.countries),
+    platforms: toArray(f.platforms),
+    sites: toArray(f.sites),
   };
 }
 
@@ -90,6 +99,11 @@ export function summaryFor(snapshot) {
   fmt('Ad Unit', p.domainName);
   fmt('App', p.domainId);
   fmt('Country', p.country);
+  fmt('App', p.apps);
+  fmt('Format', p.formats);
+  fmt('Country', p.countries);
+  fmt('Platform', p.platforms);
+  fmt('Site', p.sites);
   if (p.reportDimensions?.length) {
     parts.push(`Dims (${p.reportDimensions.length})`);
   }
@@ -241,6 +255,11 @@ export function hasSavableFilters(filter = {}) {
     || s.domainId.length
     || s.country.length
     || s.reportDimensions.length
+    || s.apps.length
+    || s.formats.length
+    || s.countries.length
+    || s.platforms.length
+    || s.sites.length
   );
 }
 

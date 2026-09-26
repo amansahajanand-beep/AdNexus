@@ -54,6 +54,12 @@ export default function CommandPalette() {
     if (canPage('my-ads')) {
       list.push({ id: 'my-ads', label: 'Google Ads', hint: 'Connect Ads accounts', to: '/my-ads' });
     }
+    if (canPage('admob-dashboard')) {
+      list.push({ id: 'admob', label: 'AdMob Dashboard', hint: 'Apps & mediation', to: '/admob/dashboard' });
+    }
+    if (canPage('adsense-dashboard')) {
+      list.push({ id: 'adsense', label: 'AdSense Dashboard', hint: 'Sites & content', to: '/adsense/dashboard' });
+    }
     if (canPage('presets')) {
       list.push({ id: 'presets', label: 'Presets', hint: 'Saved presets', to: '/presets' });
     }

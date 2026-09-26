@@ -34,6 +34,7 @@ import {
   Network,
   LayoutGrid,
   CircleHelp,
+  Newspaper,
 } from 'lucide-react';
 
 const NAV_ICONS = {
@@ -45,6 +46,12 @@ const NAV_ICONS = {
   'domain-user': UserRound,
   'my-ads': Megaphone,
   help: CircleHelp,
+  'admob-dashboard': LayoutDashboard,
+  'admob-reporting': BarChart3,
+  'adsense-dashboard': LayoutDashboard,
+  'adsense-sites': Newspaper,
+  'adsense-ad-units': LayoutGrid,
+  'adsense-reporting': BarChart3,
 };
 
 const FILTER_ICONS = {
@@ -152,4 +159,5 @@ export {
   Lock,
   Users,
   Megaphone,
+  Newspaper,
 };

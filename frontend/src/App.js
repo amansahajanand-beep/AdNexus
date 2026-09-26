@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { Routes, Route, useNavigate } from 'react-router-dom';
+import { Routes, Route, useNavigate, Navigate } from 'react-router-dom';
 import SuccessModal from './components/ui/SuccessModal';
 import Layout from './components/layout/Layout';
 import Login from './pages/Login';
@@ -15,6 +15,12 @@ import Help from './pages/Help';
 import PrivacyPolicy from './pages/PrivacyPolicy';
 import TermsOfService from './pages/TermsOfService';
 import About from './pages/About';
+import AdMobDashboard from './pages/admob/AdMobDashboard';
+import AdMobReporting from './pages/admob/AdMobReporting';
+import AdSenseDashboard from './pages/adsense/AdSenseDashboard';
+import AdSenseSites from './pages/adsense/AdSenseSites';
+import AdSenseAdUnits from './pages/adsense/AdSenseAdUnits';
+import AdSenseReporting from './pages/adsense/AdSenseReporting';
 import ProtectedRoute from './components/routing/ProtectedRoute';
 import AdminRoute from './components/routing/AdminRoute';
 import PermissionRoute from './components/routing/PermissionRoute';
@@ -123,6 +129,18 @@ function AppRoutes() {
         <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
         <Route path="/help" element={<Help />} />
+
+        <Route path="/admob" element={<PermissionRoute page="admob-dashboard"><Navigate to="/admob/dashboard" replace /></PermissionRoute>} />
+        <Route path="/admob/dashboard" element={<PermissionRoute page="admob-dashboard"><AdMobDashboard /></PermissionRoute>} />
+        <Route path="/admob/apps" element={<PermissionRoute page="admob-reporting"><Navigate to="/admob/reporting" replace /></PermissionRoute>} />
+        <Route path="/admob/ad-units" element={<PermissionRoute page="admob-reporting"><Navigate to="/admob/reporting" replace /></PermissionRoute>} />
+        <Route path="/admob/reporting" element={<PermissionRoute page="admob-reporting"><AdMobReporting /></PermissionRoute>} />
+
+        <Route path="/adsense" element={<PermissionRoute page="adsense-dashboard"><Navigate to="/adsense/dashboard" replace /></PermissionRoute>} />
+        <Route path="/adsense/dashboard" element={<PermissionRoute page="adsense-dashboard"><AdSenseDashboard /></PermissionRoute>} />
+        <Route path="/adsense/sites" element={<PermissionRoute page="adsense-sites"><AdSenseSites /></PermissionRoute>} />
+        <Route path="/adsense/ad-units" element={<PermissionRoute page="adsense-ad-units"><AdSenseAdUnits /></PermissionRoute>} />
+        <Route path="/adsense/reporting" element={<PermissionRoute page="adsense-reporting"><AdSenseReporting /></PermissionRoute>} />
       </Route>
 
       {/* Fallback */}

@@ -7,6 +7,8 @@ export const PERMISSION_SECTIONS = {
     { key: 'canAccessRoi', label: 'ROI', hint: 'Ads spend vs GAM earn & ROI %' },
     { key: 'canAccessMyAds', label: 'Google Ads', hint: 'Connect own Google Ads accounts' },
     { key: 'canAccessDomainUser', label: 'Domain User', hint: 'Per-domain earnings view' },
+    { key: 'canAccessAdMob', label: 'AdMob', hint: 'AdMob dashboards & reporting' },
+    { key: 'canAccessAdSense', label: 'AdSense', hint: 'AdSense dashboards & reporting' },
   ],
   actions: [
     { key: 'canLogin', label: 'Log in', hint: 'Allow user to sign in' },
@@ -105,7 +107,16 @@ export function hasPermission(user, key) {
 export function buildClientVisibility(user) {
   if (isAdmin(user)) {
     return {
-      pages: { dashboard: true, reporting: true, roi: true, domainUser: false, myAds: false, presets: true },
+      pages: {
+        dashboard: true,
+        reporting: true,
+        roi: true,
+        domainUser: false,
+        myAds: false,
+        presets: true,
+        admob: true,
+        adsense: true,
+      },
       revenue: true, impressions: true, ctr: true, ecpm: true, programmatic: true,
       generate: true, download: true, filters: true, reportBuilder: true,
       orders: true, inventory: true,
@@ -120,6 +131,8 @@ export function buildClientVisibility(user) {
       domainUser: p.canAccessDomainUser !== false,
       myAds: p.canAccessMyAds !== false,
       presets: p.canAccessDashboard !== false || p.canAccessReporting !== false,
+      admob: p.canAccessAdMob !== false,
+      adsense: p.canAccessAdSense !== false,
     },
     revenue: p.canSeeRevenue !== false,
     impressions: p.canSeeImpressions !== false,
@@ -142,6 +155,12 @@ export function canAccessPage(user, page) {
   if (page === 'presets') {
     return hasPermission(user, 'canAccessDashboard') || hasPermission(user, 'canAccessReporting');
   }
+  if (page === 'admob-dashboard' || page === 'admob-reporting') {
+    return hasPermission(user, 'canAccessAdMob');
+  }
+  if (page === 'adsense-dashboard' || page === 'adsense-sites' || page === 'adsense-ad-units' || page === 'adsense-reporting') {
+    return hasPermission(user, 'canAccessAdSense');
+  }
   const map = {
     dashboard: 'canAccessDashboard',
     reporting: 'canAccessReporting',
@@ -159,6 +178,8 @@ export function getDefaultHomeRoute(user) {
   if (vis.pages.dashboard) return '/dashboard';
   if (vis.pages.reporting) return '/reporting';
   if (vis.pages.roi) return '/roi';
+  if (vis.pages.admob) return '/admob/dashboard';
+  if (vis.pages.adsense) return '/adsense/dashboard';
   if (vis.pages.myAds) return '/my-ads';
   if (vis.pages.domainUser) return '/domain-user';
   return '/login';
@@ -167,7 +188,8 @@ export function getDefaultHomeRoute(user) {
 export function hasAnyPageAccess(user) {
   if (isAdmin(user)) return true;
   const vis = buildClientVisibility(user);
-  return vis.pages.dashboard || vis.pages.reporting || vis.pages.roi || vis.pages.myAds || vis.pages.domainUser;
+  return vis.pages.dashboard || vis.pages.reporting || vis.pages.roi
+    || vis.pages.myAds || vis.pages.domainUser || vis.pages.admob || vis.pages.adsense;
 }
 
 export function permissionsFromUser(user) {
@@ -195,6 +217,8 @@ export function permissionBadgeList(user) {
   if (p.canAccessRoi !== false) badges.push({ label: 'ROI', type: 'page' });
   if (p.canAccessMyAds !== false) badges.push({ label: 'Google Ads', type: 'page' });
   if (p.canAccessDomainUser !== false) badges.push({ label: 'Domain User', type: 'page' });
+  if (p.canAccessAdMob !== false) badges.push({ label: 'AdMob', type: 'page' });
+  if (p.canAccessAdSense !== false) badges.push({ label: 'AdSense', type: 'page' });
   if (p.canUseReportBuilder === false) badges.push({ label: 'No builder', type: 'off' });
   if (p.canSeeProgrammatic === false) badges.push({ label: 'No programmatic', type: 'off' });
   if (p.canSeeECPM === false) badges.push({ label: 'No eCPM', type: 'off' });

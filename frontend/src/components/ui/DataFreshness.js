@@ -1,5 +1,5 @@
 import React from 'react';
-import { buildFreshnessLabel, relativeFreshness } from '../../utils/dataFreshness';
+import { buildFreshnessLabel, buildPublisherFreshnessLabel, relativeFreshness } from '../../utils/dataFreshness';
 import { buildFreshnessHint } from '../../utils/report/dataFreshness';
 
 /**
@@ -10,10 +10,25 @@ export default function DataFreshness({
   networkInfo,
   status,
   fetchedAt = null,
+  lastSyncAt = null,
+  productLabel = null,
   tzLabel = 'SGT',
   className = '',
   compact = false,
 }) {
+  const publisherLabel = productLabel
+    ? buildPublisherFreshnessLabel(lastSyncAt || fetchedAt, { productLabel, tzLabel })
+    : null;
+  if (publisherLabel) {
+    return (
+      <span
+        className={`data-freshness freshness-ok ${className}`.trim()}
+        title={lastSyncAt || fetchedAt || publisherLabel}
+      >
+        {publisherLabel}
+      </span>
+    );
+  }
   const hintMode = coverage != null || status != null;
   const hint = hintMode ? buildFreshnessHint({ coverage, networkInfo, status }) : null;
 

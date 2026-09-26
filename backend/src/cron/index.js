@@ -754,6 +754,100 @@ function startCron() {
     });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── 4:15 AM daily: AdMob + AdSense report sync ───────────────────────────
+  cron.schedule('15 4 * * *', async () => {
+    const end = todayInTZ();
+    const admobLookback = parseInt(process.env.ADMOB_SYNC_LOOKBACK_DAYS || '30', 10) || 30;
+    const adsenseLookback = parseInt(process.env.ADSENSE_SYNC_LOOKBACK_DAYS || '30', 10) || 30;
+    try {
+      const { admobSyncQueue, adsenseSyncQueue } = require('../queues/publisherSync');
+      const { enqueueAdMobSync } = require('../services/admobSyncService');
+      const { enqueueAdSenseSync } = require('../services/adsenseSyncService');
+      await eachActiveClient(async (client) => {
+        const cid = client.id;
+        try {
+          const start = shiftYMD(end, -(admobLookback - 1));
+          const a = await enqueueAdMobSync(client, admobSyncQueue, {
+            startDate: start,
+            endDate: end,
+            jobIdPrefix: `admob-sync-daily-${cid.slice(0, 8)}-${end}`,
+            priority: 5,
+          });
+          if (a.jobs || a.ranInline) {
+            logger.info(`Cron: admob-sync-daily accounts=${a.accounts} jobs=${a.jobs || 0} client=${cid.slice(0, 8)}`);
+          }
+        } catch (e) {
+          logger.error('Cron: admob-sync-daily:', e.message);
+        }
+        try {
+          const start = shiftYMD(end, -(adsenseLookback - 1));
+          const a = await enqueueAdSenseSync(client, adsenseSyncQueue, {
+            startDate: start,
+            endDate: end,
+            jobIdPrefix: `adsense-sync-daily-${cid.slice(0, 8)}-${end}`,
+            priority: 5,
+          });
+          if (a.jobs || a.ranInline) {
+            logger.info(`Cron: adsense-sync-daily accounts=${a.accounts} jobs=${a.jobs || 0} client=${cid.slice(0, 8)}`);
+          }
+        } catch (e) {
+          logger.error('Cron: adsense-sync-daily:', e.message);
+        }
+      });
+    } catch (e) {
+      logger.error('Cron: publisher sync block:', e.message);
+    }
+  }, { timezone: 'Asia/Singapore' });
+
+  // ── Hourly: AdMob / AdSense today + yesterday refresh (AdMob UI keeps moving) ──
+  cron.schedule('20 * * * *', async () => {
+    const today = todayInTZ();
+    const yesterday = shiftYMD(today, -1);
+    try {
+      const { admobSyncQueue, adsenseSyncQueue } = require('../queues/publisherSync');
+      const { enqueueAdMobSync } = require('../services/admobSyncService');
+      const { enqueueAdSenseSync } = require('../services/adsenseSyncService');
+      const hourSlot = new Date().getHours();
+      await eachActiveClient(async (client) => {
+        const cid = client.id;
+        try {
+          const a = await enqueueAdMobSync(client, admobSyncQueue, {
+            startDate: yesterday,
+            endDate: today,
+            jobIdPrefix: `admob-sync-today-${cid.slice(0, 8)}-${today}-${hourSlot}`,
+            priority: 2,
+            jobName: 'admob-sync-account',
+          });
+          if (a.jobs) {
+            logger.info(
+              `Cron: admob-sync-today jobs=${a.jobs} client=${cid.slice(0, 8)} ${yesterday}→${today}`
+            );
+          }
+        } catch (e) {
+          logger.error('Cron: admob-sync-today:', e.message);
+        }
+        try {
+          const a = await enqueueAdSenseSync(client, adsenseSyncQueue, {
+            startDate: yesterday,
+            endDate: today,
+            jobIdPrefix: `adsense-sync-today-${cid.slice(0, 8)}-${today}-${hourSlot}`,
+            priority: 2,
+            jobName: 'adsense-sync-account',
+          });
+          if (a.jobs) {
+            logger.info(
+              `Cron: adsense-sync-today jobs=${a.jobs} client=${cid.slice(0, 8)} ${yesterday}→${today}`
+            );
+          }
+        } catch (e) {
+          logger.error('Cron: adsense-sync-today:', e.message);
+        }
+      });
+    } catch (e) {
+      logger.error('Cron: publisher today sync:', e.message);
+    }
+  }, { timezone: 'Asia/Singapore' });
+
   // ── Optional every-3h Ads recent catch-up (off by default — overlaps hourly/6h/4AM) ──
   // Set ADS_RECENT_CRON=true to enable.
   cron.schedule('45 */3 * * *', async () => {

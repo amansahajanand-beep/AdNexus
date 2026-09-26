@@ -65,6 +65,34 @@ const SECTIONS = [
     openLabel: 'Open in ROI',
     emptyPath: '/roi',
   },
+  {
+    page: PRESET_PAGES.admob,
+    label: 'AdMob Dashboard',
+    access: 'admob-dashboard',
+    openLabel: 'Open in AdMob',
+    emptyPath: '/admob/dashboard',
+  },
+  {
+    page: PRESET_PAGES.admobReporting,
+    label: 'AdMob Reporting',
+    access: 'admob-reporting',
+    openLabel: 'Open in AdMob Reporting',
+    emptyPath: '/admob/reporting',
+  },
+  {
+    page: PRESET_PAGES.adsense,
+    label: 'AdSense Dashboard',
+    access: 'adsense-dashboard',
+    openLabel: 'Open in AdSense',
+    emptyPath: '/adsense/dashboard',
+  },
+  {
+    page: PRESET_PAGES.adsenseReporting,
+    label: 'AdSense Reporting',
+    access: 'adsense-reporting',
+    openLabel: 'Open in AdSense Reporting',
+    emptyPath: '/adsense/reporting',
+  },
 ];
 
 function formatWhen(when) {
