@@ -417,6 +417,44 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
           [day, clientId]
         );
 
+        // App ID slice → dedicated rollup rows (empty web dims, inv_app set).
+        // Channel KPI rows leave inv_app empty; App-only dashboard filters need these.
+        const appKpiRes = await q(
+          `INSERT INTO rollup_kpi_daily (
+             client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
+             impressions, revenue, viewable_weight, clicks, grain_count, currency
+           )
+           SELECT
+             $2::uuid,
+             g.report_date,
+             '',
+             '',
+             '',
+             COALESCE(NULLIF(TRIM(${m.appExpr}), ''), ''),
+             COALESCE(SUM(${m.impressionExpr}), 0),
+             COALESCE(SUM(${m.revenueExpr}), 0),
+             COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
+             COALESCE(SUM(${m.clickExpr}), 0),
+             COUNT(*)::int,
+             COALESCE(MAX(${m.currencyExpr}), 'USD')
+           FROM report_grain g
+           WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+             AND g.slice_key = 'app_id'
+             AND COALESCE(NULLIF(TRIM(${m.appExpr}), ''), '') <> ''
+           GROUP BY g.report_date, COALESCE(NULLIF(TRIM(${m.appExpr}), ''), '')
+           HAVING COALESCE(SUM(${m.impressionExpr}), 0) > 0
+               OR COALESCE(SUM(${m.revenueExpr}), 0) > 0
+           ON CONFLICT (client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app)
+           DO UPDATE SET
+             impressions = EXCLUDED.impressions,
+             revenue = EXCLUDED.revenue,
+             viewable_weight = EXCLUDED.viewable_weight,
+             clicks = EXCLUDED.clicks,
+             grain_count = EXCLUDED.grain_count,
+             currency = EXCLUDED.currency`,
+          [day, clientId]
+        );
+
         const dimInserts = [
           ['domain', m.domainExpr],
           ['ad_unit', m.adUnitExpr],
@@ -446,7 +484,30 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
             [day, kind, clientId]
           );
         }
-        return kpiRes.rowCount || 0;
+
+        await q(
+          `INSERT INTO rollup_dim_daily (client_id, report_date, dim_kind, dim_value, revenue, impressions)
+           SELECT
+             $2::uuid,
+             g.report_date,
+             'app'::text,
+             NULLIF(TRIM(${m.appExpr}), ''),
+             COALESCE(SUM(${m.revenueExpr}), 0),
+             COALESCE(SUM(${m.impressionExpr}), 0)
+           FROM report_grain g
+           WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+             AND g.slice_key = 'app_id'
+           GROUP BY g.report_date, NULLIF(TRIM(${m.appExpr}), '')
+           HAVING NULLIF(TRIM(${m.appExpr}), '') IS NOT NULL
+             AND (COALESCE(SUM(${m.impressionExpr}), 0) > 0 OR COALESCE(SUM(${m.revenueExpr}), 0) > 0)
+           ON CONFLICT (client_id, report_date, dim_kind, dim_value)
+           DO UPDATE SET
+             revenue = EXCLUDED.revenue,
+             impressions = EXCLUDED.impressions`,
+          [day, clientId]
+        );
+
+        return (kpiRes.rowCount || 0) + (appKpiRes.rowCount || 0);
       });
       totalKpi += dayKpi;
     } catch (e) {
@@ -456,6 +517,96 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
   logger.info(`[${syncType}] Rebuilt rollups from grain for ${uniq.length} day(s); kpi rows≈${totalKpi}`);
   await rebuildInventoryRollupsFromGrain(uniq, syncType);
   return totalKpi;
+}
+
+/**
+ * Upsert App ID rollup rows only (no DELETE of channel KPIs).
+ * Safe for request-path backfill — avoids lock storms on rollup_kpi_daily.
+ */
+async function upsertAppRollupsFromGrain(dates, syncType = 'app-rollup') {
+  const uniq = [...new Set((dates || []).map((d) => String(d).slice(0, 10)).filter(Boolean))];
+  if (!uniq.length) return 0;
+
+  const m = typedGrainMetricSql('g');
+  let total = 0;
+  const clientId = requireClientId();
+
+  for (const day of uniq) {
+    try {
+      const dayRows = await withTransaction(async (q) => {
+        // Separate advisory key from full rebuild so we don't block channel rollup writers.
+        const [k1, k2] = rollupAdvisoryKeys(`${clientId}:app`, day);
+        await q(`SELECT pg_advisory_xact_lock($1, $2)`, [k1, k2]);
+
+        const appKpiRes = await q(
+          `INSERT INTO rollup_kpi_daily (
+             client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app,
+             impressions, revenue, viewable_weight, clicks, grain_count, currency
+           )
+           SELECT
+             $2::uuid,
+             g.report_date,
+             '',
+             '',
+             '',
+             COALESCE(NULLIF(TRIM(${m.appExpr}), ''), ''),
+             COALESCE(SUM(${m.impressionExpr}), 0),
+             COALESCE(SUM(${m.revenueExpr}), 0),
+             COALESCE(SUM((${m.impressionExpr}) * (${m.viewablePctExpr})), 0),
+             COALESCE(SUM(${m.clickExpr}), 0),
+             COUNT(*)::int,
+             COALESCE(MAX(${m.currencyExpr}), 'USD')
+           FROM report_grain g
+           WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+             AND g.slice_key = 'app_id'
+             AND COALESCE(NULLIF(TRIM(${m.appExpr}), ''), '') <> ''
+           GROUP BY g.report_date, COALESCE(NULLIF(TRIM(${m.appExpr}), ''), '')
+           HAVING COALESCE(SUM(${m.impressionExpr}), 0) > 0
+               OR COALESCE(SUM(${m.revenueExpr}), 0) > 0
+           ON CONFLICT (client_id, report_date, inv_domain, inv_site, inv_ad_unit, inv_app)
+           DO UPDATE SET
+             impressions = EXCLUDED.impressions,
+             revenue = EXCLUDED.revenue,
+             viewable_weight = EXCLUDED.viewable_weight,
+             clicks = EXCLUDED.clicks,
+             grain_count = EXCLUDED.grain_count,
+             currency = EXCLUDED.currency`,
+          [day, clientId]
+        );
+
+        await q(
+          `INSERT INTO rollup_dim_daily (client_id, report_date, dim_kind, dim_value, revenue, impressions)
+           SELECT
+             $2::uuid,
+             g.report_date,
+             'app'::text,
+             NULLIF(TRIM(${m.appExpr}), ''),
+             COALESCE(SUM(${m.revenueExpr}), 0),
+             COALESCE(SUM(${m.impressionExpr}), 0)
+           FROM report_grain g
+           WHERE g.client_id = $2::uuid AND g.report_date = $1::date
+             AND g.slice_key = 'app_id'
+           GROUP BY g.report_date, NULLIF(TRIM(${m.appExpr}), '')
+           HAVING NULLIF(TRIM(${m.appExpr}), '') IS NOT NULL
+             AND (COALESCE(SUM(${m.impressionExpr}), 0) > 0 OR COALESCE(SUM(${m.revenueExpr}), 0) > 0)
+           ON CONFLICT (client_id, report_date, dim_kind, dim_value)
+           DO UPDATE SET
+             revenue = EXCLUDED.revenue,
+             impressions = EXCLUDED.impressions`,
+          [day, clientId]
+        );
+
+        return appKpiRes.rowCount || 0;
+      });
+      total += dayRows;
+    } catch (e) {
+      logger.warn(`[${syncType}] app rollup upsert failed for ${day}:`, e.message);
+    }
+  }
+  if (total > 0) {
+    logger.info(`[${syncType}] Upserted app rollups for ${uniq.length} day(s); rows≈${total}`);
+  }
+  return total;
 }
 
 /**
@@ -1054,6 +1205,7 @@ module.exports = {
   upsertGrainFromJsonbRows,
   typedGrainMetricSql,
   rebuildRollupsFromGrain,
+  upsertAppRollupsFromGrain,
   rebuildInventoryRollupsFromGrain,
   fetchGrainLegacyFromDB,
   fetchGrainLeanRowsFromDB,

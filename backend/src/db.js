@@ -835,6 +835,9 @@ async function initSchema() {
     `CREATE INDEX IF NOT EXISTS idx_rollup_kpi_site ON rollup_kpi_daily (report_date, LOWER(inv_site))`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_kpi_ad_unit ON rollup_kpi_daily (report_date, LOWER(inv_ad_unit))`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_kpi_app ON rollup_kpi_daily (report_date, LOWER(inv_app))`,
+    `CREATE INDEX IF NOT EXISTS idx_rollup_kpi_app_only
+       ON rollup_kpi_daily (client_id, report_date, LOWER(inv_app))
+       WHERE inv_domain = '' AND inv_site = '' AND inv_ad_unit = '' AND inv_app <> ''`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_inv_kpi_date ON rollup_inventory_kpi_daily (report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_inv_kpi_domain ON rollup_inventory_kpi_daily (report_date, LOWER(inv_domain))`,
     `CREATE INDEX IF NOT EXISTS idx_rollup_inv_kpi_site ON rollup_inventory_kpi_daily (report_date, LOWER(inv_site))`,
@@ -855,6 +858,10 @@ async function initSchema() {
        ON report_grain (client_id, report_date)
        INCLUDE (domain_id, site_id, impressions, revenue, clicks, viewable_pct, currency)
        WHERE slice_key = 'inventory_core'`,
+    `CREATE INDEX IF NOT EXISTS idx_report_grain_app_id_slice
+       ON report_grain (client_id, report_date, LOWER(app_id))
+       INCLUDE (impressions, revenue, clicks, viewable_pct, currency, app_name)
+       WHERE slice_key = 'app_id'`,
     `CREATE INDEX IF NOT EXISTS idx_archive_manifest_date ON report_archive_manifest (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_dim_ad_unit_client ON dim_ad_unit (client_id)`,
     `CREATE INDEX IF NOT EXISTS idx_dim_domain_client ON dim_domain (client_id)`,
@@ -965,6 +972,24 @@ async function finishTenantBackfill() {
   const deferred = initSchema._deferredDdl || [];
   for (const sql of deferred) {
     try {
+      // ALTER TABLE ADD COLUMN always takes AccessExclusiveLock — even with IF NOT EXISTS.
+      // Probe information_schema first so boot/restart cannot jam dashboard reads.
+      const addCol = sql.match(
+        /^ALTER TABLE\s+(\w+)\s+ADD COLUMN IF NOT EXISTS\s+(\w+)\b/i
+      );
+      if (addCol) {
+        const [, table, column] = addCol;
+        const { rows } = await schemaQuery(
+          `SELECT 1
+           FROM information_schema.columns
+           WHERE table_schema = 'public'
+             AND table_name = $1
+             AND column_name = $2
+           LIMIT 1`,
+          [table.toLowerCase(), column.toLowerCase()]
+        );
+        if (rows.length) continue;
+      }
       await schemaQuery(sql);
     } catch (e) {
       logger.warn('Schema DDL skipped:', e.message);

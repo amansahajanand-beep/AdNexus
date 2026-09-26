@@ -7,7 +7,11 @@ import {
   LineChart, Line, ComposedChart,
 } from 'recharts';
 import { reportsAPI } from '../utils/api';
-import { nowTimeInTZ } from '../utils/datetime';
+import {
+  mergeDashboardResponses,
+  mergeOverviewResponses,
+} from '../utils/report/mergeNetworkReports';
+import { nowTimeInTZ, todayInTZ } from '../utils/datetime';
 import {
   getDateRestriction,
   clampDateRange,
@@ -467,10 +471,17 @@ export default function Dashboard() {
   const outlet = useOutletContext() || {};
   const networks = Array.isArray(outlet.accountNetworks) ? outlet.accountNetworks : [];
   const viewClientId = outlet.viewClientId || null;
-  return <DashboardSingle networks={networks} viewClientId={viewClientId} />;
+  const mergeNetworkIds = Array.isArray(outlet.mergeNetworkIds) ? outlet.mergeNetworkIds : null;
+  return (
+    <DashboardSingle
+      networks={networks}
+      viewClientId={viewClientId}
+      mergeNetworkIds={mergeNetworkIds}
+    />
+  );
 }
 
-function DashboardSingle({ networks = [], viewClientId = null }) {
+function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds = null }) {
   const dispatch = useDispatch();
   const { has, visibility: clientVis, user } = usePermissions();
   const canGenerate = has('canGenerateReports');
@@ -548,7 +559,17 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
   });
 
   const isMultiNetwork = networks.length > 1;
-  const activeClientId = viewClientId || user?.clientId || null;
+  // Domain users with 2+ networks: one combined Dashboard (no sidebar switch).
+  const mergeIds = useMemo(() => {
+    if (isAdmin(user)) return null;
+    const ids = (mergeNetworkIds?.length
+      ? mergeNetworkIds
+      : networks.map((n) => n.id)
+    ).map((id) => String(id || '').trim()).filter(Boolean);
+    return ids.length > 1 ? [...new Set(ids)] : null;
+  }, [user, mergeNetworkIds, networks]);
+  const mergeCacheKey = mergeIds ? `merge:${[...mergeIds].sort().join(',')}` : null;
+  const activeClientId = mergeCacheKey || viewClientId || user?.clientId || null;
   const overviewClientId = activeClientId;
   const tableClientId = activeClientId;
   const overviewCacheRef = useRef(new Map());
@@ -732,6 +753,17 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
       domainName: last.domainName?.length ? last.domainName : prev.domainName,
       domainId: last.domainId?.length ? last.domainId : prev.domainId,
     }));
+    if (
+      last.domain?.length
+      || last.site?.length
+      || last.domainName?.length
+      || last.domainId?.length
+    ) {
+      setFilterApplied(true);
+      // Last filters may differ from Redux-painted KPIs — force a network refresh.
+      skipOverviewRef.current = false;
+      skipDetailRef.current = false;
+    }
   }, [searchParams, user?.id, dateRestriction]);
 
   useEffect(() => {
@@ -764,6 +796,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     [domain, site, domainName, domainId]
   );
   const canApplyInventory = !filterVisibility.isScopedUser
+    || scopedAutoLoad
     || draftHasInventorySelection(inventoryDraft);
   const customDatesIncomplete = isCustomRangeIncomplete(preset, startDate, endDate);
 
@@ -820,10 +853,28 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     if (!silent && !hasCached) setOverviewLoading(true);
     setError(null);
     try {
-      const res = await reportsAPI.getDashboardOverview(filters, {
-        ...(ac ? { signal: ac.signal } : {}),
-        ...(overviewClientId ? { clientId: overviewClientId } : {}),
-      });
+      let res;
+      if (mergeIds?.length) {
+        const parts = await Promise.all(
+          mergeIds.map((id) => reportsAPI.getDashboardOverview(filters, {
+            ...(ac ? { signal: ac.signal } : {}),
+            clientId: id,
+          }).catch(() => null))
+        );
+        if (ac?.signal?.aborted) return;
+        res = mergeOverviewResponses(parts);
+        if (!res) {
+          setError('Could not load overview metrics for your assigned networks.');
+          return;
+        }
+      } else {
+        res = await reportsAPI.getDashboardOverview(filters, {
+          ...(ac ? { signal: ac.signal } : {}),
+          ...(overviewClientId && !String(overviewClientId).startsWith('merge:')
+            ? { clientId: overviewClientId }
+            : {}),
+        });
+      }
       if (ac?.signal?.aborted) return;
       setOverviewData((prev) => {
         const nextHas = summaryHasMetrics(res?.summary);
@@ -861,7 +912,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
       if (overviewAbortRef.current === ac) overviewInFlightRef.current = false;
       if (!silent && overviewAbortRef.current === ac) setOverviewLoading(false);
     }
-  }, [overviewFilters, overviewClientId]);
+  }, [overviewFilters, overviewClientId, mergeIds]);
 
   // Keep ref in sync for loadOverview coalesce / empty-overwrite guards.
   useEffect(() => {
@@ -903,20 +954,54 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
         startDate: applied?.startDate || startDate,
         endDate: applied?.endDate || endDate,
       };
+      const inv = normalizeInventorySelections(applied || {}, {}, scopedNormOpts);
       // Compact dashboard payload (SQL charts + capped table). Do NOT request allRows —
       // wide ranges were shipping 100k–700k grain rows and freezing the UI.
-      const res = await reportsAPI.getDashboard({
-        ...dates,
-        ...normalizeInventorySelections(applied || {}, {}, scopedNormOpts),
-      }, {
-        ...(ac ? { signal: ac.signal } : {}),
-        ...(expectedClientId ? { clientId: expectedClientId } : {}),
-      });
+      let res;
+      if (mergeIds?.length) {
+        const byId = new Map((networks || []).map((n) => [String(n.id), n]));
+        const parts = await Promise.all(
+          mergeIds.map(async (id) => {
+            try {
+              const part = await reportsAPI.getDashboard({ ...dates, ...inv }, {
+                ...(ac ? { signal: ac.signal } : {}),
+                clientId: id,
+              });
+              if (!part) return null;
+              const net = byId.get(String(id));
+              return {
+                ...part,
+                _clientId: id,
+                _networkName: net?.name || net?.networkCode || id,
+              };
+            } catch {
+              return null;
+            }
+          })
+        );
+        if (ac?.signal?.aborted) return;
+        if (gen !== detailGenRef.current) return;
+        res = mergeDashboardResponses(parts);
+        if (!res) {
+          setError('Could not load the chart and breakdown for your assigned networks.');
+          setDetailData(null);
+          return;
+        }
+      } else {
+        const singleClientId = expectedClientId && !String(expectedClientId).startsWith('merge:')
+          ? expectedClientId
+          : null;
+        res = await reportsAPI.getDashboard({ ...dates, ...inv }, {
+          ...(ac ? { signal: ac.signal } : {}),
+          ...(singleClientId ? { clientId: singleClientId } : {}),
+        });
+      }
       if (ac?.signal?.aborted) return;
       // Drop late responses after Reset / network switch.
       if (gen !== detailGenRef.current) return;
       if (
-        expectedClientId
+        !mergeIds?.length
+        && expectedClientId
         && tableClientId
         && String(expectedClientId) !== String(tableClientId)
       ) return;
@@ -927,7 +1012,8 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
       const detailRev = Number(res?.summary?.revenue ?? res?.summary?.selectRange ?? 0) || 0;
       const concrete = hasConcreteInventoryFilterSelection(applied);
       if (
-        !concrete
+        !mergeIds?.length
+        && !concrete
         && ovRev > 0
         && detailRev > 0
         && detailRev > ovRev * 5
@@ -1003,7 +1089,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
         clearTimeout(slowTimerRef.current);
       }
     }
-  }, [applied, startDate, endDate, scopedNormOpts, user?.clientId, tableClientId, overviewClientId, isMultiNetwork]);
+  }, [applied, startDate, endDate, scopedNormOpts, user?.clientId, tableClientId, overviewClientId, isMultiNetwork, mergeIds, networks]);
 
   useEffect(() => () => {
     detailAbortRef.current?.abort();
@@ -1074,6 +1160,8 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     if (skipOverviewRef.current) {
       skipOverviewRef.current = false;
       setOverviewLoading(false);
+      // Paint cache immediately, then silent-refresh so refresh never sticks on stale KPIs.
+      loadOverviewRef.current(undefined, true);
       return;
     }
     if (staleSilentOverviewRef.current && overviewDataRef.current?.summary) {
@@ -1090,6 +1178,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     if (skipDetailRef.current) {
       skipDetailRef.current = false;
       setDetailLoading(false);
+      loadDetailRef.current(true);
       return;
     }
     if (staleSilentDetailRef.current && detailDataRef.current) {
@@ -1146,17 +1235,39 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
         endDate: prior.endDate,
       };
       try {
-        const ov = await reportsAPI.getDashboardOverview(priorFilters, {
-          ...(overviewClientId ? { clientId: overviewClientId } : {}),
-        });
+        let ov;
+        if (mergeIds?.length) {
+          const parts = await Promise.all(
+            mergeIds.map((id) => reportsAPI.getDashboardOverview(priorFilters, { clientId: id }).catch(() => null))
+          );
+          ov = mergeOverviewResponses(parts);
+        } else {
+          const cid = overviewClientId && !String(overviewClientId).startsWith('merge:')
+            ? overviewClientId
+            : undefined;
+          ov = await reportsAPI.getDashboardOverview(priorFilters, {
+            ...(cid ? { clientId: cid } : {}),
+          });
+        }
         if (!cancelled) setPriorOverview(ov);
       } catch {
         /* keep last successful compare if this retry fails */
       }
       try {
-        const dash = await reportsAPI.getDashboard(priorFilters, {
-          ...(tableClientId ? { clientId: tableClientId } : {}),
-        });
+        let dash;
+        if (mergeIds?.length) {
+          const parts = await Promise.all(
+            mergeIds.map((id) => reportsAPI.getDashboard(priorFilters, { clientId: id }).catch(() => null))
+          );
+          dash = mergeDashboardResponses(parts);
+        } else {
+          const cid = tableClientId && !String(tableClientId).startsWith('merge:')
+            ? tableClientId
+            : undefined;
+          dash = await reportsAPI.getDashboard(priorFilters, {
+            ...(cid ? { clientId: cid } : {}),
+          });
+        }
         if (!cancelled) {
           setPriorDetail(dash);
           if (dash?.summary) setPriorOverview((prev) => prev || { summary: dash.summary });
@@ -1167,7 +1278,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     })();
     return () => { cancelled = true; };
   // Intentionally omit overview summary numbers — they were recreating this effect in a loop.
-  }, [canGenerate, compareKey, dateRestriction, overviewClientId, tableClientId]);
+  }, [canGenerate, compareKey, dateRestriction, overviewClientId, tableClientId, mergeIds]);
 
   useEffect(() => {
     if (!overviewData && !detailData) return;
@@ -1344,16 +1455,15 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     setDetailData(null);
     detailDataRef.current = null;
     buildingPollCountRef.current = 0;
-    if (scopedAutoLoad) {
-      setApplied(buildScopedDashboardApplied(user, r));
+    // Keep current inventory filters (App ID / Domain / Site) — only swap dates.
+    // Rebuilding scoped "all assigned" wiped narrowed App ID until Apply again.
+    setApplied((prev) => ({
+      ...prev,
+      startDate: r.startDate,
+      endDate: r.endDate,
+    }));
+    if (scopedAutoLoad || filterApplied || draftHasInventorySelection(inventoryDraft)) {
       setFilterApplied(true);
-    } else {
-      setApplied(prev => ({ ...prev, startDate: r.startDate, endDate: r.endDate }));
-      if (!filterVisibility.isScopedUser) {
-        setFilterApplied(true);
-      } else if (filterApplied && draftHasInventorySelection(inventoryDraft)) {
-        setFilterApplied(true);
-      }
     }
   };
 
@@ -1415,16 +1525,35 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
   }, [startDate, endDate]);
 
   const applyFilter = () => {
-    if (!canApplyInventory) return;
-    if (customDatesIncomplete) return;
-    const dates = clampDateRange(startDate, endDate, dateRestriction);
+    if (!canFilter) return;
+    // Custom range: keep Apply enabled; fill any missing date with today (or the other bound).
+    let sd = startDate;
+    let ed = endDate;
+    if (preset === 'custom') {
+      const today = todayInTZ();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(sd || ''))) sd = /^\d{4}-\d{2}-\d{2}$/.test(String(ed || '')) ? ed : today;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ed || ''))) ed = /^\d{4}-\d{2}-\d{2}$/.test(String(sd || '')) ? sd : today;
+      if (sd > ed) { const t = sd; sd = ed; ed = t; }
+    }
+    const dates = clampDateRange(sd, ed, dateRestriction);
     setStartDate(dates.startDate);
     setEndDate(dates.endDate);
     setPage(1);
     setDetailData(null);
     setOverviewData(null);
     // Keep Select-All sentinel in UI state; API calls normalize it to [] (no filter).
-    const nextApplied = { ...dates, domainName, domainId, domain, site };
+    // Scoped users with empty draft: apply full assigned inventory (matches "loads by default").
+    let nextInv = { domainName, domainId, domain, site };
+    if (scopedAutoLoad && !draftHasInventorySelection(nextInv)) {
+      const scoped = buildScopedDashboardApplied(user, dates);
+      nextInv = {
+        domain: scoped.domain || [],
+        site: scoped.site || [],
+        domainName: scoped.domainName || [],
+        domainId: scoped.domainId || [],
+      };
+    }
+    const nextApplied = { ...dates, ...nextInv };
     setApplied(nextApplied);
     setFilterApplied(true);
     persistRecentFilter();
@@ -1432,10 +1561,10 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
       preset,
       startDate: dates.startDate,
       endDate: dates.endDate,
-      domain,
-      site,
-      domainName,
-      domainId,
+      domain: nextInv.domain,
+      site: nextInv.site,
+      domainName: nextInv.domainName,
+      domainId: nextInv.domainId,
     }, user?.id);
     setBreakdownOpen(true);
     setChipsExpanded(false);
@@ -1462,7 +1591,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     const rangeLabel = dates.startDate === dates.endDate
       ? dates.startDate
       : `${dates.startDate} → ${dates.endDate}`;
-    showToast({ message: `Loaded ${rangeLabel}` });
+    showToast({ message: `Loaded ${rangeLabel}`, replaceKey: 'filter-loaded' });
   };
 
   const appliedChips = useMemo(
@@ -1573,6 +1702,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     loadOverview(buildOverviewFiltersForState(nextApplied, false));
     showToast({
       message: 'Filters cleared',
+      replaceKey: 'filter-status',
       actionLabel: 'Undo',
       onAction: () => {
         const snap = undoSnapRef.current;
@@ -1612,8 +1742,6 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
   useReportHotkeys({
     enabled: canGenerate && canFilter,
     onApply: () => {
-      if (customDatesIncomplete) return;
-      if (!canApplyInventory) return;
       applyFilter();
     },
     onReset: reset,
@@ -2237,7 +2365,9 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
     <div className="dashboard-page">
       <PageHeader
         title="Dashboard"
-        subtitle="Network performance overview — charts load for the selected dates; inventory filters refine them"
+        subtitle={mergeIds?.length
+          ? `Combined view across ${mergeIds.length} networks — your assigned inventory only`
+          : 'Network performance overview — charts load for the selected dates; inventory filters refine them'}
         summary={filterSummary}
       >
         {canFilter && (
@@ -2282,7 +2412,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
             filterPanelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
           }}
           onApply={() => {
-            if (!customDatesIncomplete && canApplyInventory) applyFilter();
+            applyFilter();
           }}
         />
       )}
@@ -2309,10 +2439,8 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
           </div>
           <div className="filter-actions filter-actions--desktop">
             <button className="btn-generate" onClick={applyFilter}
-              disabled={!canFilter || !canApplyInventory || customDatesIncomplete}
-              title={customDatesIncomplete
-                ? 'Select both start and end dates, then click Apply Filter'
-                : (!canApplyInventory ? 'Select at least one domain, site, or app ID from your assigned list' : '')}>✓ Apply Filter</button>
+              disabled={!canFilter}
+              title={!canFilter ? 'You do not have permission to apply filters' : ''}>✓ Apply Filter</button>
             <SavedFiltersBar
               page={SAVED_FILTERS_PAGES.dashboard}
               userId={user?.id}
@@ -2553,7 +2681,7 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
         {breakdownOpen && canFilter && (
           <div className="filter-actions-foot">
             <button className="btn-generate" onClick={applyFilter}
-              disabled={!canApplyInventory || customDatesIncomplete}>✓ Apply Filter</button>
+              disabled={!canFilter}>✓ Apply Filter</button>
             <button className="btn-reset" onClick={reset}>↺ Reset</button>
           </div>
         )}
@@ -3313,7 +3441,6 @@ function DashboardSingle({ networks = [], viewClientId = null }) {
             <button
               className="btn-generate"
               onClick={applyFilter}
-              disabled={!canApplyInventory || customDatesIncomplete}
             >✓ Apply Filter</button>
             <button type="button" className="btn-reset-link" onClick={reset}>Reset</button>
           </div>
