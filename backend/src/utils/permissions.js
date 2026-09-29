@@ -574,6 +574,47 @@ function resolveAdsAccountIdsForUser(user, requestedIds = []) {
   return hit.length ? hit : [NO_ADS_ACCOUNT_SCOPE_ID];
 }
 
+/** AdMob filter dimensions a domain user can be granted; mediation dims reveal partners/waterfalls. */
+const ADMOB_SCOPE_FILTERS = ['app', 'ad_unit', 'format', 'country', 'platform'];
+const ADMOB_DEFAULT_FILTERS = ['app', 'ad_unit', 'format', 'country', 'platform'];
+
+function cleanIdList(raw) {
+  if (!Array.isArray(raw)) return [];
+  return [...new Set(raw.map((v) => String(v || '').trim()).filter(Boolean))];
+}
+
+/**
+ * AdMob scope: accountIds (admob_accounts.id), apps / adUnits as "accountUuid:googleId".
+ * An account with no apps/adUnits selected grants the whole account.
+ */
+function normalizeAdmobScope(input) {
+  if (!input || typeof input !== 'object') return null;
+  const accountIds = cleanIdList(input.accountIds);
+  const allowedAccounts = new Set(accountIds);
+  const inAccount = (key) => allowedAccounts.has(String(key).split(':')[0]);
+  const filters = Array.isArray(input.filters)
+    ? input.filters.filter((f) => ADMOB_SCOPE_FILTERS.includes(f))
+    : ADMOB_DEFAULT_FILTERS;
+  return {
+    accountIds,
+    apps: cleanIdList(input.apps).filter(inAccount),
+    adUnits: cleanIdList(input.adUnits).filter(inAccount),
+    filters: [...new Set(filters)],
+  };
+}
+
+/** null = admin (unrestricted); otherwise the user's AdMob scope (possibly empty). */
+function getAdmobScope(user) {
+  if (isAdmin(user)) return null;
+  return normalizeAdmobScope(user?.permissions?.admobScope)
+    || { accountIds: [], apps: [], adUnits: [], filters: [] };
+}
+
+function hasAdmobAccess(user) {
+  if (isAdmin(user)) return true;
+  return getAdmobScope(user).accountIds.length > 0;
+}
+
 function normalizePermissions(role, input = {}) {
   if (role === 'admin') return null;
 
@@ -595,6 +636,8 @@ function normalizePermissions(role, input = {}) {
       .filter(Boolean);
   }
   if (Array.isArray(input.allowedAdUnits)) base.allowedAdUnits = [];
+  const admobScope = normalizeAdmobScope(input.admobScope);
+  if (admobScope) base.admobScope = admobScope;
   if (input.dateRestriction != null) {
     base.dateRestriction = resolveDateRestriction(input.dateRestriction)
       || buildDateRestrictionPayload(input.dateRestriction?.startDate, input.dateRestriction?.endDate);
@@ -625,6 +668,8 @@ function canAccessPage(user, page) {
   };
   if ((page === 'domain-user' || page === 'my-ads') && isAdmin(user)) return false;
   if (isAdmin(user)) return true;
+  if (page === 'admob-roi') return false;
+  if (String(page).startsWith('admob-')) return hasAdmobAccess(user);
   const key = map[page];
   if (!key) return false;
   return hasFlag(user, key);
@@ -655,7 +700,7 @@ function buildVisibility(user) {
       roi: p.canAccessRoi !== false,
       domainUser: p.canAccessDomainUser !== false,
       myAds: p.canAccessMyAds !== false,
-      admob: p.canAccessAdMob !== false,
+      admob: hasAdmobAccess(user),
       adsense: p.canAccessAdSense !== false,
     },
     revenue: p.canSeeRevenue !== false,
@@ -687,6 +732,10 @@ module.exports = {
   INVENTORY_SCOPE_KEYS,
   NO_ADS_ACCOUNT_SCOPE_ID,
   normalizePermissions,
+  ADMOB_SCOPE_FILTERS,
+  normalizeAdmobScope,
+  getAdmobScope,
+  hasAdmobAccess,
   hasFlag,
   canAccessPage,
   buildVisibility,

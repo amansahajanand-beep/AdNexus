@@ -48,6 +48,7 @@ const NAV_ICONS = {
   help: CircleHelp,
   'admob-dashboard': LayoutDashboard,
   'admob-reporting': BarChart3,
+  'admob-roi': TrendingUp,
   'adsense-dashboard': LayoutDashboard,
   'adsense-sites': Newspaper,
   'adsense-ad-units': LayoutGrid,

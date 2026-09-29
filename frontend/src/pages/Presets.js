@@ -18,6 +18,7 @@ import {
   summaryForPreset,
 } from '../utils/reportPresets';
 import { confirmDialog } from '../hooks/useConfirmDialog';
+import { ADSENSE_ENABLED } from '../utils/productWorkspace';
 import { validateSavedName, SAVED_NAME_RULES_HINT } from '../utils/namePolicy';
 
 const SPLIT_WIDTH_KEY = 'adnexus.presets.splitWidth';
@@ -128,7 +129,7 @@ export default function Presets() {
   const splitContainerRef = useRef(null);
 
   const availableSections = useMemo(
-    () => SECTIONS.filter((s) => canPage(s.access)),
+    () => SECTIONS.filter((s) => canPage(s.access) && (ADSENSE_ENABLED || !s.access.startsWith('adsense'))),
     [canPage]
   );
 

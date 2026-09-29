@@ -371,6 +371,7 @@ export default function usePublisherReport(api, {
     loading,
     error,
     reload: load,
+    filterParams,
     compareRange,
     compareLabel,
     isSample: !overview || overview.isSample,

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useMemo, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import PageHeader from '../../components/ui/PageHeader';
 import DataFreshness from '../../components/ui/DataFreshness';
@@ -14,6 +14,7 @@ import { showToast } from '../../hooks/useToast';
 import { usePermissions } from '../../hooks/usePermissions';
 import { useAuth } from '../../store/useAuth';
 import usePublisherReport from '../../hooks/usePublisherReport';
+import { admobAllowedFilters, admobFilterKeysForUser } from '../../utils/auth/permissions';
 
 const DIM_OPTIONS = [
   { value: 'ad_unit', label: 'Ad unit' },
@@ -31,7 +32,16 @@ export default function AdMobReporting() {
   const { visibility } = usePermissions();
   const { viewAdmobAccountId } = useOutletContext() || {};
   const compare = useProductCompareState(user?.id);
-  const [tableDim, setTableDim] = useState('ad_unit');
+  const allowedFilterKeys = useMemo(() => admobFilterKeysForUser(user), [user]);
+  const dimOptions = useMemo(() => {
+    if (isAdmin) return DIM_OPTIONS;
+    const allowed = admobAllowedFilters(user);
+    return [
+      ...DIM_OPTIONS.filter((o) => allowed.includes(o.value)),
+      { value: 'date', label: 'Date' },
+    ];
+  }, [isAdmin, user]);
+  const [tableDim, setTableDim] = useState(() => dimOptions[0]?.value || 'date');
   const report = usePublisherReport(admobAPI, {
     product: 'admob',
     canUseFilters: visibility.filters !== false,
@@ -46,7 +56,7 @@ export default function AdMobReporting() {
 
   const useSample = report.isSample;
   const currency = report.overview?.currency || 'USD';
-  const canFilter = visibility.filters !== false;
+  const canFilter = visibility.filters !== false && (!allowedFilterKeys || allowedFilterKeys.length > 0);
   const lastSyncAt = report.freshness?.lastSyncAt;
 
   const sampleRows = ADMOB_SAMPLE.tableRows.map((r) => ({
@@ -67,7 +77,9 @@ export default function AdMobReporting() {
     <div className="dashboard-page page product-page product-page--admob">
       <PageHeader
         title="AdMob Reporting"
-        subtitle="Core filters plus optional ad unit, ad source & mediation filters — pick a breakdown dimension"
+        subtitle={isAdmin
+          ? 'Core filters plus optional ad unit, ad source & mediation filters — pick a breakdown dimension'
+          : 'Earnings for your assigned apps — filter and pick a breakdown dimension'}
         summary={report.filterSummary}
       >
         {canFilter && (
@@ -118,6 +130,7 @@ export default function AdMobReporting() {
         onApplyRecentFilter={report.applyRecentSnapshot}
         timeZone={report.reportingTimeZone}
         enableExtraFilters
+        allowedFilterKeys={allowedFilterKeys}
       />
 
       <div className="filter-card" style={{ marginBottom: 14, padding: '12px 16px' }}>
@@ -129,7 +142,7 @@ export default function AdMobReporting() {
             onChange={(e) => setTableDim(e.target.value)}
             disabled={report.loading}
           >
-            {DIM_OPTIONS.map((o) => (
+            {dimOptions.map((o) => (
               <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
@@ -142,7 +155,7 @@ export default function AdMobReporting() {
       </div>
 
       <ProductDetailTable
-        title={DIM_OPTIONS.find((o) => o.value === tableDim)?.label || 'Detail'}
+        title={dimOptions.find((o) => o.value === tableDim)?.label || 'Detail'}
         product="admob"
         dim={useSample ? 'ad_unit' : tableDim}
         currency={currency}

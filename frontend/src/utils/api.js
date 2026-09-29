@@ -364,19 +364,40 @@ export const clientsAPI = {
   oauthSelect: (id, payload) => FAST_API.post(`/clients/oauth/pending/${id}/select`, payload),
 };
 
+/** Optional per-call network scope (AdMob ROI uses the account's root network for Ads). */
+function scopedTo(clientId) {
+  return clientId ? { headers: { 'X-Gam-Client-Id': String(clientId) } } : undefined;
+}
+
+/** Google Ads account management, optionally pinned to one tenant (e.g. the AdMob workspace). */
+function makeAdsAccountsAPI(scopeId = null) {
+  const sc = (clientId) => scopedTo(clientId || scopeId);
+  return {
+    listAccounts: () => FAST_API.get('/ads/accounts', sc()),
+    syncHealth: (clientId) => FAST_API.get('/ads/sync-health', sc(clientId)),
+    mccOauthUrl: (payload, clientId) => FAST_API.post('/ads/accounts/mcc/oauth-url', payload || {}, sc(clientId)),
+    oauthPending: (id, clientId) => FAST_API.get(`/ads/oauth/pending/${id}`, sc(clientId)),
+    oauthSelect: (id, payload, clientId) => FAST_API.post(`/ads/oauth/pending/${id}/select`, payload, sc(clientId)),
+    logins: (clientId) => FAST_API.get('/ads/logins', sc(clientId)),
+    useLogin: (payload, clientId) => FAST_API.post('/ads/logins/use', payload, sc(clientId)),
+    createMcc: (payload) => FAST_API.post('/ads/accounts/mcc', payload, sc()),
+    createIndividual: (payload) => FAST_API.post('/ads/accounts/individual', payload, sc()),
+    accountOauthUrl: (id, params, clientId) => FAST_API.get(`/ads/accounts/${id}/oauth-url`, { params, ...sc(clientId) }),
+    updateAccount: (id, payload) => FAST_API.patch(`/ads/accounts/${id}`, payload, sc()),
+    deleteAccount: (id) => FAST_API.delete(`/ads/accounts/${id}`, sc()),
+    deleteAllAccounts: () => FAST_API.delete('/ads/accounts', sc()),
+    refreshChildren: (id) => FAST_API.post(`/ads/accounts/${id}/refresh-children`, undefined, sc()),
+    syncAll: (payload, clientId) => FAST_API.post('/ads/sync', payload || {}, sc(clientId)),
+    syncAccount: (id, payload) => FAST_API.post(`/ads/accounts/${id}/sync`, payload || {}, sc()),
+  };
+}
+
+export function adsAPIFor(clientId) {
+  return clientId ? makeAdsAccountsAPI(clientId) : adsAPI;
+}
+
 export const adsAPI = {
-  listAccounts: () => FAST_API.get('/ads/accounts'),
-  syncHealth: () => FAST_API.get('/ads/sync-health'),
-  mccOauthUrl: () => FAST_API.post('/ads/accounts/mcc/oauth-url'),
-  oauthPending: (id) => FAST_API.get(`/ads/oauth/pending/${id}`),
-  oauthSelect: (id, payload) => FAST_API.post(`/ads/oauth/pending/${id}/select`, payload),
-  createMcc: (payload) => FAST_API.post('/ads/accounts/mcc', payload),
-  createIndividual: (payload) => FAST_API.post('/ads/accounts/individual', payload),
-  accountOauthUrl: (id) => FAST_API.get(`/ads/accounts/${id}/oauth-url`),
-  updateAccount: (id, payload) => FAST_API.patch(`/ads/accounts/${id}`, payload),
-  deleteAccount: (id) => FAST_API.delete(`/ads/accounts/${id}`),
-  deleteAllAccounts: () => FAST_API.delete('/ads/accounts'),
-  refreshChildren: (id) => FAST_API.post(`/ads/accounts/${id}/refresh-children`),
+  ...makeAdsAccountsAPI(),
   listCampaigns: (id) => FAST_API.get(`/ads/accounts/${id}/campaigns`),
   listRoiCampaigns: (params) => FAST_API.get('/ads/roi-campaigns', { params }),
   listRoiAccounts: (params) => FAST_API.get('/ads/roi-accounts', { params }),
@@ -387,8 +408,6 @@ export const adsAPI = {
   saveCampaignMap: (payload) => FAST_API.put('/ads/campaign-maps', payload),
   saveCampaignMapsBulk: (payload) => FAST_API.put('/ads/campaign-maps/bulk', payload),
   deleteCampaignMap: (id) => FAST_API.delete(`/ads/campaign-maps/${id}`),
-  syncAll: (payload) => FAST_API.post('/ads/sync', payload || {}),
-  syncAccount: (id, payload) => FAST_API.post(`/ads/accounts/${id}/sync`, payload || {}),
   listExpenses: (params) => FAST_API.get('/ads/expenses', { params }),
   createExpense: (payload) => FAST_API.post('/ads/expenses', payload),
   deleteExpense: (id) => FAST_API.delete(`/ads/expenses/${id}`),
@@ -405,6 +424,8 @@ export const adsAPI = {
 export const admobAPI = {
   health: () => FAST_API.get('/admob/health'),
   listAccounts: () => FAST_API.get('/admob/accounts'),
+  workspace: () => FAST_API.get('/admob/workspace'),
+  scopeCatalog: () => FAST_API.get('/admob/scope-catalog'),
   oauthUrl: () => FAST_API.post('/admob/accounts/oauth-url'),
   accountOauthUrl: (id) => FAST_API.get(`/admob/accounts/${id}/oauth-url`),
   oauthPending: (id) => FAST_API.get(`/admob/oauth/pending/${id}`),
@@ -420,6 +441,9 @@ export const admobAPI = {
   breakdowns: (params) => FAST_API.get('/admob/breakdowns', { params }),
   table: (params) => FAST_API.get('/admob/table', { params }),
   freshness: (params) => FAST_API.get('/admob/freshness', { params }),
+  roi: (params) => FAST_API.get('/admob/roi', { params }),
+  roiAdsAccounts: (params) => FAST_API.get('/admob/roi/ads-accounts', { params }),
+  saveRoiAdsAccounts: (payload, params) => FAST_API.put('/admob/roi/ads-accounts', payload, { params }),
 };
 
 export const adsenseAPI = {

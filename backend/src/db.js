@@ -401,6 +401,23 @@ async function initSchema() {
     logger.warn('gam_clients retention/account columns:', e.message);
   }
 
+  try {
+    // Hidden AdMob/AdSense workspace per account: own tenant, own Google Ads pool.
+    const { rowCount } = await schemaQuery(
+      `SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'gam_clients' AND column_name = 'publisher_parent_id'`
+    );
+    if (!rowCount) {
+      await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS publisher_parent_id UUID`);
+    }
+    await schemaQuery(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_gam_clients_publisher_parent
+       ON gam_clients (publisher_parent_id) WHERE publisher_parent_id IS NOT NULL`
+    );
+  } catch (e) {
+    logger.warn('gam_clients publisher_parent_id column:', e.message);
+  }
+
   // report_grain.metrics / slice_key ALTERs run after listen (ensureGrainMetricsColumn)
   // so a locked partitioned table cannot block API startup.
 
@@ -643,6 +660,15 @@ async function initSchema() {
       PRIMARY KEY (client_id, account_id, report_date)
     );
 
+    -- Google Ads accounts whose spend counts toward each AdMob publisher's ROI
+    CREATE TABLE IF NOT EXISTS admob_ads_account_links (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      admob_account_id UUID NOT NULL REFERENCES admob_accounts(id) ON DELETE CASCADE,
+      ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, admob_account_id, ads_account_id)
+    );
+
     -- Dimension breakdowns (app/format/country/… and site/country/…)
     CREATE TABLE IF NOT EXISTS admob_dim_daily (
       client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
@@ -672,6 +698,27 @@ async function initSchema() {
       updated_at TIMESTAMPTZ DEFAULT now(),
       PRIMARY KEY (client_id, account_id, report_date, dim_kind, dim_value)
     );
+
+    -- One row per app × ad unit × format × country × platform so scoped/filtered totals are exact.
+    CREATE TABLE IF NOT EXISTS admob_grain_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id UUID NOT NULL REFERENCES admob_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      app_id TEXT NOT NULL DEFAULT '',
+      app_name TEXT NOT NULL DEFAULT '',
+      ad_unit_id TEXT NOT NULL DEFAULT '',
+      ad_unit_name TEXT NOT NULL DEFAULT '',
+      format TEXT NOT NULL DEFAULT '',
+      country TEXT NOT NULL DEFAULT '',
+      platform TEXT NOT NULL DEFAULT '',
+      earnings DOUBLE PRECISION NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      clicks BIGINT NOT NULL DEFAULT 0,
+      ad_requests BIGINT NOT NULL DEFAULT 0,
+      matched_requests BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, account_id, report_date, app_id, ad_unit_id, format, country, platform)
+    );
   `);
 
   try {
@@ -690,6 +737,7 @@ async function initSchema() {
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_adsense_rollup_client_date ON adsense_rollup_daily (client_id, report_date DESC)`);
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_admob_dim_kind ON admob_dim_daily (client_id, account_id, dim_kind, report_date)`);
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_adsense_dim_kind ON adsense_dim_daily (client_id, account_id, dim_kind, report_date)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_admob_grain_client_date ON admob_grain_daily (client_id, report_date, account_id)`);
   } catch (e) {
     logger.warn('admob/adsense indexes:', e.message);
   }
@@ -900,6 +948,8 @@ const TENANT_TABLES = [
   'adsense_rollup_daily',
   'admob_dim_daily',
   'adsense_dim_daily',
+  'admob_grain_daily',
+  'admob_ads_account_links',
 ];
 
 function safeIdent(name) {
@@ -1065,6 +1115,16 @@ async function finishTenantBackfill() {
       logger.warn(`NOT NULL client_id on ${table}:`, e.message);
     }
     try {
+      // Re-adding validates every row (minutes on report_grain) under a lock on gam_clients.
+      const { rows: fk } = await schemaQuery(
+        `SELECT 1 FROM pg_constraint c
+         JOIN pg_class t ON t.oid = c.conrelid
+         JOIN pg_class r ON r.oid = c.confrelid
+         WHERE t.relname = $1 AND c.conname = $2 AND c.contype = 'f' AND r.relname = 'gam_clients'
+         LIMIT 1`,
+        [table, `${table}_client_id_fkey`]
+      );
+      if (fk.length) continue;
       await schemaQuery(
         `ALTER TABLE ${safeIdent(table)} DROP CONSTRAINT IF EXISTS ${safeIdent(`${table}_client_id_fkey`)}`
       );
@@ -1093,7 +1153,82 @@ async function finishTenantBackfill() {
     }
   }
 
+  await consolidatePublisherTenants();
+
   logger.info('Multi-client tenancy schema ready (client_id on all report tables)');
+}
+
+const PUBLISHER_TABLES = [
+  'admob_accounts',
+  'adsense_accounts',
+  'admob_report_daily',
+  'adsense_report_daily',
+  'admob_rollup_daily',
+  'adsense_rollup_daily',
+  'admob_dim_daily',
+  'adsense_dim_daily',
+  'admob_grain_daily',
+];
+
+/** AdMob / AdSense live on the account's hidden publisher workspace (see utils/publisherTenant). */
+async function consolidatePublisherTenants() {
+  try {
+    // Links from before the split point at GAM's Google Ads accounts.
+    await schemaQuery(
+      `DELETE FROM admob_ads_account_links l
+       USING gam_clients c
+       WHERE l.client_id = c.id AND c.publisher_parent_id IS NULL`
+    );
+  } catch (e) {
+    logger.warn('Publisher tenant links cleanup:', e.message);
+  }
+
+  const accountIds = new Set();
+  for (const table of ['admob_accounts', 'adsense_accounts']) {
+    try {
+      const { rows } = await schemaQuery(
+        `SELECT DISTINCT COALESCE(c.account_id, c.id) AS account_id
+         FROM ${safeIdent(table)} t
+         JOIN gam_clients c ON c.id = t.client_id
+         WHERE c.publisher_parent_id IS NULL`
+      );
+      rows.forEach((r) => accountIds.add(String(r.account_id)));
+    } catch (e) {
+      logger.warn(`Publisher tenant scan ${table}:`, e.message);
+    }
+  }
+  if (!accountIds.size) return;
+
+  // eslint-disable-next-line global-require
+  const { ensurePublisherWorkspace } = require('./models/clientStore');
+  for (const accountId of accountIds) {
+    let workspace;
+    try {
+      workspace = await ensurePublisherWorkspace(accountId);
+    } catch (e) {
+      logger.warn(`Publisher workspace for account ${accountId}:`, e.message);
+      continue;
+    }
+    if (!workspace?.id) continue;
+    for (const table of PUBLISHER_TABLES) {
+      try {
+        const res = await schemaQuery(
+          `UPDATE ${safeIdent(table)} t
+           SET client_id = $1::uuid
+           FROM gam_clients c
+           WHERE t.client_id = c.id
+             AND c.publisher_parent_id IS NULL
+             AND COALESCE(c.account_id, c.id) = $2::uuid`,
+          [workspace.id, accountId]
+        );
+        if (res.rowCount) {
+          logger.info(`Moved ${res.rowCount} ${table} row(s) to publisher workspace ${workspace.id}`);
+        }
+      } catch (e) {
+        logger.warn(`Publisher tenant move ${table}:`, e.message);
+      }
+    }
+  }
 }
 
 /**

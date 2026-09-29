@@ -43,6 +43,17 @@ function isActiveSession(user, sessionId) {
 function stripSessionFields(user) {
   if (!user) return user;
   const { passwordHash, activeSessionId, ...safe } = user;
+  const scope = safe.permissions?.admobScope;
+  if (safe.role !== 'admin' && scope) {
+    // App / ad unit ids embed the AdMob publisher id — domain users only learn counts + filters.
+    safe.permissions = {
+      ...safe.permissions,
+      admobScope: {
+        accountCount: Array.isArray(scope.accountIds) ? scope.accountIds.length : 0,
+        filters: Array.isArray(scope.filters) ? scope.filters : [],
+      },
+    };
+  }
   return safe;
 }
 

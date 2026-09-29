@@ -17,6 +17,7 @@ import TermsOfService from './pages/TermsOfService';
 import About from './pages/About';
 import AdMobDashboard from './pages/admob/AdMobDashboard';
 import AdMobReporting from './pages/admob/AdMobReporting';
+import AdMobRoi from './pages/admob/AdMobRoi';
 import AdSenseDashboard from './pages/adsense/AdSenseDashboard';
 import AdSenseSites from './pages/adsense/AdSenseSites';
 import AdSenseAdUnits from './pages/adsense/AdSenseAdUnits';
@@ -27,6 +28,7 @@ import PermissionRoute from './components/routing/PermissionRoute';
 import HomeRedirect from './components/routing/HomeRedirect';
 import PublicOnlyRoute from './components/routing/PublicOnlyRoute';
 import { useAuth } from './store/useAuth';
+import { ADSENSE_ENABLED } from './utils/productWorkspace';
 import { useCrossTabAuthSync } from './hooks/useCrossTabAuthSync';
 import {
   CROSS_TAB_ACCOUNT_SWITCH,
@@ -135,12 +137,17 @@ function AppRoutes() {
         <Route path="/admob/apps" element={<PermissionRoute page="admob-reporting"><Navigate to="/admob/reporting" replace /></PermissionRoute>} />
         <Route path="/admob/ad-units" element={<PermissionRoute page="admob-reporting"><Navigate to="/admob/reporting" replace /></PermissionRoute>} />
         <Route path="/admob/reporting" element={<PermissionRoute page="admob-reporting"><AdMobReporting /></PermissionRoute>} />
+        <Route path="/admob/roi" element={<AdminRoute><AdMobRoi /></AdminRoute>} />
 
-        <Route path="/adsense" element={<PermissionRoute page="adsense-dashboard"><Navigate to="/adsense/dashboard" replace /></PermissionRoute>} />
-        <Route path="/adsense/dashboard" element={<PermissionRoute page="adsense-dashboard"><AdSenseDashboard /></PermissionRoute>} />
-        <Route path="/adsense/sites" element={<PermissionRoute page="adsense-sites"><AdSenseSites /></PermissionRoute>} />
-        <Route path="/adsense/ad-units" element={<PermissionRoute page="adsense-ad-units"><AdSenseAdUnits /></PermissionRoute>} />
-        <Route path="/adsense/reporting" element={<PermissionRoute page="adsense-reporting"><AdSenseReporting /></PermissionRoute>} />
+        {ADSENSE_ENABLED && (
+          <>
+            <Route path="/adsense" element={<PermissionRoute page="adsense-dashboard"><Navigate to="/adsense/dashboard" replace /></PermissionRoute>} />
+            <Route path="/adsense/dashboard" element={<PermissionRoute page="adsense-dashboard"><AdSenseDashboard /></PermissionRoute>} />
+            <Route path="/adsense/sites" element={<PermissionRoute page="adsense-sites"><AdSenseSites /></PermissionRoute>} />
+            <Route path="/adsense/ad-units" element={<PermissionRoute page="adsense-ad-units"><AdSenseAdUnits /></PermissionRoute>} />
+            <Route path="/adsense/reporting" element={<PermissionRoute page="adsense-reporting"><AdSenseReporting /></PermissionRoute>} />
+          </>
+        )}
       </Route>
 
       {/* Fallback */}

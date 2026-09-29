@@ -27,14 +27,19 @@ export const PRODUCTS = {
   },
 };
 
-export const PRODUCT_LIST = [PRODUCTS.gam, PRODUCTS.admob, PRODUCTS.adsense];
+/** AdSense is hidden until it has been tested; flip to true to re-enable its routes and switcher entry. */
+export const ADSENSE_ENABLED = false;
+
+export const PRODUCT_LIST = ADSENSE_ENABLED
+  ? [PRODUCTS.gam, PRODUCTS.admob, PRODUCTS.adsense]
+  : [PRODUCTS.gam, PRODUCTS.admob];
 
 const STORAGE_KEY = 'adnexus.activeProduct';
 
 export function readStoredProduct() {
   try {
     const v = localStorage.getItem(STORAGE_KEY);
-    if (v && PRODUCTS[v]) return v;
+    if (v && PRODUCT_LIST.some((p) => p.id === v)) return v;
   } catch {
     /* ignore */
   }
@@ -87,6 +92,7 @@ export const GAM_NAV_ITEMS = [
 export const ADMOB_NAV_ITEMS = [
   { to: '/admob/dashboard', label: 'Dashboard', page: 'admob-dashboard' },
   { to: '/admob/reporting', label: 'Reporting', page: 'admob-reporting' },
+  { to: '/admob/roi', label: 'ROI', page: 'admob-roi' },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/help', label: 'Help', page: 'help', always: true },
 ];

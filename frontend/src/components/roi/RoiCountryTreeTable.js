@@ -15,7 +15,7 @@ import { downloadCsv, downloadExcel } from '../../utils/tableExport';
 import RoiTreeEntityIcon from './RoiTreeEntityIcon';
 import { EmptyIcon } from '../ui/Icon';
 
-const COLS = [
+const BASE_COLS = [
   { id: 'label', label: 'Country / Account / Package / Site', type: 'dimension' },
   { id: 'date', label: 'Date', type: 'dimension' },
   { id: 'adsSpend', label: 'Ads spend', type: 'metric' },
@@ -183,7 +183,17 @@ export default function RoiCountryTreeTable({
   showPagination = true,
   showTotals = true,
   spendCurrency = 'USD',
+  labelColumn = null,
+  hideColumns = null,
+  topIconKind = 'country',
+  searchPlaceholder = 'Search country / account / package / site…',
 }) {
+  const COLS = useMemo(() => {
+    const hidden = new Set(hideColumns || []);
+    return BASE_COLS
+      .filter((c) => !hidden.has(c.id))
+      .map((c) => (c.id === 'label' && labelColumn ? { ...c, label: labelColumn } : c));
+  }, [hideColumns, labelColumn]);
   const isMobile = useMedia('(max-width: 640px)');
   const [expandedCountries, setExpandedCountries] = useState(() => new Set());
   const [expandedAccounts, setExpandedAccounts] = useState(() => new Set());
@@ -347,9 +357,9 @@ export default function RoiCountryTreeTable({
       ? (country.packages || []).length
       : (country.accountCount || (country.accounts || []).length);
     const hasChildren = childCount > 0;
-    const childBadge = flatMode
+    const childBadge = country.childBadge || (flatMode
       ? `${childCount} item${childCount === 1 ? '' : 's'}`
-      : `${childCount} account${childCount === 1 ? '' : 's'}`;
+      : `${childCount} account${childCount === 1 ? '' : 's'}`);
 
     const renderPackageRows = (packages) => (packages || []).map((pkg) => {
       const pkgOpen = expandedPackages.has(pkg.id);
@@ -369,14 +379,16 @@ export default function RoiCountryTreeTable({
               >
                 <TreeChevron open={pkgOpen} hasChildren={hasDays} />
                 <span className="roi-tree-label-main">
-                  <RoiTreeEntityIcon
-                    kind={pkg.targetType === 'site' || pkg.earnOnly ? 'site' : 'app'}
-                    label={pkg.label}
-                  />
+                  {pkg.hideIcon ? null : (
+                    <RoiTreeEntityIcon
+                      kind={pkg.targetType === 'site' || pkg.earnOnly ? 'site' : 'app'}
+                      label={pkg.label}
+                    />
+                  )}
                   <span className="roi-tree-label-text">{pkg.label}</span>
                 </span>
                 <span className="roi-tree-kind">
-                  {pkg.targetType === 'site' || pkg.earnOnly ? 'Site' : 'Package'}
+                  {pkg.kindLabel || (pkg.targetType === 'site' || pkg.earnOnly ? 'Site' : 'Package')}
                 </span>
                 {hasDays ? (
                   <span className="roi-tree-badge">{pkg.days.length} days</span>
@@ -428,11 +440,14 @@ export default function RoiCountryTreeTable({
               <TreeChevron open={countryOpen} hasChildren={hasChildren} />
               <span className="roi-tree-label-main">
                 <RoiTreeEntityIcon
-                  kind="country"
+                  kind={country.iconKind || topIconKind}
                   code={country.countryCode}
                   label={country.label}
                 />
                 <span className="roi-tree-label-text">{country.label}</span>
+                {country.subLabel ? (
+                  <span className="roi-tree-kind">{country.subLabel}</span>
+                ) : null}
               </span>
               {hasChildren ? (
                 <span className="roi-tree-badge">{childBadge}</span>
@@ -501,7 +516,7 @@ export default function RoiCountryTreeTable({
               value={search}
               onChange={onSearchChange}
               onPageReset={onPageReset}
-              placeholder="Search country / account / package / site…"
+              placeholder={searchPlaceholder}
             />
           )}
           {headerExtra}
@@ -547,7 +562,7 @@ export default function RoiCountryTreeTable({
                 <div className="report-mobile-item-head">
                   <p className="report-mobile-title report-mobile-title--with-icon">
                     <RoiTreeEntityIcon
-                      kind="country"
+                      kind={country.iconKind || topIconKind}
                       code={country.countryCode}
                       label={country.label}
                     />

@@ -28,6 +28,7 @@ import { showToast } from '../../hooks/useToast';
 import { usePermissions } from '../../hooks/usePermissions';
 import { useAuth } from '../../store/useAuth';
 import usePublisherReport from '../../hooks/usePublisherReport';
+import { admobFilterKeysForUser } from '../../utils/auth/permissions';
 
 const ACCENT = '#0D9488';
 
@@ -119,7 +120,8 @@ export default function AdMobDashboard() {
         ctr: r.ctr,
       })));
   const lastSyncAt = report.freshness?.lastSyncAt || live?.lastSyncAt;
-  const canFilter = visibility.filters !== false;
+  const allowedFilterKeys = useMemo(() => admobFilterKeysForUser(user), [user]);
+  const canFilter = visibility.filters !== false && (!allowedFilterKeys || allowedFilterKeys.length > 0);
 
   const handleCopyLink = async () => {
     await copyReportLink(report.getSharePayload());
@@ -190,6 +192,7 @@ export default function AdMobDashboard() {
         onApplyRecentFilter={report.applyRecentSnapshot}
         timeZone={report.reportingTimeZone}
         enableExtraFilters={false}
+        allowedFilterKeys={allowedFilterKeys}
       />
 
       <ProductKpiStrip
@@ -265,7 +268,6 @@ export default function AdMobDashboard() {
           </div>
         </section>
       </div>
-
       <ProductDetailTable
         title={useSample ? 'Ad units (sample)' : tableTitle}
         product="admob"

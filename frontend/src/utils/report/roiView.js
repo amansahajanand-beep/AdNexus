@@ -767,10 +767,10 @@ export function flattenCountryTreeForExport(tree = []) {
     });
   };
   (tree || []).forEach((country) => {
-    push('Country', country.label, country.dateLabel, country);
+    push(country.exportLevel || 'Country', country.label, country.dateLabel, country);
     if (country.flatMode && (country.packages || []).length) {
       (country.packages || []).forEach((pkg) => {
-        push(pkg.targetType === 'site' || pkg.earnOnly ? 'Site' : 'Package', pkg.label, pkg.dateLabel, pkg);
+        push(pkg.kindLabel || (pkg.targetType === 'site' || pkg.earnOnly ? 'Site' : 'Package'), pkg.label, pkg.dateLabel, pkg);
         (pkg.days || []).forEach((day) => {
           push('Date', pkg.label, day.date, day);
         });

@@ -30,6 +30,20 @@ async function eachActiveClient(fn) {
   }
 }
 
+/** AdMob / AdSense tenants (hidden per-account workspaces). */
+async function eachPublisherWorkspace(fn) {
+  const { listPublisherWorkspaces } = require('../models/clientStore');
+  for (const client of await listPublisherWorkspaces()) {
+    await fn(client);
+  }
+}
+
+/** Google Ads pools: every GAM network plus every AdMob workspace. */
+async function eachAdsTenant(fn) {
+  await eachActiveClient(fn);
+  await eachPublisherWorkspace(fn);
+}
+
 /** Max calendar months to enqueue per complete-month run (2AM / drip). */
 function monthBackfillLimit() {
   const n = parseInt(process.env.SYNC_MONTH_BACKFILL_LIMIT || '2', 10);
@@ -448,7 +462,7 @@ async function enqueueAdsSyncToday({ reason } = {}) {
   const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
   const tag = reason ? ` (${reason})` : '';
   const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
-  await eachActiveClient(async (client) => {
+  await eachAdsTenant(async (client) => {
     const cid = client.id;
     try {
       const { accounts, jobs, skipped, rateLimited } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
@@ -481,7 +495,7 @@ async function enqueueAdsSyncYesterday({ reason } = {}) {
   const hourSlot = Math.floor(Date.now() / (60 * 60 * 1000));
   const tag = reason ? ` (${reason})` : '';
   const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
-  await eachActiveClient(async (client) => {
+  await eachAdsTenant(async (client) => {
     const cid = client.id;
     try {
       const { accounts, jobs, skipped } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
@@ -516,7 +530,7 @@ async function enqueueAdsReconcileRecent({ reason } = {}) {
   const yesterday = shiftYMD(today, -1);
   const tag = reason ? ` (${reason})` : '';
   const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
-  await eachActiveClient(async (client) => {
+  await eachAdsTenant(async (client) => {
     const cid = client.id;
     try {
       const { accounts, jobs, skipped } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
@@ -733,7 +747,7 @@ function startCron() {
     const end = todayInTZ();
     const start = shiftYMD(end, -(lookback - 1));
     const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
-    await eachActiveClient(async (client) => {
+    await eachAdsTenant(async (client) => {
       const cid = client.id;
       try {
         const { accounts, jobs, skipped } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {
@@ -763,7 +777,7 @@ function startCron() {
       const { admobSyncQueue, adsenseSyncQueue } = require('../queues/publisherSync');
       const { enqueueAdMobSync } = require('../services/admobSyncService');
       const { enqueueAdSenseSync } = require('../services/adsenseSyncService');
-      await eachActiveClient(async (client) => {
+      await eachPublisherWorkspace(async (client) => {
         const cid = client.id;
         try {
           const start = shiftYMD(end, -(admobLookback - 1));
@@ -808,7 +822,7 @@ function startCron() {
       const { enqueueAdMobSync } = require('../services/admobSyncService');
       const { enqueueAdSenseSync } = require('../services/adsenseSyncService');
       const hourSlot = new Date().getHours();
-      await eachActiveClient(async (client) => {
+      await eachPublisherWorkspace(async (client) => {
         const cid = client.id;
         try {
           const a = await enqueueAdMobSync(client, admobSyncQueue, {
@@ -859,7 +873,7 @@ function startCron() {
     const start = shiftYMD(end, -(Math.max(1, recentDays) - 1));
     const slot = Math.floor(Date.now() / (3 * 60 * 60 * 1000));
     const { enqueueAdsSyncAccounts } = require('../services/adsSyncService');
-    await eachActiveClient(async (client) => {
+    await eachAdsTenant(async (client) => {
       const cid = client.id;
       try {
         const { accounts, jobs, skipped } = await enqueueAdsSyncAccounts(client, adsSyncQueue, {

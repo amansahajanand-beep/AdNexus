@@ -1,8 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { adsAPI } from '../../utils/api';
+import { adsAPIFor } from '../../utils/api';
 import { TextField } from '../ui/Field';
 import Button from '../ui/Button';
 import TableSearchBar from '../ui/TableSearchBar';
+import AdsConnectChooser from '../ads/AdsConnectChooser';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 import { confirmDialog } from '../../hooks/useConfirmDialog';
 import {
@@ -47,7 +48,9 @@ const EMPTY_MCC = {
   refreshToken: '',
 };
 
-export default function AdsAccountsAdmin() {
+/** `clientId` pins every call to one tenant (the AdMob workspace); omitted = current GAM network. */
+export default function AdsAccountsAdmin({ clientId = null, scopeLabel = null }) {
+  const api = useMemo(() => adsAPIFor(clientId), [clientId]);
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -61,13 +64,14 @@ export default function AdsAccountsAdmin() {
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(1);
   const [picker, setPicker] = useState(null); // { sessionId, managers, individuals }
+  const [chooserOpen, setChooserOpen] = useState(false);
   const [pickingId, setPickingId] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const data = await adsAPI.listAccounts();
+      const data = await api.listAccounts();
       setAccounts(data.accounts || []);
     } catch (err) {
       logErrorForDebug(err, 'Ads accounts');
@@ -75,7 +79,7 @@ export default function AdsAccountsAdmin() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [api]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -91,7 +95,7 @@ export default function AdsAccountsAdmin() {
       const sessionId = params.get('session');
       if (sessionId) {
         setBusy(true);
-        adsAPI.oauthPending(sessionId)
+        api.oauthPending(sessionId)
           .then((data) => {
             setPicker({
               sessionId: data.sessionId,
@@ -145,7 +149,7 @@ export default function AdsAccountsAdmin() {
     setError(null);
     setOkMsg(null);
     try {
-      const result = await adsAPI.createIndividual({
+      const result = await api.createIndividual({
         customerId: form.customerId,
         descriptiveName: form.descriptiveName,
         loginCustomerId: form.loginCustomerId || undefined,
@@ -182,7 +186,7 @@ export default function AdsAccountsAdmin() {
     setError(null);
     setOkMsg(null);
     try {
-      const result = await adsAPI.createMcc({
+      const result = await api.createMcc({
         customerId: mccForm.customerId,
         descriptiveName: mccForm.descriptiveName,
         refreshToken: mccForm.refreshToken || undefined,
@@ -206,16 +210,24 @@ export default function AdsAccountsAdmin() {
   };
 
   const connectMccOAuth = async () => {
-    setBusy(true);
+    const { url } = await api.mccOauthUrl();
+    window.location.href = url;
+  };
+
+  const onUsedExistingLogin = async (res, login) => {
+    setChooserOpen(false);
     setError(null);
-    try {
-      const { url } = await adsAPI.mccOauthUrl();
-      window.location.href = url;
-    } catch (err) {
-      logErrorForDebug(err, 'Connect MCC');
-      setError(getUserFacingMessage(err, 'Could not start MCC OAuth.'));
-      setBusy(false);
+    if (res?.sessionId) {
+      setPicker({
+        sessionId: res.sessionId,
+        managers: res.managers || [],
+        individuals: res.individuals || [],
+      });
+      setOkMsg(`Using ${login.descriptiveName || login.customerId} — select the account to add.`);
+      return;
     }
+    setOkMsg(`${login.descriptiveName || login.customerId} is already connected in this network.`);
+    await load();
   };
 
   const selectPendingAccount = async (customerId) => {
@@ -223,7 +235,7 @@ export default function AdsAccountsAdmin() {
     setPickingId(customerId);
     setError(null);
     try {
-      const result = await adsAPI.oauthSelect(picker.sessionId, { customerId });
+      const result = await api.oauthSelect(picker.sessionId, { customerId });
       setPicker(null);
       setOkMsg(
         result.accountType === 'mcc'
@@ -240,7 +252,7 @@ export default function AdsAccountsAdmin() {
 
   const patchAccount = async (id, patch) => {
     try {
-      await adsAPI.updateAccount(id, patch);
+      await api.updateAccount(id, patch);
       await load();
     } catch (err) {
       setError(getUserFacingMessage(err, 'Could not update account.'));
@@ -253,7 +265,7 @@ export default function AdsAccountsAdmin() {
     setError(null);
     try {
       const toUpdate = childAccounts.filter((c) => !!c.includeInRoi !== includeInRoi);
-      await Promise.all(toUpdate.map((c) => adsAPI.updateAccount(c.id, { includeInRoi })));
+      await Promise.all(toUpdate.map((c) => api.updateAccount(c.id, { includeInRoi })));
       setOkMsg(
         includeInRoi
           ? `Included ${childAccounts.length} child account(s) in ROI.`
@@ -270,7 +282,7 @@ export default function AdsAccountsAdmin() {
   const connectAccount = async (id) => {
     setBusy(true);
     try {
-      const { url } = await adsAPI.accountOauthUrl(id);
+      const { url } = await api.accountOauthUrl(id);
       window.location.href = url;
     } catch (err) {
       setError(getUserFacingMessage(err, 'Could not start OAuth.'));
@@ -289,7 +301,7 @@ export default function AdsAccountsAdmin() {
     });
     if (!ok) return;
     try {
-      const result = await adsAPI.deleteAccount(id);
+      const result = await api.deleteAccount(id);
       setOkMsg(result?.message || 'OAuth disconnected. Spend history was kept.');
       await load();
     } catch (err) {
@@ -301,7 +313,7 @@ export default function AdsAccountsAdmin() {
     setBusy(true);
     setError(null);
     try {
-      const result = await adsAPI.syncAll();
+      const result = await api.syncAll();
       const syncErrors = Array.isArray(result?.errors) ? result.errors : [];
       if (syncErrors.length) {
         setError(syncErrors.map((e) => e.error || e.message).filter(Boolean).join(' · ') || 'Ads sync failed for one or more accounts.');
@@ -325,14 +337,18 @@ export default function AdsAccountsAdmin() {
     <div className="ads-admin-page">
       <div className="admin-panel-head">
         <div>
-          <h3 className="admin-panel-title">Google Ads accounts</h3>
+          <h3 className="admin-panel-title">
+            Google Ads accounts{scopeLabel ? ` · ${scopeLabel}` : ''}
+          </h3>
           <p className="reporting-sub" style={{ margin: '4px 0 0' }}>
-            Connect with Google to list manager accounts for your email, then pick one to load partner accounts.
+            {scopeLabel
+              ? `Accounts used only by ${scopeLabel} ROI — separate from GAM's Google Ads accounts.`
+              : 'Add a Google Ads account: use one that is already connected, or connect a new one with Google.'}
           </p>
         </div>
         <div className="admin-panel-actions ads-toolbar">
-          <Button type="button" variant="primary" loading={busy} onClick={connectMccOAuth}>
-            Connect with Google
+          <Button type="button" variant="primary" loading={busy} onClick={() => setChooserOpen(true)}>
+            Add Google Ads account
           </Button>
           <Button type="button" variant="secondary" loading={busy} onClick={syncAll}>
             Sync spend
@@ -575,7 +591,7 @@ export default function AdsAccountsAdmin() {
         {!mccs.length && (
           <div className="ads-empty">
             <p className="ads-empty-title">No MCC linked</p>
-            <p className="ads-empty-desc">Connect with Google to list manager accounts, then select one.</p>
+            <p className="ads-empty-desc">Click Add Google Ads account to use an existing login or connect with Google.</p>
           </div>
         )}
         {mccs.map((mcc) => {
@@ -612,7 +628,7 @@ export default function AdsAccountsAdmin() {
                         return;
                       }
                       try {
-                        await adsAPI.refreshChildren(mcc.id);
+                        await api.refreshChildren(mcc.id);
                         setOkMsg('Child accounts refreshed.');
                         await load();
                       } catch (err) {
@@ -822,6 +838,14 @@ export default function AdsAccountsAdmin() {
           </div>
         )}
       </div>
+
+      <AdsConnectChooser
+        open={chooserOpen}
+        onClose={() => setChooserOpen(false)}
+        clientId={clientId}
+        onConnectGoogle={connectMccOAuth}
+        onUsed={onUsedExistingLogin}
+      />
     </div>
   );
 }

@@ -69,12 +69,14 @@ function mergeInventoryFromBody(merged, body = {}) {
   INVENTORY_SCOPE_KEYS.forEach((k) => {
     if (Array.isArray(body[k])) merged[k] = body[k];
   });
+  if (body.admobScope && typeof body.admobScope === 'object') merged.admobScope = body.admobScope;
   return merged;
 }
 
 function permissionsTouched(body = {}) {
   return FLAG_KEYS.some((k) => k in body)
     || INVENTORY_SCOPE_KEYS.some((k) => k in body)
+    || 'admobScope' in body
     || 'maxDaysBack' in body;
 }
 
@@ -83,6 +85,7 @@ function buildFromBody(role, body = {}) {
   INVENTORY_SCOPE_KEYS.forEach((k) => {
     if (Array.isArray(body[k])) inventory[k] = body[k];
   });
+  if (body.admobScope && typeof body.admobScope === 'object') inventory.admobScope = body.admobScope;
   const maxDays = body.maxDaysBack != null ? parseInt(body.maxDaysBack, 10) : undefined;
   const dateRestriction = Number.isFinite(maxDays) && maxDays > 0 ? { maxDaysBack: maxDays } : null;
   return normalizePermissions(role, {

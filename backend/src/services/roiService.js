@@ -3519,5 +3519,6 @@ module.exports = {
   metricsFor,
   adsEngagementMetrics,
   loadCanonicalGamEarn,
+  loadMappedSpendDaily,
   invalidateRoiSummaryCache,
 };

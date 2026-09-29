@@ -85,6 +85,28 @@ async function listAdMobAccounts(gamClient, refreshToken) {
   })).filter((a) => a.accountId);
 }
 
+/** AdMob apps with their store IDs (Android package / iOS numeric ID) for Ads spend matching. */
+async function listAdMobApps(gamClient, { accountId, refreshToken }) {
+  const api = admobApi(gamClient, refreshToken);
+  const parent = accountId.startsWith('accounts/') ? accountId : `accounts/${accountId}`;
+  const out = [];
+  let pageToken;
+  do {
+    const res = await api.accounts.apps.list({ parent, pageSize: 1000, pageToken }, { timeout: 15000 });
+    for (const a of res.data?.apps || []) {
+      out.push({
+        appId: a.appId || '',
+        platform: a.platform || '',
+        storeId: a.linkedAppInfo?.appStoreId || '',
+        name: a.manualAppInfo?.displayName || a.linkedAppInfo?.displayName || a.appId || '',
+        storeName: a.linkedAppInfo?.displayName || '',
+      });
+    }
+    pageToken = res.data?.nextPageToken || undefined;
+  } while (pageToken);
+  return out;
+}
+
 function ymdParts(ymd) {
   const [y, m, d] = String(ymd).split('-').map((n) => parseInt(n, 10));
   return { year: y, month: m, day: d };
@@ -242,8 +264,10 @@ function parseAdMobReportRows(resData, extraDims = []) {
       const metrics = parseAdMobMetrics(met);
       const out = { reportDate: ymd, ...metrics };
       for (const d of extraDims) {
+        const kind = ADMOB_DIM_KINDS[d] || d.toLowerCase();
         const rawVal = dim[d]?.displayLabel || dim[d]?.value || '';
-        out[ADMOB_DIM_KINDS[d] || d.toLowerCase()] = String(rawVal || 'Unknown').trim() || 'Unknown';
+        out[kind] = String(rawVal || 'Unknown').trim() || 'Unknown';
+        out[`${kind}_id`] = String(dim[d]?.value || rawVal || '').trim();
       }
       rows.push(out);
     }
@@ -368,14 +392,50 @@ async function fetchAdMobDimReport(gamClient, {
   }));
 }
 
+/** DATE × APP × AD_UNIT × FORMAT × COUNTRY × PLATFORM in one report (exact cross-dimension facts). */
+async function fetchAdMobGrainReport(gamClient, {
+  accountId,
+  refreshToken,
+  startDate,
+  endDate,
+  currencyCode = 'USD',
+}) {
+  const rows = await generateAdMobReport(gamClient, {
+    accountId,
+    refreshToken,
+    startDate,
+    endDate,
+    currencyCode,
+    dimensions: ['DATE', 'APP', 'AD_UNIT', 'FORMAT', 'COUNTRY', 'PLATFORM'],
+  });
+  logger.info(`[admob] grain ${accountId} ${startDate}→${endDate}: ${rows.length} row(s)`);
+  return rows.map((r) => ({
+    reportDate: r.reportDate,
+    appId: r.app_id || '',
+    appName: r.app || '',
+    adUnitId: r.ad_unit_id || '',
+    adUnitName: r.ad_unit || '',
+    format: r.format || '',
+    country: r.country || '',
+    platform: r.platform || '',
+    earnings: r.earnings,
+    impressions: r.impressions,
+    clicks: r.clicks,
+    adRequests: r.adRequests,
+    matchedRequests: r.matchedRequests,
+  }));
+}
+
 module.exports = {
   ADMOB_SCOPE,
+  fetchAdMobGrainReport,
   ADMOB_DIM_KINDS,
   getAdMobOAuthClient,
   isAdMobOAuthConfigured,
   resolveAdMobOAuthApp,
   admobRedirectUri,
   listAdMobAccounts,
+  listAdMobApps,
   generateAdMobReport,
   fetchAdMobNetworkReport,
   fetchAdMobDimReport,

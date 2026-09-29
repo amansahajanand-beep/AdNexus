@@ -19,7 +19,21 @@ const {
   enqueueAdMobSync,
 } = require('../services/admobSyncService');
 const { admobSyncQueue } = require('../queues/publisherSync');
+const {
+  getAdMobRoi,
+  listAdsAccountsForAdMob,
+  setLinkedAdsAccountIds,
+} = require('../services/admobRoiService');
+const logger = require('../utils/logger');
 const { admobAccountStore } = require('../models/publisherAccountStore');
+const {
+  scopedTotals,
+  scopedTrend,
+  scopedBreakdown,
+  scopedFilterOptions,
+  grainScopeCatalog,
+} = require('../models/admobGrainStore');
+const { ADMOB_SCOPE_FILTERS, getAdmobScope, hasAdmobAccess } = require('../utils/permissions');
 const { createPublisherApiRouter, sparkFromTrend, pctChange } = require('./publisherApiFactory');
 
 function buildAdMobKpis(curr, prev, trend) {
@@ -55,8 +69,94 @@ function buildAdMobKpis(curr, prev, trend) {
   ];
 }
 
+/** ROI page: AdMob earnings vs spend from the Google Ads accounts linked to each publisher. */
+function addAdMobRoiRoutes(router, { resolveAccountContext, resolveRange, parseCsvList, store }) {
+  router.get('/roi', async (req, res) => {
+    try {
+      const ctx = await resolveAccountContext(req);
+      if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
+      const { start, end } = resolveRange(req);
+      const account = ctx.storeAccountId ? await store.getAccountById(ctx.storeAccountId) : null;
+      const apps = parseCsvList(req.query.apps);
+      const adsAccountIds = parseCsvList(req.query.adsAccountIds);
+      const data = await getAdMobRoi(req.client, {
+        clientId: ctx.clientId,
+        account,
+        start,
+        end,
+        apps: apps.length ? apps : null,
+        adsAccountIds: adsAccountIds.length ? adsAccountIds : null,
+      });
+      res.set('Cache-Control', 'no-store');
+      res.json({ account: ctx.active, ...data });
+    } catch (err) {
+      logger.error('admob roi:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get('/workspace', (req, res) => {
+    res.json({ clientId: req.client?.id || null, name: req.client?.name || null });
+  });
+
+  /** Admin → Users: publishers + their apps / ad units for domain-user AdMob scope. */
+  router.get('/scope-catalog', async (req, res) => {
+    try {
+      const accounts = await store.listAccounts(req.client.id);
+      const catalog = await grainScopeCatalog(req.client.id, accounts.map((a) => a.id));
+      res.set('Cache-Control', 'no-store');
+      res.json({
+        accounts: accounts.map((a) => ({
+          id: a.id,
+          publisherId: a.accountId,
+          name: a.descriptiveName || a.accountId,
+          currencyCode: a.currencyCode,
+        })),
+        ...catalog,
+        filters: ADMOB_SCOPE_FILTERS,
+      });
+    } catch (err) {
+      logger.error('admob scope-catalog:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get('/roi/ads-accounts', async (req, res) => {
+    try {
+      const ctx = await resolveAccountContext(req);
+      if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
+      const { start, end } = resolveRange(req);
+      const data = await listAdsAccountsForAdMob(ctx.clientId, {
+        admobAccountId: ctx.storeAccountId,
+        start,
+        end,
+      });
+      res.set('Cache-Control', 'no-store');
+      res.json({ account: ctx.active, publisherClientId: ctx.clientId, ...data });
+    } catch (err) {
+      logger.error('admob roi ads-accounts:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.put('/roi/ads-accounts', async (req, res) => {
+    try {
+      const ctx = await resolveAccountContext(req);
+      if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
+      if (!ctx.storeAccountId) return res.status(400).json({ error: 'Connect an AdMob account first' });
+      const ids = Array.isArray(req.body?.adsAccountIds) ? req.body.adsAccountIds : [];
+      const linkedIds = await setLinkedAdsAccountIds(ctx.clientId, ctx.storeAccountId, ids);
+      res.json({ ok: true, linkedIds });
+    } catch (err) {
+      logger.error('admob roi ads-accounts save:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+}
+
 module.exports = createPublisherApiRouter({
   product: 'admob',
+  adminOnly: true,
   store: admobAccountStore,
   isOAuthConfigured: isAdMobOAuthConfigured,
   resolveOAuthApp: resolveAdMobOAuthApp,
@@ -80,4 +180,13 @@ module.exports = createPublisherApiRouter({
   defaultBreakdownDim: 'app',
   defaultTableDim: 'ad_unit',
   queryParam: 'admob_oauth',
+  extendRouter: addAdMobRoiRoutes,
+  scoped: {
+    getScope: getAdmobScope,
+    hasAccess: hasAdmobAccess,
+    totals: scopedTotals,
+    trend: scopedTrend,
+    breakdown: scopedBreakdown,
+    filterOptions: scopedFilterOptions,
+  },
 });

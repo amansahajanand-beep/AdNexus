@@ -23,6 +23,7 @@ import {
   writeStoredProduct,
   getProduct,
   navItemsForProduct,
+  ADSENSE_ENABLED,
 } from '../../utils/productWorkspace';
 import {
   NavIcon,
@@ -306,19 +307,20 @@ export default function Layout() {
     if (profileRoute) go(profileRoute);
   };
 
-  const activeProduct = resolveActiveProduct(location.pathname);
-  const productMeta = getProduct(activeProduct);
-
   const allowedProducts = React.useMemo(() => {
     const ids = [];
     const pages = visibility?.pages || {};
     if (isAdmin || pages.dashboard || pages.reporting || pages.roi || pages.myAds || pages.domainUser) {
       ids.push('gam');
     }
-    if (isAdmin || pages.admob !== false) ids.push('admob');
-    if (isAdmin || pages.adsense !== false) ids.push('adsense');
+    if (isAdmin || pages.admob) ids.push('admob');
+    if (ADSENSE_ENABLED && (isAdmin || pages.adsense !== false)) ids.push('adsense');
     return ids.length ? ids : ['gam'];
   }, [visibility, isAdmin]);
+
+  const resolvedProduct = resolveActiveProduct(location.pathname);
+  const activeProduct = allowedProducts.includes(resolvedProduct) ? resolvedProduct : 'gam';
+  const productMeta = getProduct(activeProduct);
 
   const handleProductChange = useCallback((nextId) => {
     writeStoredProduct(nextId);
@@ -507,12 +509,14 @@ export default function Layout() {
         <aside className={`app-sidebar app-sidebar--${activeProduct} ${menuOpen ? 'open' : ''}${focusMode ? ' is-collapsed' : ''}`}>
           <div className="sidebar-top">
             <BrandLogo showTitle={!focusMode} markSize={focusMode ? 26 : 28} />
-            <ProductSwitcher
-              productId={activeProduct}
-              onChange={handleProductChange}
-              compact={focusMode}
-              allowedProductIds={allowedProducts}
-            />
+            {allowedProducts.length > 1 && (
+              <ProductSwitcher
+                productId={activeProduct}
+                onChange={handleProductChange}
+                compact={focusMode}
+                allowedProductIds={allowedProducts}
+              />
+            )}
             {!focusMode && activeProduct === 'gam' && showNetworkChrome && (
               canSwitchNetwork ? (
                 <label className="network-switch-wrap" title="Switch network for Dashboard & Reporting">

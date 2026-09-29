@@ -2,7 +2,8 @@ const { admobAccountStore } = require('../models/publisherAccountStore');
 const { upsertAdMobDailyRows } = require('../models/publisherReportStore');
 const { rebuildAdMobRollups } = require('../models/publisherRollupStore');
 const { upsertAdMobDimRows } = require('../models/publisherDimStore');
-const { fetchAdMobNetworkReport, fetchAdMobDimReport } = require('../admob/client');
+const { fetchAdMobNetworkReport, fetchAdMobDimReport, fetchAdMobGrainReport } = require('../admob/client');
+const { upsertAdMobGrainRows } = require('../models/admobGrainStore');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { addPublisherJob } = require('../queues/publisherSync');
 const logger = require('../utils/logger');
@@ -57,6 +58,17 @@ async function syncAdMobDims(account, gamClient, { startDate, endDate } = {}) {
   return total;
 }
 
+async function syncAdMobGrain(account, gamClient, { startDate, endDate }) {
+  const rows = await fetchAdMobGrainReport(gamClient, {
+    accountId: account.accountId,
+    refreshToken: account.refreshToken,
+    startDate,
+    endDate,
+    currencyCode: account.currencyCode || 'USD',
+  });
+  return upsertAdMobGrainRows(account.clientId, account.id, rows);
+}
+
 async function syncAdMobAccount(account, { startDate, endDate, gamClient, lookbackDays, skipDims = false } = {}) {
   if (!account?.refreshToken || !account?.accountId) {
     throw new Error('AdMob account missing refresh token or account id');
@@ -106,9 +118,16 @@ async function syncAdMobAccount(account, { startDate, endDate, gamClient, lookba
       dimRows = await syncAdMobDims(account, gamClient, { startDate: dimStart, endDate: end });
     }
 
+    let grainRows = 0;
+    try {
+      grainRows = await syncAdMobGrain(account, gamClient, { startDate: start, endDate: end });
+    } catch (e) {
+      logger.warn(`[admob-sync] grain ${account.accountId}:`, e.message);
+    }
+
     await admobAccountStore.setSyncStatus(account.id, { error: null });
-    logger.info(`[admob-sync] ${account.accountId} ${start}→${end}: ${n} fact, ${dimRows} dim`);
-    return { rows: n, dimRows, startDate: start, endDate: end };
+    logger.info(`[admob-sync] ${account.accountId} ${start}→${end}: ${n} fact, ${dimRows} dim, ${grainRows} grain`);
+    return { rows: n, dimRows, grainRows, startDate: start, endDate: end };
   } catch (err) {
     const msg = String(err.message || err).slice(0, 400);
     await admobAccountStore.setSyncStatus(account.id, { error: msg });
@@ -195,6 +214,7 @@ async function enqueueAdMobSync(gamClient, queue, {
 
 module.exports = {
   syncAdMobAccount,
+  syncAdMobGrain,
   syncAdMobAccountToday,
   syncAdMobAccountYesterday,
   syncAllAdMobForClient,

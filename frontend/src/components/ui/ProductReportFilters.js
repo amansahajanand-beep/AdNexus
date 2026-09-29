@@ -131,14 +131,20 @@ export default function ProductReportFilters({
   timeZone = null,
   /** AdMob Reporting: allow adding ad unit / ad source / mediation filters. */
   enableExtraFilters = false,
+  /** Domain users: only these filter keys are shown (null = no restriction). */
+  allowedFilterKeys = null,
 }) {
+  const allowKey = useCallback(
+    (f) => !allowedFilterKeys || allowedFilterKeys.includes(f.key),
+    [allowedFilterKeys]
+  );
   const coreFields = useMemo(
-    () => (product === 'adsense' ? ADSENSE_FIELDS : ADMOB_CORE_FIELDS),
-    [product]
+    () => (product === 'adsense' ? ADSENSE_FIELDS : ADMOB_CORE_FIELDS).filter(allowKey),
+    [product, allowKey]
   );
   const extraFields = useMemo(
-    () => (product === 'admob' && enableExtraFilters ? ADMOB_EXTRA_FIELDS : []),
-    [product, enableExtraFilters]
+    () => (product === 'admob' && enableExtraFilters ? ADMOB_EXTRA_FIELDS : []).filter(allowKey),
+    [product, enableExtraFilters, allowKey]
   );
   const dimKeyList = useMemo(
     () => publisherDimKeys(product, { includeExtra: enableExtraFilters }),

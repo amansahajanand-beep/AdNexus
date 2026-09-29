@@ -2842,6 +2842,8 @@ select.ui-field-input { border-radius: 10px; cursor: pointer; }
 .user-form-modal-content { display: flex; flex-direction: column; gap: 0; min-width: 0; }
 .user-form-modal-content .ui-field:last-child { margin-bottom: 0; }
 .user-form-modal-content .permissions-panel { margin-top: 4px; }
+.user-form-section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--border); }
+.user-form-section-title { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
 .user-form-modal-content .form-note { font-size: 12.5px; line-height: 1.5; }
 
 /* ─── Success modal (permission save) ─────────────────────────────────────── */

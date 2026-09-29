@@ -2,7 +2,8 @@
  * Factory: /api/admob and /api/adsense account + overview routes.
  */
 const express = require('express');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth } = require('../middleware/auth');
+const { usePublisherTenant } = require('../utils/publisherTenant');
 const { getPendingSessionPublic, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const logger = require('../utils/logger');
@@ -43,9 +44,30 @@ function createPublisherApiRouter({
   defaultBreakdownDim,
   defaultTableDim,
   queryParam,
+  adminOnly = false,
+  extendRouter = null,
+  scoped = null,
 }) {
   const router = express.Router();
   router.use(requireAuth);
+  router.use(usePublisherTenant);
+  // Role check only — re-running requireAuth would reset req.client to the GAM network.
+  const requireAdmin = (req, res, next) => {
+    if (req.user?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    return next();
+  };
+  // Domain users with a product scope may only use these read endpoints.
+  const SCOPED_READ_PATHS = new Set(['/kpis', '/trend', '/overview', '/freshness', '/filters', '/breakdowns', '/table']);
+  const isScopedUser = (req) => !!scoped && req.user?.role !== 'admin';
+  if (adminOnly) {
+    router.use((req, res, next) => {
+      if (req.user?.role === 'admin') return next();
+      if (scoped && req.method === 'GET' && SCOPED_READ_PATHS.has(req.path) && scoped.hasAccess(req.user)) {
+        return next();
+      }
+      return res.status(403).json({ error: 'Admin access required' });
+    });
+  }
 
   const { buildVisibility, hasFlag } = require('../utils/permissions');
 
@@ -65,6 +87,11 @@ function createPublisherApiRouter({
     };
   }
 
+  function parseCsvList(raw) {
+    if (Array.isArray(raw)) return raw.map(String).filter(Boolean);
+    return String(raw || '').split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
   function hasInventoryFilters(inv) {
     return Object.values(inv || {}).some((v) => {
       if (Array.isArray(v)) return v.length > 0;
@@ -73,7 +100,8 @@ function createPublisherApiRouter({
   }
   router.use((req, res, next) => {
     // Admin account/OAuth routes still require admin; product flag gates all reads.
-    if (!hasFlag(req.user, productAccessFlag)) {
+    const allowed = scoped ? scoped.hasAccess(req.user) : hasFlag(req.user, productAccessFlag);
+    if (!allowed) {
       return res.status(403).json({ error: `${product === 'admob' ? 'AdMob' : 'AdSense'} access not permitted` });
     }
     return next();
@@ -146,7 +174,94 @@ function createPublisherApiRouter({
     return { start, end, prevStart, prevEnd, days };
   }
 
+  // ── Scoped (domain user) reads: grain facts limited to assigned publishers/apps/ad units ──
+  const { getDateRestriction, clampDateRange } = require('../utils/dateRestriction');
+  const SCOPED_FILTER_KEYS = {
+    app: 'apps', ad_unit: 'adUnits', format: 'formats', country: 'countries', platform: 'platforms',
+  };
+  // Never expose publisher ids / account names to domain users.
+  const SCOPED_ACCOUNT = { id: null, descriptiveName: product === 'admob' ? 'AdMob' : 'AdSense' };
+
+  async function resolveScopedContext(req) {
+    const scope = scoped.getScope(req.user);
+    const clientId = req.client?.id;
+    const allowed = new Set(scope.accountIds || []);
+    const accounts = (await store.listAccounts(clientId)).filter((a) => allowed.has(a.id));
+    return { clientId, accounts, scope: { ...scope, accountIds: accounts.map((a) => a.id) } };
+  }
+
+  function scopedFilters(req, scope) {
+    if (!hasFlag(req.user, 'canUseFilters')) return {};
+    const allowed = new Set(scope.filters || []);
+    const out = {};
+    for (const [dim, key] of Object.entries(SCOPED_FILTER_KEYS)) {
+      if (allowed.has(dim) && req.query[key]) out[key] = req.query[key];
+    }
+    return out;
+  }
+
+  function scopedRange(req) {
+    const r = resolveRange(req);
+    const restriction = getDateRestriction(req.user);
+    if (!restriction?.startDate) return r;
+    const cur = clampDateRange(r.start, r.end, restriction);
+    const prev = clampDateRange(r.prevStart, r.prevEnd, restriction);
+    return { ...r, start: cur.startDate, end: cur.endDate, prevStart: prev.startDate, prevEnd: prev.endDate };
+  }
+
+  function gateRow(user, row) {
+    const vis = buildVisibility(user);
+    const out = { ...row };
+    if (!vis.revenue) delete out.earnings;
+    if (!vis.impressions) delete out.impressions;
+    if (!vis.ctr) {
+      delete out.clicks;
+      delete out.ctr;
+    }
+    if (!vis.ecpm) {
+      delete out.ecpm;
+      delete out.rpm;
+      delete out.match_rate;
+    }
+    return out;
+  }
+
+  function latestSync(accounts) {
+    return accounts.reduce((best, a) => (
+      a.lastSyncAt && (!best || new Date(a.lastSyncAt) > new Date(best)) ? a.lastSyncAt : best
+    ), null);
+  }
+
+  async function loadScopedKpiPayload(req) {
+    const ctx = await resolveScopedContext(req);
+    const { start, end, prevStart, prevEnd } = scopedRange(req);
+    const base = { scope: ctx.scope, filters: scopedFilters(req, ctx.scope) };
+    const [curr, prev, trend] = await Promise.all([
+      scoped.totals(ctx.clientId, ctx.accounts, { ...base, start, end }),
+      scoped.totals(ctx.clientId, ctx.accounts, { ...base, start: prevStart, end: prevEnd }),
+      scoped.trend(ctx.clientId, ctx.accounts, { ...base, start, end }),
+    ]);
+    const hasData = Number(curr.earnings || curr.impressions || 0) > 0 || trend.length > 0;
+    const gated = applyMetricPermissions(req.user, buildOverviewKpis(curr, prev, trend), curr);
+    return {
+      isSample: !hasData,
+      source: 'scoped-grain',
+      account: SCOPED_ACCOUNT,
+      accounts: [],
+      currency: curr.currency || 'USD',
+      range: { startDate: start, endDate: end, compareStart: prevStart, compareEnd: prevEnd },
+      totals: gated.totals,
+      previous: applyMetricPermissions(req.user, [], prev).totals,
+      kpis: gated.kpis,
+      trend: trend.map((t) => gateRow(req.user, t)),
+      visibility: gated.visibility,
+      lastSyncAt: latestSync(ctx.accounts),
+      lastSyncError: null,
+    };
+  }
+
   async function loadKpiPayload(req) {
+    if (isScopedUser(req)) return loadScopedKpiPayload(req);
     const ctx = await resolveAccountContext(req);
     if (ctx.error) throw Object.assign(new Error(ctx.error), { status: ctx.status });
     const { start, end, prevStart, prevEnd } = resolveRange(req);
@@ -466,6 +581,19 @@ function createPublisherApiRouter({
   /** Sync freshness for sidebar / page chips. */
   router.get('/freshness', async (req, res) => {
     try {
+      if (isScopedUser(req)) {
+        const ctx = await resolveScopedContext(req);
+        return res.json({
+          product,
+          lastSyncAt: latestSync(ctx.accounts),
+          accountCount: ctx.accounts.length,
+          accountId: null,
+          accountLabel: SCOPED_ACCOUNT.descriptiveName,
+          needsReconnect: false,
+          errors: [],
+          accounts: [],
+        });
+      }
       const clientId = req.client?.id || req.user?.clientId;
       if (!clientId) return res.status(400).json({ error: 'No client context' });
       const accounts = await store.listAccounts(clientId);
@@ -520,6 +648,21 @@ function createPublisherApiRouter({
       if (!hasFlag(req.user, 'canUseFilters') && req.user?.role !== 'admin') {
         return res.status(403).json({ error: 'Filters not permitted' });
       }
+      if (isScopedUser(req)) {
+        const sctx = await resolveScopedContext(req);
+        const { start, end } = scopedRange(req);
+        const options = await scoped.filterOptions(
+          sctx.clientId,
+          { scope: sctx.scope, start, end },
+          sctx.scope.filters || []
+        );
+        return res.json({
+          account: SCOPED_ACCOUNT,
+          range: { startDate: start, endDate: end },
+          allowedFilters: sctx.scope.filters || [],
+          options,
+        });
+      }
       const ctx = await resolveAccountContext(req);
       if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
       const { start, end } = resolveRange(req);
@@ -544,6 +687,28 @@ function createPublisherApiRouter({
     try {
       if (typeof breakdownFn !== 'function') {
         return res.json({ rows: [] });
+      }
+      if (isScopedUser(req)) {
+        const sctx = await resolveScopedContext(req);
+        const { start, end } = scopedRange(req);
+        const dim = String(req.query.dim || defaultBreakdownDim || 'app');
+        const allowed = (sctx.scope.filters || []).includes(dim);
+        const rows = allowed
+          ? await scoped.breakdown(
+            sctx.clientId,
+            sctx.accounts,
+            { scope: sctx.scope, filters: scopedFilters(req, sctx.scope), start, end },
+            dim,
+            req.query.limit || 20
+          )
+          : [];
+        res.set('Cache-Control', 'no-store');
+        return res.json({
+          dim,
+          range: { startDate: start, endDate: end },
+          isSample: !rows.length,
+          rows: rows.map((r) => gateRow(req.user, r)),
+        });
       }
       const ctx = await resolveAccountContext(req);
       if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
@@ -598,6 +763,37 @@ function createPublisherApiRouter({
     try {
       if (typeof tableFn !== 'function') {
         return res.json({ rows: [] });
+      }
+      if (isScopedUser(req)) {
+        const sctx = await resolveScopedContext(req);
+        const { start, end } = scopedRange(req);
+        const requestedDim = String(req.query.dim || defaultTableDim || 'ad_unit');
+        const allowedDims = sctx.scope.filters || [];
+        const opts = { scope: sctx.scope, filters: scopedFilters(req, sctx.scope), start, end };
+        let dim = requestedDim;
+        let rows;
+        if (dim !== 'date' && !allowedDims.includes(dim)) dim = allowedDims[0] || 'date';
+        if (dim === 'date') {
+          const trend = await scoped.trend(sctx.clientId, sctx.accounts, opts);
+          rows = trend.map((t) => ({ name: t.date, ...t })).reverse();
+        } else {
+          rows = await scoped.breakdown(sctx.clientId, sctx.accounts, opts, dim, Math.min(parseInt(req.query.limit, 10) || 100, 500));
+        }
+        const vis = buildVisibility(req.user);
+        res.set('Cache-Control', 'no-store');
+        return res.json({
+          dim,
+          requestedDim,
+          range: { startDate: start, endDate: end },
+          isSample: !rows.length,
+          rows: rows.map((r) => gateRow(req.user, r)),
+          visibility: {
+            revenue: !!vis.revenue,
+            impressions: !!vis.impressions,
+            ctr: !!vis.ctr,
+            ecpm: !!vis.ecpm,
+          },
+        });
       }
       const ctx = await resolveAccountContext(req);
       if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
@@ -655,6 +851,10 @@ function createPublisherApiRouter({
       res.status(500).json({ error: err.message });
     }
   });
+
+  if (typeof extendRouter === 'function') {
+    extendRouter(router, { resolveAccountContext, resolveRange, parseCsvList, store });
+  }
 
   return router;
 }
