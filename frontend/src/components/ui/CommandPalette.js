@@ -5,6 +5,7 @@ import { usePermissions } from '../../hooks/usePermissions';
 import { getSavedFilters, SAVED_FILTERS_PAGES } from '../../utils/savedFilters';
 import { getReportPresets, PRESET_PAGES, hrefForPreset } from '../../utils/reportPresets';
 import { encodeReportShare } from '../../utils/reportShare';
+import { ADSENSE_ENABLED } from '../../utils/productWorkspace';
 
 export default function CommandPalette() {
   const { user } = useAuth();
@@ -53,6 +54,12 @@ export default function CommandPalette() {
     }
     if (canPage('my-ads')) {
       list.push({ id: 'my-ads', label: 'Google Ads', hint: 'Connect Ads accounts', to: '/my-ads' });
+    }
+    if (canPage('admob-dashboard')) {
+      list.push({ id: 'admob', label: 'AdMob Dashboard', hint: 'Apps & mediation', to: '/admob/dashboard' });
+    }
+    if (ADSENSE_ENABLED && canPage('adsense-dashboard')) {
+      list.push({ id: 'adsense', label: 'AdSense Dashboard', hint: 'Sites & content', to: '/adsense/dashboard' });
     }
     if (canPage('presets')) {
       list.push({ id: 'presets', label: 'Presets', hint: 'Saved presets', to: '/presets' });

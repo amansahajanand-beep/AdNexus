@@ -28,14 +28,17 @@ function verifyAdsState(state) {
   return decoded;
 }
 
-/** returnTo: 'admin' (default) | 'my-ads' for domain-user Connect page. */
+const RETURN_PATHS = { 'my-ads': '/my-ads', 'admob-roi': '/admob/roi' };
+
+/** returnTo: 'admin' (default) | 'my-ads' (domain-user Connect page) | 'admob-roi'. */
 function adsOAuthRedirect(decoded, query = '') {
   const raw = String(query || '').replace(/^\?/, '');
   const params = new URLSearchParams(raw);
-  if (decoded?.returnTo === 'my-ads') {
+  const path = RETURN_PATHS[decoded?.returnTo];
+  if (path) {
     params.delete('tab');
     const qs = params.toString();
-    return `${frontendBaseUrl()}/my-ads${qs ? `?${qs}` : ''}`;
+    return `${frontendBaseUrl()}${path}${qs ? `?${qs}` : ''}`;
   }
   if (!params.has('tab')) params.set('tab', 'ads');
   return `${frontendBaseUrl()}/admin?${params.toString()}`;

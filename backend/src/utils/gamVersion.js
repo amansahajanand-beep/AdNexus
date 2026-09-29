@@ -1,7 +1,7 @@
 /**
  * Single source of truth for the Google Ad Manager SOAP API version.
  *
- * Set GAM_API_VERSION in .env (format: vYYYYMM, e.g. v202602). Every service
+ * Set GAM_API_VERSION in .env (format: vYYYYMM, e.g. v202608). Every service
  * call reads it from here, so upgrading the API version is a one-line change
  * in .env instead of editing 6 files.
  *
@@ -13,7 +13,7 @@
  * disrupting normal usage.
  */
 
-const GAM_API_VERSION = process.env.GAM_API_VERSION || 'v202602';
+const GAM_API_VERSION = process.env.GAM_API_VERSION || 'v202608';
 
 function addMonths(date, months) {
   const d = new Date(date.getTime());

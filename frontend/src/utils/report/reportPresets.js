@@ -18,6 +18,10 @@ export const PRESET_PAGES = Object.freeze({
   dashboard: 'dashboard',
   reporting: 'reporting',
   roi: 'roi',
+  admob: 'admob',
+  adsense: 'adsense',
+  admobReporting: 'admob-reporting',
+  adsenseReporting: 'adsense-reporting',
 });
 export const PRESETS_CHANGED_EVENT = 'report_presets_changed';
 
@@ -66,6 +70,11 @@ export function normalizePresetSnapshot(f = {}) {
     appLabels: toArray(f.appLabels),
     siteLabels: toArray(f.siteLabels),
     countryLabels: toArray(f.countryLabels),
+    apps: toArray(f.apps),
+    formats: toArray(f.formats),
+    countries: toArray(f.countries),
+    platforms: toArray(f.platforms),
+    sites: toArray(f.sites),
   };
 }
 
@@ -142,6 +151,11 @@ export function summaryForPreset(snapshot) {
   fmt('Ad Unit', p.domainName);
   fmt('App', p.domainId);
   fmt('Country', p.country);
+  fmt('App', p.apps);
+  fmt('Format', p.formats);
+  fmt('Country', p.countries);
+  fmt('Platform', p.platforms);
+  fmt('Site', p.sites);
   if (p.reportDimensions?.length) parts.push(`Dims (${p.reportDimensions.length})`);
   if (p.reportMetrics?.length) parts.push(`Metrics (${p.reportMetrics.length})`);
 
@@ -384,7 +398,15 @@ export function hrefForPreset(page, snapshot) {
     ? '/reporting'
     : page === PRESET_PAGES.roi
       ? '/roi'
-      : '/dashboard';
+      : page === PRESET_PAGES.admob
+        ? '/admob/dashboard'
+        : page === PRESET_PAGES.admobReporting
+          ? '/admob/reporting'
+          : page === PRESET_PAGES.adsense
+            ? '/adsense/dashboard'
+            : page === PRESET_PAGES.adsenseReporting
+              ? '/adsense/reporting'
+              : '/dashboard';
   const qs = encodeReportShare(normalizePresetSnapshot(snapshot));
   return qs ? `${path}?${qs}` : path;
 }

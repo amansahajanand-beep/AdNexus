@@ -52,6 +52,7 @@ function mapRuntime(row) {
     redirectUri: row.redirect_uri || process.env.GOOGLE_REDIRECT_URI || null,
     isActive: row.is_active !== false,
     isPending: isPendingNetworkCode(row.network_code) || !row.google_refresh_token_enc,
+    publisherParentId: row.publisher_parent_id || null,
   };
 }
 
@@ -112,7 +113,9 @@ async function listActiveClients() {
 }
 
 async function listAllClientsPublic() {
-  const { rows } = await query('SELECT * FROM gam_clients ORDER BY created_at ASC');
+  const { rows } = await query(
+    'SELECT * FROM gam_clients WHERE publisher_parent_id IS NULL ORDER BY created_at ASC'
+  );
   return rows.map(mapPublic);
 }
 
@@ -176,6 +179,79 @@ async function createClient({
     ]
   );
   return getClientById(id);
+}
+
+const PUBLISHER_NETWORK_PREFIX = 'publisher-';
+
+function isPublisherWorkspaceRow(row) {
+  return !!row?.publisher_parent_id;
+}
+
+async function getPublisherWorkspace(accountId) {
+  if (!accountId) return null;
+  const { rows } = await query(
+    'SELECT * FROM gam_clients WHERE publisher_parent_id = $1::uuid',
+    [accountId]
+  );
+  return rows[0] ? mapRuntime(rows[0]) : null;
+}
+
+/**
+ * Hidden AdMob/AdSense tenant for an account. It is its own account (so it never shows
+ * in the GAM network switcher), has no GAM refresh token (so GAM sync skips it), and
+ * owns a Google Ads pool separate from every GAM network.
+ */
+async function ensurePublisherWorkspace(accountId) {
+  if (!accountId) return null;
+  const existing = await getPublisherWorkspace(accountId);
+  if (existing) return existing;
+
+  const { rows } = await query('SELECT * FROM gam_clients WHERE id = $1::uuid', [accountId]);
+  const root = rows[0];
+  if (!root) return null;
+
+  const id = crypto.randomUUID();
+  let slug = slugify(`${root.name}-admob`);
+  const existingSlug = await query('SELECT 1 FROM gam_clients WHERE slug = $1', [slug]);
+  if (existingSlug.rowCount) slug = `${slug}-${id.slice(0, 8)}`;
+
+  await query(
+    `INSERT INTO gam_clients (
+       id, account_id, name, slug, network_code, google_client_id,
+       google_client_secret_enc, google_refresh_token_enc, redirect_uri, is_active,
+       publisher_parent_id
+     ) VALUES ($1,$1,$2,$3,$4,$5,$6,NULL,$7,true,$8)
+     ON CONFLICT DO NOTHING`,
+    [
+      id,
+      `${root.name} · AdMob`,
+      slug,
+      `${PUBLISHER_NETWORK_PREFIX}${String(accountId).replace(/-/g, '')}`,
+      root.google_client_id,
+      root.google_client_secret_enc,
+      root.redirect_uri || null,
+      accountId,
+    ]
+  );
+  logger.info(`[tenancy] Created publisher workspace for account ${accountId}`);
+  return getPublisherWorkspace(accountId);
+}
+
+async function listPublisherWorkspaces() {
+  const { rows } = await query(
+    `SELECT * FROM gam_clients
+     WHERE publisher_parent_id IS NOT NULL AND is_active = true
+     ORDER BY created_at ASC`
+  );
+  const out = [];
+  for (const row of rows) {
+    try {
+      out.push(mapRuntime(row));
+    } catch (e) {
+      logger.warn(`[tenancy] Skipping publisher workspace ${row.id}: ${e.message}`);
+    }
+  }
+  return out;
 }
 
 /**
@@ -297,7 +373,8 @@ async function ensureBootstrapFromEnv() {
   // Single-tenant production: env network_code may not match the only DB row.
   if (!existingRow && syncFromEnv) {
     const { rows } = await query(
-      'SELECT id, name, network_code FROM gam_clients ORDER BY created_at ASC LIMIT 2'
+      `SELECT id, name, network_code FROM gam_clients
+       WHERE publisher_parent_id IS NULL ORDER BY created_at ASC LIMIT 2`
     );
     if (rows.length === 1) {
       existingRow = rows[0];
@@ -369,4 +446,8 @@ module.exports = {
   isUsableGamClient,
   isPendingNetworkCode,
   resolveClientForUser,
+  isPublisherWorkspaceRow,
+  getPublisherWorkspace,
+  ensurePublisherWorkspace,
+  listPublisherWorkspaces,
 };

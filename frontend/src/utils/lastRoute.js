@@ -1,8 +1,25 @@
 import { getDefaultHomeRoute, isAdmin, canAccessPage } from './auth/permissions';
+import { ADSENSE_ENABLED } from './productWorkspace';
 
 const KEY = 'adnexus.lastRoute';
 
-const ALLOWED = new Set(['/dashboard', '/reporting', '/roi', '/presets', '/admin', '/domain-user', '/my-ads', '/help']);
+const ALLOWED = new Set([
+  '/dashboard',
+  '/reporting',
+  '/roi',
+  '/presets',
+  '/admin',
+  '/domain-user',
+  '/my-ads',
+  '/help',
+  '/admob/dashboard',
+  '/admob/reporting',
+  '/admob/roi',
+  '/adsense/dashboard',
+  '/adsense/sites',
+  '/adsense/ad-units',
+  '/adsense/reporting',
+]);
 
 export function rememberLastRoute(pathname) {
   const path = String(pathname || '').split('?')[0];
@@ -24,6 +41,7 @@ export function readLastRoute() {
 }
 
 function routeAllowed(user, path) {
+  if (!ADSENSE_ENABLED && path.startsWith('/adsense')) return false;
   if (path === '/admin') return isAdmin(user);
   if (path === '/help') return true;
   const pageMap = {
@@ -33,6 +51,13 @@ function routeAllowed(user, path) {
     '/presets': 'presets',
     '/domain-user': 'domain-user',
     '/my-ads': 'my-ads',
+    '/admob/dashboard': 'admob-dashboard',
+    '/admob/reporting': 'admob-reporting',
+    '/admob/roi': 'admob-roi',
+    '/adsense/dashboard': 'adsense-dashboard',
+    '/adsense/sites': 'adsense-sites',
+    '/adsense/ad-units': 'adsense-ad-units',
+    '/adsense/reporting': 'adsense-reporting',
   };
   const page = pageMap[path];
   if (page) return canAccessPage(user, page);

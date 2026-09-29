@@ -5,7 +5,11 @@ const {
   buildAdsAuthUrl,
   commitMccSelection,
   commitIndividualSelection,
+  discoverAdsCandidates,
 } = require('./authAds');
+const { getAccountIdForClient, listClientsByAccountId } = require('../models/clientStore');
+const { runWithClient } = require('../utils/clientContext');
+const { createPendingSession } = require('../models/oauthPendingStore');
 const {
   listAccounts,
   createAccount,
@@ -415,6 +419,7 @@ router.post('/accounts/mcc/oauth-url', requireAdmin, async (req, res) => {
     const url = buildAdsAuthUrl(req.client, {
       clientId: req.client.id,
       mode: 'mcc',
+      ...(req.body?.returnTo === 'admob-roi' ? { returnTo: 'admob-roi' } : {}),
     });
     res.json({ url });
   } catch (err) {
@@ -493,6 +498,107 @@ router.post('/oauth/pending/:id/select', requireAdmin, async (req, res) => {
   } catch (err) {
     logger.error('Ads OAuth select failed:', err.message);
     res.status(500).json({ error: err.message || 'Could not select Ads account' });
+  }
+});
+
+/**
+ * Top-level Google Ads logins (MCCs / standalone accounts) in every network of this account.
+ * Disconnected ones are included (hasToken=false) so their synced accounts stay usable.
+ */
+async function listAccountAdsLogins(targetClientId) {
+  const accountId = await getAccountIdForClient(targetClientId);
+  const networks = await listClientsByAccountId(accountId);
+  const logins = [];
+  for (const n of networks) {
+    const accounts = await runWithClient({ id: n.id }, () => listAccounts(n.id));
+    const childIds = new Map();
+    for (const a of accounts) {
+      if (!a.parentMccId) continue;
+      if (!childIds.has(a.parentMccId)) childIds.set(a.parentMccId, []);
+      childIds.get(a.parentMccId).push(a.id);
+    }
+    for (const a of accounts) {
+      if (a.parentMccId) continue;
+      if (!a.hasRefreshToken && a.accountType !== 'mcc') continue;
+      const inTarget = n.id === targetClientId;
+      logins.push({
+        id: a.id,
+        sourceClientId: n.id,
+        networkName: n.name || n.networkCode || 'Network',
+        accountType: a.accountType,
+        customerId: a.customerId,
+        descriptiveName: a.descriptiveName,
+        childCount: (childIds.get(a.id) || []).length,
+        hasToken: a.hasRefreshToken,
+        lastSyncError: a.lastSyncError,
+        inTarget,
+        accountIds: inTarget ? [a.id, ...(childIds.get(a.id) || [])] : [],
+      });
+    }
+  }
+  // One row per Google Ads customer — prefer the copy already in the target network.
+  const byCustomer = new Map();
+  for (const l of logins) {
+    const prev = byCustomer.get(l.customerId);
+    const better = !prev
+      || (l.inTarget && !prev.inTarget)
+      || (l.inTarget === prev.inTarget && l.hasToken && !prev.hasToken);
+    if (better) byCustomer.set(l.customerId, l);
+  }
+  return [...byCustomer.values()].sort((a, b) => (
+    Number(b.inTarget) - Number(a.inTarget)
+    || Number(b.accountType === 'mcc') - Number(a.accountType === 'mcc')
+    || a.descriptiveName.localeCompare(b.descriptiveName)
+  ));
+}
+
+router.get('/logins', requireAdmin, async (req, res) => {
+  try {
+    res.json({ logins: await listAccountAdsLogins(req.client.id) });
+  } catch (err) {
+    logger.error('Ads logins list failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * "Use this account": reuse an already-connected Google login instead of a new OAuth round-trip.
+ * Same network → returns its account ids. Other network → lists the login's accessible
+ * customers in a pending session so the admin can pick, like after Connect with Google.
+ */
+router.post('/logins/use', requireAdmin, async (req, res) => {
+  try {
+    const adsAccountId = String(req.body?.adsAccountId || '');
+    const sourceClientId = String(req.body?.sourceClientId || '');
+    const logins = await listAccountAdsLogins(req.client.id);
+    const login = logins.find((l) => l.id === adsAccountId && l.sourceClientId === sourceClientId);
+    if (!login) return res.status(404).json({ error: 'Google Ads login not found in this account.' });
+    if (login.inTarget) {
+      return res.json({ ok: true, alreadyConnected: true, login, accountIds: login.accountIds });
+    }
+    const source = await runWithClient({ id: sourceClientId }, () => getAccountById(adsAccountId));
+    if (!source?.refreshToken) {
+      return res.status(400).json({ error: 'That Google login has no saved token — use Connect with Google.' });
+    }
+    const { managers, individuals } = await discoverAdsCandidates(req.client, source.refreshToken);
+    if (!managers.length && !individuals.length) {
+      return res.status(400).json({ error: 'No Google Ads accounts are accessible with that login.' });
+    }
+    const session = await createPendingSession({
+      product: 'ads',
+      mode: 'connect',
+      clientId: req.client.id,
+      refreshToken: source.refreshToken,
+      candidates: [
+        ...managers.map((m) => ({ ...m, kind: 'mcc' })),
+        ...individuals.map((i) => ({ ...i, kind: 'client' })),
+      ],
+      payload: { userId: req.user?.id || null, returnTo: 'admin' },
+    });
+    res.json({ ok: true, sessionId: session.id, managers, individuals, login });
+  } catch (err) {
+    logger.error('Ads use login failed:', err.message);
+    res.status(500).json({ error: err.message || 'Could not use that Google login' });
   }
 });
 
@@ -678,6 +784,7 @@ router.get('/accounts/:id/oauth-url', requireAdmin, async (req, res) => {
       clientId: req.client.id,
       mode,
       adsAccountId: target.id,
+      ...(req.query.returnTo === 'admob-roi' ? { returnTo: 'admob-roi' } : {}),
     });
     res.json({ url, reconnectAccountId: target.id, reconnectMode: mode });
   } catch (err) {

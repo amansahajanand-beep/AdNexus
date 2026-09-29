@@ -1,0 +1,167 @@
+/** Sample datasets for AdMob / AdSense dashboards until live sync is wired. */
+
+function spark(values) {
+  return values.map((v) => ({ v }));
+}
+
+export const ADMOB_SAMPLE = {
+  accountLabel: 'Demo AdMob publisher',
+  currency: 'USD',
+  isSample: true,
+  kpis: [
+    {
+      key: 'earnings',
+      label: 'Estimated earnings',
+      value: 18420.55,
+      format: 'money',
+      change: 8.4,
+      spark: spark([12, 14, 13, 16, 18, 17, 19, 18]),
+    },
+    {
+      key: 'impressions',
+      label: 'Impressions',
+      value: 4820000,
+      format: 'number',
+      change: 5.1,
+      spark: spark([40, 42, 41, 45, 48, 47, 50, 48]),
+    },
+    {
+      key: 'clicks',
+      label: 'Clicks',
+      value: 96200,
+      format: 'number',
+      change: 3.2,
+      spark: spark([8, 9, 8.5, 9.2, 9.8, 9.5, 10, 9.6]),
+    },
+    {
+      key: 'ctr',
+      label: 'CTR',
+      value: 2.0,
+      format: 'percent',
+      change: -0.4,
+      spark: spark([2.1, 2.0, 2.05, 1.98, 2.0, 1.99, 2.02, 2.0]),
+    },
+    {
+      key: 'ecpm',
+      label: 'eCPM',
+      value: 3.82,
+      format: 'money',
+      change: 2.8,
+      spark: spark([3.5, 3.6, 3.55, 3.7, 3.8, 3.75, 3.9, 3.82]),
+    },
+    {
+      key: 'matchRate',
+      label: 'Match rate',
+      value: 91.4,
+      format: 'percent',
+      change: 1.1,
+      spark: spark([89, 90, 90.5, 91, 91.2, 91, 91.5, 91.4]),
+    },
+  ],
+  trend: [
+    { date: 'Mar 16', earnings: 2100, impressions: 620000 },
+    { date: 'Mar 17', earnings: 2350, impressions: 680000 },
+    { date: 'Mar 18', earnings: 2280, impressions: 650000 },
+    { date: 'Mar 19', earnings: 2610, impressions: 710000 },
+    { date: 'Mar 20', earnings: 2740, impressions: 740000 },
+    { date: 'Mar 21', earnings: 3120, impressions: 820000 },
+    { date: 'Mar 22', earnings: 3220, impressions: 800000 },
+  ],
+  byFormat: [
+    { name: 'Rewarded', earnings: 7200 },
+    { name: 'Interstitial', earnings: 5100 },
+    { name: 'Banner', earnings: 3800 },
+    { name: 'Native', earnings: 1620 },
+    { name: 'App open', earnings: 700 },
+  ],
+  topApps: [
+    { name: 'Puzzle Quest', earnings: 6400, impressions: 1800000, ecpm: 3.56 },
+    { name: 'Race Arena', earnings: 5100, impressions: 1200000, ecpm: 4.25 },
+    { name: 'Daily Trivia', earnings: 3900, impressions: 980000, ecpm: 3.98 },
+    { name: 'Fit Tracker', earnings: 3020, impressions: 840000, ecpm: 3.6 },
+  ],
+  tableRows: [
+    { app: 'Puzzle Quest', adUnit: 'Home Banner', format: 'Banner', impressions: 820000, clicks: 12400, earnings: 2100, ecpm: 2.56, ctr: 1.51 },
+    { app: 'Puzzle Quest', adUnit: 'Level End', format: 'Rewarded', impressions: 510000, clicks: 9800, earnings: 3200, ecpm: 6.27, ctr: 1.92 },
+    { app: 'Race Arena', adUnit: 'Between Races', format: 'Interstitial', impressions: 640000, clicks: 15200, earnings: 2800, ecpm: 4.38, ctr: 2.38 },
+    { app: 'Daily Trivia', adUnit: 'Quiz Native', format: 'Native', impressions: 420000, clicks: 9100, earnings: 1620, ecpm: 3.86, ctr: 2.17 },
+    { app: 'Fit Tracker', adUnit: 'Session Start', format: 'App open', impressions: 280000, clicks: 4200, earnings: 700, ecpm: 2.5, ctr: 1.5 },
+  ],
+};
+
+export const ADSENSE_SAMPLE = {
+  accountLabel: 'Demo AdSense account',
+  currency: 'USD',
+  isSample: true,
+  kpis: [
+    {
+      key: 'earnings',
+      label: 'Estimated earnings',
+      value: 12680.4,
+      format: 'money',
+      change: 6.2,
+      spark: spark([10, 11, 10.5, 12, 12.5, 12.2, 13, 12.7]),
+    },
+    {
+      key: 'pageViews',
+      label: 'Page views',
+      value: 2450000,
+      format: 'number',
+      change: 4.0,
+      spark: spark([20, 21, 22, 23, 24, 23.5, 25, 24.5]),
+    },
+    {
+      key: 'impressions',
+      label: 'Impressions',
+      value: 3180000,
+      format: 'number',
+      change: 3.5,
+      spark: spark([28, 29, 30, 31, 32, 31.5, 33, 31.8]),
+    },
+    {
+      key: 'clicks',
+      label: 'Clicks',
+      value: 58400,
+      format: 'number',
+      change: 2.1,
+      spark: spark([5, 5.2, 5.1, 5.5, 5.8, 5.6, 5.9, 5.84]),
+    },
+    {
+      key: 'rpm',
+      label: 'RPM',
+      value: 5.18,
+      format: 'money',
+      change: 2.0,
+      spark: spark([4.8, 4.9, 5.0, 5.1, 5.2, 5.15, 5.25, 5.18]),
+    },
+  ],
+  trend: [
+    { date: 'Mar 16', earnings: 1600, pageViews: 320000 },
+    { date: 'Mar 17', earnings: 1720, pageViews: 340000 },
+    { date: 'Mar 18', earnings: 1680, pageViews: 330000 },
+    { date: 'Mar 19', earnings: 1850, pageViews: 360000 },
+    { date: 'Mar 20', earnings: 1910, pageViews: 370000 },
+    { date: 'Mar 21', earnings: 2050, pageViews: 390000 },
+    { date: 'Mar 22', earnings: 1870, pageViews: 340000 },
+  ],
+  topSites: [
+    { name: 'news.example.com', earnings: 5200, pageViews: 980000, rpm: 5.31 },
+    { name: 'howto.example.com', earnings: 3100, pageViews: 620000, rpm: 5.0 },
+    { name: 'sports.example.com', earnings: 2680, pageViews: 510000, rpm: 5.25 },
+    { name: 'recipes.example.com', earnings: 1700, pageViews: 340000, rpm: 5.0 },
+  ],
+  byCountry: [
+    { name: 'United States', earnings: 4800 },
+    { name: 'India', earnings: 2100 },
+    { name: 'United Kingdom', earnings: 1600 },
+    { name: 'Germany', earnings: 1200 },
+    { name: 'Other', earnings: 2980 },
+  ],
+  tableRows: [
+    { site: 'news.example.com', adUnit: 'Article Top', impressions: 920000, clicks: 18400, pageViews: 480000, earnings: 2800, rpm: 5.83, ctr: 2.0 },
+    { site: 'news.example.com', adUnit: 'Sidebar', impressions: 410000, clicks: 6200, pageViews: 500000, earnings: 2400, rpm: 4.8, ctr: 1.51 },
+    { site: 'howto.example.com', adUnit: 'In-article', impressions: 680000, clicks: 14200, pageViews: 320000, earnings: 2100, rpm: 6.56, ctr: 2.09 },
+    { site: 'sports.example.com', adUnit: 'Scoreboard', impressions: 540000, clicks: 9800, pageViews: 280000, earnings: 1680, rpm: 6.0, ctr: 1.81 },
+    { site: 'recipes.example.com', adUnit: 'Footer', impressions: 320000, clicks: 5100, pageViews: 210000, earnings: 900, rpm: 4.29, ctr: 1.59 },
+  ],
+};

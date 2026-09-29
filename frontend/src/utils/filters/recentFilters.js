@@ -47,6 +47,7 @@ function normalize(f = {}) {
     preset: f.preset || null,
     startDate: f.startDate || null,
     endDate: f.endDate || null,
+    scope: f.scope || f.product || null,
     country: toArray(f.country),
     domain: toArray(f.domain),
     site: toArray(f.site),
@@ -55,6 +56,11 @@ function normalize(f = {}) {
     reportDimensions: toArray(f.reportDimensions),
     reportMetrics: toArray(f.reportMetrics),
     reportSettings: f.reportSettings || {},
+    apps: toArray(f.apps),
+    formats: toArray(f.formats),
+    countries: toArray(f.countries),
+    platforms: toArray(f.platforms),
+    sites: toArray(f.sites),
   };
 }
 
@@ -63,6 +69,7 @@ function snapshotKey(s) {
   return JSON.stringify({
     startDate: s.startDate,
     endDate: s.endDate,
+    scope: s.scope,
     country: s.country,
     domain: s.domain,
     site: s.site,
@@ -71,6 +78,11 @@ function snapshotKey(s) {
     reportDimensions: s.reportDimensions,
     reportMetrics: s.reportMetrics,
     reportSettings: s.reportSettings,
+    apps: s.apps,
+    formats: s.formats,
+    countries: s.countries,
+    platforms: s.platforms,
+    sites: s.sites,
   });
 }
 
@@ -231,6 +243,25 @@ export function labelFor(item) {
         : `Apps: ${p.domainId[0]} (+${p.domainId.length - 1})`
     );
   }
+
+  const fmtPub = (key, singular, plural) => {
+    const list = p[key];
+    if (!list?.length) return;
+    if (list.length === 1 && list[0] === '__ALL__') {
+      parts.push(`${plural}: All selected`);
+      return;
+    }
+    parts.push(
+      list.length === 1
+        ? `${singular}: ${list[0]}`
+        : `${plural}: ${list[0]} (+${list.length - 1})`
+    );
+  };
+  fmtPub('apps', 'App', 'Apps');
+  fmtPub('formats', 'Format', 'Formats');
+  fmtPub('countries', 'Country', 'Countries');
+  fmtPub('platforms', 'Platform', 'Platforms');
+  fmtPub('sites', 'Site', 'Sites');
 
   return parts.join(' • ');
 }

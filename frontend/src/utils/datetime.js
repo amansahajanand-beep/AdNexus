@@ -28,17 +28,22 @@ export function startOfMonth(ymd) {
   return `${y}-${m}-01`;
 }
 
-// { startDate, endDate } for a named preset, anchored on "today" in Singapore.
-export function presetRange(preset) {
-  const today = todayInTZ();
+// { startDate, endDate } for a named preset, anchored on "today" in Singapore (or opts.timeZone).
+// opts.includeToday — when true, historical presets end on today instead of yesterday.
+// opts.timeZone — IANA zone (AdMob accounts often Asia/Calcutta; GAM uses APP_TIMEZONE).
+export function presetRange(preset, opts = {}) {
+  const tz = opts.timeZone || APP_TIMEZONE;
+  const today = todayInTZ(tz);
   const yesterday = shiftYMD(today, -1);
+  const includeToday = opts.includeToday === true;
+  const histEnd = includeToday ? today : yesterday;
   if (preset === 'yesterday') {
     return { startDate: yesterday, endDate: yesterday };
   }
   if (preset === 'today') return { startDate: today, endDate: today };
-  // Historical presets end on yesterday — GAM Historical finalizes prior days only.
-  if (preset === 'last7') return { startDate: shiftYMD(yesterday, -6), endDate: yesterday };
-  if (preset === 'last30') return { startDate: shiftYMD(yesterday, -29), endDate: yesterday };
+  // Historical presets: default ends on yesterday (AdMob console Last 7 does the same).
+  if (preset === 'last7') return { startDate: shiftYMD(histEnd, -6), endDate: histEnd };
+  if (preset === 'last30') return { startDate: shiftYMD(histEnd, -29), endDate: histEnd };
   if (preset === 'lastMonth') {
     const [y, m] = today.split('-').map(Number);
     const lastM = m === 1 ? 12 : m - 1;
@@ -47,11 +52,11 @@ export function presetRange(preset) {
     const end = shiftYMD(`${y}-${String(m).padStart(2, '0')}-01`, -1);
     return { startDate: start, endDate: end };
   }
-  // thisMonth: month start through yesterday (today shown separately when selected)
+  // thisMonth: month start through histEnd
   if (preset === 'thisMonth') {
-    return { startDate: startOfMonth(today), endDate: yesterday };
+    return { startDate: startOfMonth(today), endDate: histEnd };
   }
-  return { startDate: startOfMonth(today), endDate: yesterday };
+  return { startDate: startOfMonth(today), endDate: histEnd };
 }
 
 export function thisMonthRange() {

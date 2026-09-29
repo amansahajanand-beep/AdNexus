@@ -1,5 +1,5 @@
 /**
- * GAM v202602 inventory data fetchers.
+ * GAM SOAP inventory data fetchers.
  *
  * Services probed:
  *   SiteService              — registered site URLs (MCM / publisher)

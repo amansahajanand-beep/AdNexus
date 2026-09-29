@@ -115,6 +115,7 @@ async function requireAuth(req, res, next) {
         getAccountIdForClient,
         listClientsByAccountId,
         getClientById,
+        getPublisherWorkspace,
       } = require('../models/clientStore');
       const { getAllowedClientIds } = require('../utils/permissions');
       const accountId = await getAccountIdForClient(client.id);
@@ -123,7 +124,12 @@ async function requireAuth(req, res, next) {
       const allowedIds = getAllowedClientIds(user);
       const permitted = user.role === 'admin'
         || (Array.isArray(allowedIds) && allowedIds.includes(overrideId));
-      if (!target) {
+      const workspace = !target && user.role === 'admin'
+        ? await getPublisherWorkspace(accountId)
+        : null;
+      if (workspace && workspace.id === overrideId) {
+        client = workspace;
+      } else if (!target) {
         require('../utils/logger').warn(
           `[tenancy] X-Gam-Client-Id ${overrideId.slice(0, 8)} not under account ${String(accountId).slice(0, 8)}`
         );

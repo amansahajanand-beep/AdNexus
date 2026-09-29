@@ -1,23 +1,31 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useLocation } from 'react-router-dom';
-import { usersAPI, domainsAPI, reportsAPI, adsAPI, clientsAPI } from '../utils/api';
+import { usersAPI, domainsAPI, reportsAPI, adsAPI, clientsAPI, admobAPI } from '../utils/api';
 import { useAuth } from '../store/useAuth';
 import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions, normalizeDomainPickerOptions } from '../utils/domainCatalog';
 import { isLikelyAppPackage } from '../utils/appPackage';
 import UserManagement from '../components/admin/UserManagement';
 import ClientSettings from '../components/admin/ClientSettings';
 import AdsAccountsAdmin from '../components/admin/AdsAccountsAdmin';
+import ProductAccountsAdmin from '../components/admin/ProductAccountsAdmin';
 import DomainPermissions from '../components/admin/DomainPermissions';
 import PageHeader from '../components/ui/PageHeader';
+import { ADSENSE_ENABLED, resolveActiveProduct } from '../utils/productWorkspace';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
-import { Users, ShieldAlert, Settings, Megaphone } from '../components/ui/Icon';
+import { Users, ShieldAlert, Settings, Megaphone, Smartphone, Newspaper } from '../components/ui/Icon';
 
 const TABS = [
   { id: 'user', label: 'Users', Icon: Users },
   { id: 'domains', label: 'Assign Permissions', Icon: ShieldAlert },
-  { id: 'client', label: 'GAM connection', Icon: Settings },
-  { id: 'ads', label: 'Google Ads accounts', Icon: Megaphone },
+  { id: 'client', label: 'GAM connection', Icon: Settings, products: ['gam'] },
+  { id: 'ads', label: 'Google Ads accounts', Icon: Megaphone, products: ['gam', 'admob'] },
+  { id: 'admob', label: 'AdMob accounts', Icon: Smartphone, products: ['admob'] },
+  { id: 'adsense', label: 'AdSense accounts', Icon: Newspaper, products: ['adsense'] },
 ];
+
+function tabsForProduct(product) {
+  return TABS.filter((t) => !t.products || t.products.includes(product));
+}
 
 function buildAdsAccountPickerOptions(accounts = []) {
   return (accounts || [])
@@ -39,6 +47,8 @@ export default function Admin() {
   const [tab, setTab] = useState(() => {
     const params = new URLSearchParams(location.search);
     if (params.get('tab') === 'ads' || params.get('ads_oauth')) return 'ads';
+    if (params.get('tab') === 'admob') return 'admob';
+    if (params.get('tab') === 'adsense') return 'adsense';
     if (params.get('oauth')) return 'client';
     return 'user';
   });
@@ -46,6 +56,8 @@ export default function Admin() {
   useEffect(() => {
     const params = new URLSearchParams(location.search);
     if (params.get('tab') === 'ads' || params.get('ads_oauth')) setTab('ads');
+    else if (params.get('tab') === 'admob') setTab('admob');
+    else if (params.get('tab') === 'adsense') setTab('adsense');
     else if (params.get('oauth')) setTab('client');
   }, [location.search]);
   const [users, setUsers] = useState([]);
@@ -60,6 +72,27 @@ export default function Admin() {
   const [adsAccountOptions, setAdsAccountOptions] = useState([]);
   const [adsAccountsLoading, setAdsAccountsLoading] = useState(true);
   const [networks, setNetworks] = useState([]);
+
+  const activeProduct = resolveActiveProduct(location.pathname);
+  const isAdmobProduct = activeProduct === 'admob';
+  const visibleTabs = tabsForProduct(activeProduct);
+
+  useEffect(() => {
+    if (!visibleTabs.some((t) => t.id === tab)) setTab(visibleTabs[0].id);
+  }, [visibleTabs, tab]);
+  const [admobWorkspace, setAdmobWorkspace] = useState(null);
+  const [admobWorkspaceError, setAdmobWorkspaceError] = useState(null);
+
+  useEffect(() => {
+    if (!isAdmobProduct || tab !== 'ads' || admobWorkspace) return undefined;
+    let cancelled = false;
+    admobAPI.workspace()
+      .then((ws) => { if (!cancelled) setAdmobWorkspace(ws); })
+      .catch((err) => {
+        if (!cancelled) setAdmobWorkspaceError(getUserFacingMessage(err, 'Could not load the AdMob workspace.'));
+      });
+    return () => { cancelled = true; };
+  }, [isAdmobProduct, tab, admobWorkspace]);
 
   const [permSaving, setPermSaving] = useState(false);
   const [permError, setPermError] = useState(null);
@@ -206,18 +239,24 @@ export default function Admin() {
     <div className="dashboard-page admin-page">
       <PageHeader
         title="Admin"
-        subtitle="Users, inventory permissions, GAM OAuth, and Google Ads ROI setup"
+        subtitle={
+          activeProduct === 'admob' ? 'Users, permissions, AdMob accounts, and Google Ads ROI setup'
+            : activeProduct === 'adsense' ? 'Users, permissions, and AdSense accounts'
+              : 'Users, inventory permissions, GAM OAuth, and Google Ads ROI setup'
+        }
         summary={
           tab === 'user' ? 'User management'
             : tab === 'domains' ? 'Assign inventory access'
               : tab === 'client' ? 'Client OAuth settings'
                 : tab === 'ads' ? 'Google Ads MCC & accounts'
-                  : ''
+                  : tab === 'admob' ? 'AdMob publisher accounts'
+                    : tab === 'adsense' ? 'AdSense publisher accounts'
+                      : ''
         }
       />
 
       <div className="admin-tabs" role="tablist" aria-label="Admin sections">
-        {TABS.map((t) => (
+        {visibleTabs.map((t) => (
           <button
             key={t.id}
             type="button"
@@ -256,7 +295,34 @@ export default function Admin() {
 
       {tab === 'client' && <ClientSettings />}
 
-      {tab === 'ads' && <AdsAccountsAdmin />}
+      {tab === 'ads' && !isAdmobProduct && <AdsAccountsAdmin />}
+      {tab === 'ads' && isAdmobProduct && (
+        admobWorkspace?.clientId ? (
+          <AdsAccountsAdmin
+            key={admobWorkspace.clientId}
+            clientId={admobWorkspace.clientId}
+            scopeLabel="AdMob"
+          />
+        ) : (
+          <p className="muted">{admobWorkspaceError || 'Loading AdMob Google Ads accounts…'}</p>
+        )
+      )}
+
+      {tab === 'admob' && (
+        <ProductAccountsAdmin
+          product="admob"
+          title="AdMob accounts"
+          dashboardPath="/admob/dashboard"
+        />
+      )}
+
+      {tab === 'adsense' && (
+        <ProductAccountsAdmin
+          product="adsense"
+          title="AdSense accounts"
+          dashboardPath={ADSENSE_ENABLED ? '/adsense/dashboard' : null}
+        />
+      )}
 
       {tab === 'domains' && (
         <DomainPermissions

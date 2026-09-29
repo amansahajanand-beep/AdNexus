@@ -4,6 +4,7 @@ import Button from '../ui/Button';
 import { TextField, SelectField } from '../ui/Field';
 import MultiSelect from '../ui/MultiSelect';
 import PermissionsPanel from './PermissionsPanel';
+import AdmobScopePanel, { EMPTY_ADMOB_SCOPE, admobScopeFromUser } from './AdmobScopePanel';
 import { validatePassword, PASSWORD_RULES_HINT } from '../../utils/passwordPolicy';
 import { validateUsername, USERNAME_RULES_HINT } from '../../utils/namePolicy';
 import { readDateRestrictionFromUser, dateRestrictionPayload } from '../../utils/adminDateRestriction';
@@ -89,6 +90,7 @@ export default function UserFormModal({
   const [allowedSites, setAllowedSites] = useState([]);
   const [allowedAppIds, setAllowedAppIds] = useState([]);
   const [allowedAdsAccountIds, setAllowedAdsAccountIds] = useState([]);
+  const [admobScope, setAdmobScope] = useState(EMPTY_ADMOB_SCOPE);
   const [dateRestrictionStart, setDateRestrictionStart] = useState('');
   const [dateRestrictionEnd, setDateRestrictionEnd] = useState('');
   const [localError, setLocalError] = useState(null);
@@ -116,6 +118,7 @@ export default function UserFormModal({
     setAllowedSites(user?.permissions?.allowedSites || []);
     setAllowedAppIds(user?.permissions?.allowedAppIds || []);
     setAllowedAdsAccountIds(user?.permissions?.allowedAdsAccountIds || []);
+    setAdmobScope(admobScopeFromUser(user));
     const dr = readDateRestrictionFromUser(user);
     setDateRestrictionStart(dr.start);
     setDateRestrictionEnd(dr.end);
@@ -270,6 +273,7 @@ export default function UserFormModal({
         allowedSites,
         allowedAppIds,
         allowedAdsAccountIds,
+        admobScope,
         ...dateRestrictionPayload(dateRestrictionStart, dateRestrictionEnd),
       });
     }
@@ -375,6 +379,13 @@ export default function UserFormModal({
           adsAccountOptions={adsAccountOptions}
           adsAccountsLoading={adsAccountsLoading}
         />
+      )}
+      {role !== 'admin' && (
+        <div className="user-form-section">
+          <h4 className="user-form-section-title">AdMob access</h4>
+          <p className="form-note">No publishers selected means this user has no AdMob access.</p>
+          <AdmobScopePanel value={admobScope} onChange={setAdmobScope} />
+        </div>
       )}
       </div>
     </Modal>

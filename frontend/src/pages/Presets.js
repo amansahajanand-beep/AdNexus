@@ -18,6 +18,7 @@ import {
   summaryForPreset,
 } from '../utils/reportPresets';
 import { confirmDialog } from '../hooks/useConfirmDialog';
+import { ADSENSE_ENABLED } from '../utils/productWorkspace';
 import { validateSavedName, SAVED_NAME_RULES_HINT } from '../utils/namePolicy';
 
 const SPLIT_WIDTH_KEY = 'adnexus.presets.splitWidth';
@@ -65,6 +66,34 @@ const SECTIONS = [
     openLabel: 'Open in ROI',
     emptyPath: '/roi',
   },
+  {
+    page: PRESET_PAGES.admob,
+    label: 'AdMob Dashboard',
+    access: 'admob-dashboard',
+    openLabel: 'Open in AdMob',
+    emptyPath: '/admob/dashboard',
+  },
+  {
+    page: PRESET_PAGES.admobReporting,
+    label: 'AdMob Reporting',
+    access: 'admob-reporting',
+    openLabel: 'Open in AdMob Reporting',
+    emptyPath: '/admob/reporting',
+  },
+  {
+    page: PRESET_PAGES.adsense,
+    label: 'AdSense Dashboard',
+    access: 'adsense-dashboard',
+    openLabel: 'Open in AdSense',
+    emptyPath: '/adsense/dashboard',
+  },
+  {
+    page: PRESET_PAGES.adsenseReporting,
+    label: 'AdSense Reporting',
+    access: 'adsense-reporting',
+    openLabel: 'Open in AdSense Reporting',
+    emptyPath: '/adsense/reporting',
+  },
 ];
 
 function formatWhen(when) {
@@ -100,7 +129,7 @@ export default function Presets() {
   const splitContainerRef = useRef(null);
 
   const availableSections = useMemo(
-    () => SECTIONS.filter((s) => canPage(s.access)),
+    () => SECTIONS.filter((s) => canPage(s.access) && (ADSENSE_ENABLED || !s.access.startsWith('adsense'))),
     [canPage]
   );
 

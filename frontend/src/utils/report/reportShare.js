@@ -1,6 +1,7 @@
 const LIST_KEYS = [
   'domain', 'site', 'domainName', 'domainId', 'country', 'dims', 'mets',
   'accountIds', 'campaignIds', 'appKeys', 'siteKeys', 'countryCodes',
+  'apps', 'formats', 'countries', 'platforms', 'sites',
 ];
 
 function toList(v) {
@@ -41,6 +42,11 @@ export function encodeReportShare({
   appKeys,
   siteKeys,
   countryCodes,
+  apps,
+  formats,
+  countries,
+  platforms,
+  sites,
 } = {}) {
   const p = new URLSearchParams();
   if (preset) p.set('preset', String(preset));
@@ -59,6 +65,11 @@ export function encodeReportShare({
   appendCsv(p, 'appKeys', appKeys);
   appendCsv(p, 'siteKeys', siteKeys);
   appendCsv(p, 'countryCodes', countryCodes);
+  toList(apps).forEach((v) => p.append('apps', v));
+  toList(formats).forEach((v) => p.append('formats', v));
+  toList(countries).forEach((v) => p.append('countries', v));
+  toList(platforms).forEach((v) => p.append('platforms', v));
+  toList(sites).forEach((v) => p.append('sites', v));
   return p.toString();
 }
 
@@ -91,6 +102,11 @@ export function parseReportShare(searchParams) {
     appKeys: parseCsvParam(searchParams, 'appKeys'),
     siteKeys: parseCsvParam(searchParams, 'siteKeys'),
     countryCodes: parseCsvParam(searchParams, 'countryCodes'),
+    apps: getAll('apps'),
+    formats: getAll('formats'),
+    countries: getAll('countries'),
+    platforms: getAll('platforms'),
+    sites: getAll('sites'),
   };
   const hasList = LIST_KEYS.some((k) => {
     const map = {
@@ -106,6 +122,11 @@ export function parseReportShare(searchParams) {
       appKeys: parsed.appKeys,
       siteKeys: parsed.siteKeys,
       countryCodes: parsed.countryCodes,
+      apps: parsed.apps,
+      formats: parsed.formats,
+      countries: parsed.countries,
+      platforms: parsed.platforms,
+      sites: parsed.sites,
     };
     return map[k]?.length;
   });
