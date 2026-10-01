@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useDispatch } from 'react-redux';
+import { useLocation } from 'react-router-dom';
 import { adsAPI, sessionAPI } from '../utils/api';
 import PageHeader from '../components/ui/PageHeader';
 import Button from '../components/ui/Button';
@@ -36,6 +37,7 @@ function formatSyncAt(iso) {
 
 export default function MyAds() {
   const dispatch = useDispatch();
+  const location = useLocation();
   const [accounts, setAccounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -118,7 +120,8 @@ export default function MyAds() {
     setBusy(true);
     setError(null);
     try {
-      const { url } = await adsAPI.myOauthUrl();
+      const returnTo = 'my-ads';
+      const { url } = await adsAPI.myOauthUrl({ returnTo });
       if (!url) {
         setError('Could not start Google Ads OAuth: no redirect URL returned.');
         setBusy(false);
@@ -164,7 +167,8 @@ export default function MyAds() {
   const reconnect = async (id) => {
     setBusy(true);
     try {
-      const { url } = await adsAPI.myAccountOauthUrl(id);
+      const returnTo = 'my-ads';
+      const { url } = await adsAPI.myAccountOauthUrl(id, { returnTo });
       window.location.href = url;
     } catch (err) {
       setError(getUserFacingMessage(err, 'Could not start OAuth.'));

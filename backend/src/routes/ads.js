@@ -183,13 +183,14 @@ router.post('/my/oauth-url', requireDomainUser, requireMyAdsAccess, async (req, 
         error: 'Google Ads OAuth is not configured. Ask your administrator to set Ads OAuth credentials.',
       });
     }
+    const returnTo = req.body?.returnTo === 'admob-roi' ? 'admob-roi' : 'my-ads';
     const url = buildAdsAuthUrl(req.client, {
       clientId: req.client.id,
       mode: 'mcc',
       userId: req.user.id,
-      returnTo: 'my-ads',
+      returnTo,
     });
-    res.json({ url });
+    res.json({ url, returnTo });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -300,14 +301,15 @@ router.get('/my/accounts/:id/oauth-url', requireDomainUser, requireMyAdsAccess, 
         mode = 'mcc';
       }
     }
+    const returnTo = req.query?.returnTo === 'admob-roi' ? 'admob-roi' : 'my-ads';
     const url = buildAdsAuthUrl(req.client, {
       clientId: req.client.id,
       mode,
       adsAccountId: target.id,
       userId: req.user.id,
-      returnTo: 'my-ads',
+      returnTo,
     });
-    res.json({ url, reconnectAccountId: target.id, reconnectMode: mode });
+    res.json({ url, returnTo, reconnectAccountId: target.id, reconnectMode: mode });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
