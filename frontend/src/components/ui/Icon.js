@@ -35,6 +35,7 @@ import {
   LayoutGrid,
   CircleHelp,
   Newspaper,
+  MessageSquareText,
 } from 'lucide-react';
 
 const NAV_ICONS = {
@@ -45,14 +46,16 @@ const NAV_ICONS = {
   admin: Settings,
   'domain-user': UserRound,
   'my-ads': Megaphone,
+  feedback: MessageSquareText,
   help: CircleHelp,
   'admob-dashboard': LayoutDashboard,
   'admob-reporting': BarChart3,
   'admob-roi': TrendingUp,
+  'admob-presets': Bookmark,
   'adsense-dashboard': LayoutDashboard,
-  'adsense-sites': Newspaper,
-  'adsense-ad-units': LayoutGrid,
   'adsense-reporting': BarChart3,
+  'adsense-roi': TrendingUp,
+  'adsense-presets': Bookmark,
 };
 
 const FILTER_ICONS = {

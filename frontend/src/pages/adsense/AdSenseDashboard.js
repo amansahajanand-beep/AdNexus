@@ -17,7 +17,7 @@ import SavePresetButton from '../../components/ui/SavePresetButton';
 import ProductKpiStrip from '../../components/ui/ProductKpiStrip';
 import ProductReportFilters, { useProductCompareState } from '../../components/ui/ProductReportFilters';
 import ProductDetailTable from '../../components/ui/ProductDetailTable';
-import { ADSENSE_SAMPLE } from '../../utils/productSampleData';
+import { ProductChartsSkeleton, ProductEmptyState } from '../../components/ui/ProductDataStates';
 import { adsenseAPI } from '../../utils/api';
 import { CHART_SERIES } from '../../utils/chartTheme';
 import { copyReportLink } from '../../utils/report/reportShare';
@@ -27,6 +27,7 @@ import { showToast } from '../../hooks/useToast';
 import { usePermissions } from '../../hooks/usePermissions';
 import { useAuth } from '../../store/useAuth';
 import usePublisherReport from '../../hooks/usePublisherReport';
+import { adsenseFilterKeysForUser } from '../../utils/auth/permissions';
 
 const ACCENT = '#D97706';
 
@@ -58,33 +59,28 @@ export default function AdSenseDashboard() {
     compareEnd: compare.compareEnd,
   });
 
-  const useSample = report.isSample;
   const live = report.overview;
   const currency = live?.currency || 'USD';
-  const accountLabel = useSample
-    ? ADSENSE_SAMPLE.accountLabel
-    : (live?.account?.descriptiveName || live?.account?.accountId || 'AdSense account');
+  const accountLabel = live?.account?.descriptiveName || live?.account?.accountId || (live ? 'AdSense account' : '');
 
-  const kpis = useSample ? ADSENSE_SAMPLE.kpis : (live?.kpis || []);
-  const trend = useMemo(() => {
-    if (useSample) return ADSENSE_SAMPLE.trend;
-    return (live?.trend || []).map((r) => ({
-      date: formatTrendDate(r.date),
-      earnings: Number(r.earnings) || 0,
-      pageViews: Number(r.page_views) || 0,
-    }));
-  }, [live, useSample]);
+  const kpis = live?.kpis || [];
+  const trend = useMemo(() => (live?.trend || []).map((r) => ({
+    date: formatTrendDate(r.date),
+    earnings: Number(r.earnings) || 0,
+    pageViews: Number(r.page_views) || 0,
+  })), [live]);
 
-  const topSites = useSample ? ADSENSE_SAMPLE.topSites : (report.breakdown.rows || []).map((r) => ({
+  const topSites = (report.breakdown.rows || []).map((r) => ({
     name: r.name,
     earnings: Number(r.earnings) || 0,
   }));
-  const byCountry = useSample ? ADSENSE_SAMPLE.byCountry : (report.secondaryBreakdown.rows || []).map((r) => ({
+  const byCountry = (report.secondaryBreakdown.rows || []).map((r) => ({
     name: r.name,
     earnings: Number(r.earnings) || 0,
   }));
   const lastSyncAt = report.freshness?.lastSyncAt || live?.lastSyncAt;
-  const canFilter = visibility.filters !== false;
+  const allowedFilterKeys = useMemo(() => adsenseFilterKeysForUser(user), [user]);
+  const canFilter = visibility.filters !== false && (!allowedFilterKeys || allowedFilterKeys.length > 0);
 
   const handleCopyLink = async () => {
     await copyReportLink(report.getSharePayload());
@@ -95,9 +91,7 @@ export default function AdSenseDashboard() {
     <div className="dashboard-page page product-page product-page--adsense">
       <PageHeader
         title="AdSense Dashboard"
-        subtitle={useSample
-          ? 'Web & content monetization — sample data until an AdSense account is connected and synced'
-          : 'Web & content monetization overview — charts load for the selected dates; inventory filters refine them'}
+        subtitle="Web & content monetization overview — charts load for the selected dates; inventory filters refine them"
         summary={report.filterSummary}
       >
         {canFilter && (
@@ -113,7 +107,6 @@ export default function AdSenseDashboard() {
             />
           </>
         )}
-        {useSample ? <span className="product-sample-badge">Sample data</span> : null}
         {report.loading ? (
           <span className="product-sample-badge" style={{ color: 'var(--muted)', background: 'var(--bg-soft)', borderColor: 'var(--border)' }}>
             Loading…
@@ -124,7 +117,7 @@ export default function AdSenseDashboard() {
 
       {report.error ? <p className="form-error" role="alert">{report.error}</p> : null}
 
-      <p className="product-account-chip" title="Active AdSense account">{accountLabel}</p>
+      {accountLabel ? <p className="product-account-chip" title="Active AdSense account">{accountLabel}</p> : null}
 
       <ProductReportFilters
         product="adsense"
@@ -153,6 +146,7 @@ export default function AdSenseDashboard() {
         getSharePayload={report.getSharePayload}
         onApplySavedFilter={report.applySavedSnapshot}
         onApplyRecentFilter={report.applyRecentSnapshot}
+        allowedFilterKeys={allowedFilterKeys}
       />
 
       <ProductKpiStrip
@@ -160,8 +154,16 @@ export default function AdSenseDashboard() {
         currency={currency}
         accentColor={ACCENT}
         compareLabel={report.compareLabel}
+        loading={report.initialLoading}
+        placeholderLabels={['Estimated earnings', 'Page views', 'Impressions', 'Page RPM']}
       />
 
+      {report.initialLoading && <ProductChartsSkeleton />}
+      {!report.initialLoading && !report.hasData && (
+        <ProductEmptyState report={report} canFilter={canFilter} productLabel="AdSense" />
+      )}
+      {report.hasData && (
+      <>
       <section className="chart-card product-chart-wide">
         <div className="chart-card-head">
           <h3 className="chart-card-title">Earnings vs page views</h3>
@@ -225,34 +227,17 @@ export default function AdSenseDashboard() {
         </section>
       </div>
 
-      {useSample ? (
-        <ProductDetailTable
-          title="Ad units (sample)"
-          product="adsense"
-          dim="ad_unit"
-          currency={currency}
-          visibility={report.visibility}
-          rows={ADSENSE_SAMPLE.tableRows.map((r) => ({
-            name: `${r.site} · ${r.adUnit}`,
-            impressions: r.impressions,
-            page_views: r.pageViews,
-            clicks: r.clicks,
-            earnings: r.earnings,
-            rpm: r.rpm,
-            ctr: r.ctr,
-          }))}
-        />
-      ) : (
-        <ProductDetailTable
-          title="Ad units"
-          product="adsense"
-          dim={report.table.dim || 'ad_unit'}
-          currency={currency}
-          visibility={report.visibility}
-          loading={report.loading}
-          rows={report.table.rows || []}
-          emptyMessage="No ad-unit breakdown yet — sync will populate dims."
-        />
+      <ProductDetailTable
+        title="Ad units"
+        product="adsense"
+        dim={report.table.dim || 'ad_unit'}
+        currency={currency}
+        visibility={report.visibility}
+        loading={report.loading}
+        rows={report.table.rows || []}
+        emptyMessage="No ad-unit rows for this range yet."
+      />
+      </>
       )}
     </div>
   );

@@ -154,6 +154,7 @@ export default function usePublisherReport(api, {
     [compareMode, range.startDate, range.endDate, compareStart, compareEnd]
   );
   const compareLabel = compareLabelFor(compareMode, compareRange);
+  const hasData = Boolean(overview && !overview.isSample);
 
   const filterParams = useMemo(() => {
     const params = {
@@ -369,6 +370,8 @@ export default function usePublisherReport(api, {
     table,
     freshness,
     loading,
+    initialLoading: loading && !overview,
+    hasData,
     error,
     reload: load,
     filterParams,

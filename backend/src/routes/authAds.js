@@ -28,9 +28,14 @@ function verifyAdsState(state) {
   return decoded;
 }
 
-const RETURN_PATHS = { 'my-ads': '/my-ads', 'admob-roi': '/admob/roi' };
+const RETURN_PATHS = {
+  'my-ads': '/my-ads',
+  'admob-roi': '/admob/roi',
+  'adsense-roi': '/adsense/roi',
+  'adsense-google-ads': '/my-ads',
+};
 
-/** returnTo: 'admin' (default) | 'my-ads' (domain-user Connect page) | 'admob-roi'. */
+/** returnTo: 'admin' (default) | 'my-ads' | 'admob-roi'. Legacy adsense-google-ads targets redirect to /my-ads. */
 function adsOAuthRedirect(decoded, query = '') {
   const raw = String(query || '').replace(/^\?/, '');
   const params = new URLSearchParams(raw);
@@ -64,7 +69,8 @@ function adsOAuthErrorRedirect(err, decoded = null) {
 }
 
 async function grantConnectedAccounts(decoded, gamClient, rootAccount) {
-  if (decoded?.returnTo !== 'my-ads' || !decoded?.userId || !rootAccount) return;
+  const allowedTargets = new Set(['my-ads', 'adsense-google-ads']);
+  if (!allowedTargets.has(decoded?.returnTo) || !decoded?.userId || !rootAccount) return;
   try {
     const ids = await collectGrantIds(gamClient.id, rootAccount);
     await grantAdsAccountsToUser(decoded.userId, ids);
@@ -217,7 +223,8 @@ router.get('/callback', async (req, res) => {
     // FORCE RLS on ads_accounts requires app.client_id (= gamClient.id).
     // This callback is unauthenticated, so set tenant context explicitly.
     return await runWithClient(gamClient, async () => {
-      const forDomainUser = decoded.returnTo === 'my-ads';
+      const isAdsensePage = decoded.returnTo === 'adsense-google-ads';
+      const forDomainUser = decoded.returnTo === 'my-ads' || isAdsensePage;
       const oauth2Client = getAdsOAuthClient(gamClient);
       const { tokens } = await oauth2Client.getToken(code);
       if (!tokens.refresh_token) {
@@ -342,7 +349,7 @@ router.get('/callback', async (req, res) => {
         ],
         payload: {
           userId: decoded.userId || null,
-          returnTo: forDomainUser ? 'my-ads' : 'admin',
+          returnTo: isAdsensePage ? 'adsense-google-ads' : (forDomainUser ? 'my-ads' : 'admin'),
           includeChildrenInRoi: forDomainUser,
         },
       });

@@ -11,6 +11,7 @@ import Presets from './pages/Presets';
 import Admin from './pages/Admin';
 import DomainUser from './pages/DomainUser';
 import MyAds from './pages/MyAds';
+import Feedback from './pages/Feedback';
 import Help from './pages/Help';
 import PrivacyPolicy from './pages/PrivacyPolicy';
 import TermsOfService from './pages/TermsOfService';
@@ -19,9 +20,9 @@ import AdMobDashboard from './pages/admob/AdMobDashboard';
 import AdMobReporting from './pages/admob/AdMobReporting';
 import AdMobRoi from './pages/admob/AdMobRoi';
 import AdSenseDashboard from './pages/adsense/AdSenseDashboard';
-import AdSenseSites from './pages/adsense/AdSenseSites';
-import AdSenseAdUnits from './pages/adsense/AdSenseAdUnits';
 import AdSenseReporting from './pages/adsense/AdSenseReporting';
+import AdSenseRoi from './pages/adsense/AdSenseRoi';
+import PublisherPresets from './pages/PublisherPresets';
 import ProtectedRoute from './components/routing/ProtectedRoute';
 import AdminRoute from './components/routing/AdminRoute';
 import PermissionRoute from './components/routing/PermissionRoute';
@@ -130,6 +131,7 @@ function AppRoutes() {
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
+        <Route path="/feedback" element={<PermissionRoute page="feedback"><Feedback /></PermissionRoute>} />
         <Route path="/help" element={<Help />} />
 
         <Route path="/admob" element={<PermissionRoute page="admob-dashboard"><Navigate to="/admob/dashboard" replace /></PermissionRoute>} />
@@ -137,15 +139,18 @@ function AppRoutes() {
         <Route path="/admob/apps" element={<PermissionRoute page="admob-reporting"><Navigate to="/admob/reporting" replace /></PermissionRoute>} />
         <Route path="/admob/ad-units" element={<PermissionRoute page="admob-reporting"><Navigate to="/admob/reporting" replace /></PermissionRoute>} />
         <Route path="/admob/reporting" element={<PermissionRoute page="admob-reporting"><AdMobReporting /></PermissionRoute>} />
+        <Route path="/admob/presets" element={<PublisherPresets product="admob" />} />
         <Route path="/admob/roi" element={<AdminRoute><AdMobRoi /></AdminRoute>} />
 
         {ADSENSE_ENABLED && (
           <>
             <Route path="/adsense" element={<PermissionRoute page="adsense-dashboard"><Navigate to="/adsense/dashboard" replace /></PermissionRoute>} />
             <Route path="/adsense/dashboard" element={<PermissionRoute page="adsense-dashboard"><AdSenseDashboard /></PermissionRoute>} />
-            <Route path="/adsense/sites" element={<PermissionRoute page="adsense-sites"><AdSenseSites /></PermissionRoute>} />
-            <Route path="/adsense/ad-units" element={<PermissionRoute page="adsense-ad-units"><AdSenseAdUnits /></PermissionRoute>} />
+            <Route path="/adsense/sites" element={<Navigate to="/adsense/dashboard" replace />} />
+            <Route path="/adsense/ad-units" element={<Navigate to="/adsense/dashboard" replace />} />
             <Route path="/adsense/reporting" element={<PermissionRoute page="adsense-reporting"><AdSenseReporting /></PermissionRoute>} />
+            <Route path="/adsense/roi" element={<AdminRoute><AdSenseRoi /></AdminRoute>} />
+            <Route path="/adsense/presets" element={<PublisherPresets product="adsense" />} />
           </>
         )}
       </Route>

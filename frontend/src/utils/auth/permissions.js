@@ -9,9 +9,6 @@ export const PERMISSION_SECTIONS = {
     { key: 'canAccessRoi', label: 'ROI', hint: 'Ads spend vs GAM earn & ROI %' },
     { key: 'canAccessMyAds', label: 'Google Ads', hint: 'Connect own Google Ads accounts' },
     { key: 'canAccessDomainUser', label: 'Domain User', hint: 'Per-domain earnings view' },
-    ...(ADSENSE_ENABLED
-      ? [{ key: 'canAccessAdSense', label: 'AdSense', hint: 'AdSense dashboards & reporting' }]
-      : []),
   ],
   actions: [
     { key: 'canLogin', label: 'Log in', hint: 'Allow user to sign in' },
@@ -97,13 +94,35 @@ export function isAdmin(user) {
 }
 
 export const ADMOB_FILTER_DIMS = ['app', 'ad_unit', 'format', 'country', 'platform'];
+export const ADSENSE_FILTER_DIMS = ['site', 'ad_unit', 'country', 'platform'];
 
-/** Admin list rows carry full admobScope; a domain user's own session only gets accountCount. */
-export function admobScopeAccountCount(user) {
-  const s = user?.permissions?.admobScope;
+const FILTER_KEY_BY_DIM = {
+  app: 'apps', site: 'sites', ad_unit: 'adUnits', format: 'formats', country: 'countries', platform: 'platforms',
+};
+
+const PUBLISHER_SCOPES = {
+  admob: { key: 'admobScope', dims: ADMOB_FILTER_DIMS },
+  adsense: { key: 'adsenseScope', dims: ADSENSE_FILTER_DIMS },
+};
+
+/** Admin list rows carry the full scope; a domain user's own session only gets accountCount. */
+function scopeAccountCount(user, product) {
+  const s = user?.permissions?.[PUBLISHER_SCOPES[product].key];
   if (!s) return 0;
   if (Array.isArray(s.accountIds)) return s.accountIds.length;
   return Number(s.accountCount) || 0;
+}
+
+function allowedFilters(user, product) {
+  const { key, dims } = PUBLISHER_SCOPES[product];
+  if (isAdmin(user)) return dims;
+  if (!hasPermission(user, 'canUseFilters')) return [];
+  const f = user?.permissions?.[key]?.filters;
+  return Array.isArray(f) ? f.filter((d) => dims.includes(d)) : [];
+}
+
+export function admobScopeAccountCount(user) {
+  return scopeAccountCount(user, 'admob');
 }
 
 export function hasAdmobAccess(user) {
@@ -111,22 +130,36 @@ export function hasAdmobAccess(user) {
   return admobScopeAccountCount(user) > 0;
 }
 
-const ADMOB_FILTER_KEY_BY_DIM = {
-  app: 'apps', ad_unit: 'adUnits', format: 'formats', country: 'countries', platform: 'platforms',
-};
+/** AdMob filter dimensions this user may use (admin = all). */
+export function admobAllowedFilters(user) {
+  return allowedFilters(user, 'admob');
+}
 
 /** Filter-bar keys for ProductReportFilters; null = admin (all filters, incl. mediation). */
 export function admobFilterKeysForUser(user) {
   if (isAdmin(user)) return null;
-  return admobAllowedFilters(user).map((d) => ADMOB_FILTER_KEY_BY_DIM[d]);
+  return admobAllowedFilters(user).map((d) => FILTER_KEY_BY_DIM[d]);
 }
 
-/** AdMob filter dimensions this user may use (admin = all). */
-export function admobAllowedFilters(user) {
-  if (isAdmin(user)) return ADMOB_FILTER_DIMS;
-  if (!hasPermission(user, 'canUseFilters')) return [];
-  const f = user?.permissions?.admobScope?.filters;
-  return Array.isArray(f) ? f.filter((d) => ADMOB_FILTER_DIMS.includes(d)) : [];
+export function adsenseScopeAccountCount(user) {
+  return scopeAccountCount(user, 'adsense');
+}
+
+export function hasAdsenseAccess(user) {
+  if (!ADSENSE_ENABLED) return false;
+  if (isAdmin(user)) return true;
+  return adsenseScopeAccountCount(user) > 0;
+}
+
+/** AdSense filter dimensions this user may use (admin = all). */
+export function adsenseAllowedFilters(user) {
+  return allowedFilters(user, 'adsense');
+}
+
+/** Filter-bar keys for ProductReportFilters; null = admin (no restriction). */
+export function adsenseFilterKeysForUser(user) {
+  if (isAdmin(user)) return null;
+  return adsenseAllowedFilters(user).map((d) => FILTER_KEY_BY_DIM[d]);
 }
 
 export function canViewReports(user) {
@@ -168,7 +201,8 @@ export function buildClientVisibility(user) {
       myAds: p.canAccessMyAds !== false,
       presets: p.canAccessDashboard !== false || p.canAccessReporting !== false,
       admob: hasAdmobAccess(user),
-      adsense: p.canAccessAdSense !== false,
+      adsense: hasAdsenseAccess(user),
+      feedback: true,
     },
     revenue: p.canSeeRevenue !== false,
     impressions: p.canSeeImpressions !== false,
@@ -186,16 +220,14 @@ export function buildClientVisibility(user) {
 
 export function canAccessPage(user, page) {
   if ((page === 'domain-user' || page === 'my-ads') && isAdmin(user)) return false;
-  if (page === 'help') return true;
+  if (page === 'help' || page === 'feedback') return true;
   if (isAdmin(user)) return true;
   if (page === 'presets') {
     return hasPermission(user, 'canAccessDashboard') || hasPermission(user, 'canAccessReporting');
   }
-  if (page === 'admob-roi') return false;
+  if (page === 'admob-roi' || page === 'adsense-roi') return false;
   if (String(page).startsWith('admob-')) return hasAdmobAccess(user);
-  if (page === 'adsense-dashboard' || page === 'adsense-sites' || page === 'adsense-ad-units' || page === 'adsense-reporting') {
-    return hasPermission(user, 'canAccessAdSense');
-  }
+  if (String(page).startsWith('adsense-')) return hasAdsenseAccess(user);
   const map = {
     dashboard: 'canAccessDashboard',
     reporting: 'canAccessReporting',
@@ -210,13 +242,17 @@ export function canAccessPage(user, page) {
 export function getDefaultHomeRoute(user) {
   if (isAdmin(user)) return '/dashboard';
   const vis = buildClientVisibility(user);
-  if (vis.pages.admob && !hasAssignedInventory(user)) return '/admob/dashboard';
+  if (!hasAssignedInventory(user)) {
+    if (vis.pages.admob) return '/admob/dashboard';
+    if (vis.pages.adsense) return '/adsense/dashboard';
+  }
   if (vis.pages.dashboard) return '/dashboard';
   if (vis.pages.reporting) return '/reporting';
   if (vis.pages.roi) return '/roi';
   if (vis.pages.myAds) return '/my-ads';
   if (vis.pages.domainUser) return '/domain-user';
   if (vis.pages.admob) return '/admob/dashboard';
+  if (vis.pages.adsense) return '/adsense/dashboard';
   return '/login';
 }
 
@@ -224,7 +260,7 @@ export function hasAnyPageAccess(user) {
   if (isAdmin(user)) return true;
   const vis = buildClientVisibility(user);
   return vis.pages.dashboard || vis.pages.reporting || vis.pages.roi
-    || vis.pages.myAds || vis.pages.domainUser || vis.pages.admob;
+    || vis.pages.myAds || vis.pages.domainUser || vis.pages.admob || vis.pages.adsense;
 }
 
 export function permissionsFromUser(user) {
@@ -252,9 +288,10 @@ export function permissionBadgeList(user) {
   if (p.canAccessRoi !== false) badges.push({ label: 'ROI', type: 'page' });
   if (p.canAccessMyAds !== false) badges.push({ label: 'Google Ads', type: 'page' });
   if (p.canAccessDomainUser !== false) badges.push({ label: 'Domain User', type: 'page' });
-  if (ADSENSE_ENABLED && p.canAccessAdSense !== false) badges.push({ label: 'AdSense', type: 'page' });
   const nAdmob = admobScopeAccountCount(user);
   if (nAdmob) badges.push({ label: `AdMob · ${nAdmob} publisher${nAdmob === 1 ? '' : 's'}`, type: 'page' });
+  const nAdsense = ADSENSE_ENABLED ? adsenseScopeAccountCount(user) : 0;
+  if (nAdsense) badges.push({ label: `AdSense · ${nAdsense} publisher${nAdsense === 1 ? '' : 's'}`, type: 'page' });
   if (p.canUseReportBuilder === false) badges.push({ label: 'No builder', type: 'off' });
   if (p.canSeeProgrammatic === false) badges.push({ label: 'No programmatic', type: 'off' });
   if (p.canSeeECPM === false) badges.push({ label: 'No eCPM', type: 'off' });

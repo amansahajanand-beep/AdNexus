@@ -327,6 +327,11 @@ function createPublisherApiRouter({
     };
   }
 
+  /** Shared publisher workspace tenant — owns the Google Ads accounts used for AdMob / AdSense ROI. */
+  router.get('/workspace', (req, res) => {
+    res.json({ clientId: req.client?.id || null, name: req.client?.name || null });
+  });
+
   router.get('/health', requireAdmin, (req, res) => {
     const oauth = resolveOAuthApp(req.client);
     res.json({

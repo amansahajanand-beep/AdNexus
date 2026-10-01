@@ -1,9 +1,11 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { Link, useLocation, useSearchParams } from 'react-router-dom';
 import PageHeader from '../components/ui/PageHeader';
 import RoiPresetDetail from '../components/roi/RoiPresetDetail';
 import DashboardPresetDetail from '../components/dashboard/DashboardPresetDetail';
 import ReportingPresetDetail from '../components/reporting/ReportingPresetDetail';
+import PublisherPresetDetail from '../components/presets/PublisherPresetDetail';
+import PublisherRoiPresetDetail from '../components/presets/PublisherRoiPresetDetail';
 import { useAuth } from '../store/useAuth';
 import { usePermissions } from '../hooks/usePermissions';
 import {
@@ -18,7 +20,7 @@ import {
   summaryForPreset,
 } from '../utils/reportPresets';
 import { confirmDialog } from '../hooks/useConfirmDialog';
-import { ADSENSE_ENABLED } from '../utils/productWorkspace';
+import { ADSENSE_ENABLED, productFromPath } from '../utils/productWorkspace';
 import { validateSavedName, SAVED_NAME_RULES_HINT } from '../utils/namePolicy';
 
 const SPLIT_WIDTH_KEY = 'adnexus.presets.splitWidth';
@@ -68,31 +70,45 @@ const SECTIONS = [
   },
   {
     page: PRESET_PAGES.admob,
-    label: 'AdMob Dashboard',
+    label: 'Dashboard',
     access: 'admob-dashboard',
-    openLabel: 'Open in AdMob',
+    openLabel: 'Open in AdMob Dashboard',
     emptyPath: '/admob/dashboard',
   },
   {
     page: PRESET_PAGES.admobReporting,
-    label: 'AdMob Reporting',
+    label: 'Reporting',
     access: 'admob-reporting',
     openLabel: 'Open in AdMob Reporting',
     emptyPath: '/admob/reporting',
   },
   {
+    page: PRESET_PAGES.admobRoi,
+    label: 'ROI',
+    access: 'admob-roi',
+    openLabel: 'Open in AdMob ROI',
+    emptyPath: '/admob/roi',
+  },
+  {
     page: PRESET_PAGES.adsense,
-    label: 'AdSense Dashboard',
+    label: 'Dashboard',
     access: 'adsense-dashboard',
-    openLabel: 'Open in AdSense',
+    openLabel: 'Open in AdSense Dashboard',
     emptyPath: '/adsense/dashboard',
   },
   {
     page: PRESET_PAGES.adsenseReporting,
-    label: 'AdSense Reporting',
+    label: 'Reporting',
     access: 'adsense-reporting',
     openLabel: 'Open in AdSense Reporting',
     emptyPath: '/adsense/reporting',
+  },
+  {
+    page: PRESET_PAGES.adsenseRoi,
+    label: 'ROI',
+    access: 'adsense-roi',
+    openLabel: 'Open in AdSense ROI',
+    emptyPath: '/adsense/roi',
   },
 ];
 
@@ -111,7 +127,16 @@ function formatWhen(when) {
   }
 }
 
-export default function Presets() {
+/** Each preset section belongs to one product workspace (GAM sections have no product prefix). */
+function sectionProduct(section) {
+  if (section.access.startsWith('admob-')) return 'admob';
+  if (section.access.startsWith('adsense-')) return 'adsense';
+  return 'gam';
+}
+
+export default function Presets({ product: productProp = null }) {
+  const location = useLocation();
+  const product = productProp || productFromPath(location.pathname);
   const { user } = useAuth();
   const { canPage } = usePermissions();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -129,13 +154,14 @@ export default function Presets() {
   const splitContainerRef = useRef(null);
 
   const availableSections = useMemo(
-    () => SECTIONS.filter((s) => canPage(s.access) && (ADSENSE_ENABLED || !s.access.startsWith('adsense'))),
-    [canPage]
+    () => SECTIONS.filter((s) => sectionProduct(s) === product && canPage(s.access)
+      && (ADSENSE_ENABLED || !s.access.startsWith('adsense'))),
+    [canPage, product]
   );
 
   const [selectedPage, setSelectedPage] = useState(() => {
     const pageQ = searchParams.get('page');
-    if (pageQ && SECTIONS.some((s) => s.page === pageQ)) return pageQ;
+    if (pageQ && SECTIONS.some((s) => s.page === pageQ && sectionProduct(s) === product)) return pageQ;
     return null;
   });
   const [selectedId, setSelectedId] = useState(() => searchParams.get('id') || null);
@@ -656,6 +682,17 @@ export default function Presets() {
             ) : null}
             {activeSection?.page === PRESET_PAGES.roi ? (
               <RoiPresetDetail {...detailProps} />
+            ) : null}
+            {product !== 'gam' && activeSection ? (
+              activeSection.access.endsWith('-roi') ? (
+                <PublisherRoiPresetDetail product={product} {...detailProps} />
+              ) : (
+                <PublisherPresetDetail
+                  product={product}
+                  kind={activeSection.access.endsWith('-reporting') ? 'reporting' : 'dashboard'}
+                  {...detailProps}
+                />
+              )
             ) : null}
           </div>
         </div>

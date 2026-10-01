@@ -14,11 +14,12 @@ const ALLOWED = new Set([
   '/help',
   '/admob/dashboard',
   '/admob/reporting',
+  '/admob/presets',
   '/admob/roi',
   '/adsense/dashboard',
-  '/adsense/sites',
-  '/adsense/ad-units',
   '/adsense/reporting',
+  '/adsense/presets',
+  '/adsense/roi',
 ]);
 
 export function rememberLastRoute(pathname) {
@@ -53,11 +54,12 @@ function routeAllowed(user, path) {
     '/my-ads': 'my-ads',
     '/admob/dashboard': 'admob-dashboard',
     '/admob/reporting': 'admob-reporting',
+    '/admob/presets': 'admob-presets',
     '/admob/roi': 'admob-roi',
     '/adsense/dashboard': 'adsense-dashboard',
-    '/adsense/sites': 'adsense-sites',
-    '/adsense/ad-units': 'adsense-ad-units',
     '/adsense/reporting': 'adsense-reporting',
+    '/adsense/presets': 'adsense-presets',
+    '/adsense/roi': 'adsense-roi',
   };
   const page = pageMap[path];
   if (page) return canAccessPage(user, page);
