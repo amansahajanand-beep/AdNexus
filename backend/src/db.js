@@ -669,6 +669,15 @@ async function initSchema() {
       PRIMARY KEY (client_id, admob_account_id, ads_account_id)
     );
 
+    -- Google Ads accounts whose spend counts toward each AdSense publisher's ROI
+    CREATE TABLE IF NOT EXISTS adsense_ads_account_links (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      adsense_account_id UUID NOT NULL REFERENCES adsense_accounts(id) ON DELETE CASCADE,
+      ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, adsense_account_id, ads_account_id)
+    );
+
     -- Dimension breakdowns (app/format/country/… and site/country/…)
     CREATE TABLE IF NOT EXISTS admob_dim_daily (
       client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
@@ -950,6 +959,7 @@ const TENANT_TABLES = [
   'adsense_dim_daily',
   'admob_grain_daily',
   'admob_ads_account_links',
+  'adsense_ads_account_links',
 ];
 
 function safeIdent(name) {

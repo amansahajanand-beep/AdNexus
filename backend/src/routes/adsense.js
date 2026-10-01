@@ -18,6 +18,12 @@ const {
 } = require('../services/adsenseSyncService');
 const { adsenseSyncQueue } = require('../queues/publisherSync');
 const { adsenseAccountStore } = require('../models/publisherAccountStore');
+const {
+  getAdSenseRoi,
+  listAdsAccountsForAdSense,
+  setLinkedAdsAccountIds,
+} = require('../services/adsenseRoiService');
+const logger = require('../utils/logger');
 const { createPublisherApiRouter, sparkFromTrend, pctChange } = require('./publisherApiFactory');
 
 function buildAdSenseKpis(curr, prev, trend) {
@@ -45,6 +51,69 @@ function buildAdSenseKpis(curr, prev, trend) {
   ];
 }
 
+/** ROI page: AdSense site earnings vs spend from the Google Ads accounts linked to each publisher. */
+function addAdSenseRoiRoutes(router, { resolveAccountContext, resolveRange, parseCsvList, store }) {
+  // Spend data is admin-only; domain users keep the earnings-only dashboards.
+  const adminOnly = (req, res, next) => (
+    req.user?.role === 'admin' ? next() : res.status(403).json({ error: 'Admin access required' })
+  );
+
+  router.get('/roi', adminOnly, async (req, res) => {
+    try {
+      const ctx = await resolveAccountContext(req);
+      if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
+      const { start, end } = resolveRange(req);
+      const account = ctx.storeAccountId ? await store.getAccountById(ctx.storeAccountId) : null;
+      const sites = parseCsvList(req.query.sites);
+      const data = await getAdSenseRoi({
+        clientId: ctx.clientId,
+        account,
+        start,
+        end,
+        sites: sites.length ? sites : null,
+        adsAccountIds: parseCsvList(req.query.adsAccountIds),
+      });
+      res.set('Cache-Control', 'no-store');
+      res.json({ account: ctx.active, ...data });
+    } catch (err) {
+      logger.error('adsense roi:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.get('/roi/ads-accounts', adminOnly, async (req, res) => {
+    try {
+      const ctx = await resolveAccountContext(req);
+      if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
+      const { start, end } = resolveRange(req);
+      const data = await listAdsAccountsForAdSense(ctx.clientId, {
+        adsenseAccountId: ctx.storeAccountId,
+        start,
+        end,
+      });
+      res.set('Cache-Control', 'no-store');
+      res.json({ account: ctx.active, publisherClientId: ctx.clientId, ...data });
+    } catch (err) {
+      logger.error('adsense roi ads-accounts:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  router.put('/roi/ads-accounts', adminOnly, async (req, res) => {
+    try {
+      const ctx = await resolveAccountContext(req);
+      if (ctx.error) return res.status(ctx.status).json({ error: ctx.error });
+      if (!ctx.storeAccountId) return res.status(400).json({ error: 'Connect an AdSense account first' });
+      const ids = Array.isArray(req.body?.adsAccountIds) ? req.body.adsAccountIds : [];
+      const linkedIds = await setLinkedAdsAccountIds(ctx.clientId, ctx.storeAccountId, ids);
+      res.json({ ok: true, linkedIds });
+    } catch (err) {
+      logger.error('adsense roi ads-accounts save:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+}
+
 module.exports = createPublisherApiRouter({
   product: 'adsense',
   store: adsenseAccountStore,
@@ -68,4 +137,5 @@ module.exports = createPublisherApiRouter({
   defaultBreakdownDim: 'site',
   defaultTableDim: 'ad_unit',
   queryParam: 'adsense_oauth',
+  extendRouter: addAdSenseRoiRoutes,
 });

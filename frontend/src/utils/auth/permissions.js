@@ -225,7 +225,7 @@ export function canAccessPage(user, page) {
   if (page === 'presets') {
     return hasPermission(user, 'canAccessDashboard') || hasPermission(user, 'canAccessReporting');
   }
-  if (page === 'admob-roi') return false;
+  if (page === 'admob-roi' || page === 'adsense-roi') return false;
   if (String(page).startsWith('admob-')) return hasAdmobAccess(user);
   if (String(page).startsWith('adsense-')) return hasAdsenseAccess(user);
   const map = {

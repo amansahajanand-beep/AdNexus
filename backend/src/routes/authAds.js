@@ -31,6 +31,7 @@ function verifyAdsState(state) {
 const RETURN_PATHS = {
   'my-ads': '/my-ads',
   'admob-roi': '/admob/roi',
+  'adsense-roi': '/adsense/roi',
   'adsense-google-ads': '/my-ads',
 };
 

@@ -47,6 +47,9 @@ const {
 const logger = require('../utils/logger');
 const { cache } = require('../gam/client');
 
+/** Publisher ROI pages the Ads OAuth flow can return to (admin-only pages). */
+const ROI_RETURN_TARGETS = new Set(['admob-roi', 'adsense-roi']);
+
 function parseAccountIdsQuery(raw) {
   return String(raw || '')
     .split(',')
@@ -183,7 +186,7 @@ router.post('/my/oauth-url', requireDomainUser, requireMyAdsAccess, async (req, 
         error: 'Google Ads OAuth is not configured. Ask your administrator to set Ads OAuth credentials.',
       });
     }
-    const returnTo = req.body?.returnTo === 'admob-roi' ? 'admob-roi' : 'my-ads';
+    const returnTo = ROI_RETURN_TARGETS.has(req.body?.returnTo) ? req.body.returnTo : 'my-ads';
     const url = buildAdsAuthUrl(req.client, {
       clientId: req.client.id,
       mode: 'mcc',
@@ -301,7 +304,7 @@ router.get('/my/accounts/:id/oauth-url', requireDomainUser, requireMyAdsAccess, 
         mode = 'mcc';
       }
     }
-    const returnTo = req.query?.returnTo === 'admob-roi' ? 'admob-roi' : 'my-ads';
+    const returnTo = ROI_RETURN_TARGETS.has(req.query?.returnTo) ? req.query.returnTo : 'my-ads';
     const url = buildAdsAuthUrl(req.client, {
       clientId: req.client.id,
       mode,
@@ -421,7 +424,7 @@ router.post('/accounts/mcc/oauth-url', requireAdmin, async (req, res) => {
     const url = buildAdsAuthUrl(req.client, {
       clientId: req.client.id,
       mode: 'mcc',
-      ...(req.body?.returnTo === 'admob-roi' ? { returnTo: 'admob-roi' } : {}),
+      ...(ROI_RETURN_TARGETS.has(req.body?.returnTo) ? { returnTo: req.body.returnTo } : {}),
     });
     res.json({ url });
   } catch (err) {
@@ -786,7 +789,7 @@ router.get('/accounts/:id/oauth-url', requireAdmin, async (req, res) => {
       clientId: req.client.id,
       mode,
       adsAccountId: target.id,
-      ...(req.query.returnTo === 'admob-roi' ? { returnTo: 'admob-roi' } : {}),
+      ...(ROI_RETURN_TARGETS.has(req.query.returnTo) ? { returnTo: req.query.returnTo } : {}),
     });
     res.json({ url, reconnectAccountId: target.id, reconnectMode: mode });
   } catch (err) {

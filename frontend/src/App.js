@@ -149,7 +149,7 @@ function AppRoutes() {
             <Route path="/adsense/sites" element={<Navigate to="/adsense/dashboard" replace />} />
             <Route path="/adsense/ad-units" element={<Navigate to="/adsense/dashboard" replace />} />
             <Route path="/adsense/reporting" element={<PermissionRoute page="adsense-reporting"><AdSenseReporting /></PermissionRoute>} />
-            <Route path="/adsense/roi" element={<AdSenseRoi />} />
+            <Route path="/adsense/roi" element={<AdminRoute><AdSenseRoi /></AdminRoute>} />
             <Route path="/adsense/presets" element={<PublisherPresets product="adsense" />} />
           </>
         )}

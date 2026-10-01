@@ -102,7 +102,7 @@ export const ADMOB_NAV_ITEMS = [
 export const ADSENSE_NAV_ITEMS = [
   { to: '/adsense/dashboard', label: 'Dashboard', page: 'adsense-dashboard' },
   { to: '/adsense/reporting', label: 'Reporting', page: 'adsense-reporting' },
-  { to: '/adsense/roi', label: 'ROI', page: 'adsense-roi', pageAny: ['adsense-dashboard', 'adsense-reporting'] },
+  { to: '/adsense/roi', label: 'ROI', page: 'adsense-roi', adminOnly: true },
   { to: '/adsense/presets', label: 'Presets', page: 'adsense-presets', pageAny: ['adsense-dashboard', 'adsense-reporting'] },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/help', label: 'Help', page: 'help', always: true },

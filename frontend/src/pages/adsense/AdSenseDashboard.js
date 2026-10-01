@@ -105,14 +105,6 @@ export default function AdSenseDashboard() {
               getSnapshot={report.getPresetSnapshot}
               disabled={!canFilter}
             />
-            <SavePresetButton
-              page={PRESET_PAGES.adsenseRoi}
-              userId={user?.id}
-              buttonLabel="Save ROI preset"
-              getSnapshot={report.getPresetSnapshot}
-              disabled={!canFilter}
-              hint={<>Saves the selected AdSense sites for a site-matched ROI view.</>}
-            />
           </>
         )}
         {report.loading ? (

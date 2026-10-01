@@ -18,6 +18,8 @@ export const PRESET_PAGES = Object.freeze({
   dashboard: 'dashboard',
   reporting: 'reporting',
   roi: 'roi',
+  admobRoi: 'admob-roi',
+  adsenseRoi: 'adsense-roi',
   admob: 'admob',
   adsense: 'adsense',
   admobReporting: 'admob-reporting',
@@ -402,11 +404,15 @@ export function hrefForPreset(page, snapshot) {
         ? '/admob/dashboard'
         : page === PRESET_PAGES.admobReporting
           ? '/admob/reporting'
-          : page === PRESET_PAGES.adsense
-            ? '/adsense/dashboard'
-            : page === PRESET_PAGES.adsenseReporting
-              ? '/adsense/reporting'
-              : '/dashboard';
+          : page === PRESET_PAGES.admobRoi
+            ? '/admob/roi'
+            : page === PRESET_PAGES.adsense
+              ? '/adsense/dashboard'
+              : page === PRESET_PAGES.adsenseReporting
+                ? '/adsense/reporting'
+                : page === PRESET_PAGES.adsenseRoi
+                  ? '/adsense/roi'
+                  : '/dashboard';
   const qs = encodeReportShare(normalizePresetSnapshot(snapshot));
   return qs ? `${path}?${qs}` : path;
 }

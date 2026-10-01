@@ -31,6 +31,7 @@ function DeltaLine({ change, compareLabel, loading }) {
  * Grouped ROI KPI boards — Ads performance + ROI outcome (Dashboard-style).
  */
 export default function RoiSummaryBoards({
+  groups: customGroups = null,
   summary = {},
   deltas = {},
   compareLabel = '',
@@ -39,7 +40,7 @@ export default function RoiSummaryBoards({
   fetchedAt = null,
   showLive = true,
 }) {
-  const groups = buildRoiSummaryGroups(summary).map((group) => ({
+  const groups = (customGroups || buildRoiSummaryGroups(summary)).map((group) => ({
     ...group,
     metrics: group.metrics.map((m) => {
       if (m.key === 'spend') return { ...m, delta: deltas.adsSpend };

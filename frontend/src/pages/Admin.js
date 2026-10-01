@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { useLocation } from 'react-router-dom';
-import { usersAPI, domainsAPI, reportsAPI, adsAPI, clientsAPI, admobAPI } from '../utils/api';
+import { usersAPI, domainsAPI, reportsAPI, adsAPI, clientsAPI, admobAPI, adsenseAPI } from '../utils/api';
 import { useAuth } from '../store/useAuth';
 import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions, normalizeDomainPickerOptions } from '../utils/domainCatalog';
 import { isLikelyAppPackage } from '../utils/appPackage';
@@ -18,7 +18,7 @@ const TABS = [
   { id: 'user', label: 'Users', Icon: Users },
   { id: 'domains', label: 'Assign Permissions', Icon: ShieldAlert },
   { id: 'client', label: 'GAM connection', Icon: Settings, products: ['gam'] },
-  { id: 'ads', label: 'Google Ads accounts', Icon: Megaphone, products: ['gam', 'admob'] },
+  { id: 'ads', label: 'Google Ads accounts', Icon: Megaphone, products: ['gam', 'admob', 'adsense'] },
   { id: 'admob', label: 'AdMob accounts', Icon: Smartphone, products: ['admob'] },
   { id: 'adsense', label: 'AdSense accounts', Icon: Newspaper, products: ['adsense'] },
 ];
@@ -74,25 +74,27 @@ export default function Admin() {
   const [networks, setNetworks] = useState([]);
 
   const activeProduct = resolveActiveProduct(location.pathname);
-  const isAdmobProduct = activeProduct === 'admob';
+  // AdMob and AdSense share one publisher workspace tenant that owns its own Google Ads accounts.
+  const publisherApi = activeProduct === 'admob' ? admobAPI : activeProduct === 'adsense' ? adsenseAPI : null;
+  const publisherLabel = activeProduct === 'admob' ? 'AdMob' : 'AdSense';
   const visibleTabs = tabsForProduct(activeProduct);
 
   useEffect(() => {
     if (!visibleTabs.some((t) => t.id === tab)) setTab(visibleTabs[0].id);
   }, [visibleTabs, tab]);
-  const [admobWorkspace, setAdmobWorkspace] = useState(null);
-  const [admobWorkspaceError, setAdmobWorkspaceError] = useState(null);
+  const [publisherWorkspace, setPublisherWorkspace] = useState(null);
+  const [publisherWorkspaceError, setPublisherWorkspaceError] = useState(null);
 
   useEffect(() => {
-    if (!isAdmobProduct || tab !== 'ads' || admobWorkspace) return undefined;
+    if (!publisherApi || tab !== 'ads' || publisherWorkspace) return undefined;
     let cancelled = false;
-    admobAPI.workspace()
-      .then((ws) => { if (!cancelled) setAdmobWorkspace(ws); })
+    publisherApi.workspace()
+      .then((ws) => { if (!cancelled) setPublisherWorkspace(ws); })
       .catch((err) => {
-        if (!cancelled) setAdmobWorkspaceError(getUserFacingMessage(err, 'Could not load the AdMob workspace.'));
+        if (!cancelled) setPublisherWorkspaceError(getUserFacingMessage(err, `Could not load the ${publisherLabel} workspace.`));
       });
     return () => { cancelled = true; };
-  }, [isAdmobProduct, tab, admobWorkspace]);
+  }, [publisherApi, publisherLabel, tab, publisherWorkspace]);
 
   const [permSaving, setPermSaving] = useState(false);
   const [permError, setPermError] = useState(null);
@@ -241,7 +243,7 @@ export default function Admin() {
         title="Admin"
         subtitle={
           activeProduct === 'admob' ? 'Users, permissions, AdMob accounts, and Google Ads ROI setup'
-            : activeProduct === 'adsense' ? 'Users, permissions, and AdSense accounts'
+            : activeProduct === 'adsense' ? 'Users, permissions, AdSense accounts, and Google Ads ROI setup'
               : 'Users, inventory permissions, GAM OAuth, and Google Ads ROI setup'
         }
         summary={
@@ -295,16 +297,16 @@ export default function Admin() {
 
       {tab === 'client' && <ClientSettings />}
 
-      {tab === 'ads' && !isAdmobProduct && <AdsAccountsAdmin />}
-      {tab === 'ads' && isAdmobProduct && (
-        admobWorkspace?.clientId ? (
+      {tab === 'ads' && !publisherApi && <AdsAccountsAdmin />}
+      {tab === 'ads' && publisherApi && (
+        publisherWorkspace?.clientId ? (
           <AdsAccountsAdmin
-            key={admobWorkspace.clientId}
-            clientId={admobWorkspace.clientId}
-            scopeLabel="AdMob"
+            key={publisherWorkspace.clientId}
+            clientId={publisherWorkspace.clientId}
+            scopeLabel={publisherLabel}
           />
         ) : (
-          <p className="muted">{admobWorkspaceError || 'Loading AdMob Google Ads accounts…'}</p>
+          <p className="muted">{publisherWorkspaceError || `Loading ${publisherLabel} Google Ads accounts…`}</p>
         )
       )}
 

@@ -95,10 +95,6 @@ function addAdMobRoiRoutes(router, { resolveAccountContext, resolveRange, parseC
     }
   });
 
-  router.get('/workspace', (req, res) => {
-    res.json({ clientId: req.client?.id || null, name: req.client?.name || null });
-  });
-
   /** Admin → Users: publishers + their apps / ad units for domain-user AdMob scope. */
   router.get('/scope-catalog', async (req, res) => {
     try {

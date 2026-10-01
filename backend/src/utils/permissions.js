@@ -668,7 +668,7 @@ function canAccessPage(user, page) {
   };
   if ((page === 'domain-user' || page === 'my-ads') && isAdmin(user)) return false;
   if (isAdmin(user)) return true;
-  if (page === 'admob-roi') return false;
+  if (page === 'admob-roi' || page === 'adsense-roi') return false;
   if (String(page).startsWith('admob-')) return hasAdmobAccess(user);
   const key = map[page];
   if (!key) return false;
