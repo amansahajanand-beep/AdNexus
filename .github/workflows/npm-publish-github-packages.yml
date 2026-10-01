@@ -56,8 +56,8 @@ jobs:
             npm install
 
             echo "===== Restarting Backend ====="
-            pm2 restart adnexUs
-
+            pm2 restart adNexuss
+            
             echo "===== Saving PM2 ====="
             pm2 save
 
