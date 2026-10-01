@@ -27,8 +27,8 @@ export const PRODUCTS = {
   },
 };
 
-/** AdSense is hidden until it has been tested; flip to true to re-enable its routes and switcher entry. */
-export const ADSENSE_ENABLED = false;
+/** Set to false to hide AdSense routes and its switcher entry. */
+export const ADSENSE_ENABLED = true;
 
 export const PRODUCT_LIST = ADSENSE_ENABLED
   ? [PRODUCTS.gam, PRODUCTS.admob, PRODUCTS.adsense]
@@ -86,22 +86,24 @@ export const GAM_NAV_ITEMS = [
   { to: '/presets', label: 'Presets', page: 'presets' },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/domain-user', label: 'Domain User', page: 'domain-user' },
+  { to: '/feedback', label: 'Feedback & Issues', page: 'feedback', always: true },
   { to: '/help', label: 'Help', page: 'help', always: true },
 ];
 
 export const ADMOB_NAV_ITEMS = [
   { to: '/admob/dashboard', label: 'Dashboard', page: 'admob-dashboard' },
   { to: '/admob/reporting', label: 'Reporting', page: 'admob-reporting' },
-  { to: '/admob/roi', label: 'ROI', page: 'admob-roi' },
+  { to: '/admob/presets', label: 'Presets', page: 'admob-presets', pageAny: ['admob-dashboard', 'admob-reporting'] },
+  { to: '/admob/roi', label: 'ROI', page: 'admob-roi', adminOnly: true },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/help', label: 'Help', page: 'help', always: true },
 ];
 
 export const ADSENSE_NAV_ITEMS = [
   { to: '/adsense/dashboard', label: 'Dashboard', page: 'adsense-dashboard' },
-  { to: '/adsense/sites', label: 'Sites', page: 'adsense-sites' },
-  { to: '/adsense/ad-units', label: 'Ad units', page: 'adsense-ad-units' },
   { to: '/adsense/reporting', label: 'Reporting', page: 'adsense-reporting' },
+  { to: '/adsense/roi', label: 'ROI', page: 'adsense-roi', pageAny: ['adsense-dashboard', 'adsense-reporting'] },
+  { to: '/adsense/presets', label: 'Presets', page: 'adsense-presets', pageAny: ['adsense-dashboard', 'adsense-reporting'] },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/help', label: 'Help', page: 'help', always: true },
 ];
