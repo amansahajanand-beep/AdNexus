@@ -24,6 +24,8 @@ const adsRoutes = require('./routes/ads');
 const admobRoutes = require('./routes/admob');
 const adsenseRoutes = require('./routes/adsense');
 const roiRoutes = require('./routes/roi');
+const presetsRoutes = require('./routes/presets');
+const aiRoutes = require('./routes/ai');
 const { initDB } = require('./models/userStore');
 const onboardRoutes = require('./routes/onboard');
 const clientsRoutes = require('./routes/clients');
@@ -125,6 +127,8 @@ async function startServer() {
   app.use('/api/admob', admobRoutes);        // AdMob accounts / overview
   app.use('/api/adsense', adsenseRoutes);    // AdSense accounts / overview
   app.use('/api/roi', roiRoutes);            // ROI summary
+  app.use('/api/presets', presetsRoutes);    // Saved report presets (per user)
+  app.use('/api/ai', aiRoutes);              // AI status, settings, feedback, usage
   app.use('/api/auth', sessionRoutes);       // Dashboard user login/session
   app.use('/api/users', usersRoutes);        // Admin user management
   app.use('/api/domains', domainsRoutes);    // Domain / channel catalogue
@@ -256,6 +260,27 @@ async function startServer() {
       } catch (e) {
         logger.warn('Cron start failed (non-fatal):', e.message);
       }
+    }
+
+    // Nightly AI pre-warm for pinned presets (off unless AI_PREWARM_ENABLED=true).
+    try {
+      require('./ai/presetAnalysis/prewarm').startPrewarmCron();
+    } catch (e) {
+      logger.warn('AI pre-warm schedule failed (non-fatal):', e.message);
+    }
+
+    // Weekly executive report (off unless AI_REPORT_ENABLED=true).
+    try {
+      require('./ai/report/cron').startReportCron();
+    } catch (e) {
+      logger.warn('AI weekly report schedule failed (non-fatal):', e.message);
+    }
+
+    // Nightly alert scan (off unless AI_ALERTS_ENABLED=true).
+    try {
+      require('./ai/alerts/cron').startAlertsCron();
+    } catch (e) {
+      logger.warn('AI alert schedule failed (non-fatal):', e.message);
     }
 
     // Re-fetch present + past when country/device dimensions are missing.

@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import RoiCountryTreeTable from './RoiCountryTreeTable';
 import RoiSummaryBoards from './RoiSummaryBoards';
 import PresetDateToolbar from '../presets/PresetDateToolbar';
+import PresetAiAnalysis from '../presets/PresetAiAnalysis';
 import { useAuth } from '../../store/useAuth';
 import { usePresetDateRange } from '../../hooks/usePresetDateRange';
 import { roiAPI } from '../../utils/api';
@@ -256,6 +257,16 @@ export default function RoiPresetDetail({
         onEndDateChange={setEndDate}
         onApply={applyDates}
       />
+
+      {!compareMode ? (
+        <PresetAiAnalysis
+          product="gam"
+          kind="roi"
+          filters={snapshot}
+          startDate={applied.startDate}
+          endDate={applied.endDate}
+        />
+      ) : null}
 
       {compareMode ? (
         <RoiPresetCompare

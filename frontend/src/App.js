@@ -13,6 +13,7 @@ import DomainUser from './pages/DomainUser';
 import MyAds from './pages/MyAds';
 import Feedback from './pages/Feedback';
 import Help from './pages/Help';
+import AiReport from './pages/AiReport';
 import PrivacyPolicy from './pages/PrivacyPolicy';
 import TermsOfService from './pages/TermsOfService';
 import About from './pages/About';
@@ -133,6 +134,7 @@ function AppRoutes() {
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
         <Route path="/feedback" element={<PermissionRoute page="feedback"><Feedback /></PermissionRoute>} />
         <Route path="/help" element={<Help />} />
+        <Route path="/ai-report" element={<AdminRoute><AiReport /></AdminRoute>} />
 
         <Route path="/admob" element={<PermissionRoute page="admob-dashboard"><Navigate to="/admob/dashboard" replace /></PermissionRoute>} />
         <Route path="/admob/dashboard" element={<PermissionRoute page="admob-dashboard"><AdMobDashboard /></PermissionRoute>} />

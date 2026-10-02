@@ -728,6 +728,23 @@ async function initSchema() {
       updated_at TIMESTAMPTZ DEFAULT now(),
       PRIMARY KEY (client_id, account_id, report_date, app_id, ad_unit_id, format, country, platform)
     );
+
+    -- One row per site × country × platform. AdSense attributes only part of earnings to ad units,
+    -- so ad units are not part of this grain.
+    CREATE TABLE IF NOT EXISTS adsense_scope_grain_daily (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      account_id UUID NOT NULL REFERENCES adsense_accounts(id) ON DELETE CASCADE,
+      report_date DATE NOT NULL,
+      site TEXT NOT NULL DEFAULT '',
+      country TEXT NOT NULL DEFAULT '',
+      platform TEXT NOT NULL DEFAULT '',
+      earnings DOUBLE PRECISION NOT NULL DEFAULT 0,
+      page_views BIGINT NOT NULL DEFAULT 0,
+      impressions BIGINT NOT NULL DEFAULT 0,
+      clicks BIGINT NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, account_id, report_date, site, country, platform)
+    );
   `);
 
   try {
@@ -747,6 +764,7 @@ async function initSchema() {
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_admob_dim_kind ON admob_dim_daily (client_id, account_id, dim_kind, report_date)`);
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_adsense_dim_kind ON adsense_dim_daily (client_id, account_id, dim_kind, report_date)`);
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_admob_grain_client_date ON admob_grain_daily (client_id, report_date, account_id)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_adsense_scope_grain_client_date ON adsense_scope_grain_daily (client_id, report_date, account_id)`);
   } catch (e) {
     logger.warn('admob/adsense indexes:', e.message);
   }
@@ -810,6 +828,99 @@ async function initSchema() {
     await schemaQuery(`ALTER TABLE ads_spend_daily ADD COLUMN IF NOT EXISTS app_id TEXT NOT NULL DEFAULT ''`);
   } catch (e) {
     logger.warn('ads currency columns:', e.message);
+  }
+
+  // Saved report presets (per user, one row per page) — server copy of what used to live only in localStorage.
+  try {
+    await schemaQuery(`
+      CREATE TABLE IF NOT EXISTS user_report_presets (
+        user_id TEXT NOT NULL,
+        page TEXT NOT NULL,
+        items JSONB NOT NULL DEFAULT '[]'::jsonb,
+        version INT NOT NULL DEFAULT 1,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (user_id, page)
+      )
+    `);
+  } catch (e) {
+    logger.warn('user_report_presets schema:', e.message);
+  }
+
+  // AI foundation: per-account feature flag, usage log, user feedback.
+  try {
+    await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS ai_enabled BOOLEAN`);
+    await schemaQuery(`
+      CREATE TABLE IF NOT EXISTS ai_usage_log (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        user_id TEXT,
+        client_id TEXT,
+        feature TEXT NOT NULL,
+        tier TEXT,
+        model TEXT,
+        status TEXT NOT NULL,
+        input_tokens INT NOT NULL DEFAULT 0,
+        output_tokens INT NOT NULL DEFAULT 0,
+        cache_read_tokens INT NOT NULL DEFAULT 0,
+        cache_write_tokens INT NOT NULL DEFAULT 0,
+        latency_ms INT,
+        first_token_ms INT,
+        est_cost_usd NUMERIC(12, 6),
+        error_code TEXT
+      )
+    `);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ai_usage_created ON ai_usage_log (created_at)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ai_usage_client_created ON ai_usage_log (client_id, created_at)`);
+    await schemaQuery(`
+      CREATE TABLE IF NOT EXISTS ai_alerts (
+        id BIGSERIAL PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        product TEXT NOT NULL,
+        page_kind TEXT NOT NULL,
+        signal_kind TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        facts JSONB NOT NULL DEFAULT '[]'::jsonb,
+        period_start DATE,
+        period_end DATE,
+        dedupe_key TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        dismissed_at TIMESTAMPTZ,
+        dismissed_by TEXT
+      )
+    `);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ai_alerts_account ON ai_alerts (account_id, created_at DESC)`);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ai_alerts_dedupe ON ai_alerts (account_id, dedupe_key, created_at DESC)`);
+    await schemaQuery(`
+      CREATE TABLE IF NOT EXISTS ai_reports (
+        id BIGSERIAL PRIMARY KEY,
+        account_id TEXT NOT NULL,
+        period_start DATE NOT NULL,
+        period_end DATE NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        created_by TEXT,
+        source TEXT NOT NULL,
+        model TEXT,
+        content JSONB NOT NULL,
+        facts JSONB NOT NULL DEFAULT '{}'::jsonb
+      )
+    `);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ai_reports_account ON ai_reports (account_id, created_at DESC)`);
+    await schemaQuery(`
+      CREATE TABLE IF NOT EXISTS ai_feedback (
+        id BIGSERIAL PRIMARY KEY,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        user_id TEXT NOT NULL,
+        client_id TEXT,
+        feature TEXT NOT NULL,
+        target_key TEXT,
+        rating SMALLINT NOT NULL CHECK (rating IN (-1, 1)),
+        comment TEXT
+      )
+    `);
+  } catch (e) {
+    logger.warn('AI foundation schema:', e.message);
   }
 
   // MCC delete must remove child accounts (not orphan them as "individual").
@@ -958,6 +1069,7 @@ const TENANT_TABLES = [
   'admob_dim_daily',
   'adsense_dim_daily',
   'admob_grain_daily',
+  'adsense_scope_grain_daily',
   'admob_ads_account_links',
   'adsense_ads_account_links',
 ];
@@ -1178,6 +1290,7 @@ const PUBLISHER_TABLES = [
   'admob_dim_daily',
   'adsense_dim_daily',
   'admob_grain_daily',
+  'adsense_scope_grain_daily',
 ];
 
 /** AdMob / AdSense live on the account's hidden publisher workspace (see utils/publisherTenant). */

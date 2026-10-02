@@ -1715,7 +1715,7 @@ export default function Roi() {
                     ? ` (${money(summary.mappedSpend, spendCurrency)} is in the table)`
                     : ''}.
                   {' '}Unmapped spend is hidden from the table and from Ads spend / ROI cards.
-                  Map campaigns in Admin → Campaign mapping to include them.
+                  Map campaigns in Admin → Google Ads accounts → Campaign mapping to include them.
                 </div>
               </div>
             </div>

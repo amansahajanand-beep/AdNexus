@@ -353,6 +353,7 @@ async function getAdMobRoi(gamClient, {
 }
 
 module.exports = {
+  loadAppCatalog,
   getAdMobRoi,
   listAdsAccountsForAdMob,
   listLinkedAdsAccountIds,

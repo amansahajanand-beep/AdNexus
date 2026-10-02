@@ -43,16 +43,20 @@ function isActiveSession(user, sessionId) {
 function stripSessionFields(user) {
   if (!user) return user;
   const { passwordHash, activeSessionId, ...safe } = user;
-  const scope = safe.permissions?.admobScope;
-  if (safe.role !== 'admin' && scope) {
-    // App / ad unit ids embed the AdMob publisher id — domain users only learn counts + filters.
-    safe.permissions = {
-      ...safe.permissions,
-      admobScope: {
+  if (safe.role !== 'admin' && safe.permissions) {
+    // App / site / ad unit ids embed publisher ids — domain users only learn counts, filters, metrics and report areas.
+    const perms = { ...safe.permissions };
+    for (const key of ['admobScope', 'adsenseScope']) {
+      const scope = perms[key];
+      if (!scope) continue;
+      perms[key] = {
         accountCount: Array.isArray(scope.accountIds) ? scope.accountIds.length : 0,
         filters: Array.isArray(scope.filters) ? scope.filters : [],
-      },
-    };
+        ...(Array.isArray(scope.metrics) ? { metrics: scope.metrics } : {}),
+        ...(Array.isArray(scope.reports) ? { reports: scope.reports } : {}),
+      };
+    }
+    safe.permissions = perms;
   }
   return safe;
 }

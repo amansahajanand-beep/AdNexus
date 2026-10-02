@@ -7,12 +7,16 @@ import { isLikelyAppPackage } from '../utils/appPackage';
 import UserManagement from '../components/admin/UserManagement';
 import ClientSettings from '../components/admin/ClientSettings';
 import AdsAccountsAdmin from '../components/admin/AdsAccountsAdmin';
+import CampaignMappingPanel from '../components/admin/CampaignMappingPanel';
+import AiAdminPanel from '../components/admin/AiAdminPanel';
 import ProductAccountsAdmin from '../components/admin/ProductAccountsAdmin';
 import DomainPermissions from '../components/admin/DomainPermissions';
 import PageHeader from '../components/ui/PageHeader';
 import { ADSENSE_ENABLED, resolveActiveProduct } from '../utils/productWorkspace';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
-import { Users, ShieldAlert, Settings, Megaphone, Smartphone, Newspaper } from '../components/ui/Icon';
+import {
+  Users, ShieldAlert, Settings, Megaphone, Smartphone, Newspaper, Sparkles,
+} from '../components/ui/Icon';
 
 const TABS = [
   { id: 'user', label: 'Users', Icon: Users },
@@ -21,6 +25,7 @@ const TABS = [
   { id: 'ads', label: 'Google Ads accounts', Icon: Megaphone, products: ['gam', 'admob', 'adsense'] },
   { id: 'admob', label: 'AdMob accounts', Icon: Smartphone, products: ['admob'] },
   { id: 'adsense', label: 'AdSense accounts', Icon: Newspaper, products: ['adsense'] },
+  { id: 'ai', label: 'AI', Icon: Sparkles },
 ];
 
 function tabsForProduct(product) {
@@ -49,6 +54,7 @@ export default function Admin() {
     if (params.get('tab') === 'ads' || params.get('ads_oauth')) return 'ads';
     if (params.get('tab') === 'admob') return 'admob';
     if (params.get('tab') === 'adsense') return 'adsense';
+    if (params.get('tab') === 'ai') return 'ai';
     if (params.get('oauth')) return 'client';
     return 'user';
   });
@@ -58,6 +64,7 @@ export default function Admin() {
     if (params.get('tab') === 'ads' || params.get('ads_oauth')) setTab('ads');
     else if (params.get('tab') === 'admob') setTab('admob');
     else if (params.get('tab') === 'adsense') setTab('adsense');
+    else if (params.get('tab') === 'ai') setTab('ai');
     else if (params.get('oauth')) setTab('client');
   }, [location.search]);
   const [users, setUsers] = useState([]);
@@ -253,7 +260,8 @@ export default function Admin() {
                 : tab === 'ads' ? 'Google Ads MCC & accounts'
                   : tab === 'admob' ? 'AdMob publisher accounts'
                     : tab === 'adsense' ? 'AdSense publisher accounts'
-                      : ''
+                      : tab === 'ai' ? 'AI features'
+                        : ''
         }
       />
 
@@ -297,14 +305,26 @@ export default function Admin() {
 
       {tab === 'client' && <ClientSettings />}
 
-      {tab === 'ads' && !publisherApi && <AdsAccountsAdmin />}
+      {tab === 'ads' && !publisherApi && (
+        <>
+          <AdsAccountsAdmin />
+          <CampaignMappingPanel product="gam" />
+        </>
+      )}
       {tab === 'ads' && publisherApi && (
         publisherWorkspace?.clientId ? (
-          <AdsAccountsAdmin
-            key={publisherWorkspace.clientId}
-            clientId={publisherWorkspace.clientId}
-            scopeLabel={publisherLabel}
-          />
+          <>
+            <AdsAccountsAdmin
+              key={publisherWorkspace.clientId}
+              clientId={publisherWorkspace.clientId}
+              scopeLabel={publisherLabel}
+            />
+            <CampaignMappingPanel
+              key={`map-${publisherWorkspace.clientId}-${activeProduct}`}
+              product={activeProduct}
+              clientId={publisherWorkspace.clientId}
+            />
+          </>
         ) : (
           <p className="muted">{publisherWorkspaceError || `Loading ${publisherLabel} Google Ads accounts…`}</p>
         )
@@ -325,6 +345,8 @@ export default function Admin() {
           dashboardPath={ADSENSE_ENABLED ? '/adsense/dashboard' : null}
         />
       )}
+
+      {tab === 'ai' && <AiAdminPanel />}
 
       {tab === 'domains' && (
         <DomainPermissions

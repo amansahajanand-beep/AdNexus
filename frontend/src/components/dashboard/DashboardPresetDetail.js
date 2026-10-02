@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import DynamicReportTable from '../ui/DynamicReportTable';
 import GamOverviewCard from '../ui/GamOverviewCard';
 import PresetDateToolbar from '../presets/PresetDateToolbar';
+import PresetAiAnalysis from '../presets/PresetAiAnalysis';
 import { useAuth } from '../../store/useAuth';
 import { usePresetDateRange } from '../../hooks/usePresetDateRange';
 import { reportsAPI } from '../../utils/api';
@@ -206,6 +207,14 @@ export default function DashboardPresetDetail({
         onStartDateChange={setStartDate}
         onEndDateChange={setEndDate}
         onApply={applyDates}
+      />
+
+      <PresetAiAnalysis
+        product="gam"
+        kind="dashboard"
+        filters={snapshot}
+        startDate={applied.startDate}
+        endDate={applied.endDate}
       />
 
       {error ? <div className="login-error" style={{ marginTop: 12 }}>{error}</div> : null}

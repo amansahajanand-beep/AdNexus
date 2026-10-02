@@ -18,6 +18,10 @@ import { APP_TIMEZONE } from '../../utils/datetime';
 import { buildFreshnessLabel, buildPublisherFreshnessLabel, relativeFreshness } from '../../utils/dataFreshness';
 import { applyTheme, isDarkTheme, readStoredTheme } from '../../utils/theme';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
+import { syncPresetsFromServer } from '../../utils/reportPresets';
+import AiAlertsBell from './AiAlertsBell';
+import AskDataDrawer from '../ai/AskDataDrawer';
+import { loadAiStatus } from '../../utils/ai/presetAnalysis';
 import {
   resolveActiveProduct,
   writeStoredProduct,
@@ -119,6 +123,20 @@ export default function Layout() {
     isAdmin ? readStoredAdmobAccountId() : null
   ));
   const userRef = useRef(null);
+
+  // Bring saved presets in from the server (and upload any that exist only in this browser).
+  useEffect(() => {
+    if (user?.id) syncPresetsFromServer(user.id);
+  }, [user?.id]);
+
+  // AI-only nav items (Weekly report) show only when AI is on for the account.
+  const [aiEnabled, setAiEnabled] = useState(false);
+  useEffect(() => {
+    if (!user?.id) return undefined;
+    let alive = true;
+    loadAiStatus().then((s) => { if (alive) setAiEnabled(Boolean(s?.enabled)); });
+    return () => { alive = false; };
+  }, [user?.id]);
 
   const toggleFocusMode = useCallback(() => {
     setFocusMode((prev) => {
@@ -415,6 +433,7 @@ export default function Layout() {
 
   const initial = (user?.username || 'U').charAt(0).toUpperCase();
   const navItems = navItemsForProduct(activeProduct).filter((i) => {
+    if (i.requiresAi && !aiEnabled) return false;
     if (i.adminOnly) return isAdmin;
     if (i.always) return true;
     if (i.page) return canPage(i.page);
@@ -592,6 +611,7 @@ export default function Layout() {
           </nav>
 
           <div className="sidebar-foot">
+            <AiAlertsBell isAdmin={isAdmin} collapsed={focusMode} />
             <button
               type="button"
               className="sidebar-focus-toggle"
@@ -753,6 +773,7 @@ export default function Layout() {
           <ToastStack />
           <ConfirmDialogHost />
           <CommandPalette />
+          {user ? <AskDataDrawer /> : null}
         </div>
       </div>
     </div>

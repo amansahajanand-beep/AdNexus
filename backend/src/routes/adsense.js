@@ -4,6 +4,8 @@ const {
   listAdSenseFilterOptions,
   breakdownAdSense,
   tableAdSense,
+  sumAdSenseFiltered,
+  trendAdSenseFiltered,
 } = require('../models/publisherDimStore');
 const {
   isAdSenseOAuthConfigured,
@@ -24,6 +26,14 @@ const {
   setLinkedAdsAccountIds,
 } = require('../services/adsenseRoiService');
 const logger = require('../utils/logger');
+const {
+  scopedTotals,
+  scopedTrend,
+  scopedBreakdown,
+  scopedFilterOptions,
+  grainScopeCatalog,
+} = require('../models/adsenseGrainStore');
+const { ADSENSE_SCOPE_FILTERS, getAdsenseScope, hasAdsenseAccess } = require('../utils/permissions');
 const { createPublisherApiRouter, sparkFromTrend, pctChange } = require('./publisherApiFactory');
 
 function buildAdSenseKpis(curr, prev, trend) {
@@ -81,6 +91,28 @@ function addAdSenseRoiRoutes(router, { resolveAccountContext, resolveRange, pars
     }
   });
 
+  /** Admin → Users: publishers + their sites / ad units for domain-user AdSense scope. */
+  router.get('/scope-catalog', adminOnly, async (req, res) => {
+    try {
+      const accounts = await store.listAccounts(req.client.id);
+      const catalog = await grainScopeCatalog(req.client.id, accounts.map((a) => a.id));
+      res.set('Cache-Control', 'no-store');
+      res.json({
+        accounts: accounts.map((a) => ({
+          id: a.id,
+          publisherId: a.accountId,
+          name: a.descriptiveName || a.accountId,
+          currencyCode: a.currencyCode,
+        })),
+        ...catalog,
+        filters: ADSENSE_SCOPE_FILTERS,
+      });
+    } catch (err) {
+      logger.error('adsense scope-catalog:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   router.get('/roi/ads-accounts', adminOnly, async (req, res) => {
     try {
       const ctx = await resolveAccountContext(req);
@@ -130,6 +162,8 @@ module.exports = createPublisherApiRouter({
   trendRange: trendAdSense,
   sumRollup: sumAdSenseRollup,
   trendRollup: trendAdSenseRollup,
+  sumFiltered: sumAdSenseFiltered,
+  trendFiltered: trendAdSenseFiltered,
   buildOverviewKpis: buildAdSenseKpis,
   listFilterOptions: listAdSenseFilterOptions,
   breakdownFn: breakdownAdSense,
@@ -138,4 +172,13 @@ module.exports = createPublisherApiRouter({
   defaultTableDim: 'ad_unit',
   queryParam: 'adsense_oauth',
   extendRouter: addAdSenseRoiRoutes,
+  adminOnly: true,
+  scoped: {
+    getScope: getAdsenseScope,
+    hasAccess: hasAdsenseAccess,
+    totals: scopedTotals,
+    trend: scopedTrend,
+    breakdown: scopedBreakdown,
+    filterOptions: scopedFilterOptions,
+  },
 });

@@ -450,6 +450,7 @@ export const adsenseAPI = {
   health: () => FAST_API.get('/adsense/health'),
   listAccounts: () => FAST_API.get('/adsense/accounts'),
   workspace: () => FAST_API.get('/adsense/workspace'),
+  scopeCatalog: () => FAST_API.get('/adsense/scope-catalog'),
   roi: (params) => FAST_API.get('/adsense/roi', { params }),
   roiAdsAccounts: (params) => FAST_API.get('/adsense/roi/ads-accounts', { params }),
   saveRoiAdsAccounts: (payload, params) => FAST_API.put('/adsense/roi/ads-accounts', payload, { params }),
@@ -472,6 +473,41 @@ export const adsenseAPI = {
 
 export const roiAPI = {
   summary: (params, config) => FAST_API.get('/roi/summary', { params, ...config }),
+};
+
+/** Saved report presets (server copy; localStorage stays the fast local cache). */
+export const presetsAPI = {
+  getAll: () => FAST_API.get('/presets'),
+  // 409 is a normal outcome (another device saved first): the body carries the server copy.
+  savePage: (page, items, baseVersion) => FAST_API.put(
+    `/presets/${encodeURIComponent(page)}`,
+    { items, baseVersion },
+    { validateStatus: (status) => (status >= 200 && status < 300) || status === 409 }
+  ),
+};
+
+/** Campaign → site/app mapping: AI suggestions plus the saved maps (optionally pinned to a workspace). */
+export const mappingAPI = {
+  suggest: (payload, clientId) => FAST_API.post('/ai/mapping-suggestions', payload, scopedTo(clientId)),
+  listMaps: (clientId) => FAST_API.get('/ads/campaign-maps', scopedTo(clientId)),
+  saveBulk: (payload, clientId) => FAST_API.put('/ads/campaign-maps/bulk', payload, scopedTo(clientId)),
+  deleteMap: (id, clientId) => FAST_API.delete(`/ads/campaign-maps/${id}`, scopedTo(clientId)),
+};
+
+/** AI features: availability and feedback (the analysis itself streams, see utils/ai/presetAnalysis). */
+export const aiAPI = {
+  status: () => FAST_API.get('/ai/status'),
+  feedback: (payload) => FAST_API.post('/ai/feedback', payload),
+  admin: () => FAST_API.get('/ai/admin'),
+  tokenSeries: (by) => FAST_API.get('/ai/token-series', { params: { by } }),
+  setEnabled: (enabled) => FAST_API.put('/ai/settings', { enabled }),
+  ping: () => FAST_API.post('/ai/ping', {}),
+  alerts: () => FAST_API.get('/ai/alerts'),
+  scanAlerts: () => FAST_API.post('/ai/alerts/scan', {}),
+  dismissAlert: (id) => FAST_API.post(`/ai/alerts/${id}/dismiss`, {}),
+  reports: () => FAST_API.get('/ai/reports'),
+  report: (id) => FAST_API.get(`/ai/reports/${id}`),
+  generateReport: (force = false) => FAST_API.post('/ai/reports/generate', { force }),
 };
 
 export const usersAPI = {

@@ -849,7 +849,7 @@ export default function AdSenseRoi() {
               <div className="warn-card-body">
                 <div className="warn-card-title">No Google Ads spend matched to AdSense sites</div>
                 <div className="warn-card-desc">
-                  Spend is matched when a Google Ads campaign is mapped to the site in Admin → Campaign mapping.
+                  Spend is matched when a Google Ads campaign is mapped to the site in Admin → Google Ads accounts → Campaign mapping.
                 </div>
               </div>
             </div>

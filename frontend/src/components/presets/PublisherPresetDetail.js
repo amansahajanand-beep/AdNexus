@@ -2,6 +2,7 @@ import React, { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { EmptyIcon } from '../ui/Icon';
 import PresetDateToolbar from './PresetDateToolbar';
+import PresetAiAnalysis from './PresetAiAnalysis';
 import PresetDetailHead from './PresetDetailHead';
 import ProductKpiStrip from '../ui/ProductKpiStrip';
 import ProductDetailTable from '../ui/ProductDetailTable';
@@ -106,6 +107,14 @@ export default function PublisherPresetDetail({
         onStartDateChange={dates.setStartDate}
         onEndDateChange={dates.setEndDate}
         onApply={dates.applyDates}
+      />
+
+      <PresetAiAnalysis
+        product={product}
+        kind={kind}
+        filters={presetItem.snapshot}
+        startDate={dates.applied.startDate}
+        endDate={dates.applied.endDate}
       />
 
       {report.error ? <div className="login-error" style={{ marginTop: 12 }}>{report.error}</div> : null}

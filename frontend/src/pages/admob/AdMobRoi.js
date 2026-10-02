@@ -860,7 +860,7 @@ export default function AdMobRoi() {
                 <div className="warn-card-title">No Google Ads spend matched to AdMob apps</div>
                 <div className="warn-card-desc">
                   Spend is matched when an App campaign promotes the same store app as this publisher,
-                  or a campaign is mapped to the app in Admin → Campaign mapping.
+                  or a campaign is mapped to the app in Admin → Google Ads accounts → Campaign mapping.
                 </div>
               </div>
             </div>

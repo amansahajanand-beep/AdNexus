@@ -63,12 +63,12 @@ export function productFromPath(pathname = '') {
 }
 
 /**
- * Active product for the shell. Shared routes (/admin, /help) keep the last product
+ * Active product for the shell. Shared routes (/admin, /help, /ai-report) keep the last product
  * so switching pages inside Admin does not snap the switcher back to GAM.
  */
 export function resolveActiveProduct(pathname = '') {
   const path = String(pathname || '').split('?')[0];
-  if (path === '/admin' || path === '/help') {
+  if (path === '/admin' || path === '/help' || path === '/ai-report') {
     return readStoredProduct();
   }
   return productFromPath(path);
@@ -84,6 +84,7 @@ export const GAM_NAV_ITEMS = [
   { to: '/roi', label: 'ROI', page: 'roi' },
   { to: '/my-ads', label: 'Google Ads', page: 'my-ads' },
   { to: '/presets', label: 'Presets', page: 'presets' },
+  { to: '/ai-report', label: 'Weekly report', page: 'ai-report', adminOnly: true, requiresAi: true },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/domain-user', label: 'Domain User', page: 'domain-user' },
   { to: '/feedback', label: 'Feedback & Issues', page: 'feedback', always: true },
@@ -95,6 +96,7 @@ export const ADMOB_NAV_ITEMS = [
   { to: '/admob/reporting', label: 'Reporting', page: 'admob-reporting' },
   { to: '/admob/presets', label: 'Presets', page: 'admob-presets', pageAny: ['admob-dashboard', 'admob-reporting'] },
   { to: '/admob/roi', label: 'ROI', page: 'admob-roi', adminOnly: true },
+  { to: '/ai-report', label: 'Weekly report', page: 'ai-report', adminOnly: true, requiresAi: true },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/help', label: 'Help', page: 'help', always: true },
 ];
@@ -104,6 +106,7 @@ export const ADSENSE_NAV_ITEMS = [
   { to: '/adsense/reporting', label: 'Reporting', page: 'adsense-reporting' },
   { to: '/adsense/roi', label: 'ROI', page: 'adsense-roi', adminOnly: true },
   { to: '/adsense/presets', label: 'Presets', page: 'adsense-presets', pageAny: ['adsense-dashboard', 'adsense-reporting'] },
+  { to: '/ai-report', label: 'Weekly report', page: 'ai-report', adminOnly: true, requiresAi: true },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
   { to: '/help', label: 'Help', page: 'help', always: true },
 ];
