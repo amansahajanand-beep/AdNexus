@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { EmptyIcon } from '../ui/Icon';
 import PresetDateToolbar from './PresetDateToolbar';
+import PresetAiAnalysis from './PresetAiAnalysis';
 import PresetDetailHead from './PresetDetailHead';
 import RoiSummaryBoards from '../roi/RoiSummaryBoards';
 import RoiCountryTreeTable from '../roi/RoiCountryTreeTable';
@@ -153,6 +154,14 @@ export default function PublisherRoiPresetDetail({
         onStartDateChange={dates.setStartDate}
         onEndDateChange={dates.setEndDate}
         onApply={dates.applyDates}
+      />
+
+      <PresetAiAnalysis
+        product={product}
+        kind="roi"
+        filters={presetItem.snapshot}
+        startDate={dates.applied.startDate}
+        endDate={dates.applied.endDate}
       />
 
       {error ? <div className="login-error" style={{ marginTop: 12 }}>{error}</div> : null}

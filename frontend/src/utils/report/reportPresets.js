@@ -10,6 +10,7 @@ import { TOKEN_KEY } from '../auth/authConstants';
 import { userIdFromToken } from '../auth/crossTabAuth';
 import { encodeReportShare } from './reportShare';
 import { assertValidSavedName } from '../auth/namePolicy';
+import { presetsAPI } from '../api';
 
 const STORAGE_PREFIX = 'reportPresets_v1';
 const MAX = 50;
@@ -226,8 +227,146 @@ function notifyChanged() {
 function writeList(page, userId, list) {
   const next = sortPresets(Array.isArray(list) ? list : []).slice(0, MAX);
   localStorage.setItem(storageKey(page, userId), JSON.stringify(next));
+  markDirty(page, userId);
   notifyChanged();
+  scheduleServerSave(page, userId);
   return next;
+}
+
+// ─── Server sync ──────────────────────────────────────────────────────────────
+// localStorage is the instant local copy. Every change is pushed to the server shortly after,
+// and syncPresetsFromServer() pulls the server copy on login so presets follow the user across
+// browsers. Each page's list carries a version; a push against a stale version gets the server
+// copy back and the two lists are merged by preset id (newest edit wins).
+
+const SAVE_DEBOUNCE_MS = 500;
+const MAX_PUSH_ATTEMPTS = 3;
+const saveTimers = new Map();
+
+const versionKey = (page, userId) => `${storageKey(page, userId)}:v`;
+const dirtyKey = (page, userId) => `${storageKey(page, userId)}:dirty`;
+
+function readVersion(page, userId) {
+  try { return parseInt(localStorage.getItem(versionKey(page, userId)), 10) || 0; } catch { return 0; }
+}
+function writeVersion(page, userId, v) {
+  try { localStorage.setItem(versionKey(page, userId), String(v || 0)); } catch { /* ignore */ }
+}
+function isDirty(page, userId) {
+  try { return localStorage.getItem(dirtyKey(page, userId)) === '1'; } catch { return false; }
+}
+function markDirty(page, userId) {
+  try { localStorage.setItem(dirtyKey(page, userId), '1'); } catch { /* ignore */ }
+}
+function clearDirty(page, userId) {
+  try { localStorage.removeItem(dirtyKey(page, userId)); } catch { /* ignore */ }
+}
+
+/** Union by id; when both sides have an id the more recently edited copy wins. */
+function mergeLists(localList, serverList) {
+  const byId = new Map();
+  for (const item of [...serverList, ...localList]) {
+    const prev = byId.get(item.id);
+    if (!prev || (item.when || 0) >= (prev.when || 0)) byId.set(item.id, item);
+  }
+  return sortPresets([...byId.values()]).slice(0, MAX);
+}
+
+/** Store a server list locally without marking it as a pending change. */
+function adoptServerList(page, userId, items, version) {
+  const list = parseList(JSON.stringify(items || []));
+  localStorage.setItem(storageKey(page, userId), JSON.stringify(list));
+  writeVersion(page, userId, version);
+  clearDirty(page, userId);
+  return list;
+}
+
+async function pushPage(page, userId, attempt = 1) {
+  const snapshotJson = localStorage.getItem(storageKey(page, userId)) || '[]';
+  let items;
+  try { items = JSON.parse(snapshotJson); } catch { items = []; }
+  let res;
+  try {
+    res = await presetsAPI.savePage(page, items, readVersion(page, userId));
+  } catch {
+    return false; // offline or server error: stays dirty, retried on the next sync or reconnect
+  }
+  if (res && !res.error && res.version != null) {
+    writeVersion(page, userId, res.version);
+    // Only clear the pending flag if nothing changed while the request was in flight.
+    if ((localStorage.getItem(storageKey(page, userId)) || '[]') === snapshotJson) clearDirty(page, userId);
+    else scheduleServerSave(page, userId);
+    return true;
+  }
+  if (res && res.error && Array.isArray(res.items)) {
+    const merged = mergeLists(parseList(snapshotJson), parseList(JSON.stringify(res.items)));
+    localStorage.setItem(storageKey(page, userId), JSON.stringify(merged));
+    writeVersion(page, userId, res.version);
+    markDirty(page, userId);
+    notifyChanged();
+    if (attempt < MAX_PUSH_ATTEMPTS) return pushPage(page, userId, attempt + 1);
+  }
+  return false;
+}
+
+function scheduleServerSave(page, userId) {
+  const key = storageKey(page, userId);
+  clearTimeout(saveTimers.get(key));
+  saveTimers.set(key, setTimeout(() => {
+    saveTimers.delete(key);
+    pushPage(page, userId);
+  }, SAVE_DEBOUNCE_MS));
+}
+
+let syncInFlight = null;
+
+/**
+ * Pull the signed-in user's presets from the server (and push any local-only or unsaved ones).
+ * Safe to call often; concurrent calls share one run.
+ */
+export function syncPresetsFromServer(userId) {
+  if (!userId) return Promise.resolve(false);
+  if (syncInFlight) return syncInFlight;
+  syncInFlight = (async () => {
+    let remote;
+    try {
+      remote = (await presetsAPI.getAll())?.pages || {};
+    } catch {
+      return false;
+    }
+    let changed = false;
+    for (const page of Object.values(PRESET_PAGES)) {
+      const server = remote[page];
+      const localList = getReportPresets(page, userId);
+      if (!server) {
+        // First sync from this browser: upload what is already saved locally.
+        if (localList.length) { markDirty(page, userId); await pushPage(page, userId); }
+        continue;
+      }
+      const serverList = parseList(JSON.stringify(server.items || []));
+      if (isDirty(page, userId)) {
+        const merged = mergeLists(localList, serverList);
+        localStorage.setItem(storageKey(page, userId), JSON.stringify(merged));
+        writeVersion(page, userId, server.version);
+        changed = true;
+        await pushPage(page, userId);
+      } else if (readVersion(page, userId) !== server.version) {
+        adoptServerList(page, userId, server.items, server.version);
+        changed = true;
+      }
+    }
+    if (changed) notifyChanged();
+    return true;
+  })().finally(() => { syncInFlight = null; });
+  return syncInFlight;
+}
+
+if (typeof window !== 'undefined') {
+  // Push anything that could not be saved while offline.
+  window.addEventListener('online', () => {
+    const uid = currentUserId();
+    if (uid) syncPresetsFromServer(uid);
+  });
 }
 
 export function getReportPresets(page, userId) {
@@ -418,6 +557,7 @@ export function hrefForPreset(page, snapshot) {
 }
 
 export default {
+  syncPresetsFromServer,
   getReportPresets,
   saveReportPreset,
   updateReportPreset,

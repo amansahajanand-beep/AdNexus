@@ -2,7 +2,8 @@ const { adsenseAccountStore } = require('../models/publisherAccountStore');
 const { upsertAdSenseDailyRows } = require('../models/publisherReportStore');
 const { rebuildAdSenseRollups } = require('../models/publisherRollupStore');
 const { upsertAdSenseDimRows } = require('../models/publisherDimStore');
-const { fetchAdSenseReport, fetchAdSenseDimReport } = require('../adsense/client');
+const { fetchAdSenseReport, fetchAdSenseDimReport, fetchAdSenseGrainReport } = require('../adsense/client');
+const { upsertAdSenseGrainRows } = require('../models/adsenseGrainStore');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
 const { addPublisherJob } = require('../queues/publisherSync');
 const logger = require('../utils/logger');
@@ -71,9 +72,23 @@ async function syncAdSenseAccount(account, { startDate, endDate, gamClient, look
       dimRows = await syncAdSenseDims(account, gamClient, { startDate: dimStart, endDate: end });
     }
 
+    // Combined grain for domain users' scoped views; a failure here must not fail the account sync.
+    let grainRows = 0;
+    try {
+      const grain = await fetchAdSenseGrainReport(gamClient, {
+        accountId: account.accountId,
+        refreshToken: account.refreshToken,
+        startDate: start,
+        endDate: end,
+      });
+      grainRows = await upsertAdSenseGrainRows(account.clientId, account.id, grain);
+    } catch (e) {
+      logger.warn(`[adsense-sync] grain ${account.accountId}:`, e.message);
+    }
+
     await adsenseAccountStore.setSyncStatus(account.id, { error: null });
-    logger.info(`[adsense-sync] ${account.accountId} ${start}→${end}: ${n} fact, ${dimRows} dim`);
-    return { rows: n, dimRows, startDate: start, endDate: end };
+    logger.info(`[adsense-sync] ${account.accountId} ${start}→${end}: ${n} fact, ${dimRows} dim, ${grainRows} grain`);
+    return { rows: n, dimRows, grainRows, startDate: start, endDate: end };
   } catch (err) {
     const msg = String(err.message || err).slice(0, 400);
     await adsenseAccountStore.setSyncStatus(account.id, { error: msg });

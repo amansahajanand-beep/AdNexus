@@ -36,6 +36,8 @@ import {
   CircleHelp,
   Newspaper,
   MessageSquareText,
+  FileText,
+  Sparkles,
 } from 'lucide-react';
 
 const NAV_ICONS = {
@@ -48,6 +50,7 @@ const NAV_ICONS = {
   'my-ads': Megaphone,
   feedback: MessageSquareText,
   help: CircleHelp,
+  'ai-report': FileText,
   'admob-dashboard': LayoutDashboard,
   'admob-reporting': BarChart3,
   'admob-roi': TrendingUp,
@@ -164,4 +167,5 @@ export {
   Users,
   Megaphone,
   Newspaper,
+  Sparkles,
 };

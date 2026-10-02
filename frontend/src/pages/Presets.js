@@ -18,6 +18,7 @@ import {
   toggleReportPresetPin,
   removeReportPreset,
   summaryForPreset,
+  syncPresetsFromServer,
 } from '../utils/reportPresets';
 import { confirmDialog } from '../hooks/useConfirmDialog';
 import { ADSENSE_ENABLED, productFromPath } from '../utils/productWorkspace';
@@ -141,6 +142,11 @@ export default function Presets({ product: productProp = null }) {
   const { canPage } = usePermissions();
   const [searchParams, setSearchParams] = useSearchParams();
   const userId = user?.id;
+
+  // Pick up presets saved on another device each time this page opens.
+  useEffect(() => {
+    if (userId) syncPresetsFromServer(userId);
+  }, [userId]);
 
   const [tick, setTick] = useState(0);
   const [search, setSearch] = useState('');

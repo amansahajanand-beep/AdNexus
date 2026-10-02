@@ -162,6 +162,25 @@ export function adsenseFilterKeysForUser(user) {
   return adsenseAllowedFilters(user).map((d) => FILTER_KEY_BY_DIM[d]);
 }
 
+/**
+ * Whether a domain user's product scope opens a report area ('dashboard' | 'reporting' | 'download').
+ * Older users have no list: pages stay open and downloads follow the general flag.
+ */
+export function scopeReportAllowed(user, product, area) {
+  if (isAdmin(user)) return true;
+  const reports = user?.permissions?.[PUBLISHER_SCOPES[product].key]?.reports;
+  if (!Array.isArray(reports)) return area === 'download' ? hasPermission(user, 'canDownloadReports') : true;
+  return reports.includes(area);
+}
+
+function productPageAllowed(user, product, page) {
+  if (page === `${product}-dashboard`) return scopeReportAllowed(user, product, 'dashboard');
+  if (page === `${product}-presets`) {
+    return scopeReportAllowed(user, product, 'dashboard') || scopeReportAllowed(user, product, 'reporting');
+  }
+  return scopeReportAllowed(user, product, 'reporting');
+}
+
 export function canViewReports(user) {
   return hasPermission(user, 'canGenerateReports');
 }
@@ -226,8 +245,8 @@ export function canAccessPage(user, page) {
     return hasPermission(user, 'canAccessDashboard') || hasPermission(user, 'canAccessReporting');
   }
   if (page === 'admob-roi' || page === 'adsense-roi') return false;
-  if (String(page).startsWith('admob-')) return hasAdmobAccess(user);
-  if (String(page).startsWith('adsense-')) return hasAdsenseAccess(user);
+  if (String(page).startsWith('admob-')) return hasAdmobAccess(user) && productPageAllowed(user, 'admob', page);
+  if (String(page).startsWith('adsense-')) return hasAdsenseAccess(user) && productPageAllowed(user, 'adsense', page);
   const map = {
     dashboard: 'canAccessDashboard',
     reporting: 'canAccessReporting',
@@ -239,20 +258,30 @@ export function canAccessPage(user, page) {
   return key ? hasPermission(user, key) : false;
 }
 
+/** First product page the user's scope opens, or null. */
+function publisherHome(user, product, enabled) {
+  if (!enabled) return null;
+  if (scopeReportAllowed(user, product, 'dashboard')) return `/${product}/dashboard`;
+  if (scopeReportAllowed(user, product, 'reporting')) return `/${product}/reporting`;
+  return null;
+}
+
 export function getDefaultHomeRoute(user) {
   if (isAdmin(user)) return '/dashboard';
   const vis = buildClientVisibility(user);
+  const admobHome = publisherHome(user, 'admob', vis.pages.admob);
+  const adsenseHome = publisherHome(user, 'adsense', vis.pages.adsense);
   if (!hasAssignedInventory(user)) {
-    if (vis.pages.admob) return '/admob/dashboard';
-    if (vis.pages.adsense) return '/adsense/dashboard';
+    if (admobHome) return admobHome;
+    if (adsenseHome) return adsenseHome;
   }
   if (vis.pages.dashboard) return '/dashboard';
   if (vis.pages.reporting) return '/reporting';
   if (vis.pages.roi) return '/roi';
   if (vis.pages.myAds) return '/my-ads';
   if (vis.pages.domainUser) return '/domain-user';
-  if (vis.pages.admob) return '/admob/dashboard';
-  if (vis.pages.adsense) return '/adsense/dashboard';
+  if (admobHome) return admobHome;
+  if (adsenseHome) return adsenseHome;
   return '/login';
 }
 

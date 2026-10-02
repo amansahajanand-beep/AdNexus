@@ -33,6 +33,7 @@ export default function PermissionsPanel({
   catalogLists = {},
   adsAccountOptions = [],
   adsAccountsLoading = false,
+  showDateRange = true,
 }) {
   const siteOptions = useMemo(
     () => buildAdminSitePickerOptions({
@@ -135,62 +136,75 @@ export default function PermissionsPanel({
         />
       </div>
 
-      <div className="ui-field">
-        <span className="ui-field-label">Allowed date range (optional)</span>
-        <p className="form-note" style={{ marginBottom: 8 }}>
-          User can only filter report data inside this window — from 1 day to any range you pick. Leave empty for no limit.
-        </p>
-        <div className="preset-pills" style={{ marginBottom: 10 }}>
-          {ADMIN_QUICK_DAY_LIMITS.map((n) => (
-            <button
-              key={n}
-              type="button"
-              className="preset-pill"
-              onClick={() => {
-                const r = adminQuickDateRange(n);
-                onDateRestrictionChange(r.start, r.end);
-              }}
-            >
-              Last {n} day{n > 1 ? 's' : ''}
-            </button>
-          ))}
-        </div>
-        <div className="filter-date-row" style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-          <div style={{ flex: '1 1 140px' }}>
-            <span className="form-note" style={{ display: 'block', marginBottom: 4 }}>From</span>
-            <input
-              type="date"
-              className="ui-field-input"
-              value={dateRestrictionStart || ''}
-              max={dateRestrictionEnd || undefined}
-              onChange={(e) => onDateRestrictionChange(e.target.value, dateRestrictionEnd)}
-            />
-          </div>
-          <div style={{ flex: '1 1 140px' }}>
-            <span className="form-note" style={{ display: 'block', marginBottom: 4 }}>To</span>
-            <input
-              type="date"
-              className="ui-field-input"
-              value={dateRestrictionEnd || ''}
-              min={dateRestrictionStart || undefined}
-              onChange={(e) => onDateRestrictionChange(dateRestrictionStart, e.target.value)}
-            />
-          </div>
-        </div>
-        <p className="form-note">
-          Or pick any custom From / To dates (no maximum).
-          {(dateRestrictionStart || dateRestrictionEnd) && (
-            <button
-              type="button"
-              className="link-action"
-              style={{ marginLeft: 8 }}
-              onClick={() => onDateRestrictionChange('', '')}
-            >
-              Clear
-            </button>
-          )}
-        </p>
+      {showDateRange ? (
+        <DateRestrictionField
+          start={dateRestrictionStart}
+          end={dateRestrictionEnd}
+          onChange={onDateRestrictionChange}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** "Allowed date range" picker. The user form shows it last, after the AdMob and AdSense scopes. */
+export function DateRestrictionField({ start = '', end = '', onChange }) {
+  return (
+    <div className="ui-field">
+      <span className="ui-field-label">Allowed date range (optional)</span>
+      <p className="form-note" style={{ marginBottom: 8 }}>
+        User can only filter report data inside this window — from 1 day to any range you pick. Leave empty for no limit.
+      </p>
+      <div className="preset-pills" style={{ marginBottom: 10 }}>
+        {ADMIN_QUICK_DAY_LIMITS.map((n) => (
+          <button
+            key={n}
+            type="button"
+            className="preset-pill"
+            onClick={() => {
+              const r = adminQuickDateRange(n);
+              onChange(r.start, r.end);
+            }}
+          >
+            Last {n} day{n > 1 ? 's' : ''}
+          </button>
+        ))}
       </div>
+      <div className="filter-date-row" style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ flex: '1 1 140px' }}>
+          <span className="form-note" style={{ display: 'block', marginBottom: 4 }}>From</span>
+          <input
+            type="date"
+            className="ui-field-input"
+            value={start || ''}
+            max={end || undefined}
+            onChange={(e) => onChange(e.target.value, end)}
+          />
+        </div>
+        <div style={{ flex: '1 1 140px' }}>
+          <span className="form-note" style={{ display: 'block', marginBottom: 4 }}>To</span>
+          <input
+            type="date"
+            className="ui-field-input"
+            value={end || ''}
+            min={start || undefined}
+            onChange={(e) => onChange(start, e.target.value)}
+          />
+        </div>
+      </div>
+      <p className="form-note">
+        Or pick any custom From / To dates (no maximum).
+        {(start || end) && (
+          <button
+            type="button"
+            className="link-action"
+            style={{ marginLeft: 8 }}
+            onClick={() => onChange('', '')}
+          >
+            Clear
+          </button>
+        )}
+      </p>
     </div>
   );
 }

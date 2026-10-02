@@ -3,6 +3,7 @@ import { EmptyIcon } from '../ui/Icon';
 import { useNavigate } from 'react-router-dom';
 import DynamicReportTable from '../ui/DynamicReportTable';
 import PresetDateToolbar from '../presets/PresetDateToolbar';
+import PresetAiAnalysis from '../presets/PresetAiAnalysis';
 import { useAuth } from '../../store/useAuth';
 import { usePresetDateRange } from '../../hooks/usePresetDateRange';
 import { reportsAPI } from '../../utils/api';
@@ -191,6 +192,14 @@ export default function ReportingPresetDetail({
         onStartDateChange={setStartDate}
         onEndDateChange={setEndDate}
         onApply={applyDates}
+      />
+
+      <PresetAiAnalysis
+        product="gam"
+        kind="reporting"
+        filters={snapshot}
+        startDate={applied.startDate}
+        endDate={applied.endDate}
       />
 
       {error ? <div className="login-error" style={{ marginTop: 12 }}>{error}</div> : null}

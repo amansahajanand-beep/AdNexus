@@ -120,6 +120,7 @@ async function generateAdSenseReport(gamClient, {
     dimensions,
     metrics: ADSENSE_METRICS,
     currencyCode: 'USD',
+    limit: 100000,
   });
   const extraDims = dimensions.filter((d) => d !== 'DATE');
   return parseAdSenseRows(res.data, extraDims);
@@ -160,7 +161,39 @@ async function fetchAdSenseDimReport(gamClient, {
   }));
 }
 
+/**
+ * One row per day × site × country × platform, so a domain user's site scope and filters can be applied together
+ * exactly. Ad units are left out on purpose: AdSense attributes only part of the earnings to ad units, so adding
+ * that dimension would drop most of the revenue.
+ */
+async function fetchAdSenseGrainReport(gamClient, {
+  accountId,
+  refreshToken,
+  startDate,
+  endDate,
+}) {
+  const rows = await generateAdSenseReport(gamClient, {
+    accountId,
+    refreshToken,
+    startDate,
+    endDate,
+    dimensions: ['DATE', 'DOMAIN_NAME', 'COUNTRY_CODE', 'PLATFORM_TYPE_CODE'],
+  });
+  logger.info(`[adsense] grain ${accountId} ${startDate}→${endDate}: ${rows.length} row(s)`);
+  return rows.map((r) => ({
+    reportDate: r.reportDate,
+    site: r.site,
+    country: r.country,
+    platform: r.platform,
+    earnings: r.earnings,
+    pageViews: r.pageViews,
+    impressions: r.impressions,
+    clicks: r.clicks,
+  }));
+}
+
 module.exports = {
+  fetchAdSenseGrainReport,
   ADSENSE_SCOPE,
   ADSENSE_DIM_KINDS,
   getAdSenseOAuthClient,

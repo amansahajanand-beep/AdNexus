@@ -37,6 +37,21 @@ function generateTokens(user, sessionId) {
   return { accessToken, refreshToken };
 }
 
+/**
+ * Short-lived token for server-side jobs that act as a user (e.g. the AI pre-warm).
+ * It rides on the user's current session, so it stops working when that session ends.
+ */
+function mintInternalToken(user, expiresIn = '10m') {
+  if (!user?.activeSessionId) return null;
+  return jwt.sign({
+    id: user.id,
+    role: user.role,
+    username: user.username,
+    clientId: user.clientId || null,
+    sid: user.activeSessionId,
+  }, SECRET(), { expiresIn });
+}
+
 // ─── Middleware: require login ─────────────────────────────────────────────────
 async function requireAuth(req, res, next) {
   const header = req.headers.authorization;
@@ -254,6 +269,7 @@ function filterByAllowedUnits(data, allowedAdUnits) {
 
 module.exports = {
   generateTokens,
+  mintInternalToken,
   requireAuth,
   requireAdmin,
   requireDomainUser,

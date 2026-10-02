@@ -70,6 +70,7 @@ function mergeInventoryFromBody(merged, body = {}) {
     if (Array.isArray(body[k])) merged[k] = body[k];
   });
   if (body.admobScope && typeof body.admobScope === 'object') merged.admobScope = body.admobScope;
+  if (body.adsenseScope && typeof body.adsenseScope === 'object') merged.adsenseScope = body.adsenseScope;
   return merged;
 }
 
@@ -77,6 +78,7 @@ function permissionsTouched(body = {}) {
   return FLAG_KEYS.some((k) => k in body)
     || INVENTORY_SCOPE_KEYS.some((k) => k in body)
     || 'admobScope' in body
+    || 'adsenseScope' in body
     || 'maxDaysBack' in body;
 }
 
@@ -86,6 +88,7 @@ function buildFromBody(role, body = {}) {
     if (Array.isArray(body[k])) inventory[k] = body[k];
   });
   if (body.admobScope && typeof body.admobScope === 'object') inventory.admobScope = body.admobScope;
+  if (body.adsenseScope && typeof body.adsenseScope === 'object') inventory.adsenseScope = body.adsenseScope;
   const maxDays = body.maxDaysBack != null ? parseInt(body.maxDaysBack, 10) : undefined;
   const dateRestriction = Number.isFinite(maxDays) && maxDays > 0 ? { maxDaysBack: maxDays } : null;
   return normalizePermissions(role, {

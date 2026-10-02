@@ -69,7 +69,9 @@ function createPublisherApiRouter({
     });
   }
 
-  const { buildVisibility, hasFlag } = require('../utils/permissions');
+  const { buildProductVisibility, hasFlag } = require('../utils/permissions');
+  // Metric / download visibility for this product (a domain user's product scope can narrow it).
+  const buildVisibility = (user) => buildProductVisibility(user, product);
 
   const productAccessFlag = product === 'admob' ? 'canAccessAdMob' : 'canAccessAdSense';
 
@@ -111,7 +113,10 @@ function createPublisherApiRouter({
     const vis = buildVisibility(user);
     const hide = new Set();
     if (!vis.revenue) hide.add('earnings');
-    if (!vis.impressions) hide.add('impressions');
+    if (!vis.impressions) {
+      hide.add('impressions');
+      hide.add('pageViews');
+    }
     if (!vis.ctr) {
       hide.add('clicks');
       hide.add('ctr');
@@ -126,7 +131,10 @@ function createPublisherApiRouter({
     if (!vis.revenue) {
       delete safeTotals.earnings;
     }
-    if (!vis.impressions) delete safeTotals.impressions;
+    if (!vis.impressions) {
+      delete safeTotals.impressions;
+      delete safeTotals.page_views;
+    }
     if (!vis.ctr) {
       delete safeTotals.clicks;
       delete safeTotals.ctr;
@@ -141,6 +149,7 @@ function createPublisherApiRouter({
       impressions: !!vis.impressions,
       ctr: !!vis.ctr,
       ecpm: !!vis.ecpm,
+      download: vis.download !== false,
     } };
   }
 
@@ -176,9 +185,9 @@ function createPublisherApiRouter({
 
   // ── Scoped (domain user) reads: grain facts limited to assigned publishers/apps/ad units ──
   const { getDateRestriction, clampDateRange } = require('../utils/dateRestriction');
-  const SCOPED_FILTER_KEYS = {
-    app: 'apps', ad_unit: 'adUnits', format: 'formats', country: 'countries', platform: 'platforms',
-  };
+  const SCOPED_FILTER_KEYS = product === 'adsense'
+    ? { site: 'sites', country: 'countries', platform: 'platforms' }
+    : { app: 'apps', ad_unit: 'adUnits', format: 'formats', country: 'countries', platform: 'platforms' };
   // Never expose publisher ids / account names to domain users.
   const SCOPED_ACCOUNT = { id: null, descriptiveName: product === 'admob' ? 'AdMob' : 'AdSense' };
 
@@ -213,7 +222,10 @@ function createPublisherApiRouter({
     const vis = buildVisibility(user);
     const out = { ...row };
     if (!vis.revenue) delete out.earnings;
-    if (!vis.impressions) delete out.impressions;
+    if (!vis.impressions) {
+      delete out.impressions;
+      delete out.page_views;
+    }
     if (!vis.ctr) {
       delete out.clicks;
       delete out.ctr;
@@ -797,6 +809,7 @@ function createPublisherApiRouter({
             impressions: !!vis.impressions,
             ctr: !!vis.ctr,
             ecpm: !!vis.ecpm,
+            download: vis.download !== false,
           },
         });
       }
@@ -849,6 +862,7 @@ function createPublisherApiRouter({
           impressions: !!vis.impressions,
           ctr: !!vis.ctr,
           ecpm: !!vis.ecpm,
+          download: vis.download !== false,
         },
       });
     } catch (err) {

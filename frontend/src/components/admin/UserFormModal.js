@@ -3,8 +3,10 @@ import Modal from '../ui/Modal';
 import Button from '../ui/Button';
 import { TextField, SelectField } from '../ui/Field';
 import MultiSelect from '../ui/MultiSelect';
-import PermissionsPanel from './PermissionsPanel';
+import PermissionsPanel, { DateRestrictionField } from './PermissionsPanel';
 import AdmobScopePanel, { EMPTY_ADMOB_SCOPE, admobScopeFromUser } from './AdmobScopePanel';
+import AdsenseScopePanel, { EMPTY_ADSENSE_SCOPE, adsenseScopeFromUser } from './AdsenseScopePanel';
+import { ADSENSE_ENABLED } from '../../utils/productWorkspace';
 import { validatePassword, PASSWORD_RULES_HINT } from '../../utils/passwordPolicy';
 import { validateUsername, USERNAME_RULES_HINT } from '../../utils/namePolicy';
 import { readDateRestrictionFromUser, dateRestrictionPayload } from '../../utils/adminDateRestriction';
@@ -91,6 +93,7 @@ export default function UserFormModal({
   const [allowedAppIds, setAllowedAppIds] = useState([]);
   const [allowedAdsAccountIds, setAllowedAdsAccountIds] = useState([]);
   const [admobScope, setAdmobScope] = useState(EMPTY_ADMOB_SCOPE);
+  const [adsenseScope, setAdsenseScope] = useState(EMPTY_ADSENSE_SCOPE);
   const [dateRestrictionStart, setDateRestrictionStart] = useState('');
   const [dateRestrictionEnd, setDateRestrictionEnd] = useState('');
   const [localError, setLocalError] = useState(null);
@@ -119,6 +122,7 @@ export default function UserFormModal({
     setAllowedAppIds(user?.permissions?.allowedAppIds || []);
     setAllowedAdsAccountIds(user?.permissions?.allowedAdsAccountIds || []);
     setAdmobScope(admobScopeFromUser(user));
+    setAdsenseScope(adsenseScopeFromUser(user));
     const dr = readDateRestrictionFromUser(user);
     setDateRestrictionStart(dr.start);
     setDateRestrictionEnd(dr.end);
@@ -274,6 +278,7 @@ export default function UserFormModal({
         allowedAppIds,
         allowedAdsAccountIds,
         admobScope,
+        ...(ADSENSE_ENABLED ? { adsenseScope } : {}),
         ...dateRestrictionPayload(dateRestrictionStart, dateRestrictionEnd),
       });
     }
@@ -368,9 +373,7 @@ export default function UserFormModal({
           onAppIdsChange={setAllowedAppIds}
           allowedAdsAccountIds={allowedAdsAccountIds}
           onAdsAccountsChange={setAllowedAdsAccountIds}
-          dateRestrictionStart={dateRestrictionStart}
-          dateRestrictionEnd={dateRestrictionEnd}
-          onDateRestrictionChange={handleDateRestrictionChange}
+          showDateRange={false}
           domains={scopeDomains}
           domainsLoading={scopeDomainsLoading || domainsLoading}
           catalogLoading={scopeCatalogLoading || catalogLoading}
@@ -381,11 +384,23 @@ export default function UserFormModal({
         />
       )}
       {role !== 'admin' && (
-        <div className="user-form-section">
-          <h4 className="user-form-section-title">AdMob access</h4>
-          <p className="form-note">No publishers selected means this user has no AdMob access.</p>
-          <AdmobScopePanel value={admobScope} onChange={setAdmobScope} />
-        </div>
+        <>
+          <div className="user-form-section">
+            <AdmobScopePanel value={admobScope} onChange={setAdmobScope} />
+          </div>
+          {ADSENSE_ENABLED ? (
+            <div className="user-form-section">
+              <AdsenseScopePanel value={adsenseScope} onChange={setAdsenseScope} />
+            </div>
+          ) : null}
+          <div className="user-form-section">
+            <DateRestrictionField
+              start={dateRestrictionStart}
+              end={dateRestrictionEnd}
+              onChange={handleDateRestrictionChange}
+            />
+          </div>
+        </>
       )}
       </div>
     </Modal>

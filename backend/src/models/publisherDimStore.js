@@ -374,6 +374,99 @@ async function trendAdMobFiltered(clientId, opts = {}) {
   return rows;
 }
 
+/** The active AdSense inventory filters, first one is the base the totals are summed over. */
+function collectAdSenseFilters({ sites, countries, platforms } = {}) {
+  const all = [
+    { kind: 'site', values: parseList(sites) },
+    { kind: 'country', values: parseList(countries) },
+    { kind: 'platform', values: parseList(platforms) },
+  ].filter((f) => f.values.length);
+  return { all, primary: all[0] || null };
+}
+
+/** WHERE clause for dim rows of `primary.kind`, other active filters as same-day EXISTS checks. */
+function adsenseFilterClause(params, filters) {
+  const [primary, ...cross] = filters.all;
+  params.push(primary.values);
+  let clause = ` AND d.dim_value = ANY($${params.length}::text[])`;
+  for (const f of cross) {
+    params.push(f.kind);
+    params.push(f.values);
+    clause += `
+      AND EXISTS (
+        SELECT 1 FROM adsense_dim_daily x
+        WHERE x.client_id = d.client_id AND x.account_id = d.account_id
+          AND x.report_date = d.report_date
+          AND x.dim_kind = $${params.length - 1}
+          AND x.dim_value = ANY($${params.length}::text[])
+      )`;
+  }
+  return clause;
+}
+
+/**
+ * Account totals for a date range with inventory filters applied (from dim facts).
+ * Returns null when no filter is active, so callers use the unfiltered rollups.
+ */
+async function sumAdSenseFiltered(clientId, opts = {}) {
+  const filters = collectAdSenseFilters(opts);
+  if (!filters.primary) return null;
+  const params = [clientId, opts.startDate, opts.endDate, filters.primary.kind];
+  let accountClause = '';
+  if (opts.accountId) {
+    params.push(opts.accountId);
+    accountClause = ` AND d.account_id = $${params.length}`;
+  }
+  const filterClause = adsenseFilterClause(params, filters);
+  const { rows } = await query(
+    `SELECT COALESCE(SUM(d.earnings),0)::float AS earnings,
+            COALESCE(SUM(d.page_views),0)::bigint AS page_views,
+            COALESCE(SUM(d.impressions),0)::bigint AS impressions,
+            COALESCE(SUM(d.clicks),0)::bigint AS clicks
+     FROM adsense_dim_daily d
+     WHERE d.client_id = $1
+       AND d.report_date >= $2::date AND d.report_date <= $3::date
+       AND d.dim_kind = $4
+       ${accountClause}
+       ${filterClause}`,
+    params
+  );
+  return { ...(rows[0] || { earnings: 0, page_views: 0, impressions: 0, clicks: 0 }), currency: opts.currencyCode || 'USD' };
+}
+
+async function trendAdSenseFiltered(clientId, opts = {}) {
+  const filters = collectAdSenseFilters(opts);
+  if (!filters.primary) return null;
+  const params = [clientId, opts.startDate, opts.endDate, filters.primary.kind];
+  let accountClause = '';
+  if (opts.accountId) {
+    params.push(opts.accountId);
+    accountClause = ` AND d.account_id = $${params.length}`;
+  }
+  const filterClause = adsenseFilterClause(params, filters);
+  const { rows } = await query(
+    `SELECT d.report_date::text AS date,
+            COALESCE(SUM(d.earnings),0)::float AS earnings,
+            COALESCE(SUM(d.page_views),0)::bigint AS page_views,
+            COALESCE(SUM(d.impressions),0)::bigint AS impressions,
+            COALESCE(SUM(d.clicks),0)::bigint AS clicks,
+            CASE WHEN SUM(d.page_views) > 0
+              THEN (SUM(d.earnings) / SUM(d.page_views) * 1000) ELSE 0 END AS rpm,
+            CASE WHEN SUM(d.impressions) > 0
+              THEN (SUM(d.clicks)::float8 / SUM(d.impressions) * 100) ELSE 0 END AS ctr
+     FROM adsense_dim_daily d
+     WHERE d.client_id = $1
+       AND d.report_date >= $2::date AND d.report_date <= $3::date
+       AND d.dim_kind = $4
+       ${accountClause}
+       ${filterClause}
+     GROUP BY d.report_date
+     ORDER BY d.report_date ASC`,
+    params
+  );
+  return rows;
+}
+
 async function breakdownAdSense(clientId, {
   accountId = null,
   startDate,
@@ -550,6 +643,8 @@ module.exports = {
   breakdownAdSense,
   sumAdMobFiltered,
   trendAdMobFiltered,
+  sumAdSenseFiltered,
+  trendAdSenseFiltered,
   tableAdMob,
   tableAdSense,
   parseList,

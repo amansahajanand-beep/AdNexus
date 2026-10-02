@@ -577,30 +577,56 @@ function resolveAdsAccountIdsForUser(user, requestedIds = []) {
 /** AdMob filter dimensions a domain user can be granted; mediation dims reveal partners/waterfalls. */
 const ADMOB_SCOPE_FILTERS = ['app', 'ad_unit', 'format', 'country', 'platform'];
 const ADMOB_DEFAULT_FILTERS = ['app', 'ad_unit', 'format', 'country', 'platform'];
+// No ad_unit: AdSense attributes only part of the earnings to ad units, so a scoped ad-unit view would be wrong.
+const ADSENSE_SCOPE_FILTERS = ['site', 'country', 'platform'];
+const ADSENSE_DEFAULT_FILTERS = ['site', 'country', 'platform'];
+
+/** Metric groups a publisher scope can show (same groups as the "Metrics & reports" toggles). */
+const SCOPE_METRICS = ['revenue', 'impressions', 'ctr', 'ecpm'];
+/** Report areas a publisher scope can open. */
+const SCOPE_REPORTS = ['dashboard', 'reporting', 'download'];
 
 function cleanIdList(raw) {
   if (!Array.isArray(raw)) return [];
   return [...new Set(raw.map((v) => String(v || '').trim()).filter(Boolean))];
 }
 
+/** A list limited to known values; undefined when the field was never set (older users keep their old behaviour). */
+function cleanChoice(raw, allowed) {
+  if (!Array.isArray(raw)) return undefined;
+  return [...new Set(raw.filter((v) => allowed.includes(v)))];
+}
+
 /**
- * AdMob scope: accountIds (admob_accounts.id), apps / adUnits as "accountUuid:googleId".
- * An account with no apps/adUnits selected grants the whole account.
+ * Publisher scope: accountIds (the product's account uuids), items as "accountUuid:name-or-id".
+ * An account with nothing picked under it grants the whole account.
  */
-function normalizeAdmobScope(input) {
+function normalizePublisherScope(input, { itemKeys, filters: allowedFilters, defaultFilters }) {
   if (!input || typeof input !== 'object') return null;
   const accountIds = cleanIdList(input.accountIds);
   const allowedAccounts = new Set(accountIds);
   const inAccount = (key) => allowedAccounts.has(String(key).split(':')[0]);
   const filters = Array.isArray(input.filters)
-    ? input.filters.filter((f) => ADMOB_SCOPE_FILTERS.includes(f))
-    : ADMOB_DEFAULT_FILTERS;
-  return {
-    accountIds,
-    apps: cleanIdList(input.apps).filter(inAccount),
-    adUnits: cleanIdList(input.adUnits).filter(inAccount),
-    filters: [...new Set(filters)],
-  };
+    ? input.filters.filter((f) => allowedFilters.includes(f))
+    : defaultFilters;
+  const out = { accountIds, filters: [...new Set(filters)] };
+  for (const key of itemKeys) out[key] = cleanIdList(input[key]).filter(inAccount);
+  const metrics = cleanChoice(input.metrics, SCOPE_METRICS);
+  const reports = cleanChoice(input.reports, SCOPE_REPORTS);
+  if (metrics) out.metrics = metrics;
+  if (reports) out.reports = reports;
+  return out;
+}
+
+const ADMOB_SCOPE_SHAPE = { itemKeys: ['apps', 'adUnits'], filters: ADMOB_SCOPE_FILTERS, defaultFilters: ADMOB_DEFAULT_FILTERS };
+const ADSENSE_SCOPE_SHAPE = { itemKeys: ['sites'], filters: ADSENSE_SCOPE_FILTERS, defaultFilters: ADSENSE_DEFAULT_FILTERS };
+
+function normalizeAdmobScope(input) {
+  return normalizePublisherScope(input, ADMOB_SCOPE_SHAPE);
+}
+
+function normalizeAdsenseScope(input) {
+  return normalizePublisherScope(input, ADSENSE_SCOPE_SHAPE);
 }
 
 /** null = admin (unrestricted); otherwise the user's AdMob scope (possibly empty). */
@@ -613,6 +639,48 @@ function getAdmobScope(user) {
 function hasAdmobAccess(user) {
   if (isAdmin(user)) return true;
   return getAdmobScope(user).accountIds.length > 0;
+}
+
+/** null = admin (unrestricted); otherwise the user's AdSense scope (possibly empty). */
+function getAdsenseScope(user) {
+  if (isAdmin(user)) return null;
+  return normalizeAdsenseScope(user?.permissions?.adsenseScope)
+    || { accountIds: [], sites: [], filters: [] };
+}
+
+function hasAdsenseAccess(user) {
+  if (isAdmin(user)) return true;
+  return getAdsenseScope(user).accountIds.length > 0;
+}
+
+function publisherScope(user, product) {
+  return product === 'adsense' ? getAdsenseScope(user) : getAdmobScope(user);
+}
+
+/** Whether a domain user may open a product's dashboard / reporting / CSV export (admin: always). */
+function publisherReportAllowed(user, product, area) {
+  if (isAdmin(user)) return true;
+  const reports = publisherScope(user, product)?.reports;
+  if (!reports) {
+    // Older users: pages follow the product access, downloads follow the global flag.
+    return area === 'download' ? hasFlag(user, 'canDownloadReports') : true;
+  }
+  return reports.includes(area);
+}
+
+/**
+ * Metric / download visibility for one product. A scope that lists metrics decides for that product;
+ * otherwise the user's general "Metrics & reports" flags apply.
+ */
+function buildProductVisibility(user, product) {
+  const base = buildVisibility(user);
+  if (isAdmin(user)) return base;
+  const metrics = publisherScope(user, product)?.metrics;
+  const out = { ...base, download: publisherReportAllowed(user, product, 'download') };
+  if (metrics) {
+    for (const m of SCOPE_METRICS) out[m] = metrics.includes(m);
+  }
+  return out;
 }
 
 function normalizePermissions(role, input = {}) {
@@ -638,6 +706,8 @@ function normalizePermissions(role, input = {}) {
   if (Array.isArray(input.allowedAdUnits)) base.allowedAdUnits = [];
   const admobScope = normalizeAdmobScope(input.admobScope);
   if (admobScope) base.admobScope = admobScope;
+  const adsenseScope = normalizeAdsenseScope(input.adsenseScope);
+  if (adsenseScope) base.adsenseScope = adsenseScope;
   if (input.dateRestriction != null) {
     base.dateRestriction = resolveDateRestriction(input.dateRestriction)
       || buildDateRestrictionPayload(input.dateRestriction?.startDate, input.dateRestriction?.endDate);
@@ -669,7 +739,12 @@ function canAccessPage(user, page) {
   if ((page === 'domain-user' || page === 'my-ads') && isAdmin(user)) return false;
   if (isAdmin(user)) return true;
   if (page === 'admob-roi' || page === 'adsense-roi') return false;
-  if (String(page).startsWith('admob-')) return hasAdmobAccess(user);
+  if (String(page).startsWith('admob-')) {
+    return hasAdmobAccess(user) && publisherReportAllowed(user, 'admob', page === 'admob-dashboard' ? 'dashboard' : 'reporting');
+  }
+  if (String(page).startsWith('adsense-')) {
+    return hasAdsenseAccess(user) && publisherReportAllowed(user, 'adsense', page === 'adsense-dashboard' ? 'dashboard' : 'reporting');
+  }
   const key = map[page];
   if (!key) return false;
   return hasFlag(user, key);
@@ -701,7 +776,7 @@ function buildVisibility(user) {
       domainUser: p.canAccessDomainUser !== false,
       myAds: p.canAccessMyAds !== false,
       admob: hasAdmobAccess(user),
-      adsense: p.canAccessAdSense !== false,
+      adsense: hasAdsenseAccess(user),
     },
     revenue: p.canSeeRevenue !== false,
     impressions: p.canSeeImpressions !== false,
@@ -733,9 +808,17 @@ module.exports = {
   NO_ADS_ACCOUNT_SCOPE_ID,
   normalizePermissions,
   ADMOB_SCOPE_FILTERS,
+  ADSENSE_SCOPE_FILTERS,
+  SCOPE_METRICS,
+  SCOPE_REPORTS,
   normalizeAdmobScope,
+  normalizeAdsenseScope,
   getAdmobScope,
+  getAdsenseScope,
   hasAdmobAccess,
+  hasAdsenseAccess,
+  publisherReportAllowed,
+  buildProductVisibility,
   hasFlag,
   canAccessPage,
   buildVisibility,
