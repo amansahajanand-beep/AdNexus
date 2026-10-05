@@ -1,15 +1,19 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { useLocation } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { loadAiStatus } from '../../utils/ai/presetAnalysis';
 import { askData } from '../../utils/ai/ask';
+import { runAction } from '../../utils/ai/actions';
 import { resolveActiveProduct } from '../../utils/productWorkspace';
 import RichText from './RichText';
+import ActionCard from './ActionCard';
 
-const THREAD_KEY = 'adnexus.ask.thread';
+// One conversation per signed-in user: a key shared by everyone on this browser would show one admin's chat to the next.
+const THREAD_KEY_PREFIX = 'adnexus.ask.thread';
+const threadKey = (userId) => `${THREAD_KEY_PREFIX}.${userId}`;
 const MAX_HISTORY = 8;
 
 const SUGGESTIONS = {
-  gam: ['How did revenue change last week?', 'Is eCPM going up or down this month?', 'How is ROI on Google Ads spend this week?'],
+  gam: ['How did revenue change last week?', 'How will this month end?', 'Open the ROI page'],
   admob: ['Which app earned the most last week?', 'Why did eCPM change in the last 7 days?', 'Which countries grew the most this week?'],
   adsense: ['Which sites earned the most last week?', 'How did page RPM change this month?', 'Which site grew the fastest in the last 7 days?'],
 };
@@ -22,10 +26,19 @@ function pageFromPath(path) {
   return 'dashboard';
 }
 
-function readThread() {
+function readThread(userId) {
   try {
-    const parsed = JSON.parse(sessionStorage.getItem(THREAD_KEY) || '[]');
-    return Array.isArray(parsed) ? parsed.filter((m) => m && m.content && !m.pending) : [];
+    // The old, shared key held whoever asked last; drop it so it is never read again.
+    sessionStorage.removeItem(THREAD_KEY_PREFIX);
+    const parsed = JSON.parse(sessionStorage.getItem(threadKey(userId)) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((m) => m && m.content && !m.pending)
+      .map((m) => {
+        // A click that was still working when the page closed has no result: let it be clicked again.
+        const states = Object.fromEntries(Object.entries(m.actionStates || {}).filter(([, s]) => s?.status !== 'running'));
+        return m.actions ? { ...m, actionStates: states } : m;
+      });
   } catch {
     return [];
   }
@@ -41,13 +54,20 @@ function Sparkle({ size = 16 }) {
 
 /**
  * "Ask AI" launcher and side panel: questions about the user's own data, answered from live lookups.
- * Renders nothing when AI is off. The conversation lasts for the browser session.
+ * Renders nothing when AI is off. The conversation lasts for the browser session and belongs to the signed-in
+ * user: a different user gets their own, empty or earlier, conversation.
  */
-export default function AskDataDrawer() {
+export default function AskDataDrawer({ userId = 'anon' }) {
+  // A new user remounts the panel, which drops any open question and the other user's messages from memory.
+  return <AskDataPanel key={userId} userId={userId} />;
+}
+
+function AskDataPanel({ userId }) {
   const location = useLocation();
+  const navigate = useNavigate();
   const [enabled, setEnabled] = useState(false);
   const [open, setOpen] = useState(false);
-  const [thread, setThread] = useState(readThread);
+  const [thread, setThread] = useState(() => readThread(userId));
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
   const controllerRef = useRef(null);
@@ -58,14 +78,15 @@ export default function AskDataDrawer() {
 
   useEffect(() => {
     let alive = true;
-    loadAiStatus().then((s) => { if (alive) setEnabled(Boolean(s?.enabled)); });
+    // Fresh for each signed-in user: the cached answer may belong to whoever used this browser before.
+    loadAiStatus({ force: true }).then((s) => { if (alive) setEnabled(Boolean(s?.enabled)); });
     return () => { alive = false; };
   }, []);
 
   useEffect(() => {
-    try { sessionStorage.setItem(THREAD_KEY, JSON.stringify(thread.filter((m) => !m.pending))); } catch { /* ignore */ }
+    try { sessionStorage.setItem(threadKey(userId), JSON.stringify(thread.filter((m) => !m.pending))); } catch { /* ignore */ }
     endRef.current?.scrollIntoView?.({ block: 'end' });
-  }, [thread]);
+  }, [thread, userId]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -109,9 +130,16 @@ export default function AskDataDrawer() {
             return next;
           }),
           onText: (partial) => updateLast({ content: partial }),
+          onAction: (action) => setThread((list) => {
+            const next = list.slice();
+            const last = next[next.length - 1];
+            if ((last.actions || []).some((a) => a.id === action.id)) return list;
+            next[next.length - 1] = { ...last, actions: [...(last.actions || []), action] };
+            return next;
+          }),
         }
       );
-      updateLast({ content: done.answer, steps: done.steps, pending: false });
+      updateLast({ content: done.answer, steps: done.steps, pending: false, ...(done.actions?.length ? { actions: done.actions } : {}) });
     } catch (err) {
       if (controller.signal.aborted) {
         updateLast({ pending: false, content: 'Stopped.', error: true });
@@ -134,6 +162,28 @@ export default function AskDataDrawer() {
       e.preventDefault();
       send(input);
     }
+  };
+
+  const setActionState = (messageIndex, actionId, state) => setThread((list) => list.map((m, i) => (
+    i === messageIndex ? { ...m, actionStates: { ...(m.actionStates || {}), [actionId]: state } } : m
+  )));
+
+  // Runs only from a click on a card; the assistant itself cannot trigger this.
+  const confirmAction = async (messageIndex, action) => {
+    setActionState(messageIndex, action.id, { status: 'running' });
+    let result;
+    try {
+      result = await runAction(action, { navigate, userId });
+    } catch (err) {
+      result = { ok: false, message: err?.message || 'That did not work. Try again.' };
+    }
+    setActionState(messageIndex, action.id, result.ok ? { status: 'done', ...result } : { status: 'error', message: result.message });
+    if (result.ok && action.type === 'open_page') setOpen(false);
+  };
+
+  const followLink = (href) => {
+    navigate(href);
+    setOpen(false);
   };
 
   const clear = () => {
@@ -183,6 +233,20 @@ export default function AskDataDrawer() {
                     {m.role === 'assistant'
                       ? (m.content ? <RichText text={m.content} /> : <p className="ask-wait">Looking at your data…</p>)
                       : <p>{m.content}</p>}
+                    {m.role === 'assistant' && m.actions?.length ? (
+                      <div className="act-list">
+                        {m.actions.map((a) => (
+                          <ActionCard
+                            key={a.id}
+                            action={a}
+                            state={m.actionStates?.[a.id]}
+                            onConfirm={() => confirmAction(i, a)}
+                            onCancel={() => setActionState(i, a.id, { status: 'cancelled' })}
+                            onLink={followLink}
+                          />
+                        ))}
+                      </div>
+                    ) : null}
                   </li>
                 ))}
                 <li ref={endRef} aria-hidden="true" />

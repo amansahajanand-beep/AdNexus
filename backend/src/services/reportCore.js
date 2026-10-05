@@ -761,6 +761,8 @@ const APP_AD_REQUEST_SUBSTITUTIONS = {
  *
  * Labels stay honest via reportWarningSubstitutions when a rewrite still runs.
  */
+const UNFILLED_METRIC_ID = 'total_inventory_level_unfilled_impressions';
+
 const WAREHOUSE_METRIC_ALIASES = {
   // Niche Ad Exchange variants not yet in EXTENDED_GRAIN_METRICS
   ad_exchange_lift_earnings: {
@@ -853,6 +855,15 @@ function rewriteUnsupportedMetricsToWarehouse(dimensionIds = [], metricIds = [])
       }
       continue;
     }
+    // Total fill rate is not stored, but unfilled impressions are: the rate is derived from
+    // impressions + unfilled in stampWarehouseMetricsOnRows (no value copy, so no substitution).
+    if (key === 'total_fill_rate') {
+      if (!seen.has(UNFILLED_METRIC_ID)) {
+        seen.add(UNFILLED_METRIC_ID);
+        out.push(UNFILLED_METRIC_ID);
+      }
+      continue;
+    }
     const alias = WAREHOUSE_METRIC_ALIASES[key];
     if (alias) {
       substitutions.push({
@@ -907,6 +918,13 @@ function stampWarehouseMetricsOnRows(rows = []) {
     }
     if (metrics.total_line_item_level_without_cpd_average_ecpm == null && imp > 0 && rev > 0) {
       metrics.total_line_item_level_without_cpd_average_ecpm = +((rev / imp) * 1000).toFixed(4);
+    }
+    if (metrics.total_fill_rate == null) {
+      const unfilledRaw = metrics[UNFILLED_METRIC_ID] ?? row.unfilled;
+      const unfilled = Number(unfilledRaw);
+      if (unfilledRaw != null && unfilledRaw !== '' && Number.isFinite(unfilled) && imp + unfilled > 0) {
+        metrics.total_fill_rate = +((imp / (imp + unfilled)) * 100).toFixed(2);
+      }
     }
     if (row.viewableRate != null && metrics.total_active_view_viewable_impressions_rate == null) {
       metrics.total_active_view_viewable_impressions_rate = Number(row.viewableRate) || 0;

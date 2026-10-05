@@ -508,6 +508,7 @@ export const aiAPI = {
   reports: () => FAST_API.get('/ai/reports'),
   report: (id) => FAST_API.get(`/ai/reports/${id}`),
   generateReport: (force = false) => FAST_API.post('/ai/reports/generate', { force }),
+  setForecastTarget: (product, amount) => FAST_API.put('/ai/forecast-target', { product, amount }),
 };
 
 export const usersAPI = {

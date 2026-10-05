@@ -6,9 +6,11 @@ import { MemoryRouter } from 'react-router-dom';
 
 jest.mock('../../utils/ai/presetAnalysis', () => ({ loadAiStatus: jest.fn() }));
 jest.mock('../../utils/ai/ask', () => ({ askData: jest.fn() }));
+jest.mock('../../utils/ai/actions', () => ({ runAction: jest.fn() }));
 
 import { loadAiStatus } from '../../utils/ai/presetAnalysis';
 import { askData } from '../../utils/ai/ask';
+import { runAction } from '../../utils/ai/actions';
 import AskDataDrawer from './AskDataDrawer';
 import RichText from './RichText';
 
@@ -96,7 +98,131 @@ test('streams lookups and partial text, then sends earlier turns as history', as
     { role: 'user', content: 'How did we do?' },
     { role: 'assistant', content: 'Earnings rose 120%.' },
   ]);
-  expect(JSON.parse(sessionStorage.getItem('adnexus.ask.thread'))).toHaveLength(4);
+  expect(JSON.parse(sessionStorage.getItem('adnexus.ask.thread.anon'))).toHaveLength(4);
+});
+
+test('every user has their own conversation: another user never sees it, and it returns for the same user', async () => {
+  askData.mockResolvedValue({ answer: 'Aman revenue is $5.', steps: [], meta: {} });
+  root = createRoot(container);
+  const render = (userId) => act(async () => {
+    root.render(<MemoryRouter initialEntries={['/dashboard']}><AskDataDrawer userId={userId} /></MemoryRouter>);
+  });
+  await render('user-aman');
+  await tick();
+  await openDrawer();
+  await typeAndSend('revenue for today?');
+  await tick();
+  expect(container.textContent).toContain('Aman revenue is $5.');
+
+  // another admin signs in on the same browser
+  await render('user-ravi');
+  await tick();
+  expect(container.textContent).not.toContain('Aman revenue');
+  expect(container.textContent).not.toContain('revenue for today?');
+  await openDrawer();
+  expect(container.querySelector('.ask-suggest')).not.toBeNull();
+  expect(sessionStorage.getItem('adnexus.ask.thread.user-ravi')).toBe('[]');
+  await act(async () => { container.querySelector('.ask-close').click(); });
+
+  // the first user comes back and finds their own chat
+  await render('user-aman');
+  await tick();
+  await openDrawer();
+  expect(container.textContent).toContain('Aman revenue is $5.');
+  // and the shared, older key is never used
+  expect(sessionStorage.getItem('adnexus.ask.thread')).toBeNull();
+});
+
+test('a conversation left under the old shared key is discarded, not shown to the next user', async () => {
+  sessionStorage.setItem('adnexus.ask.thread', JSON.stringify([{ role: 'user', content: 'old shared question' }]));
+  await mount();
+  await openDrawer();
+  expect(container.textContent).not.toContain('old shared question');
+  expect(sessionStorage.getItem('adnexus.ask.thread')).toBeNull();
+});
+
+const SAVE_ACTION = { id: 'a1', type: 'save_preset', product: 'adsense', page: 'reporting', presetPage: 'adsense-reporting', name: 'Top Site', snapshot: {}, title: 'Save preset "Top Site"', detail: 'AdSense reporting · sites quiz2', confirm: true };
+const OPEN_ACTION = { id: 'a2', type: 'open_page', href: '/ai-forecast', title: 'Open Forecast', detail: 'Opens in this app', confirm: false };
+
+test('prepared actions appear as cards; nothing runs until a click, and Confirm runs it once', async () => {
+  askData.mockImplementation(async (body, { onAction }) => {
+    onAction(SAVE_ACTION);
+    return { answer: 'Ready. Press Confirm to save it.', steps: [], actions: [SAVE_ACTION], meta: {} };
+  });
+  let finish;
+  runAction.mockImplementation(() => new Promise((resolve) => { finish = () => resolve({ ok: true, message: 'Saved "Top Site".', href: '/adsense/presets', linkLabel: 'View presets' }); }));
+  await mount();
+  await openDrawer();
+  await typeAndSend('save a preset called Top Site');
+  await tick();
+  expect(container.querySelectorAll('.act-card')).toHaveLength(1);
+  expect(container.querySelector('.act-title').textContent).toBe('Save preset "Top Site"');
+  expect(container.querySelector('.act-detail').textContent).toContain('sites quiz2');
+  expect(runAction).not.toHaveBeenCalled();
+
+  await act(async () => { container.querySelector('.act-confirm').click(); });
+  expect(runAction).toHaveBeenCalledTimes(1);
+  expect(runAction.mock.calls[0][0]).toMatchObject({ id: 'a1', type: 'save_preset' });
+  expect(runAction.mock.calls[0][1]).toMatchObject({ userId: 'anon' });
+  expect(container.querySelector('.act-confirm').disabled).toBe(true);
+  expect(container.querySelector('.act-confirm').textContent).toBe('Working…');
+  await act(async () => { finish(); });
+  await tick();
+  expect(container.querySelector('.act-result.ok').textContent).toContain('Saved "Top Site".');
+  expect(container.querySelector('.act-confirm')).toBeNull();
+  // the result is remembered with the conversation
+  const stored = JSON.parse(sessionStorage.getItem('adnexus.ask.thread.anon'));
+  expect(stored[1].actionStates.a1.status).toBe('done');
+});
+
+test('Cancel withdraws a card without running it; a failed action can be tried again', async () => {
+  askData.mockResolvedValue({ answer: 'Ready.', steps: [], actions: [SAVE_ACTION, { ...SAVE_ACTION, id: 'a3', title: 'Second' }], meta: {} });
+  runAction.mockResolvedValueOnce({ ok: false, message: 'A preset with that name already exists.' });
+  await mount();
+  await openDrawer();
+  await typeAndSend('save it');
+  await tick();
+  const cards = [...container.querySelectorAll('.act-card')];
+  await act(async () => { cards[1].querySelector('.act-cancel').click(); });
+  expect(container.querySelectorAll('.act-card')[1].textContent).toContain('Cancelled.');
+  expect(runAction).not.toHaveBeenCalled();
+
+  await act(async () => { cards[0].querySelector('.act-confirm').click(); });
+  await tick();
+  expect(container.querySelector('.act-card.error [role="alert"]').textContent).toContain('already exists');
+  runAction.mockResolvedValueOnce({ ok: true, message: 'Saved.' });
+  const retry = container.querySelector('.act-card.error .act-confirm');
+  expect(retry.textContent).toBe('Try again');
+  await act(async () => { retry.click(); });
+  await tick();
+  expect(container.querySelector('.act-card.done')).not.toBeNull();
+  expect(runAction).toHaveBeenCalledTimes(2);
+});
+
+test('an Open card has one button, runs on click, and closes the panel when it worked', async () => {
+  askData.mockResolvedValue({ answer: 'Here you go.', steps: [], actions: [OPEN_ACTION], meta: {} });
+  runAction.mockResolvedValue({ ok: true, message: 'Opened.' });
+  await mount();
+  await openDrawer();
+  await typeAndSend('open the forecast');
+  await tick();
+  expect(container.querySelectorAll('.act-buttons button')).toHaveLength(1);
+  expect(container.querySelector('.act-confirm').textContent).toBe('Open');
+  await act(async () => { container.querySelector('.act-confirm').click(); });
+  await tick();
+  expect(runAction.mock.calls[0][0]).toMatchObject({ type: 'open_page', href: '/ai-forecast' });
+  expect(container.querySelector('.ask-drawer')).toBeNull();
+});
+
+test('a click that was still working when the page closed can be clicked again after a reload', async () => {
+  sessionStorage.setItem('adnexus.ask.thread.anon', JSON.stringify([
+    { role: 'user', content: 'save it' },
+    { role: 'assistant', content: 'Ready.', actions: [SAVE_ACTION], actionStates: { a1: { status: 'running' } } },
+  ]));
+  await mount();
+  await openDrawer();
+  expect(container.querySelector('.act-confirm').disabled).toBe(false);
+  expect(container.querySelector('.act-confirm').textContent).toBe('Confirm');
 });
 
 test('an error is shown in the thread and not sent as history', async () => {

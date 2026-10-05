@@ -773,7 +773,7 @@ export default function Layout() {
           <ToastStack />
           <ConfirmDialogHost />
           <CommandPalette />
-          {user ? <AskDataDrawer /> : null}
+          {user ? <AskDataDrawer userId={user.id} /> : null}
         </div>
       </div>
     </div>

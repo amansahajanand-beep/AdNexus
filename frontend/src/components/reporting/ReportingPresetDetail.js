@@ -12,7 +12,7 @@ import {
   snapshotToReportingParams,
   formatReportingMoney,
 } from '../../utils/report/reportingView';
-import { buildReportColumns } from '../../utils/report/dynamicReportTable';
+import { buildReportColumns, summarizeReportingRows } from '../../utils/report/dynamicReportTable';
 import { enrichReportRows } from '../../utils/enrichReportRows';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 import { useMedia } from '../../hooks/useMedia';
@@ -123,7 +123,11 @@ export default function ReportingPresetDetail({
     return enrichReportRows(raw, tableConfig.dimensions, tableConfig.metrics);
   }, [data, tableConfig]);
 
-  const summary = data?.summary || {};
+  const serverSummary = data?.summary || {};
+  const summary = useMemo(
+    () => (tableRows.length ? { ...serverSummary, ...summarizeReportingRows(tableRows, columns) } : serverSummary),
+    [tableRows, columns, serverSummary]
+  );
   const currency = data?.currency || summary.currency || 'USD';
 
   if (!presetItem) {

@@ -97,6 +97,34 @@ test('opens the latest report with facts, risks and actions; history switches re
   expect(container.textContent).toContain('written from fixed rules');
 });
 
+test('shows a tally of findings, one card per product, and a progress banner while writing', async () => {
+  const report = REPORT(2);
+  report.content.sections.push({
+    product: 'adsense',
+    summary: 'AdSense summary.',
+    points: [{ severity: 'critical', text: 'ROI is negative', factIds: [] }, { severity: 'positive', text: 'Traffic is up', factIds: [] }],
+  });
+  aiAPI.reports.mockResolvedValue({ reports: [{ id: 2, periodStart: '2026-09-24', periodEnd: '2026-09-30', createdAt: '2026-10-01T02:00:00.000Z', source: 'ai' }] });
+  aiAPI.report.mockResolvedValue({ report });
+  await mount();
+  const tally = [...container.querySelectorAll('.rep-tally li')].map((li) => `${li.querySelector('.n').textContent} ${li.querySelector('.l').textContent}`);
+  expect(tally).toEqual(['1 Need action', '1 To watch', '1 Good news']);
+  expect([...container.querySelectorAll('.rep-card-head .rep-h3')].map((h) => h.textContent)).toEqual(['Google Ad Manager', 'AdSense']);
+  expect(container.querySelector('.rep-card--adsense .rep-card-count').textContent).toContain('2 findings · 1 urgent');
+  expect(container.querySelector('.rep-eyebrow').textContent).toContain('Weekly report');
+
+  let finish;
+  aiAPI.generateReport.mockImplementation(() => new Promise((resolve) => { finish = () => resolve({ report: REPORT(3) }); }));
+  const btn = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Write a fresh report');
+  await act(async () => { btn.click(); });
+  expect(container.querySelector('.rep-writing')).not.toBeNull();
+  expect(container.querySelector('.rep-doc').className).toContain('is-stale');
+  await act(async () => { finish(); });
+  await tick();
+  expect(container.querySelector('.rep-writing')).toBeNull();
+  expect(container.textContent).toContain('Headline 3');
+});
+
 test('writing a fresh report forces a new one when one is open', async () => {
   aiAPI.reports.mockResolvedValue({ reports: [{ id: 2, periodStart: '2026-09-24', periodEnd: '2026-09-30', createdAt: '2026-10-01T02:00:00.000Z', source: 'ai' }] });
   aiAPI.report.mockResolvedValue({ report: REPORT(2) });

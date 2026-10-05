@@ -13,6 +13,7 @@ const { askData } = require('../ai/ask');
 const reports = require('../ai/report');
 const { explainChange, ExplainError } = require('../ai/explain');
 const { accountIdFor } = require('../ai/accounts');
+const forecast = require('../ai/forecast');
 
 const router = express.Router();
 
@@ -372,6 +373,48 @@ router.post('/explain-change', requireAuth, ai.requireAiEnabled, async (req, res
     }
     if (ai.sendAiError(res, err)) return undefined;
     return res.status(status).json(payload);
+  }
+});
+
+/**
+ * Month-end earnings forecast for one product. Streams `figures` (the exact projection, immediately) and
+ * `result` (the same plus the explanation).
+ */
+router.post('/forecast', requireAdmin, ai.requireAiEnabled, async (req, res) => {
+  const controller = new AbortController();
+  res.on('close', () => { if (!res.writableFinished) controller.abort(); });
+  const { emit, isStarted } = openEvents(res);
+  try {
+    await forecast.forecastProduct({
+      authorization: req.headers.authorization,
+      ctx: req.aiCtx,
+      body: req.body,
+      emit,
+      signal: controller.signal,
+    });
+    return res.end();
+  } catch (err) {
+    const known = err instanceof forecast.ForecastRequestError || err instanceof forecast.ForecastDataError || err.code;
+    if (!known) logger.error('forecast:', err.stack || err.message);
+    const payload = { error: known ? err.message : 'Could not build the forecast.', code: err.code || null };
+    if (isStarted()) {
+      emit('error', payload);
+      return res.end();
+    }
+    if (ai.sendAiError(res, err)) return undefined;
+    return res.status(err.status || 500).json(payload);
+  }
+});
+
+/** Set (or, with a zero or empty amount, clear) the monthly earnings target for a product. */
+router.put('/forecast-target', requireAdmin, ai.requireAiEnabled, async (req, res) => {
+  try {
+    const out = await forecast.setTarget({ ctx: req.aiCtx, product: String(req.body?.product || ''), amount: req.body?.amount });
+    return res.json(out);
+  } catch (err) {
+    if (err instanceof forecast.ForecastRequestError) return res.status(400).json({ error: err.message });
+    logger.error('forecast target:', err.stack || err.message);
+    return res.status(500).json({ error: 'Could not save the target.' });
   }
 });
 

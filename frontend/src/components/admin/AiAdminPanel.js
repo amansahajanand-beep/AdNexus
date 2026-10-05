@@ -11,6 +11,7 @@ const FEATURE_LABEL = {
   'mapping-suggestions': 'Campaign mapping',
   'weekly-report': 'Weekly report',
   'explain-change': 'Why did it change?',
+  forecast: 'Forecast',
   ping: 'Connection test',
 };
 const TIER_LABEL = { fast: 'Summary', deep: 'Deep analysis', chat: 'Ask AI' };

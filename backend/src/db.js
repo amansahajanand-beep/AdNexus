@@ -907,6 +907,17 @@ async function initSchema() {
       )
     `);
     await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_ai_reports_account ON ai_reports (account_id, created_at DESC)`);
+    // A standing monthly earnings target per product, used by the forecast to say whether a month is on track.
+    await schemaQuery(`
+      CREATE TABLE IF NOT EXISTS ai_forecast_targets (
+        account_id TEXT NOT NULL,
+        product TEXT NOT NULL,
+        amount DOUBLE PRECISION NOT NULL CHECK (amount > 0),
+        updated_by TEXT,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (account_id, product)
+      )
+    `);
     await schemaQuery(`
       CREATE TABLE IF NOT EXISTS ai_feedback (
         id BIGSERIAL PRIMARY KEY,

@@ -36,7 +36,7 @@ async function requireAiEnabled(req, res, next) {
     if (!access.enabled) {
       return res.status(403).json({ error: 'AI features are turned off.', code: CODES.DISABLED, reason: access.reason });
     }
-    req.aiCtx = { userId: req.user.id, clientId: req.user.clientId || null };
+    req.aiCtx = { userId: req.user.id, clientId: req.user.clientId || null, role: req.user.role };
     return next();
   } catch (err) {
     return next(err);

@@ -13,6 +13,7 @@ const ALLOWED = new Set([
   '/my-ads',
   '/help',
   '/ai-report',
+  '/ai-forecast',
   '/admob/dashboard',
   '/admob/reporting',
   '/admob/presets',

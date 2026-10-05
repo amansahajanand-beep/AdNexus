@@ -57,14 +57,16 @@ function makeRes(resolve) {
  */
 function callRouter(router, {
   path, query = {}, authorization, method = 'GET', body, timeoutMs = DEFAULT_TIMEOUT_MS, headers: extraHeaders = {},
+  keepArrays = [],
 }) {
   return new Promise((resolve, reject) => {
     const q = {};
     for (const [k, v] of Object.entries(query)) {
       if (v == null || v === '') continue;
-      q[k] = Array.isArray(v) ? v.join(',') : String(v);
+      // Lists are joined with commas, except the ones the endpoint reads as repeated parameters (see keepArrays).
+      q[k] = Array.isArray(v) ? (keepArrays.includes(k) ? v.map(String) : v.join(',')) : String(v);
     }
-    const qs = new URLSearchParams(q).toString();
+    const qs = new URLSearchParams(Object.entries(q).flatMap(([k, v]) => (Array.isArray(v) ? v.map((x) => [k, x]) : [[k, v]]))).toString();
     const headers = { authorization: authorization || '', 'user-agent': 'adnexus-ai-internal', ...extraHeaders };
     const req = {
       method,
