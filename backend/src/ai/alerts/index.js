@@ -8,6 +8,7 @@ const { getAccountIdForClient } = require('../../models/clientStore');
 const { todayInTZ, shiftYMD } = require('../../utils/datetime');
 const { cacheGet, cacheSet } = require('../cache');
 const { buildFacts } = require('../presetAnalysis');
+const { forecastAlerts } = require('../forecast');
 const logger = require('../../utils/logger');
 
 const TARGETS = [
@@ -98,6 +99,26 @@ async function scanAccount({ user, authorization }) {
         );
         created += 1;
       }
+    }
+    // Months that look likely to miss a target the admin has set (rule-based, from the forecast).
+    try {
+      const misses = await forecastAlerts({
+        authorization,
+        ctx: { userId: user.id, clientId: user.clientId || null, role: user.role },
+      });
+      for (const a of misses) {
+        if (created >= MAX_PER_SCAN) break;
+        if (await recentlyRaised(accountId, a.key)) continue;
+        await query(
+          `INSERT INTO ai_alerts
+             (account_id, product, page_kind, signal_kind, severity, title, body, facts, period_start, period_end, dedupe_key)
+           VALUES ($1,$2,'dashboard','forecast_miss',$3,$4,$5,$6::jsonb,$7,$8,$9)`,
+          [accountId, a.product, a.severity, a.title, a.text, JSON.stringify(a.facts), start, end, a.key]
+        );
+        created += 1;
+      }
+    } catch (err) {
+      logger.info(`forecast alerts skipped: ${err.message}`);
     }
     await cacheSet(lastScanKey(accountId), Date.now(), SCAN_COOLDOWN_SEC);
     logger.info(`alert scan for account ${String(accountId).slice(0, 8)}: ${scanned} sheets, ${created} new alerts`);

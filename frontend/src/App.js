@@ -11,9 +11,9 @@ import Presets from './pages/Presets';
 import Admin from './pages/Admin';
 import DomainUser from './pages/DomainUser';
 import MyAds from './pages/MyAds';
-import Feedback from './pages/Feedback';
 import Help from './pages/Help';
 import AiReport from './pages/AiReport';
+import AiForecast from './pages/AiForecast';
 import PrivacyPolicy from './pages/PrivacyPolicy';
 import TermsOfService from './pages/TermsOfService';
 import About from './pages/About';
@@ -132,9 +132,9 @@ function AppRoutes() {
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
-        <Route path="/feedback" element={<PermissionRoute page="feedback"><Feedback /></PermissionRoute>} />
         <Route path="/help" element={<Help />} />
         <Route path="/ai-report" element={<AdminRoute><AiReport /></AdminRoute>} />
+        <Route path="/ai-forecast" element={<AdminRoute><AiForecast /></AdminRoute>} />
 
         <Route path="/admob" element={<PermissionRoute page="admob-dashboard"><Navigate to="/admob/dashboard" replace /></PermissionRoute>} />
         <Route path="/admob/dashboard" element={<PermissionRoute page="admob-dashboard"><AdMobDashboard /></PermissionRoute>} />

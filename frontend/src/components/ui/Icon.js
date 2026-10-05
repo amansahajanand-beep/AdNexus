@@ -51,6 +51,7 @@ const NAV_ICONS = {
   feedback: MessageSquareText,
   help: CircleHelp,
   'ai-report': FileText,
+  'ai-forecast': TrendingUp,
   'admob-dashboard': LayoutDashboard,
   'admob-reporting': BarChart3,
   'admob-roi': TrendingUp,

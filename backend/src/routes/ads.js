@@ -77,6 +77,39 @@ function sendCachedJson(res, cacheKey, payload, ttl = ROI_FILTER_CACHE_TTL) {
   res.json(payload);
 }
 
+/**
+ * Domain users can be assigned sites / app IDs from several networks, but ROI filter lists are loaded for the
+ * active network only. Add every assigned site / app so the dropdowns always show the full assignment.
+ * Applied per request (after the shared cache) so cached payloads stay user-independent.
+ */
+function withAssignedRoiTargets(user, payload) {
+  if (!user || user.role === 'admin') return payload;
+  const perms = user.permissions || {};
+  const clean = (arr) => [...new Set((Array.isArray(arr) ? arr : [])
+    .map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))];
+  const sites = clean(perms.allowedSites);
+  const apps = clean(perms.allowedAppIds);
+  if (!sites.length && !apps.length) return payload;
+  const out = { ...payload };
+  if (Array.isArray(payload.sites) && sites.length) {
+    const have = new Set(payload.sites.map((x) => String(x.id || '').toLowerCase()));
+    out.sites = [...payload.sites, ...sites.filter((id) => !have.has(id)).map((id) => ({ id, label: id }))];
+  }
+  if (Array.isArray(payload.apps) && apps.length) {
+    const have = new Set(payload.apps.map((x) => String(x.id || '').toLowerCase()));
+    out.apps = [...payload.apps, ...apps.filter((id) => !have.has(id)).map((id) => ({ id, label: id, campaignCount: 0, spend: 0 }))];
+  }
+  return out;
+}
+
+/** Cache the shared payload, answer with the per-user merged one. */
+function sendRoiTargets(req, res, cacheKey, payload, ttl) {
+  const cached = cache.get(cacheKey);
+  if (cached) return res.json(withAssignedRoiTargets(req.user, cached));
+  cache.set(cacheKey, payload, ttl ?? ROI_FILTER_CACHE_TTL);
+  return res.json(withAssignedRoiTargets(req.user, payload));
+}
+
 router.use(requireAuth);
 
 /** Lightweight check that Ads ROI routes are mounted (admin). */
@@ -1136,9 +1169,7 @@ router.get('/roi-sites', async (req, res) => {
       })).filter((s) => s.id),
     };
     const cacheKey = roiFilterCacheKey('sites', clientId, { source: 'dim_site_subdomains_v1' });
-    const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
-    return sendCachedJson(res, cacheKey, payload, 300);
+    return sendRoiTargets(req, res, cacheKey, payload, 300);
   } catch (err) {
     logger.error('ROI sites list:', err.message);
     res.status(500).json({ error: err.message });
@@ -1313,9 +1344,7 @@ router.get('/roi-related-targets', async (req, res) => {
       sites: [...siteById.values()],
     };
     const cacheKey = roiFilterCacheKey('related-targets', clientId, { start, end, accountIds, campaignIds });
-    const cached = cache.get(cacheKey);
-    if (cached) return res.json(cached);
-    return sendCachedJson(res, cacheKey, payload);
+    return sendRoiTargets(req, res, cacheKey, payload);
   } catch (err) {
     logger.error('ROI related targets:', err.message);
     res.status(500).json({ error: err.message });

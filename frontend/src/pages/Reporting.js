@@ -46,6 +46,7 @@ import {
   buildReportColumns,
   hasActiveReport,
   aggregateRowsByColumns,
+  summarizeReportingRows,
 } from '../utils/dynamicReportTable';
 import { enrichReportRows, sortRowsByCompleteness } from '../utils/enrichReportRows';
 import { resolveReportingQuery } from '../utils/reportSelection';
@@ -1237,7 +1238,7 @@ export default function Reporting() {
   const effectiveAppliedMets = reportingQuery?.mets ?? [];
   const reportReady = hasApplied && hasUserReport && hasActiveReport(effectiveAppliedDims, effectiveAppliedMets);
 
-  const summary = data?.summary || progData?.summary || {};
+  const serverSummary = data?.summary || progData?.summary || {};
   const summaryLoading = hasUserReport && (loading || (canGenerate && !data && !progData));
   const vis = {
     ...clientVis,
@@ -1365,6 +1366,14 @@ export default function Reporting() {
   }, [applied]);
 
   const totalRecordCount = tableRows.length;
+
+  // Cards come from the rows the table is showing; the server summary only fills in before any rows exist.
+  const summary = useMemo(
+    () => (displayRows.length
+      ? { ...serverSummary, ...summarizeReportingRows(displayRows, reportColumns) }
+      : serverSummary),
+    [displayRows, reportColumns, serverSummary]
+  );
 
   // Only treat as "no data" when the report is empty. If GAM returned a partial
   // compatible subset, still show those rows and warn about what was skipped.

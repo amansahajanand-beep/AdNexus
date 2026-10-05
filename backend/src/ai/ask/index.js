@@ -5,7 +5,9 @@
 const { runTurn } = require('../provider');
 const { AiError, CODES } = require('../errors');
 const { todayInTZ, shiftYMD } = require('../../utils/datetime');
-const { TOOLS, executeTool, describeCall, ToolInputError } = require('./tools');
+const {
+  TOOLS, executeTool, describeCall, splitAction, ToolInputError,
+} = require('./tools');
 
 const FEATURE = 'ask-data';
 const MAX_TOOL_ROUNDS = 5;
@@ -21,7 +23,11 @@ const SYSTEM = `You are the data assistant inside AdNexus, a dashboard for publi
 
 Rules:
 1. Answer only from tool results in this conversation. Never guess or invent numbers. If the tools cannot answer, say what is missing.
-2. Use the tools. get_summary is usually the best first call; for "why did earnings drop or rise?" use explain_change. Make independent calls in parallel, and stop calling tools once you can answer.
+2. Use the tools. get_summary is usually the best first call; for "why did earnings drop or rise?" use explain_change. For the earnings of one site, domain, app, ad unit, country or device, use find_filter_values for the exact name and then get_breakdown with that name in filters. Make independent calls in parallel, and stop calling tools once you can answer.
+2c. For questions about how the month will end, projections, forecasts or targets, use get_forecast. Say that it is a projection and give the likely range.
+2d. You can prepare three actions: open_page, save_preset and set_forecast_target. Prepare one only when the user clearly asks for it. They only show a card or button on the user's screen: nothing is changed until the user presses Confirm (or Open). So never say an action is done, saved or opened; say it is ready and, for saves and targets, that they need to press Confirm. Use exact names (look them up with find_filter_values first). If the tool says a name is taken, a name is not found or something is not allowed, tell the user and ask what to change.
+2a. Choose the product from the user's words and page. "GAM", "Ad Manager", "Google Ad Manager" or no product named means the product of the page they are on (stated in their message); on a Google Ad Manager page, questions about sites, domains, app IDs, ad units, countries or devices are about Google Ad Manager. Only use AdMob when they say AdMob or are on an AdMob page, and only use AdSense when they say AdSense or are on an AdSense page. Never switch product because a name was not found: say it was not found in that product. State which product you used.
+2b. In Google Ad Manager, sites and domains can be filtered together, but app IDs, ad units, countries and devices are stored one dimension at a time, so they cannot be combined with each other or with a site. If the user asks for a combination, answer the part you can, and say plainly which combination is not available.
 3. For relative dates ("last week", "yesterday", "this month") use the ready-made ranges in the user's message; "last week" means the last 7 days. Say which dates you used.
 4. When a name may not match exactly, call find_filter_values first and use the exact value it returns.
 5. Lead with the answer in one or two sentences, then add up to five short supporting points. Use plain sentences, "- " bullet lists and **bold** only. Never use headings or tables; to compare items, use a bullet list.
@@ -87,6 +93,7 @@ async function askData({ question, history, context, authorization, ctx, emit = 
   const started = Date.now();
   const messages = buildMessages({ question, history, context });
   const steps = [];
+  const actions = [];
   let answer = '';
   let model = null;
   let turns = 0;
@@ -142,7 +149,13 @@ async function askData({ question, history, context, authorization, ctx, emit = 
       const label = describeCall(tu.name, tu.input);
       emit('tool', { name: tu.name, label });
       try {
-        const content = await executeTool(tu.name, tu.input, { authorization });
+        const raw = await executeTool(tu.name, tu.input, { authorization, ctx });
+        // A prepared action goes to the screen; the model only sees that it was prepared, not done.
+        const { content, action } = splitAction(raw);
+        if (action && !actions.some((a) => a.type === action.type && a.title === action.title && a.detail === action.detail)) {
+          actions.push(action);
+          emit('action', action);
+        }
         steps.push({ label, ok: true });
         return { type: 'tool_result', tool_use_id: tu.id, content };
       } catch (err) {
@@ -159,7 +172,7 @@ async function askData({ question, history, context, authorization, ctx, emit = 
   }
 
   if (!answer) answer = 'I could not find an answer with the data available. Try asking about a specific product and period.';
-  const done = { answer, steps, meta: { model, turns, ms: Date.now() - started } };
+  const done = { answer, steps, actions, meta: { model, turns, ms: Date.now() - started } };
   emit('done', done);
   return done;
 }

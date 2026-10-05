@@ -495,6 +495,28 @@ export function summarizeRowsForOverview(rows = [], currency = 'USD') {
   };
 }
 
+/**
+ * Summary cards for Reporting, computed from the very rows the table shows, so the cards and the table's Total row
+ * can never disagree (the server's summary is built separately and can lag or cover a different slice).
+ * Revenue uses the table's own revenue column when there is one.
+ */
+export function summarizeReportingRows(rows = [], columns = []) {
+  const list = Array.isArray(rows) ? rows : [];
+  const revenueCol = (columns || []).find((c) => c.type === 'metric' && METRIC_DEFS[c.id]?.visKey === 'revenue' && c.aggregate === 'sum' && typeof c.getValue === 'function');
+  const revenue = +list.reduce((a, r) => {
+    const v = revenueCol ? Number(revenueCol.getValue(r)) : pickRowRevenueDollars(r);
+    return a + (Number.isFinite(v) ? v : 0);
+  }, 0).toFixed(2);
+  const keys = new Set();
+  for (const r of list) {
+    const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+    const app = String(r.appId || r.appPackage || '').trim().toLowerCase();
+    if (domain && domain !== '—' && domain !== '-') keys.add(`web:${domain}`);
+    if (app && app !== '—' && app !== '-') keys.add(`app:${app}`);
+  }
+  return { totalRevenue: revenue, totalDomains: keys.size, offeredRecords: list.length };
+}
+
 export function formatCellValue(value, format, currency = 'USD', moneyFn, numFn) {
   if (value == null || value === '' || value === '—') return '—';
   const n = Number(value);
