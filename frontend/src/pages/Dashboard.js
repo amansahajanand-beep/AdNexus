@@ -6,7 +6,9 @@ import {
   PieChart, Pie, Cell, Legend, BarChart, Bar,
   LineChart, Line, ComposedChart,
 } from 'recharts';
-import { reportsAPI } from '../utils/api';
+import { reportsAPI, setReportTz } from '../utils/api';
+import { useAuth } from '../store/useAuth';
+import TimezoneSwitcher from '../components/ui/TimezoneSwitcher';
 import {
   mergeDashboardResponses,
   mergeOverviewResponses,
@@ -467,7 +469,7 @@ function formatMetricValue(key, value, currency = 'USD') {
   return `${Number(value || 0).toLocaleString()}`;
 }
 
-export default function Dashboard() {
+function DashboardView() {
   const outlet = useOutletContext() || {};
   const networks = Array.isArray(outlet.accountNetworks) ? outlet.accountNetworks : [];
   const viewClientId = outlet.viewClientId || null;
@@ -1094,6 +1096,11 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
   useEffect(() => () => {
     detailAbortRef.current?.abort();
     overviewAbortRef.current?.abort();
+    // An aborted request never reaches its `finally`, so clear the in-flight flags here. Otherwise a remount (React
+    // dev double-mount, or switching the report timezone) skips its first load as "already in flight" and the
+    // overview stays at zero until the next filter change.
+    overviewInFlightRef.current = false;
+    detailInFlightRef.current = false;
     clearTimeout(slowTimerRef.current);
   }, []);
 
@@ -3447,5 +3454,60 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
         </>
       )}
     </div>
+  );
+}
+
+const REPORT_TZ_KEY = 'adnexus.dashboard.tz';
+
+function readStoredTz() {
+  try {
+    return window.localStorage.getItem(REPORT_TZ_KEY) || '';
+  } catch {
+    return '';
+  }
+}
+
+/** Dashboard with an admin timezone picker; each zone remounts the view so no numbers carry over. */
+export default function Dashboard() {
+  const dispatch = useDispatch();
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'admin';
+  const [tz, setTz] = useState(() => (isAdmin ? readStoredTz() : ''));
+  const [options, setOptions] = useState({ networkTz: '', options: [], hourlyFrom: null });
+  // Set during render so the view's first requests already carry the zone.
+  setReportTz(isAdmin ? tz : '');
+
+  useEffect(() => () => setReportTz(''), []);
+
+  useEffect(() => {
+    if (!isAdmin) return undefined;
+    let cancelled = false;
+    reportsAPI.getTimezones(tz)
+      .then((res) => { if (!cancelled) setOptions(res); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [isAdmin, tz]);
+
+  const change = (next) => {
+    const value = next === options.networkTz ? '' : next;
+    try { window.localStorage.setItem(REPORT_TZ_KEY, value); } catch { /* storage unavailable */ }
+    dispatch(saveReportPage({ pageKey: 'dashboard', payload: null }));
+    setReportTz(value);
+    setTz(value);
+  };
+
+  return (
+    <>
+      {isAdmin && options.options.length > 1 && (
+        <TimezoneSwitcher
+          networkTz={options.networkTz}
+          options={options.options}
+          value={tz}
+          hourlyFrom={options.hourlyFrom}
+          onChange={change}
+        />
+      )}
+      <DashboardView key={tz || 'network'} />
+    </>
   );
 }

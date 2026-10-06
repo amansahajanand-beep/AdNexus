@@ -96,7 +96,35 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+/**
+ * Wait until Postgres accepts connections. During a Postgres restart/recovery (57P03 "shutting down" /
+ * "starting up") exiting just makes PM2 respawn us every ~3s and every attempt fails the same way.
+ */
+async function waitForPostgres({ maxWaitMs = 5 * 60 * 1000 } = {}) {
+  const { pool } = require('./db');
+  const started = Date.now();
+  let delay = 2000;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await pool.query('SELECT 1');
+      if (attempt > 1) logger.info(`[DB] PostgreSQL is back after ${attempt} attempts`);
+      return;
+    } catch (e) {
+      if (Date.now() - started > maxWaitMs) throw e;
+      logger.warn(`[DB] PostgreSQL not ready (${e.code || ''} ${e.message}) — retrying in ${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+      delay = Math.min(delay * 2, 15000);
+    }
+  }
+}
+
 async function startServer() {
+  try {
+    await waitForPostgres();
+  } catch (e) {
+    logger.error('[DB] PostgreSQL still unavailable after waiting — continuing, init will likely fail:', e.message);
+  }
+
   try {
     const { initSchema } = require('./db');
     await initSchema();

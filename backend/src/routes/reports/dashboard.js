@@ -1,5 +1,8 @@
 const express = require('express');
 const router = express.Router();
+const { requireAdmin } = require('../../middleware/auth');
+const { timezoneOptions, SRC_TZ, isValidTz, coverageFrom } = require('../../services/hourlyView');
+const { todayInTZ } = require('../../utils/datetime');
 const { registerFilterReportRoute } = require('./register');
 const {
   handleDashboardOverview,
@@ -16,5 +19,32 @@ router.get('/summary', handleSummary);
 router.get('/trend', handleTrend);
 router.get('/by-ad-type', handleByAdType);
 router.get('/top-advertisers', handleTopAdvertisers);
+
+/** Timezones offered by the Dashboard picker. */
+router.get('/timezones', async (req, res) => {
+  const out = { networkTz: SRC_TZ, options: timezoneOptions(), hourlyFrom: null };
+  try {
+    const tz = String(req.query.tz || '').trim();
+    const clientId = req.client?.id || req.user?.clientId;
+    if (tz && tz !== SRC_TZ && isValidTz(tz) && clientId) {
+      out.hourlyFrom = await coverageFrom(clientId, tz, todayInTZ());
+    }
+  } catch (err) {
+    // The picker still works without the coverage note.
+  }
+  res.json(out);
+});
+
+/** Admin: fetch missing hourly days now (default last 30 days, up to 10 days per call). */
+router.post('/hourly/backfill', requireAdmin, async (req, res) => {
+  try {
+    const { ensureHourlyCoverage } = require('../../services/hourlySyncService');
+    const days = Math.min(120, Math.max(1, parseInt(req.body?.days, 10) || 30));
+    const maxDays = Math.min(10, Math.max(1, parseInt(req.body?.maxDays, 10) || 6));
+    res.json({ ok: true, filled: await ensureHourlyCoverage({ days, maxDays, clientId: req.client?.id || req.user.clientId }) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
