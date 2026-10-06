@@ -830,6 +830,27 @@ async function initSchema() {
     logger.warn('ads currency columns:', e.message);
   }
 
+  // Hourly revenue for the Dashboard timezone switch (see services/hourlySyncService.js).
+  try {
+    await schemaQuery(`
+      CREATE TABLE IF NOT EXISTS rollup_hourly (
+        client_id   UUID        NOT NULL REFERENCES gam_clients(id),
+        report_date DATE        NOT NULL,
+        hour        SMALLINT    NOT NULL,
+        kind        TEXT        NOT NULL,
+        dim_a       TEXT        NOT NULL DEFAULT '',
+        dim_b       TEXT        NOT NULL DEFAULT '',
+        impressions DOUBLE PRECISION NOT NULL DEFAULT 0,
+        clicks      DOUBLE PRECISION NOT NULL DEFAULT 0,
+        revenue     DOUBLE PRECISION NOT NULL DEFAULT 0,
+        PRIMARY KEY (client_id, report_date, hour, kind, dim_a, dim_b)
+      )
+    `);
+    await schemaQuery(`CREATE INDEX IF NOT EXISTS idx_rollup_hourly_kind_date ON rollup_hourly (client_id, kind, report_date)`);
+  } catch (e) {
+    logger.warn('rollup_hourly table:', e.message);
+  }
+
   // Saved report presets (per user, one row per page) — server copy of what used to live only in localStorage.
   try {
     await schemaQuery(`
@@ -1070,6 +1091,7 @@ const TENANT_TABLES = [
   'ads_accounts',
   'ads_campaign_map',
   'ads_spend_daily',
+  'rollup_hourly',
   'roi_other_expenses',
   'admob_accounts',
   'adsense_accounts',

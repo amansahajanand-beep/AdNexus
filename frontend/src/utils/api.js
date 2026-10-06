@@ -54,6 +54,26 @@ function attachAuth(config) {
 API.interceptors.request.use(attachAuth);
 FAST_API.interceptors.request.use(attachAuth);
 
+/**
+ * Timezone the Dashboard reports in (admin only). Empty = the network timezone. The backend rebuilds days it has
+ * hourly data for in this zone and leaves older days as they are.
+ */
+let reportTz = '';
+export function setReportTz(tz) {
+  reportTz = String(tz || '');
+}
+export function getReportTz() {
+  return reportTz;
+}
+function attachReportTz(config) {
+  if (reportTz && /^\/?reports\/dashboard/.test(String(config.url || ''))) {
+    config.headers['X-Report-Tz'] = reportTz;
+  }
+  return config;
+}
+API.interceptors.request.use(attachReportTz);
+FAST_API.interceptors.request.use(attachReportTz);
+
 let handlingAuthFailure = false;
 
 function clearAuthStorage() {
@@ -210,6 +230,8 @@ export const reportsAPI = {
     }),
 
   getCountries: () => FAST_API.get('/reports/countries'),
+
+  getTimezones: (tz) => FAST_API.get('/reports/timezones', { params: tz ? { tz } : undefined }),
 
   getFilterCatalog: (clientId) => API.get('/reports/filter-catalog', {
     // Bust browser HTTP cache when the active GAM network changes.

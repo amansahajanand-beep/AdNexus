@@ -894,6 +894,29 @@ function startCron() {
     });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── Hourly revenue for the Dashboard timezone switch: today+yesterday every hour at :40,
+  //    plus a gentle backfill of the last 30 days (a few days per run, newest first). ──
+  // One run per label at a time, and skipped while the DB pool is saturated, so slow GAM pulls can't pile up.
+  const hourlyRunning = new Set();
+  const hourlySafe = (label, fn) => async () => {
+    if (hourlyRunning.has(label)) { logger.info(`Hourly warehouse ${label} still running — skipping this tick`); return; }
+    if (require('../db').isPoolSaturated()) { logger.info(`Hourly warehouse ${label} skipped — DB pool saturated`); return; }
+    hourlyRunning.add(label);
+    try { await fn(); } catch (e) { logger.warn(`Hourly warehouse ${label} failed: ${e.message}`); }
+    finally { hourlyRunning.delete(label); }
+  };
+  // Today's network total (Dashboard cards) every 10 minutes — one tiny GAM report per network, independent of the queue.
+  cron.schedule('*/10 * * * *', hourlySafe('network total', async () => {
+    const { refreshNetworkKpi } = require('../services/hourlySyncService');
+    const { listActiveClients } = require('../models/clientStore');
+    for (const client of await listActiveClients()) await refreshNetworkKpi(client, [todayInTZ()]);
+  }), { timezone: 'Asia/Singapore' });
+  cron.schedule('40 * * * *', hourlySafe('recent', () => require('../services/hourlySyncService').syncHourlyRecent({ days: 2 })),
+    { timezone: 'Asia/Singapore' });
+  cron.schedule('50 */3 * * *', hourlySafe('backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })),
+    { timezone: 'Asia/Singapore' });
+  setTimeout(hourlySafe('boot backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })), 600000);
+
   logger.info(
     'Cron jobs started: hourly today-priority (+ads 1 job/client), ~90m sync-extended '
     + '(AdX/AdServer/ActiveView), :30 GAM reconcile '

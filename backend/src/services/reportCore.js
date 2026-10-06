@@ -11,7 +11,7 @@ const {
   userHasAssignedInventory,
   resolveScopedSqlInventoryOpts,
 } = require('../utils/permissions');
-const { todayInTZ, dateRangeInTZ, dateRangeYMDInTZ, listCalendarMonthsNewestFirst } = require('../utils/datetime');
+const { todayInTZ, dateRangeInTZ, dateRangeYMDInTZ, listCalendarMonthsNewestFirst, shiftYMD } = require('../utils/datetime');
 const { resolveAppFields, buildAppPackageMapsFromGamRows, buildAppPackageMapsFromMobileApps, mergeAppPackageMapData, mapsToPlain, packageListFromMapData, enrichRowsWithAppPackages, rehydrateAppPackageMaps, isLikelyAppPackage, isMobileAppRow } = require('../utils/appIdentity');
 const { domainFromAdUnit, enrichReportRow, resolveInventoryFields, rootDomainFromHost, pickSiteHost, adUnitAlignsWithSiteHost } = require('../utils/adUnit');
 const {
@@ -3034,7 +3034,125 @@ async function fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, 
 // ─── ROUTES ───────────────────────────────────────────────────────────────────
 
 // GET|POST /api/reports/dashboard/overview — overview KPIs (programmatic or inventory-scoped)
+
+/**
+ * Timezone view for the Dashboard (admin only). When a timezone other than the network's is requested
+ * (X-Report-Tz header / ?tz=), days the hourly warehouse fully covers are rebuilt from rollup_hourly in that zone;
+ * earlier days come from the normal handler unchanged. Returns true when the response was sent.
+ */
+async function tryTimezoneView(req, res, kind, handler) {
+  try {
+    if (req.query._tzDone || req.user?.role !== 'admin' || req.query.for === 'domain-user') return false;
+    const hv = require('./hourlyView');
+    const tz = String(req.headers['x-report-tz'] || req.query.tz || '').trim();
+    if (!tz || tz === hv.SRC_TZ || !hv.isValidTz(tz)) return false;
+    // Filters the hourly data cannot express (country, ad unit) → normal path.
+    if (req.query.country || req.query.domainName) return false;
+    const clientId = getClientId();
+    if (!clientId) return false;
+
+    const today = todayInTZ();
+    const startDate = req.query.startDate || today;
+    const endDate = req.query.endDate || today;
+    const cov = await hv.coverageFrom(clientId, tz, today);
+    if (!cov || endDate < cov) return false; // nothing covered in range → identical to the network-timezone data
+
+    const hourlyStart = startDate > cov ? startDate : cov;
+    const legacyEnd = shiftYMD(cov, -1);
+    const filters = {
+      domains: toFilterArray(req.query.domain),
+      sites: toFilterArray(req.query.site),
+      apps: toFilterArray(req.query.domainId),
+    };
+
+    const capture = async (fn) => {
+      const captured = { status: 200, body: null };
+      const fakeRes = {
+        headersSent: false, locals: {},
+        set() { return this; }, setHeader() { return this; }, header() { return this; },
+        get() { return undefined; }, getHeader() { return undefined; },
+        status(code) { captured.status = code; return this; },
+        json(body) { captured.body = body; return this; },
+        send(body) { captured.body = body; return this; },
+        end() { return this; },
+      };
+      const legacyReq = Object.create(req, {
+        query: { value: { ...req.query, endDate: legacyEnd, _tzDone: '1' } },
+      });
+      await fn(legacyReq, fakeRes);
+      return captured.status === 200 ? captured.body : null;
+    };
+
+    // Days the hourly warehouse does not cover keep the normal numbers. Totals come from the overview handler (the
+    // figures the Dashboard cards show); the detail handler only supplies table rows.
+    let legacy = null;
+    if (startDate < cov) {
+      const overview = await capture(handleDashboardOverview);
+      if (!overview?.summary) return false;
+      const detail = kind === 'dashboard' ? await capture(handleDashboard) : null;
+      if (kind === 'dashboard' && !detail) return false;
+      let legacyTrend = detail?.trend || [];
+      const unfiltered = !filters.domains.length && !filters.sites.length && !filters.apps.length;
+      if (unfiltered) {
+        const { rows: nd } = await require('../db').query(
+          `SELECT to_char(report_date, 'YYYY-MM-DD') AS date, revenue::float8 AS earning, impressions::float8 AS impressions
+           FROM rollup_network_daily WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date
+           ORDER BY report_date`,
+          [clientId, startDate, legacyEnd]
+        );
+        if (nd.length) {
+          legacyTrend = nd.map((r) => ({
+            date: r.date, earning: +Number(r.earning).toFixed(2), impressions: Math.round(Number(r.impressions) || 0), clicks: 0,
+          }));
+        }
+      }
+      legacy = { ...(detail || {}), ...overview, summary: overview.summary, trend: legacyTrend, rows: detail?.rows || [] };
+    }
+
+    const view = await hv.buildHourlyView({ clientId, startDate: hourlyStart, endDate: endDate, tz, filters });
+    const currency = legacy?.summary?.currency || process.env.GAM_CURRENCY || 'USD';
+    const hSum = hv.summaryFromTrend(view.trend, view.rows, { currency });
+    const L = legacy?.summary || {};
+    const trend = [...(legacy?.trend || []), ...view.trend];
+    const rows = [...(legacy?.rows || []), ...view.rows];
+    const revenue = +((Number(L.revenue ?? L.selectRange) || 0) + hSum.revenue).toFixed(2);
+    const impressions = Math.round((Number(L.impressions) || 0) + hSum.impressions);
+    const clicks = Math.round((Number(L.clicks) || 0) + hSum.clicks);
+    const merged = hv.summaryFromTrend(trend, rows, { viewability: Number(L.viewability) || 0, currency });
+    const summary = {
+      ...merged,
+      totalEarning: revenue, selectRange: revenue, revenue,
+      pageViews: impressions, impressions, clicks,
+      ctr: impressions > 0 ? +((clicks / impressions) * 100).toFixed(4) : 0,
+      ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
+      totalDomains: Math.max(merged.totalDomains, Number(L.totalDomains) || 0),
+    };
+    const timezone = { tz, networkTz: hv.SRC_TZ, hourlyFrom: cov, mixed: Boolean(legacy), applied: true };
+
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    if (kind === 'overview') {
+      res.json(applyOverviewVisibility({ ...(legacy || {}), summary, isMock: false, currency, status: 'ready', timezone }, req.user));
+      return true;
+    }
+    res.json({
+      charts: { revenue: [], device: [], country: [], performance: [] },
+      ...(legacy || {}),
+      summary, trend, rows,
+      pagination: { totalRows: rows.length, returnedRows: rows.length, truncated: false, allRows: false, compact: true },
+      grainCount: rows.length,
+      source: legacy ? `${legacy.source || 'rollup'}+hourly` : 'hourly',
+      status: 'ready',
+      timezone,
+    });
+    return true;
+  } catch (err) {
+    logger.warn(`Timezone view failed, using network timezone: ${err.message}`);
+    return false;
+  }
+}
+
 async function handleDashboardOverview(req, res) {
+  if (await tryTimezoneView(req, res, 'overview', handleDashboardOverview)) return;
   if (!canAccessPage(req.user, 'dashboard')) {
     return res.status(403).json({ error: 'You do not have permission to access the dashboard.' });
   }
@@ -3299,6 +3417,7 @@ async function handleDashboardOverview(req, res) {
 
 // GET|POST /api/reports/dashboard — summary cards + detailed rows + daily trend (realtime)
 async function handleDashboard(req, res) {
+  if (await tryTimezoneView(req, res, 'dashboard', handleDashboard)) return;
   const forDomainUser = req.query.for === 'domain-user';
   const canDashboard = canAccessPage(req.user, 'dashboard');
   const canDomainUser = canAccessPage(req.user, 'domain-user');
