@@ -142,7 +142,7 @@ function finalizeSheet(sheet) {
 
   // Finished days do not change when a sync runs, so their key ignores the sync time. Only a range
   // that includes today needs it, because new data can still arrive for it.
-  const includesToday = request.end >= todayInTZ();
+  const includesToday = request.end >= todayInTZ(request.dayTz);
   const hashed = includesToday ? prompt : { ...prompt, data_freshness: undefined };
   const hash = crypto
     .createHash('sha256')

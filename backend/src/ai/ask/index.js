@@ -38,23 +38,26 @@ Rules:
 Latency-sensitive; begin your visible answer as soon as you have the data.`;
 
 /** Ready-made date ranges, so the model never has to do calendar arithmetic. */
-function dateHelper() {
-  const today = todayInTZ();
+function dateHelper({ tz, viewTz, networkTz } = {}) {
+  const today = todayInTZ(tz);
   const yesterday = shiftYMD(today, -1);
   const monthStart = `${today.slice(0, 8)}01`;
   const lastMonthEnd = shiftYMD(monthStart, -1);
   const lastMonthStart = `${lastMonthEnd.slice(0, 8)}01`;
   return [
-    `Today is ${today} (${process.env.APP_TIMEZONE || 'Asia/Singapore'}).`,
-    `Ready-made ranges (start_date to end_date): yesterday ${yesterday} to ${yesterday}; last 7 days ${shiftYMD(yesterday, -6)} to ${yesterday};`,
+    `Today is ${today} (${tz || process.env.APP_TIMEZONE || 'Asia/Singapore'}).`,
+    viewTz
+      ? `The user is viewing Google Ad Manager in the ${viewTz} timezone (the network itself reports in ${networkTz}); every date below, and the Ad Manager days in tool results, follow ${viewTz}. Say which timezone the days are in when it matters.`
+      : null,
+    `Ready-made ranges (start_date to end_date): today ${today} to ${today} (a day still in progress, so figures keep growing); yesterday ${yesterday} to ${yesterday}; last 7 days ${shiftYMD(yesterday, -6)} to ${yesterday};`,
     `the 7 days before that ${shiftYMD(yesterday, -13)} to ${shiftYMD(yesterday, -7)}; last 30 days ${shiftYMD(yesterday, -29)} to ${yesterday};`,
     `this month so far ${monthStart} to ${yesterday}; last month ${lastMonthStart} to ${lastMonthEnd}.`,
-  ].join(' ');
+  ].filter(Boolean).join(' ');
 }
 
 const clip = (v, n) => String(v == null ? '' : v).trim().slice(0, n);
 
-function buildMessages({ question, history, context }) {
+function buildMessages({ question, history, context, ctx }) {
   const messages = [];
   for (const turn of (Array.isArray(history) ? history : []).slice(-MAX_HISTORY)) {
     const role = turn?.role === 'assistant' ? 'assistant' : turn?.role === 'user' ? 'user' : null;
@@ -68,7 +71,9 @@ function buildMessages({ question, history, context }) {
   if (messages.length && messages[messages.length - 1].role === 'user') messages.pop();
 
   const where = [PRODUCT_LABEL[context?.product], PAGE_LABEL[context?.page]].filter(Boolean).join(' ');
-  const preface = `${dateHelper()}${where ? `
+  // AdMob and AdSense keep their own account days; Google Ad Manager follows the zone the user is viewing.
+  const publisherPage = context?.product === 'admob' || context?.product === 'adsense';
+  const preface = `${dateHelper(publisherPage ? {} : { tz: ctx?.dayTz, viewTz: ctx?.viewTz, networkTz: ctx?.networkTz })}${where ? `
 The user is on the ${where} page.` : ''}`;
   messages.push({ role: 'user', content: `${preface}\n\nQuestion: ${clip(question, MAX_QUESTION)}` });
   return messages;
@@ -91,7 +96,7 @@ async function askData({ question, history, context, authorization, ctx, emit = 
     throw new AiError(CODES.BAD_REQUEST, 'Type a question first.', { status: 400 });
   }
   const started = Date.now();
-  const messages = buildMessages({ question, history, context });
+  const messages = buildMessages({ question, history, context, ctx });
   const steps = [];
   const actions = [];
   let answer = '';

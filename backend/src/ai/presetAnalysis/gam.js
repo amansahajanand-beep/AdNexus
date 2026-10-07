@@ -27,6 +27,17 @@ function lists(request, keys) {
   return q;
 }
 
+/** Tell the reader which timezone the days are in, or that the chosen one could not be used. */
+function timezoneNote(sheet, ...responses) {
+  const tzs = responses.map((r) => r?.timezone).filter(Boolean);
+  const failed = tzs.find((z) => z.applied === false);
+  if (failed) {
+    sheet.notes.push(`The selected timezone (${failed.tz}) could not be applied, so these figures use the network's own timezone (${failed.networkTz}).`);
+  } else if (tzs.length) {
+    sheet.notes.push(`Days follow the selected timezone (${tzs[0].tz}); the network itself reports in ${tzs[0].networkTz}.`);
+  }
+}
+
 function coverageSignals(sheet, coverage) {
   if (!coverage) return;
   if (coverage.complete === false) {
@@ -84,6 +95,7 @@ async function buildDashboardSheet({ request, call }) {
   sheet.currency = cur.currency || s.currency || 'USD';
   sheet.book.currency = sheet.currency;
   coverageSignals(sheet, cur.coverage);
+  timezoneNote(sheet, cur, prev);
 
   if (!(num(s.revenue) > 0) && !(num(s.impressions) > 0)) {
     sheet.noData = true;
@@ -230,6 +242,7 @@ async function buildReportingSheet({ request, call }) {
   const rows = Array.isArray(res.rows) ? res.rows : [];
   sheet.currency = res.summary?.currency || res.currency || 'USD';
   sheet.book.currency = sheet.currency;
+  timezoneNote(sheet, res, contextRes);
 
   const revenue = rows.reduce((a, r) => a + (num(r.revenue) || 0), 0);
   const impressions = rows.reduce((a, r) => a + (num(r.impression ?? r.impressions) || 0), 0);
@@ -246,7 +259,7 @@ async function buildReportingSheet({ request, call }) {
   const ecpmNow = impressions > 0 ? (revenue / impressions) * 1000 : 0;
   const ecpmPrior = prior.imp > 0 ? (prior.rev / prior.imp) * 1000 : null;
   // Today is still in progress, so setting it against a full earlier period would look like a drop that is not real.
-  const partial = request.end >= todayInTZ();
+  const partial = request.end >= todayInTZ(request.dayTz);
   const showChange = hasPrior && !partial;
   const priorDetail = (text) => (hasPrior ? { detail: `${partial ? 'full prior period' : 'prior period'} ${text}` } : {});
   const m = {};
@@ -283,7 +296,7 @@ async function buildReportingSheet({ request, call }) {
     : [...byDate.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([date, v]) => ({ date, v }));
   if (points.length > 1) {
     // Today's partial total would always look like a dip.
-    const anomalies = !sheet.small ? findAnomalies(points.filter((p) => p.date < todayInTZ())) : [];
+    const anomalies = !sheet.small ? findAnomalies(points.filter((p) => p.date < todayInTZ(request.dayTz))) : [];
     const anomalyOut = anomalies.map((a) => {
       const id = sheet.book.add(`${a.date} revenue`, a.value, 'money', { detail: `${formatChange(a.deviationPct)} compared with the other days shown` });
       sheet.signals.add(

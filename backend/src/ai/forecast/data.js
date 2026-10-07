@@ -5,7 +5,7 @@
  */
 const { schemaQuery } = require('../../db');
 const { callRouter } = require('../internalCall');
-const { shiftYMD } = require('../../utils/datetime');
+const { shiftYMD, todayInTZ } = require('../../utils/datetime');
 const { monthBounds, addDays } = require('./model');
 
 const HISTORY_DAYS = 84;
@@ -39,7 +39,33 @@ async function gamSeries({ ctx, start, end }) {
      ORDER BY report_date`,
     [ctx.clientId, start, end]
   );
-  return { series: rows, currency: 'USD', source: 'Warehouse daily rollup' };
+  const base = { series: rows, currency: 'USD', source: 'Warehouse daily rollup' };
+  if (!ctx.viewTz) return base;
+
+  // Viewing another timezone: the days the hourly data covers are regrouped into that zone's days; older days stay
+  // as the network's own. Month boundaries and "today" then follow the viewer's zone.
+  const hv = require('../../services/hourlyView');
+  let cov = await hv.coverage(ctx.clientId, ctx.viewTz, todayInTZ(ctx.viewTz), ctx.networkTz);
+  if (!cov || end > cov.through) {
+    try {
+      const client = await require('../../models/clientStore').getClientById(ctx.clientId);
+      if (client && await require('../../services/hourlySyncService').refreshNetworkHours(client)) {
+        cov = await hv.coverage(ctx.clientId, ctx.viewTz, todayInTZ(ctx.viewTz), ctx.networkTz);
+      }
+    } catch { /* the network-day series is still usable */ }
+  }
+  if (!cov || cov.from > end || end > cov.through) {
+    return { ...base, timezone: { tz: ctx.viewTz, networkTz: ctx.networkTz, applied: false } };
+  }
+  const hourly = await hv.hourlyTrend({
+    clientId: ctx.clientId, startDate: cov.from > start ? cov.from : start, endDate: end, tz: ctx.viewTz, srcTz: ctx.networkTz, kind: 'network',
+  });
+  return {
+    series: [...rows.filter((r) => r.date < cov.from), ...hourly.map((d) => ({ date: d.date, value: d.earning }))],
+    currency: 'USD',
+    source: `Warehouse rollup; days since ${cov.from} are regrouped into ${ctx.viewTz} days from hourly data`,
+    timezone: { tz: ctx.viewTz, networkTz: ctx.networkTz, applied: true, from: cov.from },
+  };
 }
 
 async function publisherSeries({ product, authorization, start, end }) {

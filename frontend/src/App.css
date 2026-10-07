@@ -6683,3 +6683,7 @@ a { color: var(--accent); }
   font-weight: 700;
   cursor: help;
 }
+
+/* Which timezone a page's days are in */
+.tz-report-note { margin: 6px 0 0; color: var(--text-secondary); }
+.tz-report-note.is-warn { color: var(--warning); }

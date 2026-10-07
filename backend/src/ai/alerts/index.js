@@ -9,6 +9,7 @@ const { todayInTZ, shiftYMD } = require('../../utils/datetime');
 const { cacheGet, cacheSet } = require('../cache');
 const { buildFacts } = require('../presetAnalysis');
 const { forecastAlerts } = require('../forecast');
+const { networkTzFor } = require('../accounts');
 const logger = require('../../utils/logger');
 
 const TARGETS = [
@@ -64,7 +65,10 @@ async function scanAccount({ user, authorization }) {
   if (inflight.has(accountId)) return inflight.get(accountId);
 
   const run = (async () => {
-    const end = shiftYMD(todayInTZ(), -1);
+    // A scan is for the whole account: Ad Manager days are the network's own, not a viewer's chosen timezone.
+    const networkTz = await networkTzFor(user);
+    const dataCtx = { userId: user.id, clientId: user.clientId || null, role: user.role, viewTz: null, networkTz, dayTz: networkTz };
+    const end = shiftYMD(todayInTZ(networkTz), -1);
     const start = shiftYMD(end, -6);
     let created = 0;
     let scanned = 0;
@@ -74,6 +78,7 @@ async function scanAccount({ user, authorization }) {
       try {
         result = await buildFacts({
           authorization,
+          ctx: dataCtx,
           body: { ...target, startDate: start, endDate: end, filters: {}, depth: 'fast' },
         });
         scanned += 1;
@@ -102,10 +107,7 @@ async function scanAccount({ user, authorization }) {
     }
     // Months that look likely to miss a target the admin has set (rule-based, from the forecast).
     try {
-      const misses = await forecastAlerts({
-        authorization,
-        ctx: { userId: user.id, clientId: user.clientId || null, role: user.role },
-      });
+      const misses = await forecastAlerts({ authorization, ctx: dataCtx });
       for (const a of misses) {
         if (created >= MAX_PER_SCAN) break;
         if (await recentlyRaised(accountId, a.key)) continue;

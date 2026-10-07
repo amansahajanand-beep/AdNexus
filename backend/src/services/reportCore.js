@@ -71,7 +71,7 @@ const {
 } = require('../utils/gamReportMetrics');
 
 const { classifyReportingQuery, isGrainMetric } = require('../utils/warehouseGrain');
-const { isMockClient, getClientId } = require('../utils/clientContext');
+const { isMockClient, getClientId, getClient } = require('../utils/clientContext');
 const {
   getToken,
   runReportAndDownload,
@@ -231,6 +231,17 @@ function getDateRange(days) {
 function asArray(v) {
   if (v == null) return [];
   return (Array.isArray(v) ? v : [v]).map(s => String(s).trim()).filter(Boolean);
+}
+
+/**
+ * Report column ids arrive as a repeated key (an array) from the browser, but in-process callers such as the AI
+ * services join them with commas. Column ids never contain a comma, so both spellings mean the same list.
+ */
+function splitIdList(v) {
+  if (v == null) return v;
+  const list = Array.isArray(v) ? v : [v];
+  if (!list.some((s) => String(s).includes(','))) return v;
+  return list.flatMap((s) => String(s).split(',')).map((s) => s.trim()).filter(Boolean);
 }
 
 function inclusiveDayCount(startDate, endDate) {
@@ -3036,69 +3047,147 @@ async function fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, 
 // GET|POST /api/reports/dashboard/overview — overview KPIs (programmatic or inventory-scoped)
 
 /**
- * Timezone view for the Dashboard (admin only). When a timezone other than the network's is requested
- * (X-Report-Tz header / ?tz=), days the hourly warehouse fully covers are rebuilt from rollup_hourly in that zone;
- * earlier days come from the normal handler unchanged. Returns true when the response was sent.
+ * Shared set-up for every page that can be viewed in another timezone (X-Report-Tz header or ?tz=).
+ *
+ * Ad Manager cuts days in the network's own timezone, so another timezone's days are rebuilt from the stored hourly
+ * data (rollup_hourly). Admins and domain users both get it; a domain user only ever sees the hours of their assigned
+ * inventory, with the same date restriction and metric visibility as the normal page.
+ *
+ * Returns null when the normal handler should answer (no timezone asked for, the network's own timezone, a filter the
+ * hourly data cannot express, or hourly data that does not cover the range). In the last case the normal response
+ * says the zone was not applied, so network-timezone figures are never mistaken for the selected zone's days.
+ */
+async function prepareTimezoneView(req, res, page, { startDate: sd, endDate: ed, bailOnFilters = ['country', 'domainName'] } = {}) {
+  if (req.query._tzDone) return null;
+  const hv = require('./hourlyView');
+  const tz = String(req.headers['x-report-tz'] || req.query.tz || '').trim();
+  if (!tz || !hv.isValidTz(tz)) return null;
+  if (req.query.for === 'domain-user' && page === 'dashboard') return null;
+  if (!canAccessPage(req.user, page)) return null;
+  const isScoped = req.user?.role !== 'admin';
+  if (isScoped && !userHasAssignedInventory(req.user)) return null;
+
+  const client = req.client || getClient();
+  // Ad Manager cuts days in the network's own timezone; viewing that zone needs no regrouping.
+  const srcTz = await require('./networkTimezone').getNetworkTz(client);
+  if (tz === srcTz) return null;
+  if (bailOnFilters.some((k) => req.query[k])) return null;
+  const clientId = getClientId();
+  if (!clientId) return null;
+
+  const today = todayInTZ(tz); // today in the zone being viewed
+  const asked = applyDateRestrictionToFilters(
+    { startDate: sd || req.query.startDate || today, endDate: ed || req.query.endDate || today },
+    req.user
+  );
+  const { startDate, endDate } = asked;
+
+  let coverage = await hv.coverage(clientId, tz, today, srcTz);
+  // The range reaches hours the hourly sync has not stored yet (it only runs while the backend is up): fetch the
+  // network's latest hours now instead of answering with another timezone's days.
+  if ((!coverage || endDate > coverage.through) && endDate >= shiftYMD(today, -2)) {
+    const refresh = require('./hourlySyncService').refreshNetworkHours(client);
+    const done = await Promise.race([refresh, new Promise((resolve) => setTimeout(() => resolve(false), 30000))]);
+    if (done) coverage = await hv.coverage(clientId, tz, today, srcTz);
+  }
+  const cov = coverage?.from || null;
+  if (!cov || endDate < cov || endDate > coverage.through) {
+    const reason = !cov ? 'no_hourly_data' : (endDate > coverage.through ? 'hourly_behind' : 'before_hourly_data');
+    markTimezoneNotApplied(res, { tz, srcTz, reason });
+    return null;
+  }
+
+  // A domain user's assigned inventory, resolved the way the normal pages resolve it.
+  const scope = isScoped
+    ? resolveScopedSqlInventoryOpts(req.user, {
+      domain: req.query.domain, site: req.query.site, domainId: req.query.domainId, domainName: req.query.domainName,
+    })
+    : null;
+
+  const legacyEnd = shiftYMD(cov, -1);
+  /** Run a normal handler for the days before the hourly data starts (they stay in the network timezone). */
+  const capture = async (fn, extraQuery = {}) => {
+    const captured = { status: 200, body: null };
+    const fakeRes = {
+      headersSent: false, locals: {},
+      set() { return this; }, setHeader() { return this; }, header() { return this; },
+      get() { return undefined; }, getHeader() { return undefined; },
+      status(code) { captured.status = code; return this; },
+      json(body) { captured.body = body; return this; },
+      send(body) { captured.body = body; return this; },
+      end() { return this; },
+    };
+    const legacyReq = Object.create(req, {
+      query: { value: { ...req.query, endDate: legacyEnd, _tzDone: '1', ...extraQuery } },
+    });
+    await fn(legacyReq, fakeRes);
+    return captured.status === 200 ? captured.body : null;
+  };
+
+  return {
+    hv, tz, srcTz, client, clientId, today, startDate, endDate, coverage, cov, legacyEnd,
+    hourlyStart: startDate > cov ? startDate : cov,
+    mixed: startDate < cov,
+    isScoped, scope,
+    meta: (extra = {}) => ({
+      tz, networkTz: srcTz, hourlyFrom: cov, mixed: startDate < cov, applied: true, partialDay: coverage.partialDay, ...extra,
+    }),
+    capture,
+  };
+}
+
+/** Make the normal handler's response say that the selected timezone could not be applied. */
+function markTimezoneNotApplied(res, { tz, srcTz, reason }) {
+  const send = res.json.bind(res);
+  res.json = (body) => send(body && typeof body === 'object' && !Array.isArray(body)
+    ? { ...body, timezone: { tz, networkTz: srcTz, applied: false, reason } }
+    : body);
+}
+
+/** Trend, rows and totals from the hourly data for this request: an admin's filters or a domain user's assignment. */
+async function timezoneHourlyView(ctx, req, { rowLimitPerDay = 200 } = {}) {
+  const { hv, clientId, hourlyStart, endDate, tz, srcTz } = ctx;
+  if (ctx.isScoped) {
+    return hv.buildScopedHourlyView({
+      clientId, startDate: hourlyStart, endDate, tz, srcTz, scope: ctx.scope, rowLimitPerDay,
+    });
+  }
+  const filters = {
+    domains: toFilterArray(req.query.domain),
+    sites: toFilterArray(req.query.site),
+    apps: toFilterArray(req.query.domainId),
+  };
+  return hv.buildHourlyView({ clientId, startDate: hourlyStart, endDate, tz, srcTz, filters, rowLimitPerDay });
+}
+
+/**
+ * Timezone view for the Dashboard (admins and domain users). Days the hourly warehouse covers are rebuilt from
+ * rollup_hourly in the selected zone; earlier days come from the normal handler unchanged.
+ * Returns true when the response was sent.
  */
 async function tryTimezoneView(req, res, kind, handler) {
   try {
-    if (req.query._tzDone || req.user?.role !== 'admin' || req.query.for === 'domain-user') return false;
-    const hv = require('./hourlyView');
-    const tz = String(req.headers['x-report-tz'] || req.query.tz || '').trim();
-    if (!tz || tz === hv.SRC_TZ || !hv.isValidTz(tz)) return false;
-    // Filters the hourly data cannot express (country, ad unit) → normal path.
-    if (req.query.country || req.query.domainName) return false;
-    const clientId = getClientId();
-    if (!clientId) return false;
-
-    const today = todayInTZ();
-    const startDate = req.query.startDate || today;
-    const endDate = req.query.endDate || today;
-    const cov = await hv.coverageFrom(clientId, tz, today);
-    if (!cov || endDate < cov) return false; // nothing covered in range → identical to the network-timezone data
-
-    const hourlyStart = startDate > cov ? startDate : cov;
-    const legacyEnd = shiftYMD(cov, -1);
-    const filters = {
-      domains: toFilterArray(req.query.domain),
-      sites: toFilterArray(req.query.site),
-      apps: toFilterArray(req.query.domainId),
-    };
-
-    const capture = async (fn) => {
-      const captured = { status: 200, body: null };
-      const fakeRes = {
-        headersSent: false, locals: {},
-        set() { return this; }, setHeader() { return this; }, header() { return this; },
-        get() { return undefined; }, getHeader() { return undefined; },
-        status(code) { captured.status = code; return this; },
-        json(body) { captured.body = body; return this; },
-        send(body) { captured.body = body; return this; },
-        end() { return this; },
-      };
-      const legacyReq = Object.create(req, {
-        query: { value: { ...req.query, endDate: legacyEnd, _tzDone: '1' } },
-      });
-      await fn(legacyReq, fakeRes);
-      return captured.status === 200 ? captured.body : null;
-    };
+    const ctx = await prepareTimezoneView(req, res, 'dashboard');
+    if (!ctx) return false;
+    const { hv, clientId, startDate, cov } = ctx;
+    const unfiltered = !toFilterArray(req.query.domain).length && !toFilterArray(req.query.site).length
+      && !toFilterArray(req.query.domainId).length;
 
     // Days the hourly warehouse does not cover keep the normal numbers. Totals come from the overview handler (the
     // figures the Dashboard cards show); the detail handler only supplies table rows.
     let legacy = null;
-    if (startDate < cov) {
-      const overview = await capture(handleDashboardOverview);
+    if (ctx.mixed) {
+      const overview = await ctx.capture(handleDashboardOverview);
       if (!overview?.summary) return false;
-      const detail = kind === 'dashboard' ? await capture(handleDashboard) : null;
+      const detail = kind === 'dashboard' ? await ctx.capture(handleDashboard) : null;
       if (kind === 'dashboard' && !detail) return false;
       let legacyTrend = detail?.trend || [];
-      const unfiltered = !filters.domains.length && !filters.sites.length && !filters.apps.length;
-      if (unfiltered) {
+      if (!ctx.isScoped && unfiltered) {
         const { rows: nd } = await require('../db').query(
           `SELECT to_char(report_date, 'YYYY-MM-DD') AS date, revenue::float8 AS earning, impressions::float8 AS impressions
            FROM rollup_network_daily WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date
            ORDER BY report_date`,
-          [clientId, startDate, legacyEnd]
+          [clientId, startDate, ctx.legacyEnd]
         );
         if (nd.length) {
           legacyTrend = nd.map((r) => ({
@@ -3109,7 +3198,7 @@ async function tryTimezoneView(req, res, kind, handler) {
       legacy = { ...(detail || {}), ...overview, summary: overview.summary, trend: legacyTrend, rows: detail?.rows || [] };
     }
 
-    const view = await hv.buildHourlyView({ clientId, startDate: hourlyStart, endDate: endDate, tz, filters });
+    const view = await timezoneHourlyView(ctx, req);
     const currency = legacy?.summary?.currency || process.env.GAM_CURRENCY || 'USD';
     const hSum = hv.summaryFromTrend(view.trend, view.rows, { currency });
     const L = legacy?.summary || {};
@@ -3127,14 +3216,14 @@ async function tryTimezoneView(req, res, kind, handler) {
       ecpm: impressions > 0 ? +((revenue / impressions) * 1000).toFixed(2) : 0,
       totalDomains: Math.max(merged.totalDomains, Number(L.totalDomains) || 0),
     };
-    const timezone = { tz, networkTz: hv.SRC_TZ, hourlyFrom: cov, mixed: Boolean(legacy), applied: true };
+    const timezone = ctx.meta();
 
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     if (kind === 'overview') {
       res.json(applyOverviewVisibility({ ...(legacy || {}), summary, isMock: false, currency, status: 'ready', timezone }, req.user));
       return true;
     }
-    res.json({
+    res.json(applyVisibility({
       charts: { revenue: [], device: [], country: [], performance: [] },
       ...(legacy || {}),
       summary, trend, rows,
@@ -3143,10 +3232,183 @@ async function tryTimezoneView(req, res, kind, handler) {
       source: legacy ? `${legacy.source || 'rollup'}+hourly` : 'hourly',
       status: 'ready',
       timezone,
-    });
+    }, req.user));
     return true;
   } catch (err) {
     logger.warn(`Timezone view failed, using network timezone: ${err.message}`);
+    return false;
+  }
+}
+
+// What the Reporting page can ask for that the hourly data can answer: date, and either domain/site or app, with
+// revenue, impressions and clicks. Anything else (country, ad unit, other metrics) stays in the network timezone.
+const TZ_REPORT_WEB_DIMS = new Set(['domain', 'site_name', 'url_name']);
+const TZ_REPORT_APP_DIMS = new Set(['mobile_app_resolved_id', 'mobile_app_name']);
+const TZ_REPORT_METRICS = new Set([
+  'total_line_item_level_cpm_and_cpc_revenue', 'total_line_item_level_all_revenue', 'total_line_item_level_impressions',
+  'total_line_item_level_clicks', 'total_line_item_level_ctr', 'total_line_item_level_without_cpd_average_ecpm',
+]);
+
+/**
+ * Reporting page in another timezone. Returns true when the response was sent.
+ * `filters` carries the date restriction already applied; the hourly rows are capped like the normal report.
+ */
+async function tryTimezoneReporting(req, res, { filters, wantAllRows, paginationOpts, maxRows }) {
+  try {
+    const dims = asArray(filters.reportDimensions).map((d) => String(d).toLowerCase());
+    const mets = asArray(filters.reportMetrics).map((m) => String(m).toLowerCase());
+    const web = dims.filter((d) => TZ_REPORT_WEB_DIMS.has(d));
+    const app = dims.filter((d) => TZ_REPORT_APP_DIMS.has(d));
+    const other = dims.filter((d) => d !== 'date' && !TZ_REPORT_WEB_DIMS.has(d) && !TZ_REPORT_APP_DIMS.has(d));
+    const metricsOk = mets.every((m) => TZ_REPORT_METRICS.has(m));
+    const supported = !other.length && !(web.length && app.length) && metricsOk
+      && !(app.length && (toFilterArray(filters.domain).length || toFilterArray(filters.site).length));
+    const ctx = await prepareTimezoneView(req, res, 'reporting', { startDate: filters.startDate, endDate: filters.endDate });
+    if (!ctx) return false;
+    if (!supported) {
+      markTimezoneNotApplied(res, { tz: ctx.tz, srcTz: ctx.srcTz, reason: 'unsupported_report' });
+      return false;
+    }
+    const { hv, clientId, tz, srcTz, hourlyStart, endDate } = ctx;
+    const perDay = dims.includes('date') || !dims.length;
+    const networkOnly = !web.length && !app.length && !toFilterArray(filters.domain).length
+      && !toFilterArray(filters.site).length && !toFilterArray(filters.domainId).length && !ctx.isScoped;
+
+    let hourlyRows;
+    let hourlyTrend;
+    if (networkOnly) {
+      // Date only: the network totals per local day (or one total when there is no date column).
+      const t = await hv.hourlyTrend({ clientId, startDate: hourlyStart, endDate, tz, srcTz, kind: 'network' });
+      hourlyTrend = t;
+      hourlyRows = perDay
+        ? t.map((d) => hv.rowFor({ date: d.date, revenue: d.earning, impressions: d.impressions, clicks: d.clicks }))
+        : [hv.rowFor({
+          date: null,
+          revenue: t.reduce((a, d) => a + d.earning, 0),
+          impressions: t.reduce((a, d) => a + d.impressions, 0),
+          clicks: t.reduce((a, d) => a + d.clicks, 0),
+        })];
+    } else {
+      const wantApp = app.length > 0 || (!web.length && toFilterArray(filters.domainId).length > 0);
+      const kind = wantApp ? 'app' : 'inventory';
+      let filter;
+      if (ctx.isScoped) {
+        filter = kind === 'app'
+          ? { apps: ctx.scope.apps }
+          : { domains: ctx.scope.domains, sites: ctx.scope.sites, scoped: true, webOr: Boolean(ctx.scope.webInventoryOr) };
+        if (kind === 'inventory' && !ctx.scope.domains.length && !ctx.scope.sites.length) filter = { domains: ['__none__'], scoped: true };
+        if (kind === 'app' && !ctx.scope.apps.length) filter = { apps: ['__none__'] };
+      } else {
+        filter = {
+          domains: toFilterArray(filters.domain), sites: toFilterArray(filters.site), apps: toFilterArray(filters.domainId), exactApps: true,
+        };
+      }
+      const base = { clientId, startDate: hourlyStart, endDate, tz, srcTz, kind, filter };
+      [hourlyRows, hourlyTrend] = await Promise.all([
+        hv.hourlyRows({ ...base, perDay, limit: maxRows }),
+        hv.hourlyTrend(base),
+      ]);
+    }
+
+    let legacy = null;
+    if (ctx.mixed) {
+      legacy = await ctx.capture(handleDetailedReport, { allRows: 'true' });
+      if (!legacy?.summary) return false;
+    }
+    const currency = legacy?.summary?.currency || process.env.GAM_CURRENCY || 'USD';
+    const rows = [...(legacy?.rows || []), ...hourlyRows].slice(0, maxRows);
+    const trend = [...(legacy?.trend || []).map((t) => ({ ...t })), ...hourlyTrend];
+    const hourlyRevenue = hourlyTrend.reduce((a, d) => a + d.earning, 0);
+    const totalRevenue = +((Number(legacy?.summary?.totalRevenue) || 0) + hourlyRevenue).toFixed(2);
+    const keys = new Set();
+    for (const r of rows) {
+      const domain = String(r.domainName || r.domain || r.gamDomain || '').trim().toLowerCase();
+      const appId = String(r.appId || r.appPackage || '').trim().toLowerCase();
+      if (domain) keys.add(`web:${domain}`);
+      if (appId) keys.add(`app:${appId}`);
+    }
+    const summary = { totalRevenue, totalDomains: Math.max(keys.size, Number(legacy?.summary?.totalDomains) || 0), offeredRecords: rows.length, currency };
+    const body = { summary, trend, isMock: false, status: 'ready', timezone: ctx.meta({ reportShape: 'hourly' }) };
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    if (wantAllRows) {
+      res.json(applyVisibility({ ...body, rows, pagination: { totalRows: rows.length, allRows: true } }, req.user));
+    } else {
+      const { rows: pageRows, pagination } = paginateRows(rows, { ...paginationOpts, limit: Math.min(paginationOpts.limit || 50, maxRows) });
+      res.json(applyVisibility({ ...body, rows: pageRows, pagination: { ...pagination, totalRows: rows.length, truncated: rows.length >= maxRows } }, req.user));
+    }
+    return true;
+  } catch (err) {
+    logger.warn(`Timezone reporting failed, using network timezone: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Domain User page in another timezone: each domain/site/app added up over the selected local days.
+ * Returns true when the response was sent.
+ */
+async function tryTimezoneDomainUser(req, res, { wantAllRows, paginationOpts, search }) {
+  try {
+    const ctx = await prepareTimezoneView(req, res, 'domain-user', { bailOnFilters: [] });
+    if (!ctx || !ctx.isScoped) return false;
+    const { hv, clientId, tz, srcTz, hourlyStart, endDate } = ctx;
+    const { rootDomainFromHost } = require('../utils/adUnit');
+    const base = { clientId, startDate: hourlyStart, endDate, tz, srcTz, perDay: false, limit: 5000 };
+    const sc = ctx.scope;
+    const hasWeb = sc.domains.length || sc.sites.length;
+    const [webRows, appRows] = await Promise.all([
+      hasWeb
+        ? hv.hourlyRows({ ...base, kind: 'inventory', filter: { domains: sc.domains, sites: sc.sites, scoped: true, webOr: Boolean(sc.webInventoryOr) } })
+        : [],
+      sc.apps.length ? hv.hourlyRows({ ...base, kind: 'app', filter: { apps: sc.apps } }) : [],
+    ]);
+    const shape = (r) => ({
+      appId: r.appId || '',
+      domainName: (r.siteName && rootDomainFromHost(r.siteName)) || r.domainName || '—',
+      siteName: r.siteName || '—',
+      siteUrl: r.siteName || '',
+      revenue: r.revenue,
+      impression: r.impression,
+      fillRate: 0,
+      ctr: r.ctr,
+    });
+    let aggregated = [...webRows, ...appRows].map(shape);
+
+    if (ctx.mixed) {
+      const legacy = await ctx.capture(handleDomainUserReport, { allRows: 'true' });
+      if (!legacy?.rows) return false;
+      const merged = new Map();
+      for (const r of [...legacy.rows, ...aggregated]) {
+        const key = `${r.appId || ''}|${r.domainName || ''}|${r.siteUrl || r.siteName || ''}`;
+        const cur = merged.get(key);
+        if (cur) {
+          cur.revenue = +(cur.revenue + (Number(r.revenue) || 0)).toFixed(2);
+          cur.impression += Number(r.impression) || 0;
+        } else {
+          merged.set(key, { ...r });
+        }
+      }
+      aggregated = [...merged.values()];
+    }
+    const currency = process.env.GAM_CURRENCY || null;
+    aggregated.sort((a, b) => (Number(b.revenue) || 0) - (Number(a.revenue) || 0));
+    const shown = wantAllRows ? aggregated : filterDomainUserRows(aggregated, search);
+    const stats = summarizeDomainUserRows(shown);
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    const timezone = ctx.meta();
+    if (wantAllRows) {
+      res.json(applyVisibility({
+        summary: { ...stats, currency }, rows: shown, isMock: false, timezone, pagination: { totalRows: shown.length, allRows: true },
+      }, req.user, { domainUserView: true }));
+    } else {
+      const { rows: pageRows, pagination } = paginateRows(shown, paginationOpts);
+      res.json(applyVisibility({
+        summary: { ...stats, currency }, rows: pageRows, isMock: false, timezone, pagination,
+      }, req.user, { domainUserView: true }));
+    }
+    return true;
+  } catch (err) {
+    logger.warn(`Timezone domain-user report failed, using network timezone: ${err.message}`);
     return false;
   }
 }
@@ -3836,6 +4098,9 @@ async function handleDomainUserReport(req, res) {
     return res.json(buildResponse(base.rows, 'USD', true, null));
   }
 
+  // Another timezone selected: each domain, site and app added up over the selected local days.
+  if (await tryTimezoneDomainUser(req, res, { wantAllRows, paginationOpts, search })) return;
+
   const currency = process.env.GAM_CURRENCY || null;
 
   try {
@@ -3963,7 +4228,7 @@ async function handleDetailedReport(req, res) {
   } = req.query;
   const filters = applyDateRestrictionToFilters({
     startDate, endDate, country, domainId, domainName, domain, site,
-    reportDimensions, reportMetrics,
+    reportDimensions: splitIdList(reportDimensions), reportMetrics: splitIdList(reportMetrics),
   }, req.user);
   const paginationOpts = parsePaginationQuery({ cursor, limit, sortColumn, sortDir });
 
@@ -3979,6 +4244,9 @@ async function handleDetailedReport(req, res) {
     || req.body?.allRows === 'true';
   // Country reports must ship the full breakdown (overview = table).
   const MAX_REPORTING_CLIENT_ROWS = 50000;
+
+  // Another timezone selected: rebuild the days from the stored hourly data when the report is one it can answer.
+  if (await tryTimezoneReporting(req, res, { filters, wantAllRows, paginationOpts, maxRows: MAX_REPORTING_CLIENT_ROWS })) return;
 
   const buildScopedFromRows = (
     allRows,

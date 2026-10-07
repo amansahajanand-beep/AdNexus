@@ -187,7 +187,8 @@ function sanitize(raw, validIds) {
 
 async function compute({ product, authorization, ctx }) {
   if (!PRODUCTS[product]) throw new ForecastRequestError('Unknown product');
-  const today = todayInTZ();
+  // Google Ad Manager months and "today" follow the zone being viewed; AdMob and AdSense keep their account days.
+  const today = todayInTZ(product === 'gam' ? ctx?.dayTz : undefined);
   const data = await loadDailyEarnings({ product, today, authorization, ctx });
   const f = forecastMonth(data.series, today);
   const target = await getTarget(await accountIdFor(ctx), product);
@@ -201,6 +202,7 @@ function figuresFor({ product, data, f, target, status, basis }) {
     label: PRODUCTS[product],
     currency: data.currency,
     source: data.source,
+    timezone: data.timezone || null,
     ok: f.ok,
     reason: f.reason || null,
     month: { ...f.month, name: monthName(f.month.start) },
@@ -247,6 +249,11 @@ async function forecastProduct({ authorization, ctx, body, emit = () => {}, sign
     month: sheet.month,
     currency: c.data.currency,
     status: c.status,
+    days: c.data.timezone
+      ? (c.data.timezone.applied
+        ? `Days follow the ${c.data.timezone.tz} timezone (the network reports in ${c.data.timezone.networkTz}).`
+        : `The selected timezone (${c.data.timezone.tz}) could not be applied; days are in the network timezone (${c.data.timezone.networkTz}).`)
+      : undefined,
     compared_against: c.basis === 'target' ? 'the monthly target' : (c.basis === 'last_month' ? 'last month' : 'nothing (no target and no full last month)'),
     facts: sheet.book.displays(),
   };

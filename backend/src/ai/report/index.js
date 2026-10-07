@@ -8,6 +8,7 @@ const { run } = require('../provider');
 const { AiError } = require('../errors');
 const { todayInTZ, shiftYMD } = require('../../utils/datetime');
 const { buildFacts } = require('../presetAnalysis');
+const { networkTzFor } = require('../accounts');
 const logger = require('../../utils/logger');
 
 const FEATURE = 'weekly-report';
@@ -85,11 +86,12 @@ const SCHEMA = {
 const clip = (v, n) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, n);
 
 /** Read every product's fact sheet; ids are prefixed per sheet (G-F1, MR-F2, ...) so they stay unique. */
-async function collectSheets(authorization, start, end) {
+async function collectSheets(authorization, start, end, ctx) {
   const results = await Promise.all(TARGETS.map(async (t) => {
     try {
       const { final } = await buildFacts({
         authorization,
+        ctx,
         body: { product: t.product, kind: t.kind, startDate: start, endDate: end, filters: {}, depth: 'fast' },
       });
       if (final.noData) return null;
@@ -192,7 +194,10 @@ function toRow(r) {
  * @returns {Promise<object>} the stored report
  */
 async function generateWeeklyReport({ user, accountId, authorization, ctx, force = false, signal }) {
-  const end = shiftYMD(todayInTZ(), -1);
+  // The report is for the whole account, not for a viewer in another timezone: Ad Manager's days are the network's own.
+  const networkTz = await networkTzFor(user);
+  const dataCtx = { ...ctx, viewTz: null, networkTz, dayTz: networkTz };
+  const end = shiftYMD(todayInTZ(networkTz), -1);
   const start = shiftYMD(end, -6);
   if (!force) {
     const { rows } = await query(
@@ -205,7 +210,7 @@ async function generateWeeklyReport({ user, accountId, authorization, ctx, force
     if (rows[0]) return { ...toRow(rows[0]), reused: true };
   }
 
-  const sheets = await collectSheets(authorization, start, end);
+  const sheets = await collectSheets(authorization, start, end, dataCtx);
   const facts = Object.assign({}, ...sheets.map((s) => s.facts));
   const validIds = new Set(Object.keys(facts));
   let content;

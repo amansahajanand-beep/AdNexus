@@ -53,6 +53,7 @@ function mapRuntime(row) {
     isActive: row.is_active !== false,
     isPending: isPendingNetworkCode(row.network_code) || !row.google_refresh_token_enc,
     publisherParentId: row.publisher_parent_id || null,
+    timeZone: row.time_zone || null,
   };
 }
 

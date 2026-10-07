@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { getReportTz, setReportTz } from './reportTimezone';
 import { TOKEN_KEY } from './auth/authConstants';
 import { clearSessionSuperseded, isIntentionalLogout } from './auth/crossTabAuth';
 import { getUserFacingMessage, logErrorForDebug } from './auth/userFacingError';
@@ -55,19 +56,15 @@ API.interceptors.request.use(attachAuth);
 FAST_API.interceptors.request.use(attachAuth);
 
 /**
- * Timezone the Dashboard reports in (admin only). Empty = the network timezone. The backend rebuilds days it has
- * hourly data for in this zone and leaves older days as they are.
+ * Timezone the user is viewing in (see utils/reportTimezone.js). Empty = the network timezone. The backend rebuilds
+ * days it has hourly data for in this zone and leaves older days as they are.
  */
-let reportTz = '';
-export function setReportTz(tz) {
-  reportTz = String(tz || '');
-}
-export function getReportTz() {
-  return reportTz;
-}
+export { setReportTz, getReportTz };
+const TZ_URL = /^\/?(reports\/(dashboard|detailed|domain-user)|ai\/)/;
 function attachReportTz(config) {
-  if (reportTz && /^\/?reports\/dashboard/.test(String(config.url || ''))) {
-    config.headers['X-Report-Tz'] = reportTz;
+  const tz = getReportTz();
+  if (tz && TZ_URL.test(String(config.url || ''))) {
+    config.headers['X-Report-Tz'] = tz;
   }
   return config;
 }

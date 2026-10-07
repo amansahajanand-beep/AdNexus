@@ -5,14 +5,27 @@
  */
 export const APP_TIMEZONE = 'Asia/Singapore';
 
+// The zone date helpers use when no zone is passed. The Dashboard sets it to the zone being viewed (the network's
+// own, or the one picked in the timezone switcher) so "today" and the presets follow it; it is reset on leaving.
+let activeTz = APP_TIMEZONE;
+export function setActiveTimezone(tz) {
+  activeTz = tz || APP_TIMEZONE;
+}
+export function getActiveTimezone() {
+  return activeTz;
+}
+
+// The zone date helpers use when no zone is passed. The Dashboard sets it to the zone being viewed (the network's
+// own, or the one picked in the timezone switcher) so \
+
 // 'YYYY-MM-DD' for a Date as seen in APP_TIMEZONE (en-CA → ISO-like).
-export function ymdInTZ(date = new Date(), tz = APP_TIMEZONE) {
+export function ymdInTZ(date = new Date(), tz = activeTz) {
   return new Intl.DateTimeFormat('en-CA', {
     timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
   }).format(date);
 }
 
-export function todayInTZ(tz = APP_TIMEZONE) {
+export function todayInTZ(tz = activeTz) {
   return ymdInTZ(new Date(), tz);
 }
 
@@ -32,7 +45,7 @@ export function startOfMonth(ymd) {
 // opts.includeToday — when true, historical presets end on today instead of yesterday.
 // opts.timeZone — IANA zone (AdMob accounts often Asia/Calcutta; GAM uses APP_TIMEZONE).
 export function presetRange(preset, opts = {}) {
-  const tz = opts.timeZone || APP_TIMEZONE;
+  const tz = opts.timeZone || activeTz;
   const today = todayInTZ(tz);
   const yesterday = shiftYMD(today, -1);
   const includeToday = opts.includeToday === true;
@@ -64,7 +77,7 @@ export function thisMonthRange() {
 }
 
 // Current time-of-day in Singapore, e.g. "10:42:05" (for "Updated …" labels).
-export function nowTimeInTZ(tz = APP_TIMEZONE) {
+export function nowTimeInTZ(tz = activeTz) {
   return new Intl.DateTimeFormat('en-GB', {
     timeZone: tz, hour: '2-digit', minute: '2-digit', second: '2-digit'
   }).format(new Date());

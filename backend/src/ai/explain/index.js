@@ -4,6 +4,7 @@
  * explanation from cited facts, and a rule-based explanation covers the case where it is unavailable.
  */
 const { callRouter } = require('../internalCall');
+const { tzHeaders } = require('../viewTz');
 const { run } = require('../provider');
 const { getOrCompute, stableKey } = require('../cache');
 const { AiError } = require('../errors');
@@ -45,10 +46,10 @@ class ExplainError extends Error {
   }
 }
 
-async function call(routerKey, path, query, authorization, required = true) {
+async function call(routerKey, path, query, authorization, required = true, ctx = null) {
   let res;
   try {
-    res = await callRouter(ROUTERS[routerKey](), { path, query, authorization, timeoutMs: 20_000 });
+    res = await callRouter(ROUTERS[routerKey](), { path, query, authorization, timeoutMs: 20_000, headers: tzHeaders(ctx) });
   } catch (err) {
     if (required) throw new ExplainError(504, 'The data took too long to load.');
     return null;
@@ -69,21 +70,23 @@ const per1000 = (earnings, volume) => (num(volume) > 0 ? (num(earnings) / num(vo
 // ─── gathering ─────────────────────────────────────────────────────────────────
 
 /** Totals for both periods, plus per-item rows for each dimension where the product offers them. */
-async function gather(request, authorization) {
+async function gather(request, authorization, ctx = null) {
   const cfg = PRODUCTS[request.product];
   const inv = inventoryQuery(request.filters);
 
   if (request.product === 'gam') {
     const [cur, prev] = await Promise.all([
-      call('reports', '/dashboard/overview', { startDate: request.start, endDate: request.end, ...inv }, authorization),
-      call('reports', '/dashboard/overview', { startDate: request.compare.start, endDate: request.compare.end, ...inv }, authorization),
+      call('reports', '/dashboard/overview', { startDate: request.start, endDate: request.end, ...inv }, authorization, true, ctx),
+      call('reports', '/dashboard/overview', { startDate: request.compare.start, endDate: request.compare.end, ...inv }, authorization, true, ctx),
     ]);
     const s = cur.summary || {};
     const p = prev.summary || {};
+    const tzr = [cur, prev].map((r) => r.timezone).find((z) => z && z.applied === false);
     return {
       currency: cur.currency || s.currency || 'USD',
       totals: { earningsNow: num(s.revenue), earningsPrev: num(p.revenue), volumeNow: num(s.impressions), volumePrev: num(p.impressions) },
       dims: [],
+      note: tzr ? `The selected timezone (${tzr.tz}) could not be applied, so these figures use the network's own timezone (${tzr.networkTz}).` : null,
     };
   }
 
@@ -151,7 +154,7 @@ function buildSheet(request, gathered) {
     book, ids, agg, dimensions, totals, delta, priceNow, pricePrev, currency,
     note: [
       gathered.note,
-      request.end >= todayInTZ() ? "The range includes today, which is still in progress, so part of this change is only a shorter day. Today's figures keep growing." : null,
+      request.end >= todayInTZ(request.dayTz) ? "The range includes today, which is still in progress, so part of this change is only a shorter day. Today's figures keep growing." : null,
     ].filter(Boolean).join(' ') || null,
   };
 }
@@ -267,7 +270,8 @@ const effectsForClient = (sheet) => sheet.dimensions.map((d) => ({
  */
 async function explainChange({ authorization, ctx, body, emit = () => {}, signal }) {
   const request = parseRequest({ ...body, kind: 'dashboard', depth: 'fast' });
-  const gathered = await gather(request, authorization);
+  if (request.product === 'gam') request.dayTz = ctx?.dayTz;
+  const gathered = await gather(request, authorization, ctx);
   const sheet = buildSheet(request, gathered);
   const cfg = PRODUCTS[request.product];
 
@@ -336,9 +340,10 @@ async function explainChange({ authorization, ctx, body, emit = () => {}, signal
 }
 
 /** The deterministic part only, as compact JSON for the chat tool (the chat model writes the explanation). */
-async function explainFigures({ authorization, body }) {
+async function explainFigures({ authorization, body, ctx = null }) {
   const request = parseRequest({ ...body, kind: 'dashboard', depth: 'fast' });
-  const gathered = await gather(request, authorization);
+  if (request.product === 'gam') request.dayTz = ctx?.dayTz;
+  const gathered = await gather(request, authorization, ctx);
   const sheet = buildSheet(request, gathered);
   const cfg = PRODUCTS[request.product];
   const money = (v) => formatMoney(v, sheet.currency);
@@ -346,6 +351,7 @@ async function explainFigures({ authorization, body }) {
     product: cfg.label,
     period: { start: request.start, end: request.end },
     compared_with: { start: request.compare.start, end: request.compare.end },
+    days_timezone: request.product === 'gam' ? request.dayTz || undefined : undefined,
     currency: sheet.currency,
     earnings: { now: money(sheet.totals.earningsNow), before: money(sheet.totals.earningsPrev), change: money(sheet.delta), change_pct: formatChange(pctChange(sheet.totals.earningsNow, sheet.totals.earningsPrev)) },
     traffic: { unit: cfg.unit, now: formatCount(sheet.totals.volumeNow), before: formatCount(sheet.totals.volumePrev), change_pct: formatChange(pctChange(sheet.totals.volumeNow, sheet.totals.volumePrev)) },

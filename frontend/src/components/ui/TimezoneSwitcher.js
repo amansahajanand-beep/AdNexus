@@ -36,7 +36,7 @@ function formatShortDate(ymd) {
  * Admin timezone dropdown for the Dashboard. `value` is '' for the network timezone. A short note beside it says
  * where the hourly data starts, so it is clear which days the zone applies to.
  */
-export default function TimezoneSwitcher({ networkTz, options, value, hourlyFrom, onChange }) {
+export default function TimezoneSwitcher({ networkTz, options, value, hourlyFrom, stale = false, onChange }) {
   const [open, setOpen] = useState(false);
   const [, tick] = useState(0);
   const rootRef = useRef(null);
@@ -114,9 +114,10 @@ export default function TimezoneSwitcher({ networkTz, options, value, hourlyFrom
         )}
       </div>
 
-      <span className={`tz-note${isNetwork ? '' : hourlyFrom ? ' is-ok' : ' is-wait'}`} role="status">
+      <span className={`tz-note${isNetwork ? '' : hourlyFrom && !stale ? ' is-ok' : ' is-wait'}`} role="status">
         {isNetwork && 'Network timezone'}
-        {!isNetwork && hourlyFrom && <>Days from <strong>{formatShortDate(hourlyFrom)}</strong> use this timezone; earlier days stay in the network timezone</>}
+        {!isNetwork && hourlyFrom && stale && 'The latest hours are still being fetched — today may show network-timezone figures until they arrive'}
+        {!isNetwork && hourlyFrom && !stale && <>Days from <strong>{formatShortDate(hourlyFrom)}</strong> use this timezone; earlier days stay in the network timezone</>}
         {!isNetwork && !hourlyFrom && 'Hourly data is still loading — showing the network timezone for now'}
       </span>
     </div>
