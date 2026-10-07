@@ -297,6 +297,43 @@ async function hourlyRows({
 }
 
 /**
+ * Revenue, impressions and clicks per local hour of `tz` (the Reporting page's Hour field), one row per local day and
+ * hour, or per hour of the day added up over the range when perDay is false. A zone whose offset from the network is
+ * half an hour (India…) has its hours cut through the middle of the stored hours: each half is worth half of its stored
+ * hour, so those hours are an even split of the two stored hours they overlap.
+ */
+async function hourlyByHour({
+  clientId, startDate, endDate, tz, srcTz = SRC_TZ, kind = 'network', filter = null, perDay = true, byItem = false, limit = 50000,
+}) {
+  const params = zonedParams(clientId, startDate, endDate, srcTz, tz);
+  const extra = filterSql(kind, filter, params);
+  params.push(limit);
+  const lim = params.length;
+  const items = byItem && kind !== 'network';
+  const { rows } = await query(
+    withZones(`SELECT ${perDay ? "to_char(ld, 'YYYY-MM-DD')" : 'NULL'} AS date, lh${items ? ', dim_a, dim_b' : ''},
+                      SUM(revenue)::float8 AS revenue, SUM(impressions)::float8 AS impressions, SUM(clicks)::float8 AS clicks
+               FROM (
+                 SELECT ${LOCAL_TS()}::date AS ld, EXTRACT(HOUR FROM ${LOCAL_TS()})::int AS lh${items ? ', h.dim_a, h.dim_b' : ''},
+                        h.revenue * 0.5 AS revenue, h.impressions * 0.5 AS impressions, h.clicks * 0.5 AS clicks
+                 FROM rollup_hourly h ${HALVES}
+                 WHERE h.client_id = $1::uuid AND h.kind = '${kind}'
+                   AND h.report_date BETWEEN $2::date AND $3::date${extra}
+               ) x
+               WHERE ld BETWEEN $4::date AND $5::date
+               GROUP BY ${perDay ? 'ld, ' : ''}lh${items ? ', dim_a, dim_b' : ''}
+               HAVING SUM(impressions) > 0 OR SUM(revenue) > 0
+               ORDER BY ${perDay ? 'ld, ' : ''}lh${items ? ', SUM(revenue) DESC' : ''}
+               LIMIT $${lim}`, 6),
+    params
+  );
+  return rows.map((r) => ({
+    date: r.date, hour: Number(r.lh), dimA: r.dim_a, dimB: r.dim_b,
+    revenue: Number(r.revenue), impressions: Number(r.impressions), clicks: Number(r.clicks),
+  }));
+}
+
+/**
  * Trend, rows and totals for local days [startDate, endDate] (already clamped to covered days).
  * filters: { domains[], sites[], apps[] } — any of them switches totals to the filtered slice.
  */
@@ -381,5 +418,5 @@ function summaryFromTrend(trend, rows, { viewability = 0, currency = 'USD' } = {
   };
 }
 
-module.exports = { SRC_TZ, timezoneOptions, isValidTz, coverage, coverageFrom, wallToInstant, localMidnight, buildHourlyView, buildScopedHourlyView, hourlyTrend, hourlyRows, rowFor, summaryFromTrend,
+module.exports = { SRC_TZ, timezoneOptions, isValidTz, coverage, coverageFrom, wallToInstant, localMidnight, buildHourlyView, buildScopedHourlyView, hourlyTrend, hourlyRows, hourlyByHour, rowFor, summaryFromTrend,
 };
