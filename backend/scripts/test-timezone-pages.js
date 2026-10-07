@@ -125,6 +125,24 @@ check('admin Reporting: date x domain x site rows add up to the regrouped site r
   });
 });
 
+check('admin Reporting by date x hour: one row per local hour, adding up to the local days', async () => {
+  await withUsers(world, async (make) => {
+    const { authorization } = await make('admin');
+    const body = await call(authorization, '/detailed', {
+      startDate: world.start, endDate: world.end, reportDimensions: 'date,hour', allRows: 'true',
+      reportMetrics: 'total_line_item_level_cpm_and_cpc_revenue,total_line_item_level_impressions',
+    });
+    assert.strictEqual(body.timezone?.applied, true, JSON.stringify(body.timezone));
+    const rows = body.rows || [];
+    assert.ok(rows.length >= 24, `hour rows: ${rows.length}`);
+    assert.ok(rows.every((r) => r.dimensions.hour >= 0 && r.dimensions.hour <= 23 && r.dimensions.date >= world.start && r.dimensions.date <= world.end));
+    const days = await hv.hourlyTrend({ clientId: world.clientId, startDate: world.start, endDate: world.end, tz: TZ, srcTz: world.srcTz, kind: 'network' });
+    for (const d of days) {
+      near(rows.filter((r) => r.dimensions.date === d.date).reduce((a, r) => a + r.revenue, 0), d.earning, `hours of ${d.date}`, 0.5);
+    }
+  });
+});
+
 check('admin Reporting with a site filter returns only that site', async () => {
   await withUsers(world, async (make) => {
     const { authorization } = await make('admin');

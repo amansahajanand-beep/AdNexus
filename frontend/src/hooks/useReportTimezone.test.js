@@ -83,9 +83,9 @@ test('picking a zone applies it everywhere, makes "today" follow it, and clears 
   expect(mockDispatch).toHaveBeenCalledWith(expect.objectContaining({ pageKey: 'reporting', payload: null }));
   expect(reportsAPI.getTimezones).toHaveBeenLastCalledWith('Asia/Kolkata');
 
-  // choosing the network's own zone clears the choice
+  // choosing the shown network's own zone stays a choice, so other networks (combined Dashboard) follow it too
   await act(async () => { latest.change('America/New_York'); });
-  expect(getReportTz()).toBe('');
+  expect(getReportTz()).toBe('America/New_York');
 });
 
 test('a choice made elsewhere (another component) reaches the page', async () => {

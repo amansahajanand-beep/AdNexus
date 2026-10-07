@@ -147,6 +147,8 @@ const LEGACY_DIMENSION = {
 
 /** Dimensions that must never get synthetic placeholders (e.g. country-name:—:844). */
 const NO_PROXY_DIMENSIONS = new Set([
+  'hour',
+  'HOUR',
   'country_name',
   'country',
   'country_code',

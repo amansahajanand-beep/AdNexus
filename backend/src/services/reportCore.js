@@ -3057,11 +3057,12 @@ async function fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, 
  * hourly data cannot express, or hourly data that does not cover the range). In the last case the normal response
  * says the zone was not applied, so network-timezone figures are never mistaken for the selected zone's days.
  */
-async function prepareTimezoneView(req, res, page, { startDate: sd, endDate: ed, bailOnFilters = ['country', 'domainName'] } = {}) {
+async function prepareTimezoneView(req, res, page, { startDate: sd, endDate: ed, bailOnFilters = ['country', 'domainName'], hourly = false } = {}) {
   if (req.query._tzDone) return null;
   const hv = require('./hourlyView');
-  const tz = String(req.headers['x-report-tz'] || req.query.tz || '').trim();
-  if (!tz || !hv.isValidTz(tz)) return null;
+  let tz = String(req.headers['x-report-tz'] || req.query.tz || '').trim();
+  if (tz && !hv.isValidTz(tz)) return null;
+  if (!tz && !hourly) return null;
   if (req.query.for === 'domain-user' && page === 'dashboard') return null;
   if (!canAccessPage(req.user, page)) return null;
   const isScoped = req.user?.role !== 'admin';
@@ -3070,7 +3071,8 @@ async function prepareTimezoneView(req, res, page, { startDate: sd, endDate: ed,
   const client = req.client || getClient();
   // Ad Manager cuts days in the network's own timezone; viewing that zone needs no regrouping.
   const srcTz = await require('./networkTimezone').getNetworkTz(client);
-  if (tz === srcTz) return null;
+  if (!tz) tz = srcTz;
+  if (tz === srcTz && !hourly) return null;
   if (bailOnFilters.some((k) => req.query[k])) return null;
   const clientId = getClientId();
   if (!clientId) return null;
@@ -3259,11 +3261,14 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
     const mets = asArray(filters.reportMetrics).map((m) => String(m).toLowerCase());
     const web = dims.filter((d) => TZ_REPORT_WEB_DIMS.has(d));
     const app = dims.filter((d) => TZ_REPORT_APP_DIMS.has(d));
-    const other = dims.filter((d) => d !== 'date' && !TZ_REPORT_WEB_DIMS.has(d) && !TZ_REPORT_APP_DIMS.has(d));
+    const other = dims.filter((d) => d !== 'date' && d !== 'hour' && !TZ_REPORT_WEB_DIMS.has(d) && !TZ_REPORT_APP_DIMS.has(d));
+    // Hour (with or without Date, and with a domain/site or app column) is answered per local hour of the viewing zone.
+    const hourMode = dims.includes('hour');
     const metricsOk = mets.every((m) => TZ_REPORT_METRICS.has(m));
     const supported = !other.length && !(web.length && app.length) && metricsOk
       && !(app.length && (toFilterArray(filters.domain).length || toFilterArray(filters.site).length));
-    const ctx = await prepareTimezoneView(req, res, 'reporting', { startDate: filters.startDate, endDate: filters.endDate });
+    // An Hour report is only answerable from the stored hourly data, so it is built from it in the network's own zone too.
+    const ctx = await prepareTimezoneView(req, res, 'reporting', { startDate: filters.startDate, endDate: filters.endDate, hourly: hourMode && supported });
     if (!ctx) return false;
     if (!supported) {
       markTimezoneNotApplied(res, { tz: ctx.tz, srcTz: ctx.srcTz, reason: 'unsupported_report' });
@@ -3276,7 +3281,48 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
 
     let hourlyRows;
     let hourlyTrend;
-    if (networkOnly) {
+    if (hourMode) {
+      // Same slice the other shapes would read (network totals, a filter, or a domain user's assignment), per local hour.
+      const wantApp = app.length > 0 || !web.length && (toFilterArray(filters.domainId).length > 0 || (ctx.isScoped && !ctx.scope.domains.length && !ctx.scope.sites.length && ctx.scope.apps.length > 0));
+      let kind = 'network';
+      let filter = null;
+      if (ctx.isScoped || !networkOnly) {
+        kind = wantApp ? 'app' : 'inventory';
+        if (ctx.isScoped) {
+          filter = kind === 'app'
+            ? { apps: ctx.scope.apps }
+            : { domains: ctx.scope.domains, sites: ctx.scope.sites, scoped: true, webOr: Boolean(ctx.scope.webInventoryOr) };
+          if (kind === 'inventory' && !ctx.scope.domains.length && !ctx.scope.sites.length) filter = { domains: ['__none__'], scoped: true };
+        } else {
+          filter = {
+            domains: toFilterArray(filters.domain), sites: toFilterArray(filters.site), apps: toFilterArray(filters.domainId), exactApps: true,
+          };
+        }
+      }
+      const base = { clientId, startDate: hourlyStart, endDate, tz, srcTz, kind, filter };
+      const [hours, trend] = await Promise.all([
+        hv.hourlyByHour({ ...base, perDay: dims.includes('date'), byItem: web.length > 0 || app.length > 0, limit: maxRows }),
+        hv.hourlyTrend(base),
+      ]);
+      hourlyTrend = trend;
+      // Domain without a site column: one row per domain, not per site.
+      const domainOnly = kind === 'inventory' && web.length > 0 && !web.includes('site_name') && !web.includes('url_name');
+      const merged = domainOnly
+        ? [...hours.reduce((m, h) => {
+          const key = `${h.date}|${h.hour}|${h.dimA}`;
+          const g = m.get(key) || { ...h, dimB: '', revenue: 0, impressions: 0, clicks: 0 };
+          g.revenue += h.revenue; g.impressions += h.impressions; g.clicks += h.clicks;
+          return m.set(key, g);
+        }, new Map()).values()].sort((x, y) => (x.date || '').localeCompare(y.date || '') || x.hour - y.hour || y.revenue - x.revenue)
+        : hours;
+      hourlyRows = merged.map((h) => {
+        const item = kind === 'app' ? { appId: h.dimB } : { domain: h.dimA, site: h.dimB };
+        const row = hv.rowFor({ date: h.date || '', revenue: h.revenue, impressions: h.impressions, clicks: h.clicks, ...(web.length || app.length ? item : {}) });
+        row.hour = h.hour;
+        row.dimensions = { ...(h.date ? { date: h.date } : {}), hour: String(h.hour) };
+        return row;
+      });
+    } else if (networkOnly) {
       // Date only: the network totals per local day (or one total when there is no date column).
       const t = await hv.hourlyTrend({ clientId, startDate: hourlyStart, endDate, tz, srcTz, kind: 'network' });
       hourlyTrend = t;
@@ -3311,7 +3357,8 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
     }
 
     let legacy = null;
-    if (ctx.mixed) {
+    // Days before the hourly data starts have no hours to show, so an Hour report covers the hourly days only.
+    if (ctx.mixed && !hourMode) {
       legacy = await ctx.capture(handleDetailedReport, { allRows: 'true' });
       if (!legacy?.summary) return false;
     }

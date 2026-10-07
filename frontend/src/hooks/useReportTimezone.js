@@ -41,11 +41,13 @@ export default function useReportTimezone() {
   useEffect(() => () => setActiveTimezone(''), []);
 
   const change = useCallback((next) => {
-    const value = next === options.networkTz ? '' : next;
+    // Kept as an explicit choice even when it is this network's own zone: a user with several networks (one combined
+    // Dashboard) must still get the other networks regrouped into it. A network already in that zone is left as is.
+    const value = String(next || '');
     dispatch(saveReportPage({ pageKey: 'dashboard', payload: null }));
     dispatch(saveReportPage({ pageKey: 'reporting', payload: null }));
     setReportTz(value);
-  }, [dispatch, options.networkTz]);
+  }, [dispatch]);
 
   return { tz, options, change };
 }
