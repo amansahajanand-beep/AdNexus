@@ -13,6 +13,7 @@ const logger = require('../utils/logger');
 const { runWithClient } = require('../utils/clientContext');
 const { parseGamRawColumnValue } = require('../utils/gamReportMetrics');
 const { todayInTZ, shiftYMD } = require('../utils/datetime');
+const { getNetworkTz } = require('./networkTimezone');
 
 const TOTAL_COLS = {
   imp: 'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS',
@@ -164,6 +165,34 @@ async function refreshNetworkKpi(client, dates) {
   return out;
 }
 
+const quickRefresh = new Map(); // client id -> { at, promise }
+const QUICK_COOLDOWN_MS = 3 * 60 * 1000;
+
+/**
+ * Pull just the network's hourly totals for yesterday and today (one small Ad Manager report) so a timezone view
+ * is not left waiting for the next cron tick. Shared between concurrent callers and rate-limited per network.
+ * The heavier site and app hours follow in the background. Resolves true when fresh hours were stored.
+ */
+function refreshNetworkHours(client) {
+  const prev = quickRefresh.get(client.id);
+  if (prev && (prev.promise.pending || Date.now() - prev.at < QUICK_COOLDOWN_MS)) return prev.promise;
+  const promise = (async () => {
+    const { getToken } = require('../gam/reportTransport');
+    const end = todayInTZ(await getNetworkTz(client));
+    const start = shiftYMD(end, -1);
+    const wrote = await runWithClient(client, async () => syncSlice(client, await getToken(), SLICES[0], start, end));
+    // Site and app hours: not needed for the totals, so they must not block the response.
+    setImmediate(() => syncHourlyForClient(client, { startDate: start, endDate: end }).catch(() => {}));
+    return wrote > 0;
+  })().catch((err) => {
+    logger.warn(`Quick hourly refresh failed client=${String(client.id).slice(0, 8)}: ${err.message}`);
+    return false;
+  }).finally(() => { promise.pending = false; });
+  promise.pending = true;
+  quickRefresh.set(client.id, { at: Date.now(), promise });
+  return promise;
+}
+
 let running = false;
 
 /** Today + yesterday for every active network (hourly cron). */
@@ -172,13 +201,16 @@ async function syncHourlyRecent({ days = 2 } = {}) {
   running = true;
   try {
     const { listActiveClients } = require('../models/clientStore');
-    const end = todayInTZ();
-    const start = shiftYMD(end, -(days - 1));
+    let last = null;
     for (const client of await listActiveClients()) {
+      // Ad Manager's days and hours follow the network's own timezone, so "today" is that zone's date.
+      const end = todayInTZ(await getNetworkTz(client));
+      const start = shiftYMD(end, -(days - 1));
       await refreshNetworkKpi(client, [end, ...(days > 1 ? [shiftYMD(end, -1)] : [])]);
       await syncHourlyForClient(client, { startDate: start, endDate: end });
+      last = { start, end };
     }
-    return { ok: true, start, end };
+    return { ok: true, ...(last || {}) };
   } finally {
     running = false;
   }
@@ -210,10 +242,10 @@ async function ensureHourlyCoverage({ days = 30, maxDays = 6, clientId = null } 
   running = true;
   try {
     const { listActiveClients } = require('../models/clientStore');
-    const today = todayInTZ();
     const out = {};
     for (const client of await listActiveClients()) {
       if (clientId && client.id !== clientId) continue;
+      const today = todayInTZ(await getNetworkTz(client));
       const yesterday = shiftYMD(today, -1);
       const missing = (await missingDates(client.id, shiftYMD(yesterday, -(days - 1)), yesterday)).reverse().slice(0, maxDays);
       if (!missing.length) { out[client.id] = 0; continue; }
@@ -227,4 +259,6 @@ async function ensureHourlyCoverage({ days = 30, maxDays = 6, clientId = null } 
   }
 }
 
-module.exports = { syncHourlyForClient, syncHourlyRecent, ensureHourlyCoverage, refreshNetworkKpi, SLICES };
+module.exports = {
+  syncHourlyForClient, syncHourlyRecent, ensureHourlyCoverage, refreshNetworkKpi, refreshNetworkHours, SLICES,
+};

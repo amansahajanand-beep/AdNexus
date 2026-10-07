@@ -10,6 +10,7 @@ const { mintInternalToken } = require('../../middleware/auth');
 const { resolveAiAccess } = require('../flags');
 const { todayInTZ, shiftYMD } = require('../../utils/datetime');
 const logger = require('../../utils/logger');
+const { networkTzFor } = require('../accounts');
 const { analyzePreset } = require('./index');
 
 // Preset page -> what to analyze. GAM Reporting is left out: it reads live reports and is slow.
@@ -27,8 +28,9 @@ const TARGETS = {
 const ACTIVE_WITHIN_MS = 14 * 24 * 3600 * 1000;
 const PAUSE_MS = 200;
 
-function ranges() {
-  const yesterday = shiftYMD(todayInTZ(), -1);
+/** Yesterday and the last 7 days, counted from `today` in the user's network timezone. */
+function ranges(today = todayInTZ()) {
+  const yesterday = shiftYMD(today, -1);
   return [
     { startDate: yesterday, endDate: yesterday },
     { startDate: shiftYMD(yesterday, -6), endDate: yesterday },
@@ -59,7 +61,6 @@ async function pinnedByUser() {
 async function prewarmPinnedPresets({ maxAnalyses = 100, maxPerUser = 4 } = {}) {
   const stats = { users: 0, analyses: 0, failed: 0, skipped: 0 };
   const byUser = await pinnedByUser();
-  const windows = ranges();
 
   for (const [userId, presets] of byUser) {
     if (stats.analyses >= maxAnalyses) break;
@@ -73,6 +74,9 @@ async function prewarmPinnedPresets({ maxAnalyses = 100, maxPerUser = 4 } = {}) 
     if (!access.enabled) { stats.skipped += 1; continue; }
 
     stats.users += 1;
+    // Nobody is viewing another timezone here, so Ad Manager days are the network's own.
+    const networkTz = await networkTzFor(user);
+    const windows = ranges(todayInTZ(networkTz));
     const chosen = presets.sort((a, b) => b.pinnedAt - a.pinnedAt).slice(0, maxPerUser);
     for (const preset of chosen) {
       for (const w of windows) {
@@ -81,7 +85,7 @@ async function prewarmPinnedPresets({ maxAnalyses = 100, maxPerUser = 4 } = {}) 
         try {
           await analyzePreset({
             authorization: `Bearer ${token}`,
-            ctx: { userId: user.id, clientId: user.clientId || null },
+            ctx: { userId: user.id, clientId: user.clientId || null, role: user.role, viewTz: null, networkTz, dayTz: networkTz },
             body: { ...TARGETS[preset.page], ...w, filters: preset.snapshot, depth: 'fast' },
           });
         } catch (err) {

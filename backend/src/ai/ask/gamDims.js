@@ -171,6 +171,62 @@ async function inventoryNames({ clientId, field, search = '' }) {
   return rows.map((r) => r.name);
 }
 
+/**
+ * The viewer's timezone: days rebuilt from the stored hourly data. Returns null when the hourly data does not
+ * cover the whole range (callers then fall back to the network's own days and say so).
+ */
+async function tzCoverage(ctx, start, end) {
+  if (!ctx?.viewTz || !ctx?.clientId) return null;
+  const hv = require('../../services/hourlyView');
+  const { todayInTZ, shiftYMD } = require('../../utils/datetime');
+  const today = todayInTZ(ctx.viewTz);
+  // Per-site figures come from the per-site hours, so it is those hours that must cover the range: mixing them with
+  // network totals would put the two answers in different timezones.
+  const cov = await hv.coverage(ctx.clientId, ctx.viewTz, today, ctx.networkTz, Date.now(), 'inventory');
+  if (!cov || start < cov.from || end > cov.through) {
+    // Behind on recent hours: ask for a refresh so the next question is covered (the network totals come first).
+    if (end >= shiftYMD(today, -2)) {
+      require('../../models/clientStore').getClientById(ctx.clientId)
+        .then((client) => client && require('../../services/hourlySyncService').refreshNetworkHours(client))
+        .catch(() => {});
+    }
+    return null;
+  }
+  return { hv, cov };
+}
+
+async function tzInventoryBreakdown({ ctx, start, end, field, sites, domains }) {
+  const c = await tzCoverage(ctx, start, end);
+  if (!c) return null;
+  const rows = await c.hv.hourlyRows({
+    clientId: ctx.clientId, startDate: start, endDate: end, tz: ctx.viewTz, srcTz: ctx.networkTz,
+    kind: 'inventory', filter: { domains: lowerList(domains), sites: lowerList(sites) }, perDay: false, limit: 5000,
+  });
+  const groups = new Map();
+  for (const r of rows) {
+    const name = (field === 'domain' ? r.domainName : r.siteName) || 'Unassigned (no site in the report)';
+    const g = groups.get(name) || { earnings: 0, impressions: 0, clicks: 0 };
+    g.earnings += r.revenue;
+    g.impressions += r.impression;
+    g.clicks += r.clicks;
+    groups.set(name, g);
+  }
+  return [...groups.entries()].map(([name, g]) => ({ name, ...withRatios(g) })).sort((a, b) => b.earnings - a.earnings);
+}
+
+async function tzInventoryTrend({ ctx, start, end, sites, domains }) {
+  const c = await tzCoverage(ctx, start, end);
+  if (!c) return null;
+  const filtered = lowerList(sites).length || lowerList(domains).length;
+  const days = await c.hv.hourlyTrend({
+    clientId: ctx.clientId, startDate: start, endDate: end, tz: ctx.viewTz, srcTz: ctx.networkTz,
+    kind: filtered ? 'inventory' : 'network',
+    filter: filtered ? { domains: lowerList(domains), sites: lowerList(sites) } : null,
+  });
+  return days.map((d) => ({ date: d.date, ...withRatios({ earnings: d.earning, impressions: d.impressions, clicks: d.clicks }) }));
+}
+
 module.exports = {
   KINDS, FILTER_KEY, dimBreakdown, dimTrend, dimNames, inventoryNames, inventoryBreakdown, inventoryTrend,
+  tzInventoryBreakdown, tzInventoryTrend,
 };

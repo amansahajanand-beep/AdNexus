@@ -909,7 +909,8 @@ function startCron() {
   cron.schedule('*/10 * * * *', hourlySafe('network total', async () => {
     const { refreshNetworkKpi } = require('../services/hourlySyncService');
     const { listActiveClients } = require('../models/clientStore');
-    for (const client of await listActiveClients()) await refreshNetworkKpi(client, [todayInTZ()]);
+    const { getNetworkTz } = require('../services/networkTimezone');
+    for (const client of await listActiveClients()) await refreshNetworkKpi(client, [todayInTZ(await getNetworkTz(client))]);
   }), { timezone: 'Asia/Singapore' });
   cron.schedule('40 * * * *', hourlySafe('recent', () => require('../services/hourlySyncService').syncHourlyRecent({ days: 2 })),
     { timezone: 'Asia/Singapore' });

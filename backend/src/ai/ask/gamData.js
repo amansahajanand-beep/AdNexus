@@ -4,6 +4,7 @@
  * "revenue of quiz13.arenapro6.com last month" works for any site.
  */
 const { callRouter } = require('../internalCall');
+const { tzHeaders } = require('../viewTz');
 
 const BLANK = new Set(['', '—', '-', 'null', 'undefined']);
 const UNASSIGNED = 'Unassigned (no site in the report)';
@@ -27,12 +28,13 @@ function domainOf(row) {
 }
 
 /** All rows for the period as the signed-in user sees them. */
-async function loadGamRows({ start, end, authorization }) {
+async function loadGamRows({ start, end, authorization, ctx }) {
   const res = await callRouter(require('../../routes/reports'), {
     path: '/dashboard',
     query: { startDate: start, endDate: end, allRows: 'true' },
     authorization,
     timeoutMs: 60_000,
+    headers: tzHeaders(ctx),
   });
   if (res.status !== 200) {
     const reason = res.status === 403 ? 'This user is not allowed to see that data.' : (res.body?.error || 'The data could not be loaded.');

@@ -67,12 +67,6 @@ export const REPORT_SETTINGS_OPTIONS = {
     { id: 'GBP', label: 'GBP — British Pound' },
     { id: 'SGD', label: 'SGD — Singapore Dollar' },
   ],
-  timezones: [
-    { id: 'Asia/Singapore', label: 'Asia/Singapore' },
-    { id: 'America/New_York', label: 'America/New_York' },
-    { id: 'Europe/London', label: 'Europe/London' },
-    { id: 'Asia/Kolkata', label: 'Asia/Kolkata' },
-  ],
   adUnitViews: [
     { id: 'FLAT', label: 'Flat' },
     { id: 'HIERARCHICAL', label: 'Hierarchical' },
@@ -155,15 +149,12 @@ export function reportSettingsToChips(settings = DEFAULT_REPORT_SETTINGS) {
   const chips = [];
   const run = REPORT_SETTINGS_OPTIONS.runTypes.find(r => r.id === settings.runType);
   const cur = REPORT_SETTINGS_OPTIONS.currencies.find(c => c.id === settings.currency);
-  const tz = REPORT_SETTINGS_OPTIONS.timezones.find(t => t.id === settings.timezone);
   const view = REPORT_SETTINGS_OPTIONS.adUnitViews.find(v => v.id === settings.adUnitView);
   // Only show chip when the value differs from the default so clicking × actually makes it disappear
   if (run && settings.runType !== DEFAULT_REPORT_SETTINGS.runType)
     chips.push({ id: 'set-run', field: 'reportSetting', settingKey: 'runType', category: 'Run', label: run.label });
   if (cur && settings.currency !== DEFAULT_REPORT_SETTINGS.currency)
     chips.push({ id: 'set-currency', field: 'reportSetting', settingKey: 'currency', category: 'Currency', label: cur.id });
-  if (tz && settings.timezone !== DEFAULT_REPORT_SETTINGS.timezone)
-    chips.push({ id: 'set-tz', field: 'reportSetting', settingKey: 'timezone', category: 'Timezone', label: tz.label });
   if (view && settings.adUnitView !== DEFAULT_REPORT_SETTINGS.adUnitView)
     chips.push({ id: 'set-view', field: 'reportSetting', settingKey: 'adUnitView', category: 'Ad unit view', label: view.label });
   return chips;

@@ -3,7 +3,9 @@ import { useDispatch, useSelector } from 'react-redux';
 import { useOutletContext, useSearchParams } from 'react-router-dom';
 import { reportsAPI } from '../utils/api';
 import { mergeDashboardResponses } from '../utils/report/mergeNetworkReports';
-import { nowTimeInTZ, todayInTZ } from '../utils/datetime';
+import { APP_TIMEZONE, nowTimeInTZ, todayInTZ } from '../utils/datetime';
+import TimezoneSwitcher from '../components/ui/TimezoneSwitcher';
+import useReportTimezone from '../hooks/useReportTimezone';
 import {
   getDateRestriction,
   clampDateRange,
@@ -160,7 +162,7 @@ function num(v) {
   return parseInt(v || 0).toLocaleString();
 }
 
-export default function Reporting() {
+function ReportingView() {
   const dispatch = useDispatch();
   const { has, visibility: clientVis, user } = usePermissions();
   const canGenerate = has('canGenerateReports');
@@ -1698,6 +1700,7 @@ export default function Reporting() {
             : `Allowed filter window: ${formatDateRestrictionLabel(dateRestriction)}`}
         </p>
       )}
+      <TimezoneNote info={data?.timezone || progData?.timezone} />
 
       <div className="quick-views-row" role="group" aria-label="Quick views">
         <span className="quick-views-label">Quick views</span>
@@ -2175,5 +2178,49 @@ export default function Reporting() {
         </>
       )}
     </div>
+  );
+}
+
+const TZ_REASON = {
+  unsupported_report: 'Other timezones apply to reports by date, domain, site or app with revenue, impressions and clicks. This report uses other fields',
+  hourly_behind: 'the newest hours are still being fetched',
+  no_hourly_data: 'hourly data is not available yet',
+  before_hourly_data: 'hourly data does not reach back to these dates',
+};
+
+/** Says which timezone the report's days are in, and why the chosen one was not used when it could not be. */
+function TimezoneNote({ info }) {
+  if (!info?.tz) return null;
+  if (info.applied === false) {
+    return (
+      <p className="form-note page-restriction-note tz-report-note is-warn" role="status">
+        Showing days in the network timezone ({info.networkTz}), not {info.tz}: {TZ_REASON[info.reason] || 'the selected timezone could not be applied'}.
+      </p>
+    );
+  }
+  return (
+    <p className="form-note page-restriction-note tz-report-note" role="status">
+      Days follow {info.tz}{info.mixed && info.hourlyFrom ? `; days before ${info.hourlyFrom} stay in the network timezone (${info.networkTz})` : ''}.
+    </p>
+  );
+}
+
+/** Reporting with a timezone picker; each zone remounts the report so no numbers carry over. */
+export default function Reporting() {
+  const { tz, options, change } = useReportTimezone();
+  return (
+    <>
+      {options.options.length > 1 && (
+        <TimezoneSwitcher
+          networkTz={options.networkTz}
+          options={options.options}
+          value={tz}
+          hourlyFrom={options.hourlyFrom}
+          stale={Boolean(options.stale)}
+          onChange={change}
+        />
+      )}
+      <ReportingView key={tz || (options.networkTz && options.networkTz !== APP_TIMEZONE ? options.networkTz : 'network')} />
+    </>
   );
 }

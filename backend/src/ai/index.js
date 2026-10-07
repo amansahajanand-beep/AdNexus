@@ -5,6 +5,7 @@ const { run } = require('./provider');
 const { getOrCompute, stableKey } = require('./cache');
 const { resolveAiAccess, setAccountAiEnabled, getAccountSetting } = require('./flags');
 const { usageToday } = require('./limits');
+const { resolveViewTz } = require('./viewTz');
 const {
   logUsage, addFeedback, usageSummary, dailySeries, tokenSeries, tokenAverages, flush: flushUsage,
   recentFeedback, recentFailures,
@@ -36,7 +37,12 @@ async function requireAiEnabled(req, res, next) {
     if (!access.enabled) {
       return res.status(403).json({ error: 'AI features are turned off.', code: CODES.DISABLED, reason: access.reason });
     }
-    req.aiCtx = { userId: req.user.id, clientId: req.user.clientId || null, role: req.user.role };
+    req.aiCtx = {
+      userId: req.user.id,
+      clientId: req.user.clientId || null,
+      role: req.user.role,
+      ...(await resolveViewTz(req)),
+    };
     return next();
   } catch (err) {
     return next(err);

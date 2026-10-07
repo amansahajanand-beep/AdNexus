@@ -189,7 +189,7 @@ async function withAdmin(fn, { role = 'admin', gamNetwork = false } = {}) {
     updated_by TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (account_id, product))`);
   const { rows } = await db.schemaQuery(
     gamNetwork
-      ? `SELECT u.client_id AS id FROM users u JOIN user_report_presets p ON p.user_id = u.id WHERE u.client_id IS NOT NULL LIMIT 1`
+      ? `SELECT client_id AS id FROM rollup_inventory_kpi_daily GROUP BY client_id ORDER BY COUNT(*) DESC LIMIT 1`
       : `SELECT c.publisher_parent_id AS id FROM gam_clients c JOIN adsense_accounts a ON a.client_id = c.id
          WHERE c.publisher_parent_id IS NOT NULL LIMIT 1`
   );

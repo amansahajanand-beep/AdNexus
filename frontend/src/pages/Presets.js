@@ -7,6 +7,9 @@ import ReportingPresetDetail from '../components/reporting/ReportingPresetDetail
 import PublisherPresetDetail from '../components/presets/PublisherPresetDetail';
 import PublisherRoiPresetDetail from '../components/presets/PublisherRoiPresetDetail';
 import { useAuth } from '../store/useAuth';
+import TimezoneSwitcher from '../components/ui/TimezoneSwitcher';
+import useReportTimezone from '../hooks/useReportTimezone';
+import { APP_TIMEZONE } from '../utils/datetime';
 import { usePermissions } from '../hooks/usePermissions';
 import {
   PRESET_PAGES,
@@ -135,7 +138,7 @@ function sectionProduct(section) {
   return 'gam';
 }
 
-export default function Presets({ product: productProp = null }) {
+function PresetsView({ product: productProp = null }) {
   const location = useLocation();
   const product = productProp || productFromPath(location.pathname);
   const { user } = useAuth();
@@ -705,4 +708,31 @@ export default function Presets({ product: productProp = null }) {
       )}
     </div>
   );
+}
+
+/** Google Ad Manager presets can be previewed in another timezone; each zone remounts the page so no numbers carry over. */
+function GamPresets(props) {
+  const { tz, options, change } = useReportTimezone();
+  return (
+    <>
+      {options.options.length > 1 && (
+        <TimezoneSwitcher
+          networkTz={options.networkTz}
+          options={options.options}
+          value={tz}
+          hourlyFrom={options.hourlyFrom}
+          stale={Boolean(options.stale)}
+          onChange={change}
+        />
+      )}
+      <PresetsView key={tz || (options.networkTz && options.networkTz !== APP_TIMEZONE ? options.networkTz : 'network')} {...props} />
+    </>
+  );
+}
+
+export default function Presets(props) {
+  const location = useLocation();
+  const product = props.product || productFromPath(location.pathname);
+  // AdMob and AdSense keep their own account days.
+  return product === 'gam' ? <GamPresets {...props} /> : <PresetsView {...props} />;
 }

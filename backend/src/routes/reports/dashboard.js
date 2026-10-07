@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
 const { requireAdmin } = require('../../middleware/auth');
-const { timezoneOptions, SRC_TZ, isValidTz, coverageFrom } = require('../../services/hourlyView');
+const { timezoneOptions, SRC_TZ, isValidTz, coverage } = require('../../services/hourlyView');
+const { getNetworkTz } = require('../../services/networkTimezone');
 const { todayInTZ } = require('../../utils/datetime');
 const { registerFilterReportRoute } = require('./register');
 const {
@@ -20,14 +21,19 @@ router.get('/trend', handleTrend);
 router.get('/by-ad-type', handleByAdType);
 router.get('/top-advertisers', handleTopAdvertisers);
 
-/** Timezones offered by the Dashboard picker. */
+/** Timezones offered by the Dashboard picker, starting from this network's own timezone. */
 router.get('/timezones', async (req, res) => {
-  const out = { networkTz: SRC_TZ, options: timezoneOptions(), hourlyFrom: null };
+  const srcTz = await getNetworkTz(req.client).catch(() => SRC_TZ);
+  const out = { networkTz: srcTz, options: timezoneOptions(srcTz), hourlyFrom: null };
   try {
     const tz = String(req.query.tz || '').trim();
     const clientId = req.client?.id || req.user?.clientId;
-    if (tz && tz !== SRC_TZ && isValidTz(tz) && clientId) {
-      out.hourlyFrom = await coverageFrom(clientId, tz, todayInTZ());
+    if (tz && tz !== srcTz && isValidTz(tz) && clientId) {
+      const cov = await coverage(clientId, tz, todayInTZ(tz), srcTz);
+      out.hourlyFrom = cov?.from || null;
+      out.partialDay = cov?.partialDay || null;
+      // The newest hours are not stored yet: "today" in this zone cannot be shown until the sync catches up.
+      out.stale = !cov || cov.through < todayInTZ(tz);
     }
   } catch (err) {
     // The picker still works without the coverage note.

@@ -8,6 +8,7 @@
  * pays for a second model call; and the headline is sent as soon as it has streamed.
  */
 const { callRouter } = require('../internalCall');
+const { tzHeaders } = require('../viewTz');
 const { run } = require('../provider');
 const { stableKey, getOrCompute, cacheGet, cacheSet } = require('../cache');
 const { AiError, CODES } = require('../errors');
@@ -43,11 +44,11 @@ const ROUTERS = {
   roi: () => require('../../routes/roi'),
 };
 
-function makeCall(authorization) {
+function makeCall(authorization, ctx) {
   return async function call(routerKey, path, query, { required = false, timeoutMs = DATA_TIMEOUT_MS } = {}) {
     let res;
     try {
-      res = await callRouter(ROUTERS[routerKey](), { path, query, authorization, timeoutMs });
+      res = await callRouter(ROUTERS[routerKey](), { path, query, authorization, timeoutMs, headers: tzHeaders(ctx) });
     } catch (err) {
       if (required) throw new AnalysisError(504, 'The data took too long to load.', 'data_timeout');
       return null;
@@ -86,11 +87,13 @@ function factsForClient(final, analysis) {
  */
 async function analyzePreset({ authorization, ctx, body, emit = () => {}, signal }) {
   const request = parseRequest(body);
+  // Google Ad Manager days follow the zone the user is viewing; the other products keep their own account zone.
+  if (request.product === 'gam') request.dayTz = ctx?.dayTz;
   const deep = request.depth === 'deep';
   const tier = deep ? 'deep' : 'fast';
 
   const recentKey = stableKey('pa-recent', {
-    u: ctx.userId, p: request.product, k: request.kind, s: request.start, e: request.end, f: request.filters, d: request.depth,
+    u: ctx.userId, p: request.product, k: request.kind, s: request.start, e: request.end, f: request.filters, d: request.depth, z: ctx.viewTz || '',
   });
   if (!request.force) {
     const recent = await cacheGet(recentKey);
@@ -105,7 +108,7 @@ async function analyzePreset({ authorization, ctx, body, emit = () => {}, signal
 
   const factsStart = Date.now();
   const build = request.product === 'gam' ? buildGamSheet : buildPublisherSheet;
-  const sheet = await build({ request, call: makeCall(authorization), deep });
+  const sheet = await build({ request, call: makeCall(authorization, ctx), deep });
   const final = finalizeSheet(sheet);
   final.metricIds = sheet.metricIds;
   const factsMs = Date.now() - factsStart;
@@ -209,10 +212,11 @@ async function analyzePreset({ authorization, ctx, body, emit = () => {}, signal
  * Build the fact sheet for a request without calling the model (used by alert scans).
  * @returns {Promise<{request: object, final: object}>}
  */
-async function buildFacts({ authorization, body }) {
+async function buildFacts({ authorization, body, ctx }) {
   const request = parseRequest(body);
+  if (request.product === 'gam') request.dayTz = ctx?.dayTz;
   const build = request.product === 'gam' ? buildGamSheet : buildPublisherSheet;
-  const sheet = await build({ request, call: makeCall(authorization), deep: false });
+  const sheet = await build({ request, call: makeCall(authorization, ctx), deep: false });
   const final = finalizeSheet(sheet);
   final.metricIds = sheet.metricIds;
   return { request, final };

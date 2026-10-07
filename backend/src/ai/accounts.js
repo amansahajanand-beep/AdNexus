@@ -44,4 +44,20 @@ async function forEachAccountAdmin(fn) {
   return stats;
 }
 
-module.exports = { forEachAccountAdmin, accountIdFor };
+/**
+ * "Today" for a background job working as this user: the date in their Google Ad Manager network's own timezone.
+ * (Jobs have no one viewing in another zone, and Ad Manager closes its days in the network's zone.)
+ */
+async function networkTzFor(user) {
+  const { getClientById } = require('../models/clientStore');
+  const { getNetworkTz } = require('../services/networkTimezone');
+  const client = user?.clientId ? await getClientById(user.clientId).catch(() => null) : null;
+  return getNetworkTz(client);
+}
+
+async function networkTodayFor(user) {
+  const { todayInTZ } = require('../utils/datetime');
+  return todayInTZ(await networkTzFor(user));
+}
+
+module.exports = { forEachAccountAdmin, accountIdFor, networkTzFor, networkTodayFor };

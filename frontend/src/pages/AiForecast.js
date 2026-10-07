@@ -264,6 +264,14 @@ export default function AiForecast() {
 
           <TargetEditor figures={figures} onSaved={() => load(product)} />
 
+          {figures.timezone ? (
+            <p className={`form-note tz-report-note${figures.timezone.applied ? '' : ' is-warn'}`} role="status">
+              {figures.timezone.applied
+                ? `Months and days follow ${figures.timezone.tz}; days before ${figures.timezone.from} stay in the network timezone (${figures.timezone.networkTz}).`
+                : `Showing days in the network timezone (${figures.timezone.networkTz}), not ${figures.timezone.tz}: the hourly data does not cover this month yet.`}
+            </p>
+          ) : null}
+
           <footer className="rep-foot">
             <span>Figures run through yesterday · {figures.source}</span>
             <span>A projection from recent daily earnings, not a promise. The range holds the likely outcome about 8 times in 10.</span>

@@ -286,12 +286,20 @@ function gamSummaryFilters(filters) {
   return { picked: {} };
 }
 
-async function loadGam({ start, end, authorization }) {
+async function loadGam({ start, end, authorization, ctx }) {
   try {
-    return await gamData.loadGamRows({ start, end, authorization });
+    return await gamData.loadGamRows({ start, end, authorization, ctx });
   } catch (err) {
     throw new ToolInputError(err.status === 403 ? 'This user is not allowed to see that data.' : (err.message || 'The data could not be loaded.'));
   }
+}
+
+/** Which timezone the days of a Google Ad Manager answer are in, when the user is viewing another one. */
+function tzNote(ctx, applied) {
+  if (!ctx?.viewTz) return null;
+  return applied
+    ? `Days are in the selected timezone (${ctx.viewTz}); the network itself reports in ${ctx.networkTz}.`
+    : `The selected timezone (${ctx.viewTz}) could not be applied to this answer, so its days are in the network timezone (${ctx.networkTz}).`;
 }
 
 function gamNote(data, extra, nothingMatched) {
@@ -357,6 +365,7 @@ async function executeTool(name, rawInput, { authorization, ctx }) {
     try {
       result = await buildFacts({
         authorization,
+        ctx,
         body: { product, kind: page, startDate: start, endDate: end, filters: picked, depth: 'fast' },
       });
     } catch (err) {
@@ -405,14 +414,17 @@ async function executeTool(name, rawInput, { authorization, ctx }) {
           note: [
             all.length === 0 ? 'No rows matched. Check the exact name with find_filter_values, or the period may have no data for it.' : null,
             'From the warehouse rollups, so the network total can differ slightly from the Dashboard total.',
+            ctx?.viewTz ? `This split is only stored by network day, so its days are in the network timezone (${ctx.networkTz}), not ${ctx.viewTz}.` : null,
             all.length > limit ? `Only the top ${limit} of ${all.length} are listed; shares are of all ${all.length}.` : null,
           ].filter(Boolean).join(' '),
         });
       }
       const fromRollup = ctx?.role === 'admin' && ctx?.clientId;
-      const data = fromRollup ? { currency: 'USD', warning: null } : await loadGam({ start, end, authorization });
+      // In another timezone the days are rebuilt from the stored hours; without coverage it falls back to network days.
+      const tzRows = fromRollup ? await gamDims.tzInventoryBreakdown({ ctx, start, end, field: dimension, sites: filters.sites, domains: filters.domains }) : null;
+      const data = fromRollup ? { currency: 'USD', warning: null } : await loadGam({ start, end, authorization, ctx });
       const scoped = fromRollup
-        ? await gamDims.inventoryBreakdown({ clientId: ctx.clientId, start, end, field: dimension, sites: filters.sites, domains: filters.domains })
+        ? (tzRows || await gamDims.inventoryBreakdown({ clientId: ctx.clientId, start, end, field: dimension, sites: filters.sites, domains: filters.domains }))
         : gamData.filterRows(data.rows, filters);
       const all = fromRollup ? scoped : gamData.breakdown(scoped, dimension, 5000);
       const totalEarnings = all.reduce((a, r) => a + (r.earnings || 0), 0);
@@ -433,7 +445,11 @@ async function executeTool(name, rawInput, { authorization, ctx }) {
           ecpm: round(r.ecpm),
           ctr_pct: round(r.ctr, 2),
         })),
-        note: gamNote(data, all.length > limit ? `Only the top ${limit} of ${all.length} are listed; shares are of all ${all.length}.` : null, scoped.length === 0),
+        note: gamNote(
+          data,
+          [all.length > limit ? `Only the top ${limit} of ${all.length} are listed; shares are of all ${all.length}.` : null, tzNote(ctx, Boolean(tzRows))].filter(Boolean).join(' ') || null,
+          scoped.length === 0
+        ),
       });
     }
     const { q } = filterQuery(input.filters);
@@ -475,13 +491,15 @@ async function executeTool(name, rawInput, { authorization, ctx }) {
           note: [
             days.length === 0 ? 'No rows matched. Check the exact name with find_filter_values.' : null,
             'From the warehouse rollups, so totals can differ slightly from the Dashboard.',
+            ctx?.viewTz ? `These days are in the network timezone (${ctx.networkTz}), not ${ctx.viewTz}: this split is only stored by network day.` : null,
           ].filter(Boolean).join(' '),
         });
       }
       const fromRollup = ctx?.role === 'admin' && ctx?.clientId;
-      const data = fromRollup ? { currency: 'USD', warning: null } : await loadGam({ start, end, authorization });
+      const tzDays = fromRollup ? await gamDims.tzInventoryTrend({ ctx, start, end, sites: filters.sites, domains: filters.domains }) : null;
+      const data = fromRollup ? { currency: 'USD', warning: null } : await loadGam({ start, end, authorization, ctx });
       const scoped = fromRollup
-        ? await gamDims.inventoryTrend({ clientId: ctx.clientId, start, end, sites: filters.sites, domains: filters.domains })
+        ? (tzDays || await gamDims.inventoryTrend({ clientId: ctx.clientId, start, end, sites: filters.sites, domains: filters.domains }))
         : gamData.filterRows(data.rows, filters);
       return limitSize({
         product: PRODUCT_LABEL.gam,
@@ -489,7 +507,7 @@ async function executeTool(name, rawInput, { authorization, ctx }) {
         rows: (fromRollup ? scoped : gamData.dailyTrend(scoped)).map((t) => ({
           date: t.date, earnings: round(t.earnings), impressions: t.impressions, clicks: t.clicks, ecpm: round(t.ecpm),
         })),
-        note: gamNote(data, null, scoped.length === 0),
+        note: gamNote(data, tzNote(ctx, Boolean(tzDays)), scoped.length === 0),
       });
     }
     const { q } = filterQuery(input.filters);
@@ -514,7 +532,7 @@ async function executeTool(name, rawInput, { authorization, ctx }) {
     const { start, end } = requireRange(input);
     const { picked } = product === 'gam' ? gamSummaryFilters(input.filters, 'dashboard') : filterQuery(input.filters);
     try {
-      return limitSize(await explainFigures({ authorization, body: { product, startDate: start, endDate: end, filters: picked } }));
+      return limitSize(await explainFigures({ authorization, ctx, body: { product, startDate: start, endDate: end, filters: picked } }));
     } catch (err) {
       if (err instanceof ExplainError) throw new ToolInputError(err.status === 403 ? 'This user is not allowed to see that data.' : err.message);
       throw new ToolInputError(err.message || 'The data could not be loaded.');

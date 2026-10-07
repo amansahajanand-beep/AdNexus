@@ -870,6 +870,8 @@ async function initSchema() {
   // AI foundation: per-account feature flag, usage log, user feedback.
   try {
     await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS ai_enabled BOOLEAN`);
+    // The network's own Ad Manager timezone (IANA id); report days and hours are cut in it.
+    await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS time_zone TEXT`);
     await schemaQuery(`
       CREATE TABLE IF NOT EXISTS ai_usage_log (
         id BIGSERIAL PRIMARY KEY,

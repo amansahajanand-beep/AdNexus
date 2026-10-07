@@ -1,4 +1,5 @@
 import { getToken } from '../api';
+import { reportTzHeaders } from '../reportTimezone';
 
 const API_BASE = process.env.REACT_APP_API_URL || '/api';
 
@@ -36,6 +37,8 @@ export async function postEventStream(path, body, { signal, onEvent } = {}) {
     headers: {
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
+      // The AI reads the same days the pages show.
+      ...reportTzHeaders(),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify(body),

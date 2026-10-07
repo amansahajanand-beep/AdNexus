@@ -128,19 +128,6 @@ export default function ReportSettingsFilters({
         </div>
 
         <div className="filter-field">
-          <label>Timezone</label>
-          <select
-            value={settings.timezone}
-            disabled={disabled}
-            onChange={e => set('timezone', e.target.value)}
-          >
-            {REPORT_SETTINGS_OPTIONS.timezones.map(o => (
-              <option key={o.id} value={o.id}>{o.label}</option>
-            ))}
-          </select>
-        </div>
-
-        <div className="filter-field">
           <label>Ad unit view</label>
           <select
             value={settings.adUnitView}
