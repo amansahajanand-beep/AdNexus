@@ -722,6 +722,7 @@ function GamPresets(props) {
           value={tz}
           hourlyFrom={options.hourlyFrom}
           stale={Boolean(options.stale)}
+          dataUntil={options.dataUntil}
           onChange={change}
         />
       )}

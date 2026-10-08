@@ -11,6 +11,7 @@
     "dev": "nodemon src/server.js",
     "test:session": "node scripts/test-single-session.js",
     "test:scope": "node scripts/test-publisher-scope.js",
+    "test:roi": "node scripts/test-roi-merge.js && node scripts/test-roi-timezone.js",
     "test:timezone": "node scripts/test-timezone-view.js && node scripts/test-timezone-pages.js",
     "test:ai":"node scripts/test-ai-openai.js && node scripts/test-ai-preset-analysis.js && node scripts/test-ai-mapping-alerts.js && node scripts/test-ai-ask-report.js && node scripts/test-ai-explain.js && node scripts/test-ai-forecast.js && node scripts/test-ai-timezone.js"
   },

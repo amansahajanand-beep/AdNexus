@@ -3,6 +3,8 @@ import { useDispatch, useSelector } from 'react-redux';
 import { useOutletContext, useSearchParams, Link } from 'react-router-dom';
 import PageHeader from '../components/ui/PageHeader';
 import RoiCountryTreeTable from '../components/roi/RoiCountryTreeTable';
+import TimezoneSwitcher from '../components/ui/TimezoneSwitcher';
+import useReportTimezone from '../hooks/useReportTimezone';
 import RoiSummaryBoards from '../components/roi/RoiSummaryBoards';
 import RoiInventoryEarnOverview from '../components/roi/RoiInventoryEarnOverview';
 import CompareRangeBar from '../components/ui/CompareRangeBar';
@@ -114,7 +116,7 @@ function roiLoadKeyFromApplied(applied, userId) {
   });
 }
 
-export default function Roi() {
+function RoiView() {
   const dispatch = useDispatch();
   const { user } = useAuth();
   const savedRaw = useSelector((s) => s.reports?.roi);
@@ -126,6 +128,10 @@ export default function Roi() {
   ) ? savedRaw : null;
   const cacheFresh = isReportCacheFresh(saved, ROI_POLL_MS, { clientId: user?.clientId });
   const outlet = useOutletContext() || {};
+  const mergedNetworkIds = useMemo(
+    () => (user?.role === 'admin' ? [] : (Array.isArray(outlet.mergeNetworkIds) ? outlet.mergeNetworkIds : []).filter(Boolean)),
+    [user?.role, (outlet.mergeNetworkIds || []).join(',')]
+  );
   const networkInfo = outlet.networkInfo;
   const [searchParams] = useSearchParams();
   const dateRestriction = useMemo(() => getDateRestriction(user), [user]);
@@ -176,6 +182,7 @@ export default function Roi() {
   const [roiAppsLoading, setRoiAppsLoading] = useState(false);
   const [roiCountriesLoading, setRoiCountriesLoading] = useState(false);
   const [roiCountriesFallback, setRoiCountriesFallback] = useState(false);
+  const [earnTz, setEarnTz] = useState(null);
   const [data, setData] = useState(() => (cacheFresh || saved?.data ? saved?.data : null) ?? null);
   const [loading, setLoading] = useState(() => !saved?.data);
   const [breakdownLoading, setBreakdownLoading] = useState(() => (
@@ -496,6 +503,7 @@ export default function Roi() {
         setData((prev) => mergeRoiSummaryPayload(prev, fast));
         setLastUpdated(nowTimeInTZ());
         setFetchedAt(Date.now());
+        setEarnTz(fast?.earnTimezone || null);
         setThresholdBanners(evaluateRoiThresholds(fast?.summary || fast || {}));
         setLoading(false);
         return fast;
@@ -942,7 +950,10 @@ export default function Roi() {
     (async () => {
       setInventoryLoading(true);
       try {
-        const picker = await usersAPI.getInventoryPicker();
+        // A domain user with several networks sees them together, so the sites and apps of all of them can be picked.
+        const picker = mergedNetworkIds.length > 1
+          ? await usersAPI.getMergedInventoryPicker(mergedNetworkIds)
+          : await usersAPI.getInventoryPicker();
         if (cancelled) return;
         setSiteHosts(Array.isArray(picker?.siteHosts) ? picker.siteHosts : []);
         setAppIds(Array.isArray(picker?.appIds) ? picker.appIds : []);
@@ -957,7 +968,7 @@ export default function Roi() {
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [mergedNetworkIds.join(',')]);
 
   const getPresetSnapshot = useCallback(() => filtersOnlySnapshot({
     targetType: applied?.targetType || 'all',
@@ -1379,6 +1390,7 @@ export default function Roi() {
           hint="Saves accounts, campaigns, app IDs, sites, and countries (not the date range)."
         />
       </PageHeader>
+      <RoiTimezoneNote info={earnTz} />
 
       <CompareRangeBar
         mode={compareMode}
@@ -1834,5 +1846,50 @@ export default function Roi() {
         </div>
       )}
     </div>
+  );
+}
+
+const ROI_TZ_REASON = {
+  hourly_behind: 'the newest hours are still being fetched',
+  no_hourly_data: 'hourly data is not available yet',
+  before_hourly_data: 'hourly data does not reach back to these dates',
+  country_filter: 'a country filter is applied, and country figures only exist per network day',
+};
+
+/** Says which days the earnings follow. Ads spend is reported by Google Ads in its own account days. */
+function RoiTimezoneNote({ info }) {
+  if (!info) return null;
+  if (info.applied === false) {
+    return (
+      <p className="tz-report-note" role="status">
+        Earnings are in the network timezone ({info.networkTz || 'network'}), not {info.tz}: {ROI_TZ_REASON[info.reason] || 'the selected timezone could not be applied'}.
+      </p>
+    );
+  }
+  return (
+    <p className="tz-report-note" role="status">
+      Earnings follow {info.tz} days. Country rows stay in network days ({info.networkTz}), and Ads spend stays in the Google Ads account's own days.
+    </p>
+  );
+}
+
+/** ROI with the same timezone picker as the Dashboard and Reporting; each zone remounts the view so no numbers carry over. */
+export default function Roi() {
+  const { tz, options, change } = useReportTimezone();
+  return (
+    <>
+      {options.options.length > 1 && (
+        <TimezoneSwitcher
+          networkTz={options.networkTz}
+          options={options.options}
+          value={tz}
+          hourlyFrom={options.hourlyFrom}
+          stale={Boolean(options.stale)}
+          dataUntil={options.dataUntil}
+          onChange={change}
+        />
+      )}
+      <RoiView key={tz || 'network'} />
+    </>
   );
 }

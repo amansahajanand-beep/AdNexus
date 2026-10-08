@@ -8,6 +8,72 @@ const { coerceWarehouseRevenue } = require('../utils/gamReportMetrics');
 const { adsSpendSql, adsSpendDisplayCurrency, usdToSpendCurrency } = require('../utils/adsCurrency');
 const { kpiSliceFilterSql } = require('./reportGrainStore');
 const { cache } = require('../gam/client');
+const { AsyncLocalStorage } = require('async_hooks');
+
+/**
+ * Earnings in the zone the user is viewing. GAM cuts days in the network's own timezone, so when another zone is
+ * chosen the site/app/network earnings below are rebuilt from the stored hourly data (rollup_hourly) in that zone, the
+ * same way the Dashboard and Reporting do. The zone only applies to the request that set it (see getRoiSummary).
+ * Country splits have no hourly data, so they stay in the network's days.
+ */
+const zoneStore = new AsyncLocalStorage();
+
+async function resolveEarnZone(clientId, viewTz, start, end) {
+  const hv = require('./hourlyView');
+  if (!hv.isValidTz(viewTz)) return { zone: null, meta: null };
+  const { getClientById } = require('../models/clientStore');
+  const srcTz = await require('./networkTimezone').getNetworkTz(await getClientById(clientId));
+  if (srcTz === viewTz) return { zone: null, meta: null };
+  const { todayInTZ, shiftYMD } = require('../utils/datetime');
+  const today = todayInTZ(viewTz);
+  const meta = (extra) => ({ tz: viewTz, networkTz: srcTz, ...extra });
+  for (const kind of ['network', 'inventory', 'app']) {
+    const cov = await hv.coverage(clientId, viewTz, today, srcTz, Date.now(), kind);
+    if (cov && start >= cov.from && end <= cov.through) continue;
+    if (kind === 'app' && !cov) {
+      const { rows } = await query("SELECT 1 FROM rollup_hourly WHERE client_id = $1::uuid AND kind = 'app' LIMIT 1", [clientId]);
+      if (!rows.length) continue;
+    }
+    if (end >= shiftYMD(today, -2)) {
+      // Behind on the newest hours: ask for them so the next load is covered.
+      getClientById(clientId)
+        .then((client) => client && require('./hourlySyncService').refreshNetworkHours(client))
+        .catch(() => {});
+    }
+    const reason = !cov ? 'no_hourly_data' : (end > cov.through ? 'hourly_behind' : 'before_hourly_data');
+    return { zone: null, meta: meta({ applied: false, reason }) };
+  }
+  return { zone: { clientId, tz: viewTz, srcTz }, meta: meta({ applied: true }) };
+}
+
+const activeZone = (clientId) => {
+  const z = zoneStore.getStore();
+  return z && z.clientId === clientId ? z : null;
+};
+
+/** Earn per site / app in the viewing zone: { sites: [{targetKey, earn, date?}], apps: [...] }. null = use the normal data. */
+async function zonedTargets(clientId, start, end, { perDay = false, apps, sites } = {}) {
+  const z = activeZone(clientId);
+  if (!z) return null;
+  const hv = require('./hourlyView');
+  const base = { clientId, startDate: start, endDate: end, tz: z.tz, srcTz: z.srcTz, perDay };
+  const want = (list) => list === undefined || list.length > 0;
+  const [siteRows, appRows] = await Promise.all([
+    want(sites) ? hv.hourlyTargets({ ...base, kind: 'inventory', keys: sites }) : [],
+    want(apps) ? hv.hourlyTargets({ ...base, kind: 'app', keys: apps }) : [],
+  ]);
+  const shape = (r) => ({ ...(perDay ? { date: r.date } : {}), targetKey: r.key, earn: r.earn });
+  return { sites: siteRows.map(shape), apps: appRows.map(shape) };
+}
+
+async function zonedNetworkEarn(clientId, start, end) {
+  const z = activeZone(clientId);
+  if (!z) return null;
+  const days = await require('./hourlyView').hourlyTrend({
+    clientId, startDate: start, endDate: end, tz: z.tz, srcTz: z.srcTz, kind: 'network',
+  });
+  return round2(days.reduce((a, d) => a + d.earning, 0));
+}
 
 /** Prefer cost_native (Google Ads account currency) so totals match the Ads UI. */
 const SPEND = (alias = 's') => adsSpendSql(alias);
@@ -168,6 +234,8 @@ async function metricsFor(earn, adsSpend, otherExpenses, engagement = {}, { endD
  * Do NOT sum inventory_core + app_id (those overlap and ~2× Overview).
  */
 async function loadCanonicalGamEarn(clientId, start, end) {
+  const zoned = await zonedNetworkEarn(clientId, start, end);
+  if (zoned != null) return zoned;
   // Prefer network rollup (same source as dashboard overview) — one row/day, avoids
   // contending with grain scans while Ads/GAM sync holds pool connections.
   try {
@@ -260,6 +328,11 @@ async function loadAdsLinkedGamEarn(clientId, start, end, spendOpts = {}) {
   const uniqSites = [...new Set(siteKeys)];
   if (!uniqApps.length && !uniqSites.length) return 0;
 
+  const zoned = await zonedTargets(clientId, start, end, {
+    apps: uniqApps, sites: uniqSites.map((k) => normSiteHost(k)).filter(Boolean),
+  });
+  if (zoned) return round2([...zoned.sites, ...zoned.apps].reduce((a, r) => a + r.earn, 0));
+
   let earn = 0;
   if (uniqApps.length) {
     const appParams = [clientId, start, end, uniqApps];
@@ -300,6 +373,10 @@ async function loadAdsLinkedGamEarn(clientId, start, end, spendOpts = {}) {
 
 /** Daily per site/app earn for ROI table rows (attribution), not for network summary. */
 async function loadGamEarnByTargetDaily(clientId, start, end, { countryNames = null } = {}) {
+  if (!(Array.isArray(countryNames) && countryNames.length)) {
+    const zoned = await zonedTargets(clientId, start, end, { perDay: true });
+    if (zoned) return zoned;
+  }
   const countryFilter = Array.isArray(countryNames) && countryNames.length
     ? countryNames.map((n) => String(n).trim().toLowerCase()).filter(Boolean)
     : null;
@@ -365,6 +442,10 @@ async function loadGamEarnByTargetDaily(clientId, start, end, { countryNames = n
 
 /** Per site/app earn totals (no daily grain) — used when ROI table rows are not requested. */
 async function loadGamEarnByTargetAggregated(clientId, start, end, { countryNames = null } = {}) {
+  if (!(Array.isArray(countryNames) && countryNames.length)) {
+    const zoned = await zonedTargets(clientId, start, end);
+    if (zoned) return zoned;
+  }
   const countryFilter = Array.isArray(countryNames) && countryNames.length
     ? countryNames.map((n) => String(n).trim().toLowerCase()).filter(Boolean)
     : null;
@@ -437,6 +518,17 @@ async function loadGamEarnByTargetAggregatedScoped(clientId, start, end, {
   const countryFilter = Array.isArray(countryNames) && countryNames.length
     ? countryNames.map((n) => String(n).trim().toLowerCase()).filter(Boolean)
     : null;
+  if (!countryFilter?.length) {
+    const zoned = await zonedTargets(clientId, start, end, {
+      apps, sites: sites.map((k) => normSiteHost(k)).filter(Boolean),
+    });
+    if (zoned) {
+      // The same site can appear under its bare and www. spelling: add them up.
+      const merged = new Map();
+      for (const r of zoned.sites) merged.set(r.targetKey, (merged.get(r.targetKey) || 0) + r.earn);
+      return { sites: [...merged].map(([targetKey, earn]) => ({ targetKey, earn })), apps: zoned.apps };
+    }
+  }
 
   const outSites = [];
   const outApps = [];
@@ -2783,7 +2875,8 @@ async function buildRoiCountryBreakdown(clientId, {
  * Build ROI summary with separate ROI% for Ads spend and for other expenses.
  * Table rows are daily (date × site/app), plus unmapped Ads spend rows by account.
  */
-async function getRoiSummary(clientId, {
+async function getRoiSummaryInner(clientId, {
+  zoneKey = null,
   start,
   end,
   targetType = 'all',
@@ -2799,7 +2892,7 @@ async function getRoiSummary(clientId, {
 } = {}) {
   const cacheKey = breakdownOnly
     ? `roi_bd_v17_${clientId}_${JSON.stringify({
-      start, end, targetType, accountIds, campaignIds, appKeys, siteKeys, countryCodes, includeDaily,
+      start, end, targetType, accountIds, campaignIds, appKeys, siteKeys, countryCodes, includeDaily, zoneKey,
     })}`
     : `roi_sum_v17_${clientId}_${JSON.stringify({
       start,
@@ -2814,6 +2907,7 @@ async function getRoiSummary(clientId, {
       summaryOnly,
       breakdownOnly,
       includeDaily,
+      zoneKey,
     })}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
@@ -3513,8 +3607,27 @@ function invalidateRoiSummaryCache(clientId) {
   return keys.length;
 }
 
+/**
+ * ROI summary / breakdown for a network. `viewTz` is the zone the user is viewing: site, app and network earnings are
+ * then the earnings of that zone's days (see resolveEarnZone). The result says whether it was applied (earnTimezone).
+ */
+async function getRoiSummary(clientId, opts = {}) {
+  const { viewTz = null, ...rest } = opts;
+  if (!viewTz) return getRoiSummaryInner(clientId, rest);
+  if (Array.isArray(rest.countryCodes) && rest.countryCodes.length) {
+    const data = await getRoiSummaryInner(clientId, rest);
+    return { ...data, earnTimezone: { tz: viewTz, applied: false, reason: 'country_filter' } };
+  }
+  const { zone, meta } = await resolveEarnZone(clientId, viewTz, rest.start, rest.end);
+  const run = () => getRoiSummaryInner(clientId, { ...rest, zoneKey: zone ? zone.tz : null });
+  const data = zone ? await zoneStore.run(zone, run) : await run();
+  return meta ? { ...data, earnTimezone: meta } : data;
+}
+
 module.exports = {
   getRoiSummary,
+  // for tests
+  _earn: { zoneStore, loadGamEarnByTargetAggregatedScoped, loadGamEarnByTargetDaily, loadAdsLinkedGamEarn, loadCanonicalGamEarn },
   roiPercent,
   metricsFor,
   adsEngagementMetrics,
