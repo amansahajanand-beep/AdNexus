@@ -913,8 +913,12 @@ function RoiView() {
     (async () => {
       setRoiSitesLoading(true);
       try {
-        const res = await adsAPI.listRoiSites();
+        // A domain user with several networks is offered the assigned sites of all of them.
+        const lists = mergedNetworkIds.length > 1
+          ? await Promise.all(mergedNetworkIds.map((id) => adsAPI.listRoiSites(undefined, id).catch(() => null)))
+          : [await adsAPI.listRoiSites()];
         if (cancelled) return;
+        const res = { sites: lists.filter(Boolean).flatMap((r) => r.sites || []) };
         const opts = (res.sites || []).map((s) => ({
           value: String(s.id || '').toLowerCase(),
           label: s.label || s.id,
@@ -943,7 +947,7 @@ function RoiView() {
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [mergedNetworkIds.join(",")]);
 
   useEffect(() => {
     let cancelled = false;

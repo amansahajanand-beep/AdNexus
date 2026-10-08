@@ -1162,13 +1162,18 @@ router.get('/roi-sites', async (req, res) => {
        ORDER BY site_name ASC`,
       [clientId]
     );
-    const payload = {
-      sites: (rows || []).map((r) => ({
-        id: String(r.site_key || '').toLowerCase(),
-        label: String(r.site_name || r.site_key || '').trim().replace(/^www\./i, ''),
-      })).filter((s) => s.id),
-    };
-    const cacheKey = roiFilterCacheKey('sites', clientId, { source: 'dim_site_subdomains_v1' });
+    let sites = (rows || []).map((r) => ({
+      id: String(r.site_key || '').toLowerCase(),
+      label: String(r.site_name || r.site_key || '').trim().replace(/^www\./i, ''),
+    })).filter((s) => s.id);
+    // A domain user is offered only their assigned sites (and the sites under their assigned domains).
+    const scope = await require('../services/roiScope').roiInventoryScope(req.user, clientId);
+    if (scope) {
+      const ok = new Set(scope.sites);
+      sites = sites.filter((s) => ok.has(s.id));
+    }
+    const payload = { sites };
+    const cacheKey = roiFilterCacheKey('sites', clientId, { source: 'dim_site_subdomains_v1', user: scope ? req.user.id : 'all' });
     return sendRoiTargets(req, res, cacheKey, payload, 300);
   } catch (err) {
     logger.error('ROI sites list:', err.message);
