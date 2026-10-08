@@ -60,7 +60,7 @@ FAST_API.interceptors.request.use(attachAuth);
  * days it has hourly data for in this zone and leaves older days as they are.
  */
 export { setReportTz, getReportTz };
-const TZ_URL = /^\/?(reports\/(dashboard|detailed|domain-user)|ai\/)/;
+const TZ_URL = /^\/?(reports\/(dashboard|detailed|domain-user)|roi\/|ai\/)/;
 function attachReportTz(config) {
   const tz = getReportTz();
   if (tz && TZ_URL.test(String(config.url || ''))) {

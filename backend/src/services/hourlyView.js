@@ -334,6 +334,37 @@ async function hourlyByHour({
 }
 
 /**
+ * Earnings per site host (kind 'inventory') or app id (kind 'app') over the local days of `tz`, unrounded, for the ROI
+ * page. `keys` limits it to those hosts / ids (site hosts compare without a leading "www."); perDay adds the local date.
+ */
+async function hourlyTargets({
+  clientId, startDate, endDate, tz, srcTz = SRC_TZ, kind = 'inventory', keys = null, perDay = false,
+}) {
+  const params = zonedParams(clientId, startDate, endDate, srcTz, tz);
+  const keyExpr = kind === 'inventory'
+    ? "LOWER(TRIM(REGEXP_REPLACE(h.dim_b, '^www[.]', '', 'i')))"
+    : 'LOWER(TRIM(h.dim_b))';
+  let keyClause = '';
+  if (Array.isArray(keys) && keys.length) {
+    params.push(keys.map((k) => String(k).trim().toLowerCase()));
+    keyClause = ` AND ${keyExpr} = ANY($${params.length}::text[])`;
+  }
+  const { rows } = await query(
+    withZones(`SELECT ${perDay ? "to_char(ld, 'YYYY-MM-DD')" : 'NULL'} AS date, k, SUM(revenue)::float8 AS revenue
+               FROM (
+                 SELECT ${LOCAL_TS()}::date AS ld, ${keyExpr} AS k, h.revenue * 0.5 AS revenue
+                 FROM rollup_hourly h ${HALVES}
+                 WHERE h.client_id = $1::uuid AND h.kind = '${kind}' AND NULLIF(TRIM(h.dim_b), '') IS NOT NULL
+                   AND h.report_date BETWEEN $2::date AND $3::date${keyClause}
+               ) x
+               WHERE ld BETWEEN $4::date AND $5::date
+               GROUP BY ${perDay ? 'ld, ' : ''}k`, 6),
+    params
+  );
+  return rows.map((r) => ({ date: r.date, key: r.k, earn: Number(r.revenue) || 0 }));
+}
+
+/**
  * Trend, rows and totals for local days [startDate, endDate] (already clamped to covered days).
  * filters: { domains[], sites[], apps[] } — any of them switches totals to the filtered slice.
  */
@@ -418,5 +449,5 @@ function summaryFromTrend(trend, rows, { viewability = 0, currency = 'USD' } = {
   };
 }
 
-module.exports = { SRC_TZ, timezoneOptions, isValidTz, coverage, coverageFrom, wallToInstant, localMidnight, buildHourlyView, buildScopedHourlyView, hourlyTrend, hourlyRows, hourlyByHour, rowFor, summaryFromTrend,
+module.exports = { SRC_TZ, timezoneOptions, isValidTz, coverage, coverageFrom, wallToInstant, localMidnight, buildHourlyView, buildScopedHourlyView, hourlyTrend, hourlyRows, hourlyByHour, hourlyTargets, rowFor, summaryFromTrend,
 };
