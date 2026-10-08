@@ -43,4 +43,14 @@ assert.strictEqual(site.ecpm, 150);                         // earn-only row: re
 assert.strictEqual(a.summary.adsSpend, 100);                // the inputs (cached by the ROI service) are never changed
 assert.strictEqual(mergeRoiParts([a]), a);
 assert.strictEqual(mergeRoiParts([null, a]), a);
+// the same country listed as US (with Ads spend) and as UNITED_STATES (sites only) is one country
+const c1 = { countryBreakdown: [{ countryCode: 'US', countryName: 'United States', adsSpend: 10, earn: 5, impressions: 1, clicks: 0, conversions: 0 }],
+  countryTargetBreakdown: [{ adsAccountId: 'a1', targetType: 'app', targetKey: 'com.x', countryCode: 'US', countryName: 'United States', adsSpend: 10, earn: 5 }], countryTargetDailyBreakdown: [] };
+const c2 = { countryBreakdown: [{ countryCode: 'UNITED_STATES', countryName: 'UNITED_STATES', adsSpend: 0, earn: 7, impressions: 0, clicks: 0, conversions: 0 }],
+  countryTargetBreakdown: [{ adsAccountId: 'gam-sites', targetType: 'site', targetKey: 's.com', countryCode: 'UNITED_STATES', countryName: 'UNITED_STATES', adsSpend: 0, earn: 7, earnOnly: true }], countryTargetDailyBreakdown: [] };
+const u = mergeRoiParts([c1, c2]);
+assert.strictEqual(u.countryBreakdown.length, 1);
+assert.strictEqual(u.countryBreakdown[0].countryCode, 'US');
+assert.strictEqual(u.countryBreakdown[0].earn, 12);
+assert.ok(u.countryTargetBreakdown.every((r) => r.countryCode === 'US'));
 console.log('All checks passed');

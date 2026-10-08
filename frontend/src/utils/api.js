@@ -420,7 +420,10 @@ export const adsAPI = {
   listCampaigns: (id) => FAST_API.get(`/ads/accounts/${id}/campaigns`),
   listRoiCampaigns: (params) => FAST_API.get('/ads/roi-campaigns', { params }),
   listRoiAccounts: (params) => FAST_API.get('/ads/roi-accounts', { params }),
-  listRoiSites: (params) => FAST_API.get('/ads/roi-sites', { params }),
+  listRoiSites: (params, clientId) => FAST_API.get('/ads/roi-sites', {
+    params,
+    ...(clientId ? { headers: { 'X-Gam-Client-Id': String(clientId) } } : {}),
+  }),
   listRoiRelatedTargets: (params) => FAST_API.get('/ads/roi-related-targets', { params }),
   listRoiCountries: (params) => FAST_API.get('/ads/roi-countries', { params }),
   listCampaignMaps: () => FAST_API.get('/ads/campaign-maps'),

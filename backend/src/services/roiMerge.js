@@ -66,10 +66,39 @@ const dedupeBy = (lists, keyOf) => {
   return [...seen.values()];
 };
 
+const countryName = (r) => String(r.countryName || r.countryCode || '').trim().toLowerCase().replace(/_/g, ' ');
+
+/**
+ * A country with no Ads spend in a network is listed under a code made from its name (UNITED_STATES), while the same
+ * country with spend carries its real code (US). Across networks they are one country: copy every row so the real
+ * two-letter code (and its name) is used for all of them.
+ */
+function unifyCountries(parts) {
+  const real = new Map();
+  for (const p of parts) {
+    for (const k of ['countryBreakdown', 'countryTargetBreakdown', 'countryTargetDailyBreakdown']) {
+      for (const r of p[k] || []) {
+        if (/^[A-Za-z]{2}$/.test(String(r.countryCode || '')) && r.countryName) real.set(countryName(r), { code: String(r.countryCode).toUpperCase(), name: r.countryName });
+      }
+    }
+  }
+  const fix = (r) => {
+    if (/^[A-Za-z]{2}$/.test(String(r.countryCode || ''))) return r;
+    const hit = real.get(countryName(r));
+    return hit ? { ...r, countryCode: hit.code, countryName: hit.name } : r;
+  };
+  return parts.map((p) => ({
+    ...p,
+    ...Object.fromEntries(['countryBreakdown', 'countryTargetBreakdown', 'countryTargetDailyBreakdown']
+      .filter((k) => Array.isArray(p[k])).map((k) => [k, p[k].map(fix)])),
+  }));
+}
+
 /** parts: the getRoiSummary results of each network (any of summaryOnly, breakdownOnly or full). */
 function mergeRoiParts(parts) {
-  const ok = parts.filter(Boolean);
-  if (ok.length <= 1) return ok[0] || null;
+  const found = parts.filter(Boolean);
+  if (found.length <= 1) return found[0] || null;
+  const ok = unifyCountries(found);
   const first = ok[0];
   const out = { ...first };
 

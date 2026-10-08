@@ -5,6 +5,7 @@ const { getRoiSummary } = require('../services/roiService');
 const { todayInTZ } = require('../utils/datetime');
 const { resolveAdsAccountIdsForUser, getAllowedClientIds } = require('../utils/permissions');
 const { mergeRoiParts } = require('../services/roiMerge');
+const { roiInventoryScope, limitKeys } = require('../services/roiScope');
 const logger = require('../utils/logger');
 
 router.use(requireAuth);
@@ -45,7 +46,7 @@ router.get('/summary', async (req, res) => {
 
     // The zone the user is viewing (same header the Dashboard and Reporting send): earnings follow it.
     const viewTz = String(req.headers['x-report-tz'] || req.query.tz || '').trim() || null;
-    const opts = {
+    const baseOpts = {
       viewTz,
       start,
       end,
@@ -59,6 +60,18 @@ router.get('/summary', async (req, res) => {
       summaryOnly,
       breakdownOnly,
       includeDaily,
+    };
+    // A domain user only ever sees their assigned sites and apps (assigned domains count for every site under them),
+    // whatever the page asks for. Each network resolves the assignment against its own site list.
+    const optsFor = async (id) => {
+      const scope = await roiInventoryScope(req.user, id);
+      if (!scope) return baseOpts;
+      const host = (v) => String(v || '').trim().toLowerCase().replace(/^www\./, '');
+      return {
+        ...baseOpts,
+        siteKeys: limitKeys(siteKeys, scope.sites, host),
+        appKeys: limitKeys(appKeys, scope.apps, (v) => String(v).trim().toLowerCase()),
+      };
     };
 
     // A domain user with several networks sees them together (the Dashboard does the same): each network's ROI is
@@ -74,6 +87,7 @@ router.get('/summary', async (req, res) => {
         const runtime = id === String(clientId) ? (req.client || await getClientById(id)) : await getClientById(id);
         if (!runtime) return null;
         // Some loaders read the active network from the request context, so each runs inside its own.
+        const opts = await optsFor(id);
         return runWithClient(runtime, () => getRoiSummary(id, opts));
       }));
       const parts = results.filter((r) => r.status === 'fulfilled').map((r) => r.value).filter(Boolean);
@@ -87,7 +101,7 @@ router.get('/summary', async (req, res) => {
       // One note for the combined view: the first network whose earnings could not follow the zone, else the zone.
       if (metas.length) data.earnTimezone = metas.find((m) => m.applied === false) || metas[0];
     } else {
-      data = await getRoiSummary(clientId, opts);
+      data = await getRoiSummary(clientId, await optsFor(clientId));
     }
     res.json({
       start,
