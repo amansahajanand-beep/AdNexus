@@ -1525,6 +1525,9 @@ async function runCatalogReport(token) {
         '| rows:', appRaw.length,
         '| packages:', Object.keys(appPackageMaps.byPackage).length
       );
+      // First scan that returns rows already carries app id + name; the remaining ~30k-row
+      // GAM reports only re-download the same apps and made every rebuild ~2x slower.
+      break;
     } catch (err) {
       logger.warn(`App package scan failed for [${dims.join(', ')}]: ${err.message}`);
     }
@@ -1846,15 +1849,20 @@ async function ensureInventoryCatalog(token) {
   }
 }
 
+const LEGACY_CATALOG_KEYS = ['filter_catalog_inventory_v26', 'filter_catalog_inventory_v25'];
 let catalogBgRefresh = null;
-const CATALOG_STALE_MS = 10 * 60 * 1000; // refresh from GAM in background after 10 min
+// The catalog is rebuilt by the 00:05 daily cron (cron/index.js). Page loads only trigger a
+// safety-net rebuild if the saved copy is over a day old (e.g. the cron missed a run).
+const CATALOG_STALE_MS = 25 * 60 * 60 * 1000;
 
 function catalogIsStale(payload) {
   const t = Number(payload?.generatedAt) || 0;
-  return !t || (Date.now() - t) > CATALOG_STALE_MS;
+  // Payloads without a timestamp (older versions) are judged by their Postgres age instead,
+  // so they don't trigger a rebuild on every request.
+  return t > 0 && (Date.now() - t) > CATALOG_STALE_MS;
 }
 
-function scheduleCatalogBackgroundRefresh(token) {
+function scheduleCatalogBackgroundRefresh(token, { ignoreGate = false } = {}) {
   if (!token || catalogBgRefresh) return;
   const { getClient, runWithClient } = require('../utils/clientContext');
   const startedFor = getClient();
@@ -1864,7 +1872,7 @@ function scheduleCatalogBackgroundRefresh(token) {
     try {
       try {
         const { isTodayPriorityActive } = require('./syncPriorityGate');
-        if (await isTodayPriorityActive()) {
+        if (!ignoreGate && await isTodayPriorityActive()) {
           logger.info(
             `Filter catalog: background refresh deferred — today-priority active`
             + ` client=${String(startedId).slice(0, 8)}`
@@ -1935,6 +1943,20 @@ async function getFilterCatalog(token, { allowStale = true, forceRefresh = false
         );
         if (token && (ageMs > CATALOG_STALE_MS || catalogIsStale(db.payload))) scheduleCatalogBackgroundRefresh(token);
         return db.payload;
+      }
+    }
+  }
+
+  // Cold start after a catalog version bump: serve the previous version's copy right away and
+  // rebuild in the background, instead of making the first request wait ~80s on GAM.
+  if (!forceRefresh && allowStale && token) {
+    for (const legacyKey of LEGACY_CATALOG_KEYS) {
+      const old = await kvGet(legacyKey);
+      if (old?.payload?.rows?.length) {
+        cache.set(catalogCacheKey(), old.payload, 300);
+        logger.info(`Filter catalog served from previous version ${legacyKey} while rebuilding (${old.payload.rows.length} rows)`);
+        scheduleCatalogBackgroundRefresh(token, { ignoreGate: true });
+        return old.payload;
       }
     }
   }
@@ -5380,7 +5402,16 @@ async function handleTopAdvertisers(req, res) {
   }
 }
 
+/** Rebuild + persist the filter catalog for the active client (startup warm-up; non-blocking callers). */
+async function warmFilterCatalog() {
+  const token = await getToken();
+  const fresh = await getFilterCatalog(token, { allowStale: false, forceRefresh: true });
+  if (fresh?.rows?.length) cache.set(catalogCacheKey(), fresh, REPORT_CACHE_TTL);
+  return fresh;
+}
+
 module.exports = {
+  warmFilterCatalog,
   runDetailedReport,
   runProgrammaticReport,
   handleRangeReport,

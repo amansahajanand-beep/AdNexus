@@ -1297,6 +1297,16 @@ async function finishTenantBackfill() {
 
   for (const table of TENANT_TABLES) {
     try {
+      // ALTER TABLE / DROP POLICY take an ACCESS EXCLUSIVE lock that queues behind running
+      // queries and stalls every new report query on report_grain at each restart. Skip when
+      // RLS + the tenant policy are already in place.
+      const { rows: rls } = await schemaQuery(
+        `SELECT c.relrowsecurity AS on, c.relforcerowsecurity AS forced,
+                EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid AND p.polname = 'tenant_isolation') AS has_policy
+         FROM pg_class c WHERE c.oid = to_regclass($1)`,
+        [table]
+      );
+      if (rls[0]?.on && rls[0]?.forced && rls[0]?.has_policy) continue;
       await schemaQuery(`ALTER TABLE ${safeIdent(table)} ENABLE ROW LEVEL SECURITY`);
       await schemaQuery(`ALTER TABLE ${safeIdent(table)} FORCE ROW LEVEL SECURITY`);
       await schemaQuery(`DROP POLICY IF EXISTS tenant_isolation ON ${table}`);
