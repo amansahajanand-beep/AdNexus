@@ -179,10 +179,19 @@ function isMobileAppRow(row = {}) {
   return rowIsMobileApp(row);
 }
 
+/** Ad-unit filter match: name may sit in `site` (legacy rows) or AD_UNIT_NAME (SQL/grain rows). */
+function rowMatchesAdUnitFilter(row, adUnits = []) {
+  if (!adUnits.length) return true;
+  const set = new Set(adUnits.map((a) => String(a).toLowerCase().trim()));
+  return [row.site, row.AD_UNIT_NAME, row.ad_unit_name, row.adUnit].some(
+    (n) => n && set.has(String(n).toLowerCase().trim())
+  );
+}
+
 /** Admin / manual filters: AND across every active dimension. */
 function rowMatchesInventoryFilters(row, { apps = [], adUnits = [], domains = [], siteUrls = [] } = {}, matchOpts = {}) {
   if (apps.length && !rowMatchesAppFilter(row, apps)) return false;
-  if (adUnits.length && !adUnits.includes(row.site)) return false;
+  if (adUnits.length && !rowMatchesAdUnitFilter(row, adUnits)) return false;
   if (!rowMatchesDomainFilter(row, domains)) return false;
   if (!rowMatchesSiteFilter(row, siteUrls, matchOpts)) return false;
   return true;
@@ -215,7 +224,7 @@ function rowMatchesScopedInventoryFilter(row, { apps = [], adUnits = [], domains
     else webOk = hasSite ? siteOk : domOk;
   }
   if (hasAd) {
-    webOk = webOk && adUnits.includes(row.site);
+    webOk = webOk && rowMatchesAdUnitFilter(row, adUnits);
   }
 
   const appOk = rowMatchesAppFilter(row, apps);

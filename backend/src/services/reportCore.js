@@ -3921,7 +3921,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v24_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v25_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3964,19 +3964,22 @@ async function handleDashboard(req, res) {
       let webInventoryOr = false;
       // GAM Domain ∩ Site: exact inv_domain / inv_site match (no LIKE '%domain%').
       let skipAdUnitLike = true;
+      let dashAdUnitNames = toFilterArray(filters.domainName);
       // Scoped children must never see network-wide SQL aggregates.
       if (isScopedChild) {
         const scoped = resolveScopedSqlInventoryOpts(req.user, filters);
         domains = scoped.domains;
         sites = scoped.sites;
         apps = scoped.apps;
+        // Assigned ad units bound the query (empty request → all assigned units).
+        dashAdUnitNames = scoped.adUnitNames || dashAdUnitNames;
         webInventoryOr = !!scoped.webInventoryOr;
         skipAdUnitLike = scoped.skipAdUnitLike !== false;
       }
       const compat = await fetchLeanDashboardBundleCompatible(svc, filters.startDate, filters.endDate, {
         domains,
         sites,
-        adUnitNames: toFilterArray(filters.domainName),
+        adUnitNames: dashAdUnitNames,
         apps,
         countryNames: toFilterArray(filters.country).map((c) => String(c)),
         currency,
@@ -4517,7 +4520,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v37_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v39_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4606,6 +4609,7 @@ async function handleDetailedReport(req, res) {
     let domains = toFilterArray(filters.domain);
     let sites = toFilterArray(filters.site);
     let apps = toFilterArray(filters.domainId);
+    let adUnitNames = toFilterArray(filters.domainName);
     let webInventoryOr = false;
     let skipAdUnitLike = true;
     const isScopedChild = req.user?.role !== 'admin' && userHasAssignedInventory(req.user);
@@ -4614,6 +4618,8 @@ async function handleDetailedReport(req, res) {
       domains = scoped.domains;
       sites = scoped.sites;
       apps = scoped.apps;
+      // Assigned ad units bound the query (empty request → all assigned units).
+      adUnitNames = scoped.adUnitNames || adUnitNames;
       webInventoryOr = !!scoped.webInventoryOr;
       skipAdUnitLike = scoped.skipAdUnitLike !== false;
     }
@@ -4665,7 +4671,7 @@ async function handleDetailedReport(req, res) {
       needUnfilled: originalMetIds.some((m) => String(m).toLowerCase() === 'total_fill_rate'),
       domains,
       sites,
-      adUnitNames: toFilterArray(filters.domainName),
+      adUnitNames,
       apps,
       countryNames: resolveCountryNamesForDb(filters.country),
       currency,
