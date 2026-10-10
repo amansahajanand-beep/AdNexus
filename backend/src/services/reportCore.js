@@ -4266,14 +4266,18 @@ async function handleFilterCatalog(req, res) {
       if (!sitesByDomain[root]) sitesByDomain[root] = [];
       if (!sitesByDomain[root].includes(host)) sitesByDomain[root].push(host);
     });
+    const adUnits = [...(scope?.adUnits || [])]
+      .map((v) => String(req.user?.permissions?.allowedAdUnits?.find((x) => String(x).toLowerCase().trim() === v) || v))
+      .sort((a, b) => a.localeCompare(b));
     return res.json({
       rows: [],
       domainRoots,
       siteHosts,
       sitesByDomain,
       adUnitsByHost: {},
+      adUnits,
       appPackages,
-      noDomainsAssigned: domainRoots.length === 0 && siteHosts.length === 0 && appPackages.length === 0,
+      noDomainsAssigned: domainRoots.length === 0 && siteHosts.length === 0 && appPackages.length === 0 && adUnits.length === 0,
       noInventoryAssigned: false,
       fromAssignment: true,
     });
