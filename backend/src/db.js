@@ -1197,6 +1197,16 @@ async function finishTenantBackfill() {
         );
         if (rows.length) continue;
       }
+      // CREATE INDEX IF NOT EXISTS still takes a SHARE lock before noticing the index exists,
+      // which queues behind running reports and blocks writers on every restart. Probe first.
+      const createIdx = sql.match(/^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+IF NOT EXISTS\s+(\w+)/i);
+      if (createIdx) {
+        const { rows } = await schemaQuery(
+          `SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1 LIMIT 1`,
+          [createIdx[1].toLowerCase()]
+        );
+        if (rows.length) continue;
+      }
       await schemaQuery(sql);
     } catch (e) {
       logger.warn('Schema DDL skipped:', e.message);
@@ -1254,6 +1264,21 @@ async function finishTenantBackfill() {
   ];
   for (const [table, newName, cols] of pkSwaps) {
     try {
+      // Dropping + re-adding the PK rebuilds its index under an ACCESS EXCLUSIVE lock and blocks
+      // every query on the table on EACH restart. Only swap when the key is not already right.
+      const { rows: cur } = await schemaQuery(
+        `SELECT c.conname, pg_get_constraintdef(c.oid) AS def
+         FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+         JOIN pg_namespace n ON n.oid = t.relnamespace
+         WHERE n.nspname = 'public' AND t.relname = $1 AND c.contype = 'p'`,
+        [table]
+      );
+      const wantCols = cols.replace(/[()\s]/g, '');
+      if (cur.length === 1
+        && cur[0].conname === newName
+        && String(cur[0].def).replace(/PRIMARY KEY|[()\s]/g, '') === wantCols) {
+        continue;
+      }
       const pks = await listConstraints(table, ['p']);
       for (const pk of pks) {
         await schemaQuery(`ALTER TABLE ${safeIdent(table)} DROP CONSTRAINT IF EXISTS ${safeIdent(pk.conname)}`);
@@ -1267,7 +1292,17 @@ async function finishTenantBackfill() {
   for (const table of TENANT_TABLES) {
     if (table === 'sync_log') continue;
     try {
+      // SET NOT NULL scans the whole table under an ACCESS EXCLUSIVE lock — skip when already set.
+      const { rows: nn } = await schemaQuery(
+        `SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = $1 AND column_name = 'client_id'`,
+        [table.toLowerCase()]
+      );
+      if (nn[0] && nn[0].is_nullable === 'NO') {
+        // already NOT NULL
+      } else {
       await schemaQuery(`ALTER TABLE ${safeIdent(table)} ALTER COLUMN client_id SET NOT NULL`);
+      }
     } catch (e) {
       logger.warn(`NOT NULL client_id on ${table}:`, e.message);
     }

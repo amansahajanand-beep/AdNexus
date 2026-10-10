@@ -205,11 +205,12 @@ function rowMatchesUserScope(row, scope, siteCtx = null) {
   const hasWebScope = !!(scope.domains?.size || scope.sites?.size);
   const hasAdUnitScope = !!scope.adUnits?.size;
 
-  // Ad units alone grant exactly those units; combined with domains/sites/apps they
-  // narrow that grant (same AND semantics the SQL filter uses).
+  // An assigned ad unit is its own grant: a row for that ad unit is always visible (ad-unit
+  // rows carry no app id / site, so AND-ing with app or site scope would hide every row).
+  // Other assigned inventory (domains / sites / apps) is matched below as before.
   if (hasAdUnitScope) {
-    if (!rowMatchesAllowedAdUnits(row, scope.adUnits)) return false;
-    if (!hasAppScope && !hasWebScope) return true;
+    if (rowMatchesAllowedAdUnits(row, scope.adUnits)) return true;
+    if (!hasAppScope && !hasWebScope) return false;
   }
 
   if (hasAppScope && hasWebScope) {

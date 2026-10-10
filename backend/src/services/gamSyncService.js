@@ -1999,17 +1999,28 @@ async function rebuildRollupsForDates(dates, syncType = 'rollup') {
 }
 
 /** One-shot: rebuild rollups for lean dates not yet covered (post-deploy warm). */
+let rollupBackfillRunning = false;
 async function backfillAllRollups(syncType = 'rollup-backfill') {
+  // Only the last ROLLUP_BACKFILL_DAYS (default 45): a full-history scan took ~15 min per network.
+  // One scan at a time: concurrent/restart-stacked scans of report_grain hold the table busy
+  // and block rollup DDL + dashboard queries for minutes.
+  if (rollupBackfillRunning) return 0;
+  rollupBackfillRunning = true;
   try {
+    // Per-day probes (index on client_id, report_date) instead of an anti-join over every grain row.
     const { rows } = await query(`
-      SELECT DISTINCT to_char(g.report_date, 'YYYY-MM-DD') AS d
-      FROM report_grain g
-      WHERE NOT EXISTS (
-        SELECT 1 FROM rollup_kpi_daily r
-        WHERE r.client_id = g.client_id AND r.report_date = g.report_date
-      )
+      SELECT to_char(d.day, 'YYYY-MM-DD') AS d
+      FROM generate_series(CURRENT_DATE - $2::int, CURRENT_DATE, '1 day'::interval) AS d(day)
+      WHERE EXISTS (
+          SELECT 1 FROM report_grain g
+          WHERE g.client_id = $1::uuid AND g.report_date = d.day::date
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM rollup_kpi_daily r
+          WHERE r.client_id = $1::uuid AND r.report_date = d.day::date
+        )
       ORDER BY 1
-    `);
+    `, [requireClientId(), parseInt(process.env.ROLLUP_BACKFILL_DAYS || '45', 10) || 45]);
     const dates = rows.map((r) => r.d).filter(Boolean);
     if (!dates.length) {
       logger.info(`[${syncType}] Rollups already up to date`);
@@ -2027,6 +2038,8 @@ async function backfillAllRollups(syncType = 'rollup-backfill') {
   } catch (e) {
     logger.warn(`[${syncType}] backfill skipped:`, e.message);
     return 0;
+  } finally {
+    rollupBackfillRunning = false;
   }
 }
 
