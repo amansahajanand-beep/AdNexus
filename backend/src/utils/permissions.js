@@ -33,6 +33,7 @@ function getUserInventoryScope(user) {
     domains: toOptionalSet(perms.allowedDomains),
     sites: toOptionalSet(perms.allowedSites),
     appIds: toOptionalSet(perms.allowedAppIds),
+    adUnits: toOptionalSet(perms.allowedAdUnits),
   };
 }
 
@@ -186,7 +187,14 @@ function rowMatchesWebScope(row, scope, siteCtx = null) {
 
 function scopeHasAssignment(scope) {
   if (!scope) return true;
-  return !!(scope.domains?.size || scope.sites?.size || scope.appIds?.size);
+  return !!(scope.domains?.size || scope.sites?.size || scope.appIds?.size || scope.adUnits?.size);
+}
+
+/** Ad-unit grant: row's ad unit name is one of the assigned ad units. */
+function rowMatchesAllowedAdUnits(row, adUnitSet) {
+  if (!adUnitSet?.size) return false;
+  const names = [row.site, row.AD_UNIT_NAME, row.ad_unit_name, row.adUnit];
+  return names.some((n) => n && n !== '—' && adUnitSet.has(norm(n)));
 }
 
 function rowMatchesUserScope(row, scope, siteCtx = null) {
@@ -195,6 +203,14 @@ function rowMatchesUserScope(row, scope, siteCtx = null) {
 
   const hasAppScope = !!scope.appIds?.size;
   const hasWebScope = !!(scope.domains?.size || scope.sites?.size);
+  const hasAdUnitScope = !!scope.adUnits?.size;
+
+  // Ad units alone grant exactly those units; combined with domains/sites/apps they
+  // narrow that grant (same AND semantics the SQL filter uses).
+  if (hasAdUnitScope) {
+    if (!rowMatchesAllowedAdUnits(row, scope.adUnits)) return false;
+    if (!hasAppScope && !hasWebScope) return true;
+  }
 
   if (hasAppScope && hasWebScope) {
     const appMatch = isMobileAppRow(row) && rowMatchesAllowedAppIds(row, scope.appIds);
@@ -210,7 +226,7 @@ function rowMatchesUserScope(row, scope, siteCtx = null) {
 function userHasAssignedInventory(user) {
   const scope = getUserInventoryScope(user);
   if (scope === null) return true;
-  return !!(scope.domains?.size || scope.sites?.size || scope.appIds?.size);
+  return !!(scope.domains?.size || scope.sites?.size || scope.appIds?.size || scope.adUnits?.size);
 }
 
 function getInventoryScopeCacheKey(user) {
@@ -221,6 +237,7 @@ function getInventoryScopeCacheKey(user) {
     `d:${part(scope.domains)}`,
     `s:${part(scope.sites)}`,
     `a:${part(scope.appIds)}`,
+    `u:${part(scope.adUnits)}`,
   ].join('|');
 }
 
@@ -283,14 +300,19 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
   let domains = clampToScopeSet(reqDomains, scope.domains);
   let sites = clampToScopeSet(reqSites, scope.sites);
   let apps = clampToScopeSet(reqApps, scope.appIds);
-  let adUnitNames = reqAdUnits;
+  // Assigned ad units always bound the request (empty/unmatched request → all assigned units).
+  let adUnitNames = scope.adUnits?.size
+    ? (clampToScopeSet(reqAdUnits, scope.adUnits).length
+      ? clampToScopeSet(reqAdUnits, scope.adUnits)
+      : [...scope.adUnits])
+    : reqAdUnits;
 
   if (!anyRequest) {
     // Empty / "All selected" collapsed to [] → full assignment (domains ∪ sites ∪ apps).
     domains = scope.domains?.size ? [...scope.domains] : [];
     sites = scope.sites?.size ? [...scope.sites] : [];
     apps = scope.appIds?.size ? [...scope.appIds] : [];
-    adUnitNames = [];
+    adUnitNames = scope.adUnits?.size ? [...scope.adUnits] : [];
   }
   // When the request already picks domains/sites/ad units, do NOT auto-union every
   // assigned app — that injected app×country / blank Domain·Site rows (~$628 "—")
@@ -306,6 +328,7 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
   if (sites.length > max) sites = sites.slice(0, max);
   if (domains.length > max) domains = domains.slice(0, max);
   if (apps.length > max) apps = apps.slice(0, max);
+  if (adUnitNames.length > max) adUnitNames = adUnitNames.slice(0, max);
 
   return {
     domains,
@@ -507,6 +530,7 @@ const INVENTORY_SCOPE_KEYS = [
   'allowedDomains',
   'allowedSites',
   'allowedAppIds',
+  'allowedAdUnits',
   'allowedAdsAccountIds',
   'allowedClientIds',
 ];
@@ -703,7 +727,9 @@ function normalizePermissions(role, input = {}) {
       .map((id) => String(id || '').trim())
       .filter(Boolean);
   }
-  if (Array.isArray(input.allowedAdUnits)) base.allowedAdUnits = [];
+  if (Array.isArray(input.allowedAdUnits)) {
+    base.allowedAdUnits = [...new Set(input.allowedAdUnits.map((v) => String(v || '').trim()).filter(Boolean))];
+  }
   const admobScope = normalizeAdmobScope(input.admobScope);
   if (admobScope) base.admobScope = admobScope;
   const adsenseScope = normalizeAdsenseScope(input.adsenseScope);

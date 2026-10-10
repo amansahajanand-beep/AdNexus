@@ -47,6 +47,10 @@ function soapEnvelope(service, method, body) {
 </soapenv:Envelope>`;
 }
 
+// Short TTLs so added/removed sites, apps and ad units show up quickly; failures retry soon.
+const INVENTORY_SOAP_TTL = 120;
+const INVENTORY_FAIL_TTL = 120;
+
 async function soapCall(service, method, body, token) {
   const res = await axios.post(
     `${BASE}/${service}`,
@@ -129,7 +133,7 @@ async function fetchSitesBySiteService(token) {
     // Check for SOAP fault — SiteService not enabled for this network
     if (xml.includes('<faultstring>') || xml.includes('ServiceNotEnabled') || xml.includes('PERMISSION_DENIED')) {
       logger.info('[SiteService] Not available for this network — will use InventoryService fallback');
-      cache.set(cacheKey, null, 3600);
+      cache.set(cacheKey, null, INVENTORY_FAIL_TTL);
       return null;
     }
 
@@ -147,7 +151,7 @@ async function fetchSitesBySiteService(token) {
     });
 
     logger.info(`[SiteService] Found ${sites.length} sites:`, sites.slice(0, 5).map(s => s.url).join(' | '));
-    cache.set(cacheKey, sites, 600);
+    cache.set(cacheKey, sites, INVENTORY_SOAP_TTL);
     return sites;
   } catch (err) {
     // 403 / SOAP fault / unknown service — not available
@@ -157,7 +161,7 @@ async function fetchSitesBySiteService(token) {
     } else {
       logger.warn('[SiteService] Unexpected error:', err.message);
     }
-    cache.set(cacheKey, null, 3600);
+    cache.set(cacheKey, null, INVENTORY_FAIL_TTL);
     return null;
   }
 }
@@ -169,24 +173,30 @@ async function fetchSitesBySiteService(token) {
  * Returns {units, rootId, level2} where level2 = direct children of root.
  */
 async function fetchAdUnitHierarchy(token) {
-  const cacheKey = invCacheKey('gam_ad_unit_hierarchy_v1');
+  const cacheKey = invCacheKey('gam_ad_unit_hierarchy_v2');
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
-  const xml = await soapCall(
-    'InventoryService',
-    'getAdUnitsByStatement',
-    `<filterStatement><query>WHERE status = 'ACTIVE' LIMIT 500</query></filterStatement>`,
-    token
-  );
-
-  const blocks = parseResults(xml);
-  const units = blocks.map(b => ({
-    id: extractTag(b, 'id'),
-    parentId: extractTag(b, 'parentId'),
-    name: extractTag(b, 'name'),
-    code: extractTag(b, 'adUnitCode'),
-  })).filter(u => u.id);
+  // Page through ALL active ad units (a single LIMIT 500 truncated big networks and
+  // left stale/missing units in the catalog).
+  const units = [];
+  const pageSize = 500;
+  for (let offset = 0; offset <= 50000; offset += pageSize) {
+    const xml = await soapCall(
+      'InventoryService',
+      'getAdUnitsByStatement',
+      `<filterStatement><query>WHERE status = 'ACTIVE' ORDER BY id ASC LIMIT ${pageSize} OFFSET ${offset}</query></filterStatement>`,
+      token
+    );
+    const page = parseResults(xml).map(b => ({
+      id: extractTag(b, 'id'),
+      parentId: extractTag(b, 'parentId'),
+      name: extractTag(b, 'name'),
+      code: extractTag(b, 'adUnitCode'),
+    })).filter(u => u.id);
+    units.push(...page);
+    if (page.length < pageSize) break;
+  }
 
   // Root = unit whose parentId does not exist in the set (or has no parentId)
   const allIds = new Set(units.map(u => u.id));
@@ -199,7 +209,7 @@ async function fetchAdUnitHierarchy(token) {
   logger.info(`[InventoryService] ${units.length} units | root: ${root?.name}(${rootId}) | level-2 sites: ${level2.map(u => u.name).join(' | ')}`);
 
   const result = { units, rootId, level2 };
-  cache.set(cacheKey, result, 600);
+  cache.set(cacheKey, result, INVENTORY_SOAP_TTL);
   return result;
 }
 
@@ -267,7 +277,7 @@ async function fetchMobileApps(token) {
 
       if (xml.includes('<faultstring>') || xml.includes('ServiceNotEnabled')) {
         logger.info('[MobileApplicationService] Not available for this network');
-        cache.set(cacheKey, null, 3600);
+        cache.set(cacheKey, null, INVENTORY_FAIL_TTL);
         return null;
       }
 
@@ -285,11 +295,11 @@ async function fetchMobileApps(token) {
     }
 
     logger.info(`[MobileApplicationService] Found ${all.length} apps`);
-    cache.set(cacheKey, all, 3600);
+    cache.set(cacheKey, all, INVENTORY_SOAP_TTL);
     return all;
   } catch (err) {
     logger.info('[MobileApplicationService] Unavailable:', err.message);
-    cache.set(cacheKey, null, 3600);
+    cache.set(cacheKey, null, INVENTORY_FAIL_TTL);
     return null;
   }
 }
@@ -309,7 +319,7 @@ async function fetchMobileApps(token) {
  *   3. adUnitId→siteUrl map always comes from InventoryService hierarchy.
  */
 async function fetchGAMInventoryData(token) {
-  const cacheKey = invCacheKey('gam_inventory_data_v5');
+  const cacheKey = invCacheKey('gam_inventory_data_v6');
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
@@ -333,7 +343,7 @@ async function fetchGAMInventoryData(token) {
   }
 
   const result = { siteMap, sites, adUnits: hierarchy.units, mobileApps };
-  cache.set(cacheKey, result, 600);
+  cache.set(cacheKey, result, INVENTORY_SOAP_TTL);
   return result;
 }
 

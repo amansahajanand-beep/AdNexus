@@ -3,6 +3,7 @@ import { PERMISSION_SECTIONS } from '../../utils/permissions';
 import {
   buildAdminSitePickerOptions,
   buildAdminAppPickerOptions,
+  buildAdminAdUnitPickerOptions,
 } from '../../utils/catalogOptions';
 import DomainSelector from '../ui/DomainSelector';
 import { adminQuickDateRange } from '../../utils/dateRestriction';
@@ -21,6 +22,8 @@ export default function PermissionsPanel({
   onSitesChange,
   allowedAppIds = [],
   onAppIdsChange,
+  allowedAdUnits = [],
+  onAdUnitsChange,
   allowedAdsAccountIds = [],
   onAdsAccountsChange,
   dateRestrictionStart = '',
@@ -50,6 +53,14 @@ export default function PermissionsPanel({
       assignedAppIds: allowedAppIds,
     }),
     [catalogRows, catalogLists, allowedAppIds]
+  );
+  const adUnitOptions = useMemo(
+    () => buildAdminAdUnitPickerOptions({
+      catalogRows,
+      adUnitsByHost: catalogLists.adUnitsByHost || {},
+      assignedAdUnits: allowedAdUnits,
+    }),
+    [catalogRows, catalogLists, allowedAdUnits]
   );
   const pickerLoading = domainsLoading || catalogLoading;
 
@@ -118,6 +129,26 @@ export default function PermissionsPanel({
           itemLabel="app IDs"
         />
       </div>
+
+      {onAdUnitsChange ? (
+        <div className="ui-field">
+          <span className="ui-field-label">Data scope — assigned ad units (optional)</span>
+          <p className="form-note">
+            Restrict to specific ad units. With no domains/sites/apps assigned, only these ad units are visible;
+            with them assigned, the user sees just these ad units inside that inventory.
+          </p>
+          <DomainSelector
+            domains={adUnitOptions}
+            selected={allowedAdUnits}
+            onChange={onAdUnitsChange}
+            loading={pickerLoading}
+            selectAllLabel="Select All Ad Units"
+            searchPlaceholder="Search ad unit…"
+            emptyLabel="No ad units found"
+            itemLabel="ad units"
+          />
+        </div>
+      ) : null}
 
       <div className="ui-field">
         <span className="ui-field-label">Data scope — assigned Google Ads accounts</span>

@@ -2296,6 +2296,15 @@ function mapDomainTableRow(r) {
     if (metrics[id] == null) metrics[id] = n;
   }
 
+  // Total fill rate = impressions / (impressions + unfilled), from summed grain counts.
+  const unfilled = Number(r.unfilled) || 0;
+  if (metrics.total_inventory_level_unfilled_impressions == null && unfilled > 0) {
+    metrics.total_inventory_level_unfilled_impressions = unfilled;
+  }
+  if (metrics.total_fill_rate == null && impression + unfilled > 0 && unfilled > 0) {
+    metrics.total_fill_rate = +((impression / (impression + unfilled)) * 100).toFixed(2);
+  }
+
   // Recompute rate metrics from summed AdX counts when possible.
   const adxImp = Number(metrics.ad_exchange_line_item_level_impressions) || 0;
   const adxClicks = Number(metrics.ad_exchange_line_item_level_clicks) || 0;
@@ -2333,6 +2342,8 @@ function mapDomainTableRow(r) {
     ctr: impression > 0 && clicks > 0 ? +((clicks / impression) * 100).toFixed(4) : 0,
     viewableRate,
     ecpm,
+    unfilled,
+    ...(metrics.total_fill_rate != null ? { fillRate: metrics.total_fill_rate } : {}),
     currency: r.currency || 'USD',
     metrics,
   };
@@ -3070,6 +3081,7 @@ async function hydrateGrainIdRows(rawRows) {
       revenue_raw: r.revenue_raw,
       viewable_raw: r.viewable_raw,
       clicks: r.clicks,
+      unfilled: r.unfilled,
       currency: r.currency,
       ext_metrics: r.ext_metrics || {},
     });

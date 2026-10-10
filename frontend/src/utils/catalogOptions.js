@@ -179,6 +179,23 @@ export function buildAdminSitePickerOptions({
   return list.map((h) => ({ id: h, label: h }));
 }
 
+/** Admin ad-unit picker — every catalog ad unit (adUnitsByHost incl. app ad units) + assigned. */
+export function buildAdminAdUnitPickerOptions({
+  catalogRows = [],
+  adUnitsByHost = {},
+  assignedAdUnits = [],
+} = {}) {
+  const set = new Set();
+  const add = (v) => {
+    const s = String(v || '').trim();
+    if (s && s !== '—') set.add(s);
+  };
+  Object.values(adUnitsByHost || {}).forEach((units) => (units || []).forEach(add));
+  if (catalogRows.length) optionsFor(catalogRows, {}, 'adUnit').forEach(add);
+  (assignedAdUnits || []).forEach(add);
+  return [...set].sort((a, b) => a.localeCompare(b)).map((v) => ({ id: v, label: v }));
+}
+
 /** Admin app ID picker — assigned values only (for viewing/removing). */
 export function buildAdminAssignedAppOptions(assignedAppIds = []) {
   const seen = new Set();
@@ -296,7 +313,11 @@ export function buildFilterDropdownOptions({
         'adUnit'
       );
     }
-    adUnitOptions = scopedAdUnits;
+    // Assigned ad units are an explicit grant/narrowing — they are the options.
+    adUnitOptions = inventoryScope.allowedAdUnits?.length
+      ? [...inventoryScope.allowedAdUnits].map((v) => String(v || '').trim()).filter(Boolean)
+        .sort((a, b) => a.localeCompare(b))
+      : scopedAdUnits;
     domainOptionsOut = inventoryScope.allowedDomains?.length
       ? [...inventoryScope.allowedDomains].sort((a, b) => String(a).localeCompare(String(b)))
       : [];

@@ -20,7 +20,7 @@ const {
 } = require('./adUnit');
 
 /** Reuse rows from any cached full report to avoid extra GAM jobs. */
-const CATALOG_CACHE_KEY = 'filter_catalog_inventory_v25';
+const CATALOG_CACHE_KEY = 'filter_catalog_inventory_v27';
 
 /** Memory/Redis key — must include active network (client_id). Postgres kv already tenant-scopes. */
 function catalogCacheKey() {

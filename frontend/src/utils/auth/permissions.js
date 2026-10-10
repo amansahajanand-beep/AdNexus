@@ -34,6 +34,7 @@ export const INVENTORY_SCOPE_KEYS = [
   'allowedDomains',
   'allowedSites',
   'allowedAppIds',
+  'allowedAdUnits',
   'allowedAdsAccountIds',
 ];
 
@@ -55,6 +56,12 @@ export function getAssignedAppIds(user) {
   return Array.isArray(allowed) ? allowed : [];
 }
 
+export function getAssignedAdUnits(user) {
+  if (isAdmin(user)) return null;
+  const allowed = user?.permissions?.allowedAdUnits;
+  return Array.isArray(allowed) ? allowed : [];
+}
+
 export function getAssignedAdsAccountIds(user) {
   if (isAdmin(user)) return null;
   const perms = user?.permissions || {};
@@ -69,6 +76,7 @@ export function getAssignedInventoryScope(user) {
     allowedDomains: getAssignedDomains(user),
     allowedSites: getAssignedSites(user),
     allowedAppIds: getAssignedAppIds(user),
+    allowedAdUnits: getAssignedAdUnits(user),
     allowedAdsAccountIds: getAssignedAdsAccountIds(user),
   };
 }
@@ -79,7 +87,8 @@ export function hasAssignedInventory(user) {
   const scope = getAssignedInventoryScope(user);
   return scope.allowedDomains.length > 0
     || scope.allowedSites.length > 0
-    || scope.allowedAppIds.length > 0;
+    || scope.allowedAppIds.length > 0
+    || scope.allowedAdUnits.length > 0;
 }
 
 export function hasAssignedDomains(user) {
@@ -302,6 +311,7 @@ export function permissionsToPayload(state) {
     allowedDomains: state.allowedDomains,
     allowedSites: state.allowedSites,
     allowedAppIds: state.allowedAppIds,
+    allowedAdUnits: state.allowedAdUnits || [],
     ...dateRestrictionPayload(state.dateRestrictionStart, state.dateRestrictionEnd),
   };
 }
@@ -326,10 +336,12 @@ export function permissionBadgeList(user) {
   const nDom = p.allowedDomains?.length || 0;
   const nSite = p.allowedSites?.length || 0;
   const nApp = p.allowedAppIds?.length || 0;
+  const nUnit = p.allowedAdUnits?.length || 0;
   const parts = [];
   if (nDom) parts.push(`${nDom} domain${nDom === 1 ? '' : 's'}`);
   if (nSite) parts.push(`${nSite} site${nSite === 1 ? '' : 's'}`);
   if (nApp) parts.push(`${nApp} app${nApp === 1 ? '' : 's'}`);
+  if (nUnit) parts.push(`${nUnit} ad unit${nUnit === 1 ? '' : 's'}`);
   badges.push({ label: parts.length ? parts.join(', ') : 'No inventory', type: 'scope' });
   return badges;
 }

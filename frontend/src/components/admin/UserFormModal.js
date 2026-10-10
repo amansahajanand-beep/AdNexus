@@ -91,6 +91,7 @@ export default function UserFormModal({
   const [allowedDomains, setAllowedDomains] = useState([]);
   const [allowedSites, setAllowedSites] = useState([]);
   const [allowedAppIds, setAllowedAppIds] = useState([]);
+  const [allowedAdUnits, setAllowedAdUnits] = useState([]);
   const [allowedAdsAccountIds, setAllowedAdsAccountIds] = useState([]);
   const [admobScope, setAdmobScope] = useState(EMPTY_ADMOB_SCOPE);
   const [adsenseScope, setAdsenseScope] = useState(EMPTY_ADSENSE_SCOPE);
@@ -120,6 +121,7 @@ export default function UserFormModal({
     setAllowedDomains(user?.permissions?.allowedDomains || []);
     setAllowedSites(user?.permissions?.allowedSites || []);
     setAllowedAppIds(user?.permissions?.allowedAppIds || []);
+    setAllowedAdUnits(user?.permissions?.allowedAdUnits || []);
     setAllowedAdsAccountIds(user?.permissions?.allowedAdsAccountIds || []);
     setAdmobScope(admobScopeFromUser(user));
     setAdsenseScope(adsenseScopeFromUser(user));
@@ -276,6 +278,7 @@ export default function UserFormModal({
         allowedDomains,
         allowedSites,
         allowedAppIds,
+        allowedAdUnits,
         allowedAdsAccountIds,
         admobScope,
         ...(ADSENSE_ENABLED ? { adsenseScope } : {}),
@@ -371,6 +374,8 @@ export default function UserFormModal({
           onSitesChange={setAllowedSites}
           allowedAppIds={allowedAppIds}
           onAppIdsChange={setAllowedAppIds}
+          allowedAdUnits={allowedAdUnits}
+          onAdUnitsChange={setAllowedAdUnits}
           allowedAdsAccountIds={allowedAdsAccountIds}
           onAdsAccountsChange={setAllowedAdsAccountIds}
           showDateRange={false}

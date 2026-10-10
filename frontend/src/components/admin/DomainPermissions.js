@@ -35,6 +35,7 @@ export default function DomainPermissions({
   const [allowedDomains, setAllowedDomains] = useState([]);
   const [allowedSites, setAllowedSites] = useState([]);
   const [allowedAppIds, setAllowedAppIds] = useState([]);
+  const [allowedAdUnits, setAllowedAdUnits] = useState([]);
   const [allowedAdsAccountIds, setAllowedAdsAccountIds] = useState([]);
   const [dateRestrictionStart, setDateRestrictionStart] = useState('');
   const [dateRestrictionEnd, setDateRestrictionEnd] = useState('');
@@ -53,6 +54,7 @@ export default function DomainPermissions({
     setAllowedDomains(selectedUser.permissions?.allowedDomains || []);
     setAllowedSites(selectedUser.permissions?.allowedSites || []);
     setAllowedAppIds(selectedUser.permissions?.allowedAppIds || []);
+    setAllowedAdUnits(selectedUser.permissions?.allowedAdUnits || []);
     setAllowedAdsAccountIds(selectedUser.permissions?.allowedAdsAccountIds || []);
     const dr = readDateRestrictionFromUser(selectedUser);
     setDateRestrictionStart(dr.start);
@@ -70,6 +72,7 @@ export default function DomainPermissions({
         allowedDomains,
         allowedSites,
         allowedAppIds,
+        allowedAdUnits,
         allowedAdsAccountIds,
         ...dateRestrictionPayload(dateRestrictionStart, dateRestrictionEnd),
       };
@@ -80,7 +83,7 @@ export default function DomainPermissions({
       await onSave(selectedUser.id, payload, selectedUser.username);
       setSuccessMsg(buildPermissionSaveSummary(oldUser.username, oldUser, payload, { adsAccountLabelById }));
     } catch (_) {}
-  }, [selectedUser, flags, allowedDomains, allowedSites, allowedAppIds, allowedAdsAccountIds, dateRestrictionStart, dateRestrictionEnd, onSave, adsAccountOptions]);
+  }, [selectedUser, flags, allowedDomains, allowedSites, allowedAppIds, allowedAdUnits, allowedAdsAccountIds, dateRestrictionStart, dateRestrictionEnd, onSave, adsAccountOptions]);
 
   return (
     <div className="admin-panel">
@@ -126,6 +129,8 @@ export default function DomainPermissions({
             onSitesChange={setAllowedSites}
             allowedAppIds={allowedAppIds}
             onAppIdsChange={setAllowedAppIds}
+            allowedAdUnits={allowedAdUnits}
+            onAdUnitsChange={setAllowedAdUnits}
             allowedAdsAccountIds={allowedAdsAccountIds}
             onAdsAccountsChange={setAllowedAdsAccountIds}
             dateRestrictionStart={dateRestrictionStart}

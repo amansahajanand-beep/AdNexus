@@ -45,6 +45,13 @@ export function buildPermissionSaveSummary(username, oldUser, newPayload = {}, o
   appAdd.forEach((a) => added.push(`App ID: ${a}`));
   appRem.forEach((a) => removed.push(`App ID: ${a}`));
 
+  const { added: unitAdd, removed: unitRem } = diffLists(
+    oldPerms.allowedAdUnits,
+    newPayload.allowedAdUnits
+  );
+  unitAdd.forEach((a) => added.push(`Ad unit: ${a}`));
+  unitRem.forEach((a) => removed.push(`Ad unit: ${a}`));
+
   const { added: adsAdd, removed: adsRem } = diffLists(
     oldPerms.allowedAdsAccountIds,
     newPayload.allowedAdsAccountIds
@@ -112,6 +119,7 @@ export function buildNewUserInventorySummary(payload = {}) {
   (payload.allowedDomains || []).forEach((d) => changes.push({ type: 'added', text: `Domain: ${d}` }));
   (payload.allowedSites || []).forEach((s) => changes.push({ type: 'added', text: `Site: ${s}` }));
   (payload.allowedAppIds || []).forEach((a) => changes.push({ type: 'added', text: `App ID: ${a}` }));
+  (payload.allowedAdUnits || []).forEach((a) => changes.push({ type: 'added', text: `Ad unit: ${a}` }));
   (payload.allowedAdsAccountIds || []).forEach((a) => changes.push({ type: 'added', text: `Ads account: ${a}` }));
   const drLabel = formatDateRestrictionForSummary({
     startDate: payload.dateRestrictionStart,

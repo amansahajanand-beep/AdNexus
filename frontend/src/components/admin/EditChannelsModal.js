@@ -29,6 +29,7 @@ export default function EditChannelsModal({
   const [allowedDomains, setAllowedDomains] = useState([]);
   const [allowedSites, setAllowedSites] = useState([]);
   const [allowedAppIds, setAllowedAppIds] = useState([]);
+  const [allowedAdUnits, setAllowedAdUnits] = useState([]);
   const [allowedAdsAccountIds, setAllowedAdsAccountIds] = useState([]);
   const [dateRestrictionStart, setDateRestrictionStart] = useState('');
   const [dateRestrictionEnd, setDateRestrictionEnd] = useState('');
@@ -39,6 +40,7 @@ export default function EditChannelsModal({
       setAllowedDomains(user.permissions?.allowedDomains || []);
       setAllowedSites(user.permissions?.allowedSites || []);
       setAllowedAppIds(user.permissions?.allowedAppIds || []);
+      setAllowedAdUnits(user.permissions?.allowedAdUnits || []);
       setAllowedAdsAccountIds(user.permissions?.allowedAdsAccountIds || []);
       const dr = readDateRestrictionFromUser(user);
       setDateRestrictionStart(dr.start);
@@ -54,6 +56,7 @@ export default function EditChannelsModal({
       allowedDomains,
       allowedSites,
       allowedAppIds,
+      allowedAdUnits,
       allowedAdsAccountIds,
       ...dateRestrictionPayload(dateRestrictionStart, dateRestrictionEnd),
     };
@@ -92,6 +95,8 @@ export default function EditChannelsModal({
           onSitesChange={setAllowedSites}
           allowedAppIds={allowedAppIds}
           onAppIdsChange={setAllowedAppIds}
+          allowedAdUnits={allowedAdUnits}
+          onAdUnitsChange={setAllowedAdUnits}
           allowedAdsAccountIds={allowedAdsAccountIds}
           onAdsAccountsChange={setAllowedAdsAccountIds}
           dateRestrictionStart={dateRestrictionStart}
