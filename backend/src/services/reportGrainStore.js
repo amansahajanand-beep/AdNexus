@@ -1048,6 +1048,7 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
              ELSE 0
            END AS viewable_raw,
            COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+           COALESCE(SUM(g.unfilled), 0)::float8 AS unfilled,
            COALESCE(MAX(g.currency), 'USD') AS currency
          ${GRAIN_JOIN_SQL}
          WHERE g.client_id = $1::uuid
@@ -1061,7 +1062,7 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
        to_char(day_rows.report_date, 'YYYY-MM-DD') AS report_date,
        day_rows.domain_name, day_rows.site_url, day_rows.ad_unit, day_rows.app_id,
        day_rows.country, day_rows.device,
-       day_rows.impression, day_rows.revenue_raw, day_rows.viewable_raw, day_rows.clicks, day_rows.currency
+       day_rows.impression, day_rows.revenue_raw, day_rows.viewable_raw, day_rows.clicks, day_rows.unfilled, day_rows.currency
      FROM generate_series($2::date, $3::date, '1 day'::interval) AS d(day)
      CROSS JOIN LATERAL (
        SELECT
@@ -1081,6 +1082,7 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
              ELSE 0
            END AS viewable_raw,
            COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+           COALESCE(SUM(g.unfilled), 0)::float8 AS unfilled,
            COALESCE(MAX(g.currency), 'USD') AS currency
          ${GRAIN_JOIN_SQL}
          WHERE g.client_id = $1::uuid

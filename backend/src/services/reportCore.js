@@ -1544,6 +1544,66 @@ async function runCatalogReport(token) {
   rows = enrichRowsWithAppPackages(rows, rehydrateAppPackageMaps(appPackageMaps));
   let adUnitsByHost = buildAdUnitsByHost(rows, mergedSiteMap);
   adUnitsByHost = augmentAdUnitsByHost(adUnitsByHost, rows, rawHosts.sitesByDomain || {});
+  // Newly created ad units have no traffic yet, so they are absent from the 30-day report rows.
+  // Add every ACTIVE ad unit whose parent site is known so it can be picked right away.
+  {
+    const sets = {};
+    for (const [h, names] of Object.entries(adUnitsByHost)) sets[h] = new Set(names);
+    const parentIds = new Set((inventoryData.adUnits || []).map((u) => String(u.parentId || '')).filter(Boolean));
+    const listed = new Set();
+    Object.values(sets).forEach((v) => v.forEach((n) => listed.add(n)));
+    for (const u of inventoryData.adUnits || []) {
+      const host = mergedSiteMap[u.id];
+      const name = String(u.name || '').trim();
+      if (!name) continue;
+      if (host) {
+        (sets[host] = sets[host] || new Set()).add(name);
+        listed.add(name);
+      } else if (u.parentId && !parentIds.has(String(u.id)) && !listed.has(name)) {
+        // App / site-less leaf ad units (e.g. com.pkg_banner_id): no site host to hang them on,
+        // so keep them under a catch-all bucket so the ad-unit dropdown still lists them.
+        (sets.__app_ad_units__ = sets.__app_ad_units__ || new Set()).add(name);
+        listed.add(name);
+      }
+    }
+    adUnitsByHost = Object.fromEntries(
+      Object.entries(sets).map(([h, v]) => [h, Array.from(v).sort((x, y) => x.localeCompare(y))])
+    );
+  }
+  // Ad units deleted/archived in GAM still have traffic in the 30-day report window;
+  // drop them so the dropdown mirrors the live (ACTIVE) inventory.
+  if ((inventoryData.adUnits || []).length) {
+    const activeNames = new Set();
+    for (const u of inventoryData.adUnits) {
+      const n = String(u.name || '').trim();
+      if (n) { activeNames.add(n); activeNames.add(n.replace(/\s*\(\d+\)\s*$/, '').trim()); }
+    }
+    const pruned = {};
+    for (const [host, names] of Object.entries(adUnitsByHost)) {
+      const keep = names.filter((n) => activeNames.has(n) || activeNames.has(String(n).replace(/\s*\(\d+\)\s*$/, '').trim()));
+      if (keep.length) pruned[host] = keep;
+    }
+    if (Object.keys(pruned).length) adUnitsByHost = pruned;
+  }
+  // Every ad unit the warehouse has synced (dim_ad_unit) is what report filters match on, so
+  // make sure all of them are selectable even when GAM's hierarchy/traffic scan can't place them
+  // under a site (app ad units like com.pkg_main_banner).
+  try {
+    const { requireClientId } = require('../utils/clientContext');
+    const { rows: dimUnits } = await require('../db').query(
+      `SELECT DISTINCT name FROM dim_ad_unit WHERE client_id = $1 AND name IS NOT NULL AND name <> ''`,
+      [requireClientId()]
+    );
+    const have = new Set();
+    Object.values(adUnitsByHost).forEach((v) => v.forEach((n) => have.add(n)));
+    const extra = dimUnits.map((r) => String(r.name).trim()).filter((n) => n && !have.has(n));
+    if (extra.length) {
+      adUnitsByHost.__app_ad_units__ = [...new Set([...(adUnitsByHost.__app_ad_units__ || []), ...extra])]
+        .sort((x, y) => x.localeCompare(y));
+    }
+  } catch (err) {
+    logger.warn(`[catalog] dim_ad_unit merge failed: ${err.message}`);
+  }
   const adUnitSiteMapFromScan = Object.fromEntries(
     buildAdUnitSiteMapFromUrlScan(rawUrlScan, adUnitByName)
   );
@@ -1557,12 +1617,14 @@ async function runCatalogReport(token) {
     '| withApp:', withApp,
     '| appPackages:', appPackages.length,
     '| adUnitsByHost:', Object.keys(adUnitsByHost).length,
+    '| activeAdUnits:', (inventoryData.adUnits || []).length,
+    '| appAdUnits:', (adUnitsByHost.__app_ad_units__ || []).length,
     '| siteService:', (gamSites || []).length,
     '| urlScanRows:', rawUrlScan.length,
     '| subdomains:', rawHosts.siteHosts.length,
     '| domainsWithSites:', Object.keys(rawHosts.sitesByDomain || {}).length
   );
-  return { rows, startDate, endDate, rawHosts, adUnitsByHost, appPackages, appPackageMaps, adUnitSiteMapFromScan };
+  return { rows, startDate, endDate, rawHosts, adUnitsByHost, appPackages, appPackageMaps, adUnitSiteMapFromScan, generatedAt: Date.now() };
 }
 
 // ─── Programmatic channel report (GAM screenshots 1–2) ───────────────────────
@@ -1785,7 +1847,12 @@ async function ensureInventoryCatalog(token) {
 }
 
 let catalogBgRefresh = null;
-const CATALOG_STALE_MS = 60 * 60 * 1000; // refresh from GAM in background after 1h
+const CATALOG_STALE_MS = 10 * 60 * 1000; // refresh from GAM in background after 10 min
+
+function catalogIsStale(payload) {
+  const t = Number(payload?.generatedAt) || 0;
+  return !t || (Date.now() - t) > CATALOG_STALE_MS;
+}
 
 function scheduleCatalogBackgroundRefresh(token) {
   if (!token || catalogBgRefresh) return;
@@ -1835,7 +1902,10 @@ function scheduleCatalogBackgroundRefresh(token) {
 async function getFilterCatalog(token, { allowStale = true, forceRefresh = false } = {}) {
   if (!forceRefresh) {
     const mem = cache.get(catalogCacheKey());
-    if (mem?.rows?.length) return mem;
+    if (mem?.rows?.length) {
+      if (token && catalogIsStale(mem)) scheduleCatalogBackgroundRefresh(token);
+      return mem;
+    }
 
     const r = getRedis();
     if (r?.redisGet) {
@@ -1844,6 +1914,7 @@ async function getFilterCatalog(token, { allowStale = true, forceRefresh = false
         if (redisData?.rows?.length) {
           cache.set(catalogCacheKey(), redisData, REPORT_CACHE_TTL);
           logger.info(`Filter catalog served from Redis (${redisData.rows.length} rows)`);
+          if (token && catalogIsStale(redisData)) scheduleCatalogBackgroundRefresh(token);
           return redisData;
         }
       } catch (_) { /* ignore */ }
@@ -1862,7 +1933,7 @@ async function getFilterCatalog(token, { allowStale = true, forceRefresh = false
           + (ageMs ? `, age=${Math.round(ageMs / 1000)}s` : '')
           + ')'
         );
-        if (token && ageMs > CATALOG_STALE_MS) scheduleCatalogBackgroundRefresh(token);
+        if (token && (ageMs > CATALOG_STALE_MS || catalogIsStale(db.payload))) scheduleCatalogBackgroundRefresh(token);
         return db.payload;
       }
     }
@@ -4236,7 +4307,9 @@ async function handleFilterCatalog(req, res) {
   // Admin: full network catalog (enriched with InventoryService site map).
   try {
     const token = await getToken();
-    const result = await getFilterCatalog(token, { allowStale: true });
+    const wantsRefresh = req.user?.role === 'admin'
+      && ['1', 'true'].includes(String(req.query?.refresh || '').toLowerCase());
+    const result = await getFilterCatalog(token, { allowStale: true, forceRefresh: wantsRefresh });
     const scoped = scopeCatalogOptionsForUser(
       {
         rows: result.rows || [],
