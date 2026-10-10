@@ -62,7 +62,8 @@ export function normalizeInventorySelections(filters = {}, optionLists = {}, opt
     || (expandAll ? assigned?.allowedDomains : null);
   const siteOptions = optionLists.site || optionLists.siteOptions
     || (expandAll ? assigned?.allowedSites : null);
-  const adUnitOptions = optionLists.domainName || optionLists.adUnitOptions;
+  const adUnitOptions = optionLists.domainName || optionLists.adUnitOptions
+    || (expandAll ? assigned?.allowedAdUnits : null);
   const appOptions = optionLists.domainId || optionLists.appOptions
     || (expandAll ? assigned?.allowedAppIds : null);
   return {

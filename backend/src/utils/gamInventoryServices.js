@@ -47,9 +47,9 @@ function soapEnvelope(service, method, body) {
 </soapenv:Envelope>`;
 }
 
-// Short TTLs so added/removed sites, apps and ad units show up quickly; failures retry soon.
-const INVENTORY_SOAP_TTL = 120;
-const INVENTORY_FAIL_TTL = 120;
+// Same cadence as before the catalog work (10 min); failures retry after 5 min.
+const INVENTORY_SOAP_TTL = 600;
+const INVENTORY_FAIL_TTL = 300;
 
 async function soapCall(service, method, body, token) {
   const res = await axios.post(

@@ -84,10 +84,11 @@ export function getAssignedFilterVisibility(user) {
   const hasDom = scope.allowedDomains.length > 0;
   const hasSite = scope.allowedSites.length > 0;
   const hasApp = scope.allowedAppIds.length > 0;
+  const hasAdUnit = (scope.allowedAdUnits || []).length > 0;
   return {
     showDomain: hasDom,
     showSite: hasSite,
-    showAdUnit: false,
+    showAdUnit: hasAdUnit,
     showApp: hasApp,
     isScopedUser: true,
   };

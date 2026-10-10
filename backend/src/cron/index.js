@@ -711,6 +711,22 @@ function startCron() {
     await enqueueReconcileHistorical({ reason: '1am-reconcile' });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── 00:05 daily (start of the new day): rebuild the filter catalog in the background ──
+  // Picks up added/removed ad units, sites and apps. Page loads only read the saved catalog;
+  // clients are rebuilt one at a time so GAM / Postgres are not hit by several at once.
+  cron.schedule('5 0 * * *', async () => {
+    const { runWithClient } = require('../utils/clientContext');
+    const reportCore = require('../services/reportCore');
+    await eachActiveClient(async (client) => {
+      try {
+        await runWithClient(client, () => reportCore.warmFilterCatalog());
+        logger.info(`Cron: daily filter catalog rebuilt client=${String(client.id).slice(0, 8)}`);
+      } catch (e) {
+        logger.warn(`Cron: daily filter catalog rebuild failed client=${String(client.id).slice(0, 8)}: ${e.message}`);
+      }
+    });
+  }, { timezone: 'Asia/Singapore' });
+
   // ── Every 15 min: watchdog if hourly sync stalled ───────────────────────
   cron.schedule('*/15 * * * *', async () => {
     await watchdogStaleSync();
