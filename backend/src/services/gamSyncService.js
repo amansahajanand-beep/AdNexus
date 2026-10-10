@@ -1006,6 +1006,7 @@ async function fetchAppSliceDashboardBundle(startDate, endDate, opts = {}) {
              ELSE 0
            END AS viewable_raw,
            COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+           SUM(g.unfilled)::float8 AS unfilled,
            COALESCE(MAX(g.currency), 'USD') AS currency
          FROM report_grain g
          ${countryJoin}
@@ -1027,7 +1028,7 @@ async function fetchAppSliceDashboardBundle(startDate, endDate, opts = {}) {
        SELECT
          to_char(report_date, 'YYYY-MM-DD') AS report_date,
          domain_name, site_url, ad_unit, app_id, country,
-         impression, revenue_raw, viewable_raw, clicks, currency
+         impression, revenue_raw, viewable_raw, clicks, unfilled, currency
        FROM ranked
        WHERE day_rank <= $${tableParams.length - 1}
        ORDER BY day_rank ASC, report_date DESC, revenue_raw DESC
@@ -1559,7 +1560,7 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
            agg.domain_id, agg.site_id, agg.ad_unit_id,
            agg.country_id, agg.device_id, agg.app_id,
            agg.impression, agg.revenue_raw, agg.viewable_raw,
-           agg.clicks, agg.currency
+           agg.clicks, agg.unfilled, agg.currency
          FROM (
            SELECT
              ${selectIds.join(',\n             ')},
@@ -1571,6 +1572,7 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
                ELSE 0
              END AS viewable_raw,
              COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+             SUM(g.unfilled)::float8 AS unfilled,
              COALESCE(MAX(g.currency), 'USD') AS currency
            FROM report_grain g
            WHERE ${whereRange}
@@ -1590,6 +1592,7 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
            ELSE 0
          END AS viewable_raw,
          COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+         SUM(g.unfilled)::float8 AS unfilled,
          COALESCE(MAX(g.currency), 'USD') AS currency
        FROM report_grain g
        WHERE ${whereRange}
@@ -1610,7 +1613,7 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
        ranked.domain_id, ranked.site_id, ranked.ad_unit_id,
        ranked.country_id, ranked.device_id, ranked.app_id,
        ranked.impression, ranked.revenue_raw, ranked.viewable_raw,
-       ranked.clicks, ranked.currency
+       ranked.clicks, ranked.unfilled, ranked.currency
      FROM ranked
      WHERE ranked.day_rank <= $${perDayIdx}
      ORDER BY ranked.report_date ASC, ranked.revenue_raw DESC, ranked.impression DESC
@@ -2297,11 +2300,14 @@ function mapDomainTableRow(r) {
   }
 
   // Total fill rate = impressions / (impressions + unfilled), from summed grain counts.
-  const unfilled = Number(r.unfilled) || 0;
-  if (metrics.total_inventory_level_unfilled_impressions == null && unfilled > 0) {
+  // r.unfilled is NULL/undefined when the rows were never synced with that metric: leave fill
+  // rate unset then (an assumed 0 unfilled would show a false 100%).
+  const hasUnfilled = r.unfilled != null && r.unfilled !== '' && Number.isFinite(Number(r.unfilled));
+  const unfilled = hasUnfilled ? Number(r.unfilled) : 0;
+  if (hasUnfilled && metrics.total_inventory_level_unfilled_impressions == null) {
     metrics.total_inventory_level_unfilled_impressions = unfilled;
   }
-  if (metrics.total_fill_rate == null && impression + unfilled > 0 && unfilled > 0) {
+  if (hasUnfilled && metrics.total_fill_rate == null && impression + unfilled > 0) {
     metrics.total_fill_rate = +((impression / (impression + unfilled)) * 100).toFixed(2);
   }
 
@@ -2342,7 +2348,7 @@ function mapDomainTableRow(r) {
     ctr: impression > 0 && clicks > 0 ? +((clicks / impression) * 100).toFixed(4) : 0,
     viewableRate,
     ecpm,
-    unfilled,
+    ...(hasUnfilled ? { unfilled } : {}),
     ...(metrics.total_fill_rate != null ? { fillRate: metrics.total_fill_rate } : {}),
     currency: r.currency || 'USD',
     metrics,
@@ -2686,7 +2692,8 @@ async function fetchBundleTableRows(startDate, endDate, opts, tableLimit) {
   };
 
   // Country/device dims (or country filter): rollups lack geo — aggregate from grain.
-  if (wantsGeoTableDims(opts)) {
+  // Total fill rate also needs grain: rollup tables do not store unfilled impressions.
+  if (wantsGeoTableDims(opts) || opts.needUnfilled) {
     const rows = await fetchGrainDomainTableRows(startDate, endDate, tableOpts);
     return rows.map(mapDomainTableRow);
   }
@@ -2706,6 +2713,8 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
   // Rollups have no country/device grain — never use them when Reporting needs geo dims.
   if (opts.countryNames && opts.countryNames.length) return null;
   if (wantsGeoTableDims(opts)) return null;
+  // Rollup tables do not store unfilled impressions (Total fill rate) — use grain.
+  if (opts.needUnfilled) return null;
 
   const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
   const skipCharts = Boolean(opts.skipCharts || opts.reportingFast);
@@ -3114,6 +3123,7 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     dayCount > DASHBOARD_ROLLUP_FIRST_DAYS
     && !hasAppsOnly
     && !wantsGeoTableDims(opts)
+    && !opts.needUnfilled
     && !opts.countryNames?.length
   ) {
     try {
@@ -3205,6 +3215,11 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
           `Reporting inventory-core ${startDate}..${endDate}`
           + ` grain≈${core.grainCount || 0} in ${Date.now() - t0}ms`
         );
+        if (opts.needUnfilled && core.rows?.length) {
+          await enrichUnfilledFromAppSlice(core.rows, startDate, endDate).catch((e) => {
+            logger.warn('Reporting fill-rate enrich failed:', e.message);
+          });
+        }
         return { ...core, source: 'reporting-inventory-core' };
       }
     } catch (e) {
@@ -3262,6 +3277,11 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
       }),
     ]);
     const merged = mergeReportingBundles(webBundle, appBundle, opts);
+    if (merged && opts.needUnfilled) {
+      await enrichUnfilledFromAppSlice(merged.rows, startDate, endDate).catch((e) => {
+        logger.warn('Reporting fill-rate enrich failed:', e.message);
+      });
+    }
     if (merged) {
       const wantsSiteOrDomain = Boolean(
         opts.groupBySite
@@ -3291,7 +3311,53 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     return null;
   }
 
-  return fetchReportingIdGrainFromDB(startDate, endDate, opts, t0);
+  const idBundle = await fetchReportingIdGrainFromDB(startDate, endDate, opts, t0);
+  if (idBundle?.rows?.length && opts.needUnfilled) {
+    await enrichUnfilledFromAppSlice(idBundle.rows, startDate, endDate).catch((e) => {
+      logger.warn('Reporting fill-rate enrich failed:', e.message);
+    });
+  }
+  return idBundle;
+}
+
+/**
+ * Ad-unit rows from the inventory_core slice carry no unfilled impressions, so Total fill rate
+ * would be empty/0. The app_id slice stores unfilled per ad unit — look it up there
+ * (date × ad unit) and set unfilled + fill rate on rows that lack it.
+ */
+async function enrichUnfilledFromAppSlice(rows = [], startDate, endDate) {
+  const need = (rows || []).filter((r) => (
+    r.unfilled == null && !r.country && String(r.AD_UNIT_NAME || r.ad_unit_name || '').trim()
+  ));
+  if (!need.length) return;
+  const names = [...new Set(need.map((r) => String(r.AD_UNIT_NAME || r.ad_unit_name).trim()))];
+  const clientId = requireClientId();
+  const { rows: agg } = await query(
+    `SELECT to_char(g.report_date, 'YYYY-MM-DD') AS d, da.name AS ad_unit,
+            SUM(g.impressions)::float8 AS imp, SUM(g.unfilled)::float8 AS unfilled
+     FROM report_grain g
+     JOIN dim_ad_unit da ON da.id = g.ad_unit_id AND da.client_id = g.client_id
+     WHERE g.client_id = $1::uuid AND g.slice_key = 'app_id'
+       AND g.report_date BETWEEN $2::date AND $3::date
+       AND da.name = ANY($4::text[])
+     GROUP BY 1, 2
+     HAVING SUM(g.unfilled) IS NOT NULL`,
+    [clientId, startDate, endDate, names]
+  );
+  const byKey = new Map(agg.map((r) => [`${r.d}|${r.ad_unit}`, r]));
+  for (const r of need) {
+    const name = String(r.AD_UNIT_NAME || r.ad_unit_name).trim();
+    const hit = byKey.get(`${String(r.date || r.report_date).slice(0, 10)}|${name}`);
+    if (!hit || !(hit.imp + hit.unfilled > 0)) continue;
+    const fill = +((hit.imp / (hit.imp + hit.unfilled)) * 100).toFixed(2);
+    r.unfilled = hit.unfilled;
+    r.fillRate = fill;
+    r.metrics = {
+      ...(r.metrics || {}),
+      total_inventory_level_unfilled_impressions: hit.unfilled,
+      total_fill_rate: fill,
+    };
+  }
 }
 
 /** Merge two Reporting bundles (web + app) into one table payload. */
@@ -3594,7 +3660,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
            sub.domain_id, sub.site_id, sub.ad_unit_id,
            sub.country_id, sub.device_id, sub.app_id,
            sub.impression, sub.revenue_raw, sub.viewable_raw,
-           sub.clicks, sub.currency, sub.ext_metrics
+           sub.clicks, sub.unfilled, sub.currency, sub.ext_metrics
          FROM (
            SELECT
              ${selectIds.join(',\n             ')},
@@ -3606,6 +3672,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
                ELSE 0
              END AS viewable_raw,
              COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+             SUM(g.unfilled)::float8 AS unfilled,
              COALESCE(MAX(g.currency), 'USD') AS currency,
              ${grainExtendedMetricSumSql('g')}
            FROM report_grain g
@@ -3626,7 +3693,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
            day_rows.domain_id, day_rows.site_id, day_rows.ad_unit_id,
            day_rows.country_id, day_rows.device_id, day_rows.app_id,
            day_rows.impression, day_rows.revenue_raw, day_rows.viewable_raw,
-           day_rows.clicks, day_rows.currency, day_rows.ext_metrics
+           day_rows.clicks, day_rows.unfilled, day_rows.currency, day_rows.ext_metrics
          FROM generate_series($2::date, $3::date, '1 day'::interval) AS d(day)
          CROSS JOIN LATERAL (
            SELECT
@@ -3645,6 +3712,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
                  ELSE 0
                END AS viewable_raw,
                COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
+               SUM(g.unfilled)::float8 AS unfilled,
                COALESCE(MAX(g.currency), 'USD') AS currency,
                ${grainExtendedMetricSumSql('g')}
              FROM report_grain g
@@ -3787,7 +3855,7 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
   // Prefer inventory Site/Domain rollups (daily rows) for any unfiltered / domain-filtered range.
   // Site filters also use inventory rollups — channel KPI rollups lack request hosts.
   const requestSiteOnly = siteKind === 'request' && (opts.sites || []).length && !hasApp;
-  if (!wantsGeo && !hasApp) {
+  if (!wantsGeo && !hasApp && !opts.needUnfilled) {
     const wantsInvTable = dayCount > 1
       || (opts.sites || []).length
       || (opts.domains || []).length

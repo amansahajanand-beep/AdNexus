@@ -1048,7 +1048,7 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
              ELSE 0
            END AS viewable_raw,
            COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
-           COALESCE(SUM(g.unfilled), 0)::float8 AS unfilled,
+           SUM(g.unfilled)::float8 AS unfilled,
            COALESCE(MAX(g.currency), 'USD') AS currency
          ${GRAIN_JOIN_SQL}
          WHERE g.client_id = $1::uuid
@@ -1082,7 +1082,7 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
              ELSE 0
            END AS viewable_raw,
            COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
-           COALESCE(SUM(g.unfilled), 0)::float8 AS unfilled,
+           SUM(g.unfilled)::float8 AS unfilled,
            COALESCE(MAX(g.currency), 'USD') AS currency
          ${GRAIN_JOIN_SQL}
          WHERE g.client_id = $1::uuid

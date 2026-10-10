@@ -4498,6 +4498,12 @@ async function handleDetailedReport(req, res) {
     filters.reportMetrics = metIds.filter((id) => classified.usedMetrics.includes(catalogIdToGamEnum(id)));
   }
 
+  logger.info(
+    `Reporting request dims=[${dimIds.join(',')}] metrics=[${originalMetIds.join(',')}]`
+    + ` adUnits=${toFilterArray(filters.domainName).length} apps=${toFilterArray(filters.domainId).length}`
+    + ` mode=${classified.mode}`
+  );
+
   const warehouseSubChips = (warehouseRewrite.substitutions || []).map(
     (s) => `${s.fromLabel} → ${s.toLabel}`
   );
@@ -4511,7 +4517,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v31_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v37_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4656,6 +4662,7 @@ async function handleDetailedReport(req, res) {
       )
       : tableLimit;
     const invOpts = {
+      needUnfilled: originalMetIds.some((m) => String(m).toLowerCase() === 'total_fill_rate'),
       domains,
       sites,
       adUnitNames: toFilterArray(filters.domainName),
@@ -4734,6 +4741,11 @@ async function handleDetailedReport(req, res) {
           const offeredRecords = scopedChild
             ? scopedRows.length
             : (bundle.grainCount || scopedRows.length);
+          logger.info(
+            `Reporting rows=${scopedRows.length} sample=${JSON.stringify((scopedRows.slice(0, 3)).map((r) => ({
+              site: r.site, AD_UNIT_NAME: r.AD_UNIT_NAME, appId: r.appId, unfilled: r.unfilled, fillRate: r.fillRate,
+            })))}`
+          );
           const composedPartial = Boolean(
             warehouseSkipChips.length
             || classified.skippedDims?.length
