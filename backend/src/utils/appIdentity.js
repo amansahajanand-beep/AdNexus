@@ -255,21 +255,61 @@ function loadGrainAppPackageMapsFallback() {
   return { byPackage: new Map(), byName: new Map(), byResolvedId: new Map() };
 }
 
-async function warmAppPackageMapsFromGrain() {
+// One warm at a time: concurrent report requests each started this 14-day scan (2+ min each on
+// a busy DB) and stacked on top of one another.
+let _warmInflight = null;
+function warmAppPackageMapsFromGrain() {
+  if (!_warmInflight) {
+    _warmInflight = warmAppPackageMapsFromGrainOnce().finally(() => { _warmInflight = null; });
+  }
+  return _warmInflight;
+}
+
+/**
+ * Report paths: wait for the alias warm only briefly. Package / numeric App ID filters work
+ * without the maps (they only add name aliases), so never hold a report for the full scan.
+ */
+async function warmAppPackageMapsBounded(maxWaitMs = 3000) {
+  const maps = loadCachedAppPackageMaps();
+  if (maps.byPackage.size || maps.byResolvedId.size) return maps;
+  const warm = warmAppPackageMapsFromGrain().catch(() => maps);
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(null), maxWaitMs));
+  return (await Promise.race([warm, timeout])) || maps;
+}
+
+async function warmAppPackageMapsFromGrainOnce() {
+  // 1) The filter catalog already holds GAM-built package↔name↔id maps, persisted in Postgres
+  //    (app_kv_cache) — one row read instead of scanning report_grain.
+  try {
+    const { kvGet } = require('./kvCache');
+    const { CATALOG_CACHE_KEY } = require('./inventoryCatalog');
+    const hit = await kvGet(CATALOG_CACHE_KEY);
+    const fromKv = rehydrateAppPackageMaps(hit?.payload?.appPackageMaps);
+    if (fromKv.byPackage.size || fromKv.byResolvedId.size) {
+      _grainAppMapsCache = { at: Date.now(), maps: fromKv };
+      return fromKv;
+    }
+  } catch (_) { /* fall through to grain */ }
   try {
     const { query } = require('../db');
+    let clientId = null;
+    try { clientId = require('./clientContext').getClientId(); } catch (_) { /* no context */ }
+    // Current network only (uses the client_id/report_date index) — other tenants' apps
+    // are not needed and tripled the scan.
     const { rows } = await query(
       `SELECT DISTINCT
          NULLIF(TRIM(app_id), '') AS app_id,
          NULLIF(TRIM(app_name), '') AS app_name
        FROM report_grain
        WHERE slice_key = 'app_id'
-         AND report_date >= (CURRENT_DATE - INTERVAL '14 days')
+         ${clientId ? 'AND client_id = $1::uuid' : ''}
+         AND report_date >= (CURRENT_DATE - INTERVAL '3 days')
          AND (
            NULLIF(TRIM(app_id), '') IS NOT NULL
            OR NULLIF(TRIM(app_name), '') IS NOT NULL
          )
-       LIMIT 20000`
+       LIMIT 20000`,
+      clientId ? [clientId] : []
     );
     const byPackage = new Map();
     const byName = new Map();
@@ -327,10 +367,7 @@ async function warmAppPackageMapsFromGrain() {
 
 /** Expand + ensure grain alias maps are warm (async callers). */
 async function expandAppFilterAliasesAsync(apps = []) {
-  let maps = loadCachedAppPackageMaps();
-  if (!maps.byPackage.size && !maps.byResolvedId.size) {
-    maps = await warmAppPackageMapsFromGrain();
-  }
+  const maps = await warmAppPackageMapsBounded();
   return expandAppFilterAliases(apps, maps);
 }
 
@@ -408,6 +445,7 @@ module.exports = {
   expandAppFilterAliasesAsync,
   loadCachedAppPackageMaps,
   warmAppPackageMapsFromGrain,
+  warmAppPackageMapsBounded,
   isMobileAppRow,
   appPackageForPicker,
   isLikelyAppPackage,

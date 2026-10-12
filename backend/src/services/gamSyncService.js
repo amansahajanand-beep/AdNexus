@@ -69,6 +69,7 @@ const {
   expandAppFilterAliases,
   loadCachedAppPackageMaps,
   warmAppPackageMapsFromGrain,
+  warmAppPackageMapsBounded,
   isLikelyAppPackage,
 } = require('../utils/appIdentity');
 const logger  = require('../utils/logger');
@@ -219,6 +220,23 @@ function sqlAppMatchClause(params, apps, appExpr, adUnitExpr) {
 function appendExpandedAppFilter(params, whereCore, apps) {
   const expanded = expandedAppFilterValues(apps);
   if (!expanded.length) return { whereCore, matched: false };
+  // Every app_id-slice row carries app_id (checked: 0 of 232k rows without one), and alias
+  // expansion always includes the package / numeric id. Match LOWER(app_id) on those only so the
+  // partial index (client_id, report_date, LOWER(app_id)) is used — OR-ing app_name (no index)
+  // made Postgres read every row of the day (~10x slower per query).
+  // Names alone (no id resolved) still fall back to the app_name match.
+  // Only on the app_id slice: other slices (inventory_core) may leave app_id empty.
+  const appSlice = whereCore.includes("slice_key = 'app_id'");
+  const ids = appSlice
+    ? expanded.filter((v) => /^[\w-]+(\.[\w-]+)+$/.test(v) || /^\d+$/.test(v))
+    : [];
+  if (ids.length) {
+    params.push(ids);
+    return {
+      whereCore: `${whereCore} AND LOWER(g.app_id) = ANY($${params.length}::text[])`,
+      matched: true,
+    };
+  }
   params.push(expanded);
   return {
     whereCore: `${whereCore} AND (LOWER(COALESCE(g.app_id, '')) = ANY($${params.length}::text[])
@@ -2011,11 +2029,13 @@ async function backfillAllRollups(syncType = 'rollup-backfill') {
     const { rows } = await query(`
       SELECT to_char(d.day, 'YYYY-MM-DD') AS d
       FROM generate_series(CURRENT_DATE - $2::int, CURRENT_DATE, '1 day'::interval) AS d(day)
-      WHERE EXISTS (
-          SELECT 1 FROM report_grain g
-          WHERE g.client_id = $1::uuid AND g.report_date = d.day::date
-        )
-        AND NOT EXISTS (
+      -- One index probe per day (a plain EXISTS became a hash semi-join over the whole window).
+      CROSS JOIN LATERAL (
+        SELECT 1 FROM report_grain g
+        WHERE g.client_id = $1::uuid AND g.report_date = d.day::date
+        LIMIT 1
+      ) has_grain
+      WHERE NOT EXISTS (
           SELECT 1 FROM rollup_kpi_daily r
           WHERE r.client_id = $1::uuid AND r.report_date = d.day::date
         )
@@ -2705,8 +2725,7 @@ async function fetchBundleTableRows(startDate, endDate, opts, tableLimit) {
   };
 
   // Country/device dims (or country filter): rollups lack geo — aggregate from grain.
-  // Total fill rate also needs grain: rollup tables do not store unfilled impressions.
-  if (wantsGeoTableDims(opts) || opts.needUnfilled) {
+  if (wantsGeoTableDims(opts)) {
     const rows = await fetchGrainDomainTableRows(startDate, endDate, tableOpts);
     return rows.map(mapDomainTableRow);
   }
@@ -2726,8 +2745,6 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
   // Rollups have no country/device grain — never use them when Reporting needs geo dims.
   if (opts.countryNames && opts.countryNames.length) return null;
   if (wantsGeoTableDims(opts)) return null;
-  // Rollup tables do not store unfilled impressions (Total fill rate) — use grain.
-  if (opts.needUnfilled) return null;
 
   const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
   const skipCharts = Boolean(opts.skipCharts || opts.reportingFast);
@@ -3121,7 +3138,7 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     try {
       const maps = loadCachedAppPackageMaps();
       if (!maps.byPackage.size && !maps.byResolvedId.size) {
-        await warmAppPackageMapsFromGrain();
+        await warmAppPackageMapsBounded();
       }
     } catch (_) { /* ignore */ }
   }
@@ -3131,12 +3148,32 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     && !(opts.sites || []).length
     && !(opts.adUnitNames || []).length;
 
+  // App ID only, no country/device breakdown: same app rollups the Dashboard reads (date × app),
+  // instead of aggregating the app_id grain (24s for 30 days, minutes for 90). Fill rate is
+  // added afterwards from rollup_fill_daily.
+  if (hasAppsOnly && dayCount > 1 && !wantsGeoTableDims(opts) && !opts.countryNames?.length) {
+    try {
+      const rolled = await fetchAppSliceDashboardFromRollup(startDate, endDate, {
+        ...opts,
+        skipCharts: true,
+        reportingFast: true,
+      });
+      if (rolled?.rows?.length) {
+        logger.info(
+          `Reporting app-rollup ${startDate}..${endDate} table=${rolled.rows.length} in ${Date.now() - t0}ms`
+        );
+        return { ...rolled, source: 'reporting-app-rollup' };
+      }
+    } catch (e) {
+      logger.warn('Reporting app-rollup failed (falling back to grain):', e.message);
+    }
+  }
+
   // Long ranges: rollup KPIs + inventory Site/Domain rollups (real SITE_NAME).
   if (
     dayCount > DASHBOARD_ROLLUP_FIRST_DAYS
     && !hasAppsOnly
     && !wantsGeoTableDims(opts)
-    && !opts.needUnfilled
     && !opts.countryNames?.length
   ) {
     try {
@@ -3334,43 +3371,80 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
 }
 
 /**
- * Ad-unit rows from the inventory_core slice carry no unfilled impressions, so Total fill rate
- * would be empty/0. The app_id slice stores unfilled per ad unit — look it up there
- * (date × ad unit) and set unfilled + fill rate on rows that lack it.
+ * Fill impressions/unfilled for a set of (day, key) pairs: rollup_fill_daily first (tiny,
+ * indexed), raw app_id grain only for days the fill rollup does not have yet and only on
+ * short ranges, so long-range reports never scan report_grain.
  */
-async function enrichUnfilledFromAppSlice(rows = [], startDate, endDate) {
-  const need = (rows || []).filter((r) => (
-    r.unfilled == null && !r.country && String(r.AD_UNIT_NAME || r.ad_unit_name || '').trim()
-  ));
-  if (!need.length) return;
-  const names = [...new Set(need.map((r) => String(r.AD_UNIT_NAME || r.ad_unit_name).trim()))];
+const FILL_GRAIN_FALLBACK_MAX_DAYS = Math.max(1, parseInt(process.env.FILL_GRAIN_FALLBACK_MAX_DAYS || '7', 10) || 7);
+async function lookupFillTotals(kind, keys, startDate, endDate) {
   const clientId = requireClientId();
-  const { rows: agg } = await query(
-    `SELECT to_char(g.report_date, 'YYYY-MM-DD') AS d, da.name AS ad_unit,
-            SUM(g.impressions)::float8 AS imp, SUM(g.unfilled)::float8 AS unfilled
-     FROM report_grain g
-     JOIN dim_ad_unit da ON da.id = g.ad_unit_id AND da.client_id = g.client_id
-     WHERE g.client_id = $1::uuid AND g.slice_key = 'app_id'
-       AND g.report_date BETWEEN $2::date AND $3::date
-       AND da.name = ANY($4::text[])
-     GROUP BY 1, 2
-     HAVING SUM(g.unfilled) IS NOT NULL`,
-    [clientId, startDate, endDate, names]
-  );
-  const byKey = new Map(agg.map((r) => [`${r.d}|${r.ad_unit}`, r]));
-  for (const r of need) {
-    const name = String(r.AD_UNIT_NAME || r.ad_unit_name).trim();
-    const hit = byKey.get(`${String(r.date || r.report_date).slice(0, 10)}|${name}`);
-    if (!hit || !(hit.imp + hit.unfilled > 0)) continue;
-    const fill = +((hit.imp / (hit.imp + hit.unfilled)) * 100).toFixed(2);
-    r.unfilled = hit.unfilled;
-    r.fillRate = fill;
-    r.metrics = {
-      ...(r.metrics || {}),
-      total_inventory_level_unfilled_impressions: hit.unfilled,
-      total_fill_rate: fill,
-    };
+  const out = new Map();
+  if (!keys.length) return out;
+  const { rows } = await query(
+    `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, key, impressions AS imp, unfilled
+     FROM rollup_fill_daily
+     WHERE client_id = $1::uuid AND kind = $2 AND report_date BETWEEN $3::date AND $4::date
+       AND key = ANY($5::text[])`,
+    [clientId, kind, startDate, endDate, keys]
+  ).catch(() => ({ rows: [] }));
+  const coveredDays = new Set();
+  for (const r of rows) {
+    coveredDays.add(r.d);
+    if (r.unfilled != null) out.set(`${r.d}|${r.key}`, { imp: Number(r.imp), unfilled: Number(r.unfilled) });
   }
+  // Days the fill rollup has not built yet → grain, but only when that is a short scan.
+  const { rows: dayRows } = await query(
+    `SELECT to_char(d::date, 'YYYY-MM-DD') AS d FROM generate_series($1::date, $2::date, '1 day'::interval) d`,
+    [startDate, endDate]
+  );
+  const missing = dayRows.map((r) => r.d).filter((d) => !coveredDays.has(d));
+  if (!missing.length || missing.length > FILL_GRAIN_FALLBACK_MAX_DAYS) return out;
+  const grainSql = kind === 'app'
+    ? `SELECT to_char(g.report_date, 'YYYY-MM-DD') AS d, LOWER(g.app_id) AS key,
+              SUM(g.impressions)::float8 AS imp, SUM(g.unfilled)::float8 AS unfilled
+       FROM report_grain g
+       WHERE g.client_id = $1::uuid AND g.slice_key = 'app_id'
+         AND g.report_date = ANY($2::date[]) AND LOWER(g.app_id) = ANY($3::text[])
+       GROUP BY 1, 2 HAVING SUM(g.unfilled) IS NOT NULL`
+    : `SELECT to_char(g.report_date, 'YYYY-MM-DD') AS d, da.name AS key,
+              SUM(g.impressions)::float8 AS imp, SUM(g.unfilled)::float8 AS unfilled
+       FROM report_grain g
+       JOIN dim_ad_unit da ON da.id = g.ad_unit_id AND da.client_id = g.client_id
+       WHERE g.client_id = $1::uuid AND g.slice_key = 'app_id'
+         AND g.report_date = ANY($2::date[])
+         AND g.ad_unit_id = ANY(ARRAY(SELECT id FROM dim_ad_unit WHERE client_id = $1::uuid AND name = ANY($3::text[])))
+       GROUP BY 1, 2 HAVING SUM(g.unfilled) IS NOT NULL`;
+  const { rows: g } = await query(grainSql, [clientId, missing, keys]);
+  for (const r of g) out.set(`${r.d}|${r.key}`, { imp: Number(r.imp), unfilled: Number(r.unfilled) });
+  return out;
+}
+
+function applyFillToRow(r, hit) {
+  if (!hit || !(hit.imp + hit.unfilled > 0)) return;
+  const fill = +((hit.imp / (hit.imp + hit.unfilled)) * 100).toFixed(2);
+  r.unfilled = hit.unfilled;
+  r.fillRate = fill;
+  r.metrics = {
+    ...(r.metrics || {}),
+    total_inventory_level_unfilled_impressions: hit.unfilled,
+    total_fill_rate: fill,
+  };
+}
+
+/** Rows from rollups / inventory_core carry no unfilled — fill app and ad-unit rows. */
+async function enrichUnfilledFromAppSlice(rows = [], startDate, endDate) {
+  const isApp = (v) => v && v !== '—' && v !== '-' && v !== '–';
+  const unitOf = (r) => String(r.AD_UNIT_NAME || r.ad_unit_name || '').trim();
+  const dayOf = (r) => String(r.date || r.report_date || '').slice(0, 10);
+  const open = (rows || []).filter((r) => r.unfilled == null && !r.country);
+  const unitRows = open.filter((r) => unitOf(r));
+  const appRows = open.filter((r) => !unitOf(r) && isApp(r.appId));
+  const [unitFill, appFill] = await Promise.all([
+    lookupFillTotals('ad_unit', [...new Set(unitRows.map(unitOf))], startDate, endDate),
+    lookupFillTotals('app', [...new Set(appRows.map((r) => String(r.appId).trim().toLowerCase()))], startDate, endDate),
+  ]);
+  for (const r of unitRows) applyFillToRow(r, unitFill.get(`${dayOf(r)}|${unitOf(r)}`));
+  for (const r of appRows) applyFillToRow(r, appFill.get(`${dayOf(r)}|${String(r.appId).trim().toLowerCase()}`));
 }
 
 /** Merge two Reporting bundles (web + app) into one table payload. */
@@ -3466,7 +3540,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
     try {
       const maps = loadCachedAppPackageMaps();
       if (!maps.byPackage.size && !maps.byResolvedId.size) {
-        await warmAppPackageMapsFromGrain();
+        await warmAppPackageMapsBounded();
       }
     } catch (_) { /* ignore */ }
   }
@@ -3868,7 +3942,7 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
   // Prefer inventory Site/Domain rollups (daily rows) for any unfiltered / domain-filtered range.
   // Site filters also use inventory rollups — channel KPI rollups lack request hosts.
   const requestSiteOnly = siteKind === 'request' && (opts.sites || []).length && !hasApp;
-  if (!wantsGeo && !hasApp && !opts.needUnfilled) {
+  if (!wantsGeo && !hasApp) {
     const wantsInvTable = dayCount > 1
       || (opts.sites || []).length
       || (opts.domains || []).length
@@ -5773,6 +5847,7 @@ module.exports = {
   pickBestFullSlice,
   rebuildRollupsForDates,
   backfillAllRollups,
+  enrichUnfilledFromAppSlice,
   rowsHaveLeanMetrics,
   fetchFromGAM,
   streamSyncFromGAM,

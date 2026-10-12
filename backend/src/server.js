@@ -225,6 +225,8 @@ async function startServer() {
           await runWithClient(client, async () => {
             const n = await backfillAllRollups('startup-rollup');
             if (n > 0) logger.info(`Startup rollup backfill client=${client.id.slice(0, 8)} wrote ≈${n} kpi row(s)`);
+            // Fill-rate rollups for recent days (Reporting Total fill rate on long ranges).
+            await require('./services/reportGrainStore').backfillFillRollups();
           });
         }
       } catch (e) {
