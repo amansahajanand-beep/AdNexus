@@ -9,7 +9,7 @@ const {
   grainRowToLegacyDimensions,
   grainRowToLegacyMetrics,
 } = require('./dimLookupService');
-const { expandAppFilterAliases, loadCachedAppPackageMaps, warmAppPackageMapsFromGrain } = require('../utils/appIdentity');
+const { expandAppFilterAliases, loadCachedAppPackageMaps, warmAppPackageMapsBounded } = require('../utils/appIdentity');
 const logger = require('../utils/logger');
 
 function expandedAppFilterValues(apps = []) {
@@ -19,9 +19,8 @@ function expandedAppFilterValues(apps = []) {
 }
 
 async function ensureAppAliasMapsWarm() {
-  const maps = loadCachedAppPackageMaps();
-  if (maps.byPackage.size || maps.byResolvedId.size) return maps;
-  return warmAppPackageMapsFromGrain();
+  // Bounded: never hold a report for the full alias scan (see warmAppPackageMapsBounded).
+  return warmAppPackageMapsBounded();
 }
 
 const RICH_GRAIN_SQL = `(g.country_id IS NOT NULL AND g.country_id <> 0 AND g.device_id IS NOT NULL AND g.device_id <> 0)`;
@@ -516,7 +515,93 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
   }
   logger.info(`[${syncType}] Rebuilt rollups from grain for ${uniq.length} day(s); kpi rows≈${totalKpi}`);
   await rebuildInventoryRollupsFromGrain(uniq, syncType);
+  await rebuildFillRollupsForDates(uniq, syncType);
   return totalKpi;
+}
+
+/**
+ * rollup_fill_daily: impressions + unfilled per day per app and per ad unit, from the app_id
+ * slice (the only slice that reliably stores unfilled). One indexed day-scan per date.
+ */
+async function rebuildFillRollupsForDates(dates, syncType = 'fill-rollup') {
+  const uniq = [...new Set((dates || []).map((d) => String(d).slice(0, 10)).filter(Boolean))];
+  if (!uniq.length) return 0;
+  const clientId = requireClientId();
+  let n = 0;
+  for (const day of uniq) {
+    try {
+      n += await withTransaction(async (q) => {
+        await q(
+          `DELETE FROM rollup_fill_daily WHERE client_id = $1::uuid AND report_date = $2::date`,
+          [clientId, day]
+        );
+        const apps = await q(
+          `INSERT INTO rollup_fill_daily (client_id, report_date, kind, key, impressions, unfilled)
+           SELECT $1::uuid, $2::date, 'app', LOWER(g.app_id),
+                  COALESCE(SUM(g.impressions), 0)::float8, SUM(g.unfilled)::float8
+           FROM report_grain g
+           WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'app_id'
+             AND NULLIF(TRIM(g.app_id), '') IS NOT NULL
+           GROUP BY LOWER(g.app_id)`,
+          [clientId, day]
+        );
+        const units = await q(
+          `INSERT INTO rollup_fill_daily (client_id, report_date, kind, key, impressions, unfilled)
+           SELECT $1::uuid, $2::date, 'ad_unit', da.name,
+                  COALESCE(SUM(g.impressions), 0)::float8, SUM(g.unfilled)::float8
+           FROM report_grain g
+           JOIN dim_ad_unit da ON da.id = g.ad_unit_id AND da.client_id = g.client_id
+           WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'app_id'
+             AND NULLIF(TRIM(da.name), '') IS NOT NULL
+           GROUP BY da.name
+           ON CONFLICT (client_id, report_date, kind, key) DO NOTHING`,
+          [clientId, day]
+        );
+        return (apps.rowCount || 0) + (units.rowCount || 0);
+      });
+    } catch (e) {
+      logger.warn(`[${syncType}] fill rollup failed for ${day}:`, e.message);
+    }
+  }
+  return n;
+}
+
+let fillBackfillRunning = false;
+/** Background: build rollup_fill_daily for recent days that do not have it yet (oldest last). */
+async function backfillFillRollups(days = parseInt(process.env.FILL_ROLLUP_BACKFILL_DAYS || '120', 10) || 120) {
+  if (fillBackfillRunning) return 0;
+  fillBackfillRunning = true;
+  try {
+    const clientId = requireClientId();
+    const { rows } = await query(
+      `SELECT to_char(d.day, 'YYYY-MM-DD') AS d
+       FROM generate_series(CURRENT_DATE - $2::int, CURRENT_DATE, '1 day'::interval) AS d(day)
+       -- LATERAL … LIMIT 1 = one index probe per day; a plain EXISTS was planned as a hash
+       -- semi-join over every report_grain row in the window (minutes on a busy disk).
+       CROSS JOIN LATERAL (
+         SELECT 1 FROM report_grain g
+         WHERE g.client_id = $1::uuid AND g.report_date = d.day::date AND g.slice_key = 'app_id'
+         LIMIT 1
+       ) has_grain
+       WHERE NOT EXISTS (
+           SELECT 1 FROM rollup_fill_daily f
+           WHERE f.client_id = $1::uuid AND f.report_date = d.day::date
+         )
+       ORDER BY d.day DESC`,
+      [clientId, days]
+    );
+    const dates = rows.map((r) => r.d);
+    if (!dates.length) return 0;
+    logger.info(`[fill-rollup] backfilling ${dates.length} day(s) client=${String(clientId).slice(0, 8)}`);
+    const n = await rebuildFillRollupsForDates(dates, 'fill-rollup-backfill');
+    logger.info(`[fill-rollup] backfill done (${n} row(s)) client=${String(clientId).slice(0, 8)}`);
+    return n;
+  } catch (e) {
+    logger.warn('[fill-rollup] backfill failed:', e.message);
+    return 0;
+  } finally {
+    fillBackfillRunning = false;
+  }
 }
 
 /**
@@ -1212,6 +1297,8 @@ module.exports = {
   fetchGrainLegacyFromDB,
   fetchGrainLeanRowsFromDB,
   fetchGrainDomainTableRows,
+  rebuildFillRollupsForDates,
+  backfillFillRollups,
   reportingTableLimit,
   appendGrainInventoryFilters,
   grainHasRichDimsForDate,

@@ -4520,7 +4520,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v39_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v41_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4702,6 +4702,12 @@ async function handleDetailedReport(req, res) {
           filters.endDate,
           invOpts
         );
+        // Total fill rate: rows from fast rollup paths carry no unfilled — fill them from the
+        // app_id slice (indexed lookups) instead of forcing every report onto raw grain.
+        if (invOpts.needUnfilled && bundle?.rows?.length && svc.enrichUnfilledFromAppSlice) {
+          await svc.enrichUnfilledFromAppSlice(bundle.rows, filters.startDate, filters.endDate)
+            .catch((e) => logger.warn('Reporting fill-rate enrich failed:', e.message));
+        }
         const countryOk = !wantsCountryCol
           || (bundle?.rows || []).some((r) => String(r.country || r.COUNTRY_NAME || '').trim());
         if (bundle && countryOk && (bundle.rows?.length || bundle.grainCount)) {

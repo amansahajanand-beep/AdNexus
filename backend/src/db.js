@@ -285,6 +285,19 @@ async function initSchema() {
       PRIMARY KEY (client_id, report_date, dim_kind, dim_value)
     );
 
+    -- Total fill rate inputs per day (from the app_id slice): kind = 'app' (LOWER(app_id)) or
+    -- 'ad_unit' (ad unit name). unfilled NULL = GAM sent no unfilled count for that day.
+    -- Lets Reporting show fill rate on long ranges without scanning report_grain.
+    CREATE TABLE IF NOT EXISTS rollup_fill_daily (
+      client_id    UUID        NOT NULL,
+      report_date  DATE        NOT NULL,
+      kind         TEXT        NOT NULL,
+      key          TEXT        NOT NULL,
+      impressions  DOUBLE PRECISION NOT NULL DEFAULT 0,
+      unfilled     DOUBLE PRECISION,
+      PRIMARY KEY (client_id, report_date, kind, key)
+    );
+
     CREATE TABLE IF NOT EXISTS rollup_network_daily (
       client_id       UUID        NOT NULL REFERENCES gam_clients(id),
       report_date     DATE        NOT NULL,
