@@ -108,8 +108,20 @@ export default function ProductDetailTable({
         aggregate: 'avg',
       });
     }
+    // AdMob "Total fill rate" = match rate (matched requests / ad requests). Total row is the
+    // request-weighted rate, not an average of the row percentages.
+    if (product === 'admob' && vis.ecpm !== false) {
+      cols.push({
+        id: 'fill_rate',
+        type: 'metric',
+        label: 'Total fill rate',
+        getValue: (r) => Number(r.match_rate) || 0,
+        format: 'percent',
+        aggregate: 'weightedFill',
+      });
+    }
     return cols;
-  }, [nameLabel, vis.impressions, vis.ctr, vis.revenue, vis.ecpm, showPageViews]);
+  }, [nameLabel, vis.impressions, vis.ctr, vis.revenue, vis.ecpm, showPageViews, product]);
 
   return (
     <DynamicReportTable

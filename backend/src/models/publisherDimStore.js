@@ -281,10 +281,15 @@ async function breakdownAdMob(clientId, {
             SUM(d.earnings)::float AS earnings,
             SUM(d.impressions)::bigint AS impressions,
             SUM(d.clicks)::bigint AS clicks,
+            COALESCE(SUM(d.ad_requests), 0)::bigint AS ad_requests,
+            COALESCE(SUM(d.matched_requests), 0)::bigint AS matched_requests,
             CASE WHEN SUM(d.impressions) > 0
               THEN (SUM(d.earnings) / SUM(d.impressions) * 1000) ELSE 0 END AS ecpm,
             CASE WHEN SUM(d.impressions) > 0
-              THEN (SUM(d.clicks)::float8 / SUM(d.impressions) * 100) ELSE 0 END AS ctr
+              THEN (SUM(d.clicks)::float8 / SUM(d.impressions) * 100) ELSE 0 END AS ctr,
+            -- AdMob's fill rate is its match rate: matched requests / ad requests.
+            CASE WHEN SUM(d.ad_requests) > 0
+              THEN (SUM(d.matched_requests)::float8 / SUM(d.ad_requests) * 100) ELSE 0 END AS match_rate
      FROM admob_dim_daily d
      WHERE d.client_id = $1
        AND d.report_date >= $2::date AND d.report_date <= $3::date
@@ -552,10 +557,14 @@ async function dateRowsAdMob(clientId, {
             SUM(earnings)::float AS earnings,
             SUM(impressions)::bigint AS impressions,
             SUM(clicks)::bigint AS clicks,
+            COALESCE(SUM(ad_requests), 0)::bigint AS ad_requests,
+            COALESCE(SUM(matched_requests), 0)::bigint AS matched_requests,
             CASE WHEN SUM(impressions) > 0
               THEN (SUM(earnings) / SUM(impressions) * 1000) ELSE 0 END AS ecpm,
             CASE WHEN SUM(impressions) > 0
-              THEN (SUM(clicks)::float8 / SUM(impressions) * 100) ELSE 0 END AS ctr
+              THEN (SUM(clicks)::float8 / SUM(impressions) * 100) ELSE 0 END AS ctr,
+            CASE WHEN SUM(ad_requests) > 0
+              THEN (SUM(matched_requests)::float8 / SUM(ad_requests) * 100) ELSE 0 END AS match_rate
      FROM admob_report_daily
      WHERE client_id = $1
        AND report_date >= $2::date AND report_date <= $3::date

@@ -759,6 +759,9 @@ function createPublisherApiRouter({
         if (!vis.ecpm) {
           delete out.ecpm;
           delete out.rpm;
+          delete out.match_rate;
+          delete out.ad_requests;
+          delete out.matched_requests;
         }
         return out;
       });
@@ -847,6 +850,9 @@ function createPublisherApiRouter({
         if (!vis.ecpm) {
           delete out.ecpm;
           delete out.rpm;
+          delete out.match_rate;
+          delete out.ad_requests;
+          delete out.matched_requests;
         }
         return out;
       });
