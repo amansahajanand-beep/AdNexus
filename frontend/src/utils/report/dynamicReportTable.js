@@ -556,6 +556,15 @@ export function aggregateColumn(rows, col) {
     });
     return imp > 0 ? (rev / imp) * 1000 : 0;
   }
+  if (col.aggregate === 'weightedFill') {
+    let matched = 0;
+    let requests = 0;
+    rows.forEach((r) => {
+      matched += Number(r.matched_requests) || 0;
+      requests += Number(r.ad_requests) || 0;
+    });
+    return requests > 0 ? (matched / requests) * 100 : 0;
+  }
   if (col.aggregate === 'weightedCtr') {
     let clicks = 0;
     let imp = 0;
