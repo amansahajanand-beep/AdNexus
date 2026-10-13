@@ -160,7 +160,8 @@ async function startServer() {
   app.use('/api/auth', sessionRoutes);       // Dashboard user login/session
   app.use('/api/users', usersRoutes);        // Admin user management
   app.use('/api/domains', domainsRoutes);    // Domain / channel catalogue
-  app.use('/api/reports', reportsRoutes);
+  // Backfills wait while a report is running (see utils/activityGate).
+  app.use('/api/reports', require('./utils/activityGate').reportActivity, reportsRoutes);
   app.use('/api/orders', ordersRoutes);
   app.use('/api/inventory', inventoryRoutes);
   app.use('/api/network', networkRoutes);
@@ -227,6 +228,8 @@ async function startServer() {
             if (n > 0) logger.info(`Startup rollup backfill client=${client.id.slice(0, 8)} wrote ≈${n} kpi row(s)`);
             // Fill-rate rollups for recent days (Reporting Total fill rate on long ranges).
             await require('./services/reportGrainStore').backfillFillRollups();
+            // Ad Exchange requests / match rate (GAM) for Reporting match-rate columns.
+            await require('./services/requestRollupStore').backfillRequestRollups();
           });
         }
       } catch (e) {

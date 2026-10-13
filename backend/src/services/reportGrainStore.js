@@ -523,12 +523,14 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
  * rollup_fill_daily: impressions + unfilled per day per app and per ad unit, from the app_id
  * slice (the only slice that reliably stores unfilled). One indexed day-scan per date.
  */
-async function rebuildFillRollupsForDates(dates, syncType = 'fill-rollup') {
+async function rebuildFillRollupsForDates(dates, syncType = 'fill-rollup', { pauseMs = 0 } = {}) {
   const uniq = [...new Set((dates || []).map((d) => String(d).slice(0, 10)).filter(Boolean))];
   if (!uniq.length) return 0;
   const clientId = requireClientId();
   let n = 0;
   for (const day of uniq) {
+    // Backfill days wait for a quiet moment (no report running) before writing.
+    if (pauseMs > 0) await require('../utils/activityGate').waitForQuiet();
     try {
       n += await withTransaction(async (q) => {
         await q(
@@ -557,11 +559,40 @@ async function rebuildFillRollupsForDates(dates, syncType = 'fill-rollup') {
            ON CONFLICT (client_id, report_date, kind, key) DO NOTHING`,
           [clientId, day]
         );
-        return (apps.rowCount || 0) + (units.rowCount || 0);
+        // Country breakdowns: key = '<app id | ad unit>|<country name>' (names as dim_country
+        // stores them, so report rows match exactly).
+        const appsC = await q(
+          `INSERT INTO rollup_fill_daily (client_id, report_date, kind, key, impressions, unfilled)
+           SELECT $1::uuid, $2::date, 'app_country', LOWER(g.app_id) || '|' || dc.name,
+                  COALESCE(SUM(g.impressions), 0)::float8, SUM(g.unfilled)::float8
+           FROM report_grain g
+           JOIN dim_country dc ON dc.id = g.country_id
+           WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'app_id'
+             AND NULLIF(TRIM(g.app_id), '') IS NOT NULL AND NULLIF(TRIM(dc.name), '') IS NOT NULL
+           GROUP BY LOWER(g.app_id), dc.name`,
+          [clientId, day]
+        );
+        const unitsC = await q(
+          `INSERT INTO rollup_fill_daily (client_id, report_date, kind, key, impressions, unfilled)
+           SELECT $1::uuid, $2::date, 'ad_unit_country', da.name || '|' || dc.name,
+                  COALESCE(SUM(g.impressions), 0)::float8, SUM(g.unfilled)::float8
+           FROM report_grain g
+           JOIN dim_ad_unit da ON da.id = g.ad_unit_id AND da.client_id = g.client_id
+           JOIN dim_country dc ON dc.id = g.country_id
+           WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'app_id'
+             AND NULLIF(TRIM(da.name), '') IS NOT NULL AND NULLIF(TRIM(dc.name), '') IS NOT NULL
+           GROUP BY da.name, dc.name
+           ON CONFLICT (client_id, report_date, kind, key) DO NOTHING`,
+          [clientId, day]
+        );
+        return (apps.rowCount || 0) + (units.rowCount || 0)
+          + (appsC.rowCount || 0) + (unitsC.rowCount || 0);
       });
     } catch (e) {
       logger.warn(`[${syncType}] fill rollup failed for ${day}:`, e.message);
     }
+    // Backfill only: breathe between days so report queries get the disk (small DB hosts).
+    if (pauseMs > 0) await new Promise((r) => setTimeout(r, pauseMs));
   }
   return n;
 }
@@ -586,6 +617,7 @@ async function backfillFillRollups(days = parseInt(process.env.FILL_ROLLUP_BACKF
        WHERE NOT EXISTS (
            SELECT 1 FROM rollup_fill_daily f
            WHERE f.client_id = $1::uuid AND f.report_date = d.day::date
+             AND f.kind = 'ad_unit_country'
          )
        ORDER BY d.day DESC`,
       [clientId, days]
@@ -593,7 +625,10 @@ async function backfillFillRollups(days = parseInt(process.env.FILL_ROLLUP_BACKF
     const dates = rows.map((r) => r.d);
     if (!dates.length) return 0;
     logger.info(`[fill-rollup] backfilling ${dates.length} day(s) client=${String(clientId).slice(0, 8)}`);
-    const n = await rebuildFillRollupsForDates(dates, 'fill-rollup-backfill');
+    // Pause between days (default 4 s) so a long backfill never saturates a small host's disk;
+    // set FILL_BACKFILL_PAUSE_MS=0 for a fast one-off rebuild on a quiet database.
+    const pauseMs = Math.max(0, parseInt(process.env.FILL_BACKFILL_PAUSE_MS || '4000', 10) || 0);
+    const n = await rebuildFillRollupsForDates(dates, 'fill-rollup-backfill', { pauseMs });
     logger.info(`[fill-rollup] backfill done (${n} row(s)) client=${String(clientId).slice(0, 8)}`);
     return n;
   } catch (e) {

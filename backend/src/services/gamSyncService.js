@@ -3300,6 +3300,11 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
   // web leg when assigned site hosts don't resolve to dim_site ids, leaving only app_id
   // totals (Domain/Site columns show "—").
   if (hasWebInv && hasAppInv) {
+    // App ID/name used only as a breakdown column (no App filter) next to an ad-unit / site /
+    // domain filter: the app leg would list EVERY app and ignore those filters (thousands of
+    // unrelated rows), so skip it — the web leg already returns exactly the filtered inventory.
+    const appLegWanted = (opts.apps || []).length > 0
+      || !((opts.adUnitNames || []).length || (opts.sites || []).length || (opts.domains || []).length);
     const [webBundle, appBundle] = await Promise.all([
       fetchLeanDashboardBundleFromDB(startDate, endDate, {
         ...opts,
@@ -3311,7 +3316,7 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
         logger.warn('Reporting web lean leg failed:', e.message);
         return null;
       }),
-      fetchLeanDashboardBundleFromDB(startDate, endDate, {
+      appLegWanted ? fetchLeanDashboardBundleFromDB(startDate, endDate, {
         ...opts,
         domains: [],
         sites: [],
@@ -3324,7 +3329,7 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
       }).catch((e) => {
         logger.warn('Reporting app lean leg failed:', e.message);
         return null;
-      }),
+      }) : Promise.resolve(null),
     ]);
     const merged = mergeReportingBundles(webBundle, appBundle, opts);
     if (merged && opts.needUnfilled) {
@@ -3399,7 +3404,23 @@ async function lookupFillTotals(kind, keys, startDate, endDate) {
   );
   const missing = dayRows.map((r) => r.d).filter((d) => !coveredDays.has(d));
   if (!missing.length || missing.length > FILL_GRAIN_FALLBACK_MAX_DAYS) return out;
-  const grainSql = kind === 'app'
+  const grainSql = kind === 'app_country'
+    ? `SELECT to_char(g.report_date, 'YYYY-MM-DD') AS d, LOWER(g.app_id) || '|' || dc.name AS key,
+              SUM(g.impressions)::float8 AS imp, SUM(g.unfilled)::float8 AS unfilled
+       FROM report_grain g JOIN dim_country dc ON dc.id = g.country_id
+       WHERE g.client_id = $1::uuid AND g.slice_key = 'app_id'
+         AND g.report_date = ANY($2::date[]) AND LOWER(g.app_id) = ANY($3::text[])
+       GROUP BY 1, 2 HAVING SUM(g.unfilled) IS NOT NULL`
+    : kind === 'ad_unit_country'
+    ? `SELECT to_char(g.report_date, 'YYYY-MM-DD') AS d, da.name || '|' || dc.name AS key,
+              SUM(g.impressions)::float8 AS imp, SUM(g.unfilled)::float8 AS unfilled
+       FROM report_grain g
+       JOIN dim_ad_unit da ON da.id = g.ad_unit_id AND da.client_id = g.client_id
+       JOIN dim_country dc ON dc.id = g.country_id
+       WHERE g.client_id = $1::uuid AND g.slice_key = 'app_id'
+         AND g.report_date = ANY($2::date[]) AND da.name = ANY($3::text[])
+       GROUP BY 1, 2 HAVING SUM(g.unfilled) IS NOT NULL`
+    : kind === 'app'
     ? `SELECT to_char(g.report_date, 'YYYY-MM-DD') AS d, LOWER(g.app_id) AS key,
               SUM(g.impressions)::float8 AS imp, SUM(g.unfilled)::float8 AS unfilled
        FROM report_grain g
@@ -3414,8 +3435,15 @@ async function lookupFillTotals(kind, keys, startDate, endDate) {
          AND g.report_date = ANY($2::date[])
          AND g.ad_unit_id = ANY(ARRAY(SELECT id FROM dim_ad_unit WHERE client_id = $1::uuid AND name = ANY($3::text[])))
        GROUP BY 1, 2 HAVING SUM(g.unfilled) IS NOT NULL`;
-  const { rows: g } = await query(grainSql, [clientId, missing, keys]);
-  for (const r of g) out.set(`${r.d}|${r.key}`, { imp: Number(r.imp), unfilled: Number(r.unfilled) });
+  // Country kinds are keyed '<name>|<country>': filter grain by the name part, keep wanted pairs.
+  const isCountryKind = kind.endsWith('_country');
+  const wanted = new Set(keys);
+  const baseKeys = isCountryKind ? [...new Set(keys.map((k) => k.split('|')[0]))] : keys;
+  const { rows: g } = await query(grainSql, [clientId, missing, baseKeys]);
+  for (const r of g) {
+    if (isCountryKind && !wanted.has(r.key)) continue;
+    out.set(`${r.d}|${r.key}`, { imp: Number(r.imp), unfilled: Number(r.unfilled) });
+  }
   return out;
 }
 
@@ -3431,20 +3459,38 @@ function applyFillToRow(r, hit) {
   };
 }
 
-/** Rows from rollups / inventory_core carry no unfilled — fill app and ad-unit rows. */
+/**
+ * Rows from rollups / inventory_core carry no unfilled — fill app and ad-unit rows, including
+ * country breakdowns (kinds app_country / ad_unit_country). Device-level rows are skipped.
+ */
 async function enrichUnfilledFromAppSlice(rows = [], startDate, endDate) {
   const isApp = (v) => v && v !== '—' && v !== '-' && v !== '–';
   const unitOf = (r) => String(r.AD_UNIT_NAME || r.ad_unit_name || '').trim();
   const dayOf = (r) => String(r.date || r.report_date || '').slice(0, 10);
-  const open = (rows || []).filter((r) => r.unfilled == null && !r.country);
+  const countryOf = (r) => String(r.country || '').trim();
+  const open = (rows || []).filter((r) => r.unfilled == null && !r.device);
   const unitRows = open.filter((r) => unitOf(r));
   const appRows = open.filter((r) => !unitOf(r) && isApp(r.appId));
-  const [unitFill, appFill] = await Promise.all([
-    lookupFillTotals('ad_unit', [...new Set(unitRows.map(unitOf))], startDate, endDate),
-    lookupFillTotals('app', [...new Set(appRows.map((r) => String(r.appId).trim().toLowerCase()))], startDate, endDate),
+  const unitKey = (r) => (countryOf(r) ? `${unitOf(r)}|${countryOf(r)}` : unitOf(r));
+  const appKey = (r) => {
+    const a = String(r.appId).trim().toLowerCase();
+    return countryOf(r) ? `${a}|${countryOf(r)}` : a;
+  };
+  const keysFor = (list, keyFn, pred) => [...new Set(list.filter(pred).map(keyFn))];
+  const [unitFill, unitCFill, appFill, appCFill] = await Promise.all([
+    lookupFillTotals('ad_unit', keysFor(unitRows, unitKey, (r) => !countryOf(r)), startDate, endDate),
+    lookupFillTotals('ad_unit_country', keysFor(unitRows, unitKey, (r) => countryOf(r)), startDate, endDate),
+    lookupFillTotals('app', keysFor(appRows, appKey, (r) => !countryOf(r)), startDate, endDate),
+    lookupFillTotals('app_country', keysFor(appRows, appKey, (r) => countryOf(r)), startDate, endDate),
   ]);
-  for (const r of unitRows) applyFillToRow(r, unitFill.get(`${dayOf(r)}|${unitOf(r)}`));
-  for (const r of appRows) applyFillToRow(r, appFill.get(`${dayOf(r)}|${String(r.appId).trim().toLowerCase()}`));
+  for (const r of unitRows) {
+    const m = countryOf(r) ? unitCFill : unitFill;
+    applyFillToRow(r, m.get(`${dayOf(r)}|${unitKey(r)}`));
+  }
+  for (const r of appRows) {
+    const m = countryOf(r) ? appCFill : appFill;
+    applyFillToRow(r, m.get(`${dayOf(r)}|${appKey(r)}`));
+  }
 }
 
 /** Merge two Reporting bundles (web + app) into one table payload. */

@@ -298,6 +298,19 @@ async function initSchema() {
       PRIMARY KEY (client_id, report_date, kind, key)
     );
 
+    -- Ad Exchange ad requests + matched requests per day (GAM AD_EXCHANGE_TOTAL_REQUESTS and
+    -- AD_EXCHANGE_MATCH_RATE; matched = requests x rate). kind/key as in rollup_fill_daily plus
+    -- 'country'. Lets Reporting show match rate / total requests without scanning report_grain.
+    CREATE TABLE IF NOT EXISTS rollup_request_daily (
+      client_id         UUID        NOT NULL,
+      report_date       DATE        NOT NULL,
+      kind              TEXT        NOT NULL,
+      key               TEXT        NOT NULL,
+      ad_requests       DOUBLE PRECISION NOT NULL DEFAULT 0,
+      matched_requests  DOUBLE PRECISION NOT NULL DEFAULT 0,
+      PRIMARY KEY (client_id, report_date, kind, key)
+    );
+
     CREATE TABLE IF NOT EXISTS rollup_network_daily (
       client_id       UUID        NOT NULL REFERENCES gam_clients(id),
       report_date     DATE        NOT NULL,

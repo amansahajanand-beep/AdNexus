@@ -10,6 +10,7 @@ const {
   getUserInventoryScope,
   userHasAssignedInventory,
   resolveScopedSqlInventoryOpts,
+  rowMatchesAllowedAdUnits,
 } = require('../utils/permissions');
 const { todayInTZ, dateRangeInTZ, dateRangeYMDInTZ, listCalendarMonthsNewestFirst, shiftYMD } = require('../utils/datetime');
 const { resolveAppFields, buildAppPackageMapsFromGamRows, buildAppPackageMapsFromMobileApps, mergeAppPackageMapData, mapsToPlain, packageListFromMapData, enrichRowsWithAppPackages, rehydrateAppPackageMaps, isLikelyAppPackage, isMobileAppRow } = require('../utils/appIdentity');
@@ -2043,7 +2044,22 @@ function prepareScopedReportRows(allRows, filters, user) {
           urlScanMap: catalogPayload.adUnitSiteMapFromScan || {},
         });
       }
-      rows = filterRowsByInventory(rows, filters, { scopedChild: true, adUnitToHost });
+      const scope = getUserInventoryScope(user);
+      if (scope?.adUnits?.size) {
+        // An assigned ad unit is its own grant: its rows carry no app id / site, so the app
+        // filter (the user's assigned app) must not be applied to them — it dropped every
+        // ad-unit row and left only the app total. Other rows are filtered as before.
+        const isUnit = (r) => rowMatchesAllowedAdUnits(r, scope.adUnits);
+        const unitKept = new Set(filterRowsByInventory(
+          rows.filter(isUnit), { ...filters, domainId: [] }, { scopedChild: true, adUnitToHost }
+        ));
+        const otherKept = new Set(filterRowsByInventory(
+          rows.filter((r) => !isUnit(r)), filters, { scopedChild: true, adUnitToHost }
+        ));
+        rows = rows.filter((r) => unitKept.has(r) || otherKept.has(r));
+      } else {
+        rows = filterRowsByInventory(rows, filters, { scopedChild: true, adUnitToHost });
+      }
       if (adUnitToHost?.size) {
         rows = rows.map((row) => {
           const host = lookupCatalogAdUnitHost(row, adUnitToHost);
@@ -4520,7 +4536,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v41_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v45_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4669,6 +4685,7 @@ async function handleDetailedReport(req, res) {
       : tableLimit;
     const invOpts = {
       needUnfilled: originalMetIds.some((m) => String(m).toLowerCase() === 'total_fill_rate'),
+      needRequests: originalMetIds.some((m) => ['ad_exchange_match_rate', 'ad_exchange_total_requests'].includes(String(m).toLowerCase())),
       domains,
       sites,
       adUnitNames,
@@ -4693,6 +4710,12 @@ async function handleDetailedReport(req, res) {
       skipCharts: true,
     };
 
+    logger.info(
+      `Reporting scope opts domains=${invOpts.domains.length} sites=${invOpts.sites.length}`
+      + ` apps=${invOpts.apps.length} adUnits=${(invOpts.adUnitNames || []).length}`
+      + ` groupByApp=${invOpts.groupByApp} groupBySite=${invOpts.groupBySite} country=${invOpts.groupByCountry}`
+    );
+
     // ── Reporting fast path (rollup or ID-filtered grain — seconds, not minutes) ─
     if (useGrainSql && typeof svc?.fetchReportingBundleFromDB === 'function') {
       const t0 = Date.now();
@@ -4704,6 +4727,11 @@ async function handleDetailedReport(req, res) {
         );
         // Total fill rate: rows from fast rollup paths carry no unfilled — fill them from the
         // app_id slice (indexed lookups) instead of forcing every report onto raw grain.
+        if (invOpts.needRequests && bundle?.rows?.length) {
+          await require('./requestRollupStore')
+            .enrichRequestMetrics(bundle.rows, filters.startDate, filters.endDate)
+            .catch((e) => logger.warn('Reporting request-metric enrich failed:', e.message));
+        }
         if (invOpts.needUnfilled && bundle?.rows?.length && svc.enrichUnfilledFromAppSlice) {
           await svc.enrichUnfilledFromAppSlice(bundle.rows, filters.startDate, filters.endDate)
             .catch((e) => logger.warn('Reporting fill-rate enrich failed:', e.message));
