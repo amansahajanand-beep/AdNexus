@@ -572,21 +572,46 @@ async function rebuildFillRollupsForDates(dates, syncType = 'fill-rollup', { pau
            GROUP BY LOWER(g.app_id), dc.name`,
           [clientId, day]
         );
+        // Ad unit x country by id (compact; replaces the old text-keyed 'ad_unit_country' rows).
+        // Upsert so ad_requests / matched_requests written by the GAM request sync are kept.
         const unitsC = await q(
-          `INSERT INTO rollup_fill_daily (client_id, report_date, kind, key, impressions, unfilled)
-           SELECT $1::uuid, $2::date, 'ad_unit_country', da.name || '|' || dc.name,
+          `INSERT INTO rollup_unit_country_fill (client_id, report_date, ad_unit_id, country_id, fill_impressions, unfilled)
+           SELECT $1::uuid, $2::date, g.ad_unit_id, g.country_id,
                   COALESCE(SUM(g.impressions), 0)::float8, SUM(g.unfilled)::float8
            FROM report_grain g
-           JOIN dim_ad_unit da ON da.id = g.ad_unit_id AND da.client_id = g.client_id
-           JOIN dim_country dc ON dc.id = g.country_id
            WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'app_id'
-             AND NULLIF(TRIM(da.name), '') IS NOT NULL AND NULLIF(TRIM(dc.name), '') IS NOT NULL
-           GROUP BY da.name, dc.name
-           ON CONFLICT (client_id, report_date, kind, key) DO NOTHING`,
+             AND g.ad_unit_id <> 0 AND g.country_id <> 0
+           GROUP BY g.ad_unit_id, g.country_id
+           ON CONFLICT (client_id, report_date, ad_unit_id, country_id)
+           DO UPDATE SET fill_impressions = EXCLUDED.fill_impressions, unfilled = EXCLUDED.unfilled`,
+          [clientId, day]
+        );
+        // Inventory x country summary for long-range Reporting (see rollup_unit_country_daily).
+        await q(
+          `DELETE FROM rollup_unit_country_daily WHERE client_id = $1::uuid AND report_date = $2::date`,
+          [clientId, day]
+        );
+        const uc = await q(
+          `INSERT INTO rollup_unit_country_daily (
+             client_id, report_date, ad_unit_id, country_id, site_id, domain_id,
+             impressions, revenue, clicks, viewable_weight, currency
+           )
+           SELECT $1::uuid, $2::date, g.ad_unit_id, g.country_id,
+                  (array_agg(g.site_id ORDER BY g.impressions DESC))[1],
+                  (array_agg(g.domain_id ORDER BY g.impressions DESC))[1],
+                  COALESCE(SUM(g.impressions), 0)::float8,
+                  COALESCE(SUM(g.revenue), 0)::float8,
+                  COALESCE(SUM(g.clicks), 0)::float8,
+                  COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8,
+                  COALESCE(MAX(g.currency), 'USD')
+           FROM report_grain g
+           WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'inventory_core'
+           GROUP BY g.ad_unit_id, g.country_id
+           HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0`,
           [clientId, day]
         );
         return (apps.rowCount || 0) + (units.rowCount || 0)
-          + (appsC.rowCount || 0) + (unitsC.rowCount || 0);
+          + (appsC.rowCount || 0) + (unitsC.rowCount || 0) + (uc.rowCount || 0);
       });
     } catch (e) {
       logger.warn(`[${syncType}] fill rollup failed for ${day}:`, e.message);
@@ -599,7 +624,7 @@ async function rebuildFillRollupsForDates(dates, syncType = 'fill-rollup', { pau
 
 let fillBackfillRunning = false;
 /** Background: build rollup_fill_daily for recent days that do not have it yet (oldest last). */
-async function backfillFillRollups(days = parseInt(process.env.FILL_ROLLUP_BACKFILL_DAYS || '120', 10) || 120) {
+async function backfillFillRollups(days = parseInt(process.env.FILL_ROLLUP_BACKFILL_DAYS || '180', 10) || 180) {
   if (fillBackfillRunning) return 0;
   fillBackfillRunning = true;
   try {
@@ -615,9 +640,8 @@ async function backfillFillRollups(days = parseInt(process.env.FILL_ROLLUP_BACKF
          LIMIT 1
        ) has_grain
        WHERE NOT EXISTS (
-           SELECT 1 FROM rollup_fill_daily f
-           WHERE f.client_id = $1::uuid AND f.report_date = d.day::date
-             AND f.kind = 'ad_unit_country'
+           SELECT 1 FROM rollup_unit_country_daily u
+           WHERE u.client_id = $1::uuid AND u.report_date = d.day::date
          )
        ORDER BY d.day DESC`,
       [clientId, days]

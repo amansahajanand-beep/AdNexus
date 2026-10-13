@@ -311,6 +311,48 @@ async function initSchema() {
       PRIMARY KEY (client_id, report_date, kind, key)
     );
 
+    -- Inventory x country summary (date x ad unit x country, by dim id) from
+    -- inventory_core. Ids only: names are resolved when a report reads it (joining the dim tables
+    -- per row made the daily build take 25-45 s).
+    -- Lets Reporting answer long date ranges with a country breakdown from a small indexed table
+    -- instead of scanning report_grain (that path timed out and fell back to a slow async job).
+    CREATE TABLE IF NOT EXISTS rollup_unit_country_daily (
+      client_id        UUID        NOT NULL,
+      report_date      DATE        NOT NULL,
+      ad_unit_id       INT         NOT NULL DEFAULT 0,
+      country_id       INT         NOT NULL DEFAULT 0,
+      -- site / domain of the ad unit's highest-traffic row that day (an ad unit sits on one
+      -- site in practice; reports filtered by site skip this table, see fetchUnitCountryRollupBundle)
+      site_id          INT         NOT NULL DEFAULT 0,
+      domain_id        INT         NOT NULL DEFAULT 0,
+      impressions      DOUBLE PRECISION NOT NULL DEFAULT 0,
+      revenue          DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks           DOUBLE PRECISION NOT NULL DEFAULT 0,
+      viewable_weight  DOUBLE PRECISION NOT NULL DEFAULT 0,
+      currency         CHAR(3)     NOT NULL DEFAULT 'USD',
+      PRIMARY KEY (client_id, report_date, ad_unit_id, country_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_rollup_unit_country_unit
+      ON rollup_unit_country_daily (client_id, ad_unit_id, report_date);
+
+    -- Fill-rate + Ad Exchange request inputs per (day, ad unit, country), by dim id. Compact
+    -- replacement for the text-keyed 'ad_unit_country' rows in rollup_fill_daily /
+    -- rollup_request_daily (those were ~5M rows / GBs and slow to read).
+    -- fill_impressions + unfilled come from the app_id slice; ad_requests + matched_requests from GAM.
+    CREATE TABLE IF NOT EXISTS rollup_unit_country_fill (
+      client_id          UUID        NOT NULL,
+      report_date        DATE        NOT NULL,
+      ad_unit_id         INT         NOT NULL,
+      country_id         INT         NOT NULL,
+      fill_impressions   DOUBLE PRECISION NOT NULL DEFAULT 0,
+      unfilled           DOUBLE PRECISION,
+      ad_requests        DOUBLE PRECISION,
+      matched_requests   DOUBLE PRECISION,
+      PRIMARY KEY (client_id, report_date, ad_unit_id, country_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_rollup_unit_country_fill_unit
+      ON rollup_unit_country_fill (client_id, ad_unit_id, report_date);
+
     CREATE TABLE IF NOT EXISTS rollup_network_daily (
       client_id       UUID        NOT NULL REFERENCES gam_clients(id),
       report_date     DATE        NOT NULL,
