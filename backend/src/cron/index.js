@@ -740,6 +740,15 @@ function startCron() {
     });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── 03:30 daily: trim derived summary tables + the background-report cache (batched deletes) ──
+  cron.schedule('30 3 * * *', async () => {
+    try {
+      await require('../services/storageMaintenance').runStorageMaintenance();
+    } catch (e) {
+      logger.warn(`Cron: storage maintenance failed: ${e.message}`);
+    }
+  }, { timezone: 'Asia/Singapore' });
+
   // ── Every 15 min: watchdog if hourly sync stalled ───────────────────────
   cron.schedule('*/15 * * * *', async () => {
     await watchdogStaleSync();

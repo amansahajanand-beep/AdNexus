@@ -38,9 +38,11 @@ const PULLS = [
   },
   { kind: 'country', dims: ['DATE', 'COUNTRY_NAME'], key: (r) => clean(r['Dimension.COUNTRY_NAME']) },
   {
+    // Stored by dim id in rollup_unit_country_fill (compact), not as text keys.
     kind: 'ad_unit_country',
     dims: ['DATE', 'COUNTRY_NAME', 'AD_UNIT_NAME'],
     key: (r) => pair(clean(r['Dimension.AD_UNIT_NAME']), clean(r['Dimension.COUNTRY_NAME'])),
+    byId: true,
   },
   {
     kind: 'app_country',
@@ -70,6 +72,7 @@ async function syncRequestWindow(startDate, endDate) {
   const clientId = requireClientId();
   const token = await getToken();
   const byKey = new Map(); // day|kind|key -> { req, matched }
+  const byId = new Map(); // day|kind|'<ad unit>|<country>' -> { req, matched } (stored by dim id)
   let ok = 0;
   for (const pull of PULLS) {
     try {
@@ -82,6 +85,13 @@ async function syncRequestWindow(startDate, endDate) {
         const req = Number(r['Column.AD_EXCHANGE_TOTAL_REQUESTS']) || 0;
         const rate = Number(r['Column.AD_EXCHANGE_MATCH_RATE']) || 0;
         const k = `${day}|${pull.kind}|${key}`;
+        if (pull.byId) {
+          const prevId = byId.get(k) || { req: 0, matched: 0 };
+          prevId.req += req;
+          prevId.matched += req * rate;
+          byId.set(k, prevId);
+          continue;
+        }
         const prev = byKey.get(k) || { req: 0, matched: 0 };
         prev.req += req;
         prev.matched += req * rate;
@@ -124,7 +134,42 @@ async function syncRequestWindow(startDate, endDate) {
       );
     }
   });
-  return rows.length;
+  if (byId.size) await storeUnitCountryRequests(clientId, byId);
+  return rows.length + byId.size;
+}
+
+/** Upsert ad_requests / matched_requests into rollup_unit_country_fill (names -> dim ids). */
+async function storeUnitCountryRequests(clientId, byId) {
+  const entries = [...byId.entries()].map(([k, v]) => {
+    const [day, , ...rest] = k.split('|');
+    const key = rest.join('|');
+    const i = key.lastIndexOf('|');
+    return { day, unit: key.slice(0, i), country: key.slice(i + 1), req: v.req, matched: v.matched };
+  });
+  const units = [...new Set(entries.map((e) => e.unit))];
+  const countries = [...new Set(entries.map((e) => e.country))];
+  const [{ rows: uRows }, { rows: cRows }] = await Promise.all([
+    query('SELECT id, name FROM dim_ad_unit WHERE client_id = $1::uuid AND name = ANY($2::text[])', [clientId, units]),
+    query('SELECT id, name FROM dim_country WHERE name = ANY($1::text[])', [countries]),
+  ]);
+  const unitId = new Map(uRows.map((r) => [r.name, Number(r.id)]));
+  const countryId = new Map(cRows.map((r) => [r.name, Number(r.id)]));
+  const rows = entries
+    .map((e) => ({ ...e, u: unitId.get(e.unit), c: countryId.get(e.country) }))
+    .filter((e) => e.u && e.c);
+  const CH = 5000;
+  for (let i = 0; i < rows.length; i += CH) {
+    const part = rows.slice(i, i + CH);
+    await query(
+      `INSERT INTO rollup_unit_country_fill (client_id, report_date, ad_unit_id, country_id, ad_requests, matched_requests)
+       SELECT $1::uuid, d, u, c, r, m
+       FROM unnest($2::date[], $3::int[], $4::int[], $5::float8[], $6::float8[]) AS t(d, u, c, r, m)
+       ON CONFLICT (client_id, report_date, ad_unit_id, country_id)
+       DO UPDATE SET ad_requests = EXCLUDED.ad_requests, matched_requests = EXCLUDED.matched_requests`,
+      [clientId, part.map((x) => x.day), part.map((x) => x.u), part.map((x) => x.c),
+        part.map((x) => x.req), part.map((x) => x.matched)]
+    );
+  }
 }
 
 /** Sync a list of days in windows of up to `windowDays` (GAM returns DATE-keyed rows). */
@@ -147,7 +192,7 @@ async function syncRequestDays(dates, { windowDays = 7, pauseMs = 0 } = {}) {
 
 let backfillRunning = false;
 /** Background: build request rollups for the last N days that have none (newest first). */
-async function backfillRequestRollups(days = parseInt(process.env.REQUEST_ROLLUP_BACKFILL_DAYS || '120', 10) || 120) {
+async function backfillRequestRollups(days = parseInt(process.env.REQUEST_ROLLUP_BACKFILL_DAYS || '180', 10) || 180) {
   if (backfillRunning) return 0;
   backfillRunning = true;
   try {
@@ -156,8 +201,8 @@ async function backfillRequestRollups(days = parseInt(process.env.REQUEST_ROLLUP
       `SELECT to_char(d.day, 'YYYY-MM-DD') AS d
        FROM generate_series(CURRENT_DATE - $2::int, CURRENT_DATE, '1 day'::interval) AS d(day)
        WHERE NOT EXISTS (
-         SELECT 1 FROM rollup_request_daily r
-         WHERE r.client_id = $1::uuid AND r.report_date = d.day::date AND r.kind = 'ad_unit'
+         SELECT 1 FROM rollup_unit_country_fill r
+         WHERE r.client_id = $1::uuid AND r.report_date = d.day::date AND r.ad_requests IS NOT NULL
        )
        ORDER BY d.day DESC`,
       [clientId, days]
@@ -185,16 +230,65 @@ async function refreshRecentRequestRollups(days = 3) {
   return syncRequestDays(ymdList(start, end), { windowDays: days });
 }
 
+/**
+ * ad unit x country by dim id: Map `${day}|${unit}|${country}` -> { fillImp, unfilled, req, matched }.
+ * One indexed range read (client, ad unit id, date) instead of thousands of text-key probes.
+ */
+async function lookupUnitCountryExtras(pairKeys, startDate, endDate) {
+  const out = new Map();
+  if (!pairKeys.length) return out;
+  const clientId = requireClientId();
+  const parsed = pairKeys.map((k) => {
+    const i = k.lastIndexOf('|');
+    return { unit: k.slice(0, i), country: k.slice(i + 1) };
+  });
+  const units = [...new Set(parsed.map((p) => p.unit))];
+  const countries = [...new Set(parsed.map((p) => p.country))];
+  const [{ rows: uRows }, { rows: cRows }] = await Promise.all([
+    query('SELECT id, name FROM dim_ad_unit WHERE client_id = $1::uuid AND name = ANY($2::text[])', [clientId, units]),
+    query('SELECT id, name FROM dim_country WHERE name = ANY($1::text[])', [countries]),
+  ]);
+  if (!uRows.length || !cRows.length) return out;
+  const unitName = new Map(uRows.map((r) => [Number(r.id), r.name]));
+  const countryName = new Map(cRows.map((r) => [Number(r.id), r.name]));
+  const { rows } = await query(
+    `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, ad_unit_id, country_id,
+            fill_impressions, unfilled, ad_requests, matched_requests
+     FROM rollup_unit_country_fill
+     WHERE client_id = $1::uuid AND ad_unit_id = ANY($2::int[])
+       AND report_date BETWEEN $3::date AND $4::date AND country_id = ANY($5::int[])`,
+    [clientId, [...unitName.keys()], startDate, endDate, [...countryName.keys()]]
+  ).catch(() => ({ rows: [] }));
+  for (const r of rows) {
+    out.set(`${r.d}|${unitName.get(Number(r.ad_unit_id))}|${countryName.get(Number(r.country_id))}`, {
+      fillImp: Number(r.fill_impressions) || 0,
+      unfilled: r.unfilled == null ? null : Number(r.unfilled),
+      req: r.ad_requests == null ? null : Number(r.ad_requests),
+      matched: r.matched_requests == null ? null : Number(r.matched_requests),
+    });
+  }
+  return out;
+}
+
 /** Per (day|key) requests / matched for one kind. */
 async function lookupRequestTotals(kind, keys, startDate, endDate) {
   const out = new Map();
   if (!keys.length) return out;
+  if (kind === 'ad_unit_country') {
+    const extras = await lookupUnitCountryExtras(keys, startDate, endDate);
+    for (const [k, v] of extras) {
+      if (v.req != null) out.set(k, { req: v.req, matched: v.matched || 0 });
+    }
+    return out;
+  }
+  // Exact day list (not BETWEEN) so the primary key (client, date, kind, key) is used directly.
+  const days = ymdList(startDate, endDate);
   const { rows } = await query(
     `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, key, ad_requests AS req, matched_requests AS matched
      FROM rollup_request_daily
-     WHERE client_id = $1::uuid AND kind = $2 AND report_date BETWEEN $3::date AND $4::date
-       AND key = ANY($5::text[])`,
-    [requireClientId(), kind, startDate, endDate, keys]
+     WHERE client_id = $1::uuid AND kind = $2 AND report_date = ANY($3::date[])
+       AND key = ANY($4::text[])`,
+    [requireClientId(), kind, days, keys]
   ).catch(() => ({ rows: [] }));
   for (const r of rows) out.set(`${r.d}|${r.key}`, { req: Number(r.req) || 0, matched: Number(r.matched) || 0 });
   return out;
@@ -252,6 +346,7 @@ async function enrichRequestMetrics(rows = [], startDate, endDate) {
 }
 
 module.exports = {
+  lookupUnitCountryExtras,
   syncRequestDays,
   backfillRequestRollups,
   refreshRecentRequestRollups,
