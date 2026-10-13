@@ -855,6 +855,7 @@ module.exports = {
   getAllowedAdsAccountIds,
   resolveAdsAccountIdsForUser,
   scopeRowsToUser,
+  rowMatchesAllowedAdUnits,
   applyScopedOverviewSiteTightening,
   scopeCatalogOptionsForUser,
   getAllowedDomainSet,

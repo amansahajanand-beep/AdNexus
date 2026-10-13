@@ -115,7 +115,13 @@ const DIMENSION_DEFS = {
     cellClass: '',
   },
   ad_unit_name: {
-    getValue: (r) => r.AD_UNIT_NAME || r.ad_unit_name || r.site || readDimensionValue(r, 'ad_unit_name') || '—',
+    // Rows from the warehouse carry AD_UNIT_NAME (possibly empty) and keep the site host in
+    // `site`; only legacy rows without that key store the ad unit in `site`.
+    getValue: (r) => r.AD_UNIT_NAME
+      || r.ad_unit_name
+      || ('AD_UNIT_NAME' in r || 'ad_unit_name' in r ? '' : r.site)
+      || readDimensionValue(r, 'ad_unit_name')
+      || '—',
     cellClass: '',
   },
   programmatic_channel_name: {
@@ -174,10 +180,11 @@ const METRIC_DEFS = {
   },
   total_fill_rate: {
     label: 'Total Fill Rate',
-    getValue: (r) => Number(r.fillRate) || 0,
+    // Unknown (GAM sent no unfilled count) stays empty — a 0.00% would read as "nothing filled".
+    getValue: (r) => (r.fillRate == null || r.fillRate === '' ? null : Number(r.fillRate)),
     format: 'percent',
     visKey: 'ecpm',
-    aggregate: 'avg',
+    aggregate: 'weightedKnownFill',
   },
   total_line_item_level_without_cpd_average_ecpm: {
     label: 'eCPM',
@@ -239,7 +246,15 @@ const METRIC_DEFS = {
     getValue: (r) => readMetricValue(r, 'ad_exchange_match_rate', (row) => row.adxMatchRate),
     format: 'percent',
     visKey: 'ecpm',
-    aggregate: 'avg',
+    // Total = sum(matched) / sum(requests), not an average of the row percentages.
+    aggregate: 'weightedMatchRate',
+  },
+  ad_exchange_total_requests: {
+    label: 'Ad Exchange total requests',
+    getValue: (r) => readMetricValue(r, 'ad_exchange_total_requests', (row) => row.adRequests),
+    format: 'num',
+    visKey: 'impressions',
+    aggregate: 'sum',
   },
   ad_exchange_line_item_level_revenue: {
     label: 'Ad Exchange revenue',
@@ -413,13 +428,17 @@ export function aggregateRowsByColumns(rows = [], columns = []) {
     const rev = pickRowRevenueDollars(row);
     const ctr = Number(row.ctr) || 0;
     const view = Number(row.viewableRate) || 0;
-    const fill = Number(row.fillRate) || 0;
+    const fillKnown = row.fillRate != null && row.fillRate !== '' && Number.isFinite(Number(row.fillRate));
+    const fill = fillKnown ? Number(row.fillRate) : 0;
     bucket.revenue += rev;
     bucket.impression += imp;
     bucket.impressions += imp;
     bucket.clicks += Number(row.clicks) || 0;
     bucket._viewWeighted += view * imp;
-    bucket._fillWeighted += fill * imp;
+    if (fillKnown) {
+      bucket._fillWeighted += fill * imp;
+      bucket._fillImp = (bucket._fillImp || 0) + imp;
+    }
     bucket._ctrWeighted += ctr * imp;
     bucket._weight += imp;
   });
@@ -429,7 +448,8 @@ export function aggregateRowsByColumns(rows = [], columns = []) {
     out.revenue = +out.revenue.toFixed(2);
     const imp = out.impression;
     out.viewableRate = imp > 0 ? +(out._viewWeighted / imp).toFixed(2) : 0;
-    out.fillRate = imp > 0 ? +(out._fillWeighted / imp).toFixed(2) : 0;
+    // Weight only over rows whose fill rate is known; leave it empty when none is.
+    out.fillRate = out._fillImp > 0 ? +(out._fillWeighted / out._fillImp).toFixed(2) : undefined;
     out.ctr = imp > 0 && out.clicks > 0
       ? +((out.clicks / imp) * 100).toFixed(4)
       : (imp > 0 ? +(out._ctrWeighted / imp).toFixed(4) : 0);
@@ -556,6 +576,18 @@ export function aggregateColumn(rows, col) {
     });
     return imp > 0 ? (rev / imp) * 1000 : 0;
   }
+  if (col.aggregate === 'weightedMatchRate') {
+    let matched = 0;
+    let requests = 0;
+    rows.forEach((r) => {
+      const req = Number(r.adRequests ?? r.metrics?.ad_exchange_total_requests);
+      if (!Number.isFinite(req) || req <= 0) return;
+      const pct = Number(r.adxMatchRate ?? r.metrics?.ad_exchange_match_rate);
+      matched += Number.isFinite(Number(r.matchedRequests)) ? Number(r.matchedRequests) : (Number.isFinite(pct) ? (pct / 100) * req : 0);
+      requests += req;
+    });
+    return requests > 0 ? (matched / requests) * 100 : '—';
+  }
   if (col.aggregate === 'weightedFill') {
     let matched = 0;
     let requests = 0;
@@ -564,6 +596,17 @@ export function aggregateColumn(rows, col) {
       requests += Number(r.ad_requests) || 0;
     });
     return requests > 0 ? (matched / requests) * 100 : 0;
+  }
+  if (col.aggregate === 'weightedKnownFill') {
+    let w = 0;
+    let acc = 0;
+    rows.forEach((r) => {
+      if (r.fillRate == null || r.fillRate === '' || !Number.isFinite(Number(r.fillRate))) return;
+      const imp = Number(r.impression ?? r.impressions) || 0;
+      acc += Number(r.fillRate) * imp;
+      w += imp;
+    });
+    return w > 0 ? acc / w : '—';
   }
   if (col.aggregate === 'weightedCtr') {
     let clicks = 0;

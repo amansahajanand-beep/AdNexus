@@ -727,6 +727,19 @@ function startCron() {
     });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── :20 hourly: refresh recent days of Ad Exchange requests / match rate (rollup_request_daily) ──
+  cron.schedule('20 * * * *', async () => {
+    const { runWithClient } = require('../utils/clientContext');
+    const { refreshRecentRequestRollups } = require('../services/requestRollupStore');
+    await eachActiveClient(async (client) => {
+      try {
+        await runWithClient(client, () => refreshRecentRequestRollups(3));
+      } catch (e) {
+        logger.warn(`Cron: request rollup refresh failed client=${String(client.id).slice(0, 8)}: ${e.message}`);
+      }
+    });
+  }, { timezone: 'Asia/Singapore' });
+
   // ── Every 15 min: watchdog if hourly sync stalled ───────────────────────
   cron.schedule('*/15 * * * *', async () => {
     await watchdogStaleSync();
