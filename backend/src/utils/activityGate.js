@@ -28,7 +28,13 @@ function isQuiet(quietMs) {
   return active === 0 && Date.now() - lastActivityAt >= quietMs;
 }
 
-async function waitForQuiet({ quietMs = 20000, maxWaitMs = 10 * 60 * 1000, pollMs = 2000 } = {}) {
+async function waitForQuiet({
+  quietMs = 20000,
+  // Busy hours: wait for a gap, but never longer than this per step, or a 180-day backfill
+  // would take ~30 h. Raise BACKFILL_MAX_WAIT_MS to be gentler on reports.
+  maxWaitMs = parseInt(process.env.BACKFILL_MAX_WAIT_MS || '60000', 10) || 60000,
+  pollMs = 2000,
+} = {}) {
   const start = Date.now();
   while (!isQuiet(quietMs) && Date.now() - start < maxWaitMs) {
     await new Promise((resolve) => setTimeout(resolve, pollMs));

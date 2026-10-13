@@ -227,9 +227,12 @@ async function startServer() {
             const n = await backfillAllRollups('startup-rollup');
             if (n > 0) logger.info(`Startup rollup backfill client=${client.id.slice(0, 8)} wrote ≈${n} kpi row(s)`);
             // Fill-rate rollups for recent days (Reporting Total fill rate on long ranges).
-            await require('./services/reportGrainStore').backfillFillRollups();
-            // Ad Exchange requests / match rate (GAM) for Reporting match-rate columns.
-            await require('./services/requestRollupStore').backfillRequestRollups();
+            // Fill-rate (Postgres) and Ad Exchange requests (GAM) backfills are independent:
+            // run them side by side so one does not wait hours for the other.
+            await Promise.all([
+              require('./services/reportGrainStore').backfillFillRollups(),
+              require('./services/requestRollupStore').backfillRequestRollups(),
+            ]);
           });
         }
       } catch (e) {
