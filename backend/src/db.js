@@ -353,6 +353,19 @@ async function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_rollup_unit_country_fill_unit
       ON rollup_unit_country_fill (client_id, ad_unit_id, report_date);
 
+    -- ROI earnings per day x site/app x country (same keys the ROI queries produce: lower-cased
+    -- site host / app id and lower-cased country name). ROI reads this instead of scanning
+    -- report_grain for every request (7 days took ~7 minutes on the raw data).
+    CREATE TABLE IF NOT EXISTS rollup_roi_earn_daily (
+      client_id    UUID        NOT NULL,
+      report_date  DATE        NOT NULL,
+      target_type  TEXT        NOT NULL,
+      target_key   TEXT        NOT NULL,
+      country_key  TEXT        NOT NULL,
+      earn         DOUBLE PRECISION NOT NULL DEFAULT 0,
+      PRIMARY KEY (client_id, report_date, target_type, target_key, country_key)
+    );
+
     CREATE TABLE IF NOT EXISTS rollup_network_daily (
       client_id       UUID        NOT NULL REFERENCES gam_clients(id),
       report_date     DATE        NOT NULL,

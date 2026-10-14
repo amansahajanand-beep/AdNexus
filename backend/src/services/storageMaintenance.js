@@ -42,7 +42,7 @@ async function deleteInBatches(label, selectCtidSql, params) {
 async function pruneSummaryTables(retentionDays = retentionFromEnv('SUMMARY_RETENTION_DAYS')) {
   retentionDays = Math.max(MIN_RETENTION_DAYS, retentionDays);
   const cutoff = new Date(Date.now() - retentionDays * 86400000).toISOString().slice(0, 10);
-  const tables = ['rollup_fill_daily', 'rollup_request_daily', 'rollup_unit_country_daily', 'rollup_unit_country_fill'];
+  const tables = ['rollup_fill_daily', 'rollup_request_daily', 'rollup_unit_country_daily', 'rollup_unit_country_fill', 'rollup_roi_earn_daily'];
   const out = {};
   for (const table of tables) {
     try {

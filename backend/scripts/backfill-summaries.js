@@ -10,6 +10,8 @@
  *   node scripts/backfill-summaries.js            # 180 days, every active network
  *   node scripts/backfill-summaries.js 90         # last 90 days
  *   node scripts/backfill-summaries.js 180 c7f026e5   # one network (id prefix)
+ *   node scripts/backfill-summaries.js 180 all requests   # only the GAM ad-request backfill
+ *   node scripts/backfill-summaries.js 180 all fill       # only the fill-rate / country backfill
  */
 process.env.FILL_BACKFILL_PAUSE_MS = '0';
 process.env.REQUEST_BACKFILL_PAUSE_MS = '0';
@@ -17,12 +19,13 @@ require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') }
 
 const { runWithClient } = require('../src/utils/clientContext');
 const { listActiveClients } = require('../src/models/clientStore');
-const { backfillFillRollups } = require('../src/services/reportGrainStore');
+const { backfillFillRollups, backfillRoiEarnRollups } = require('../src/services/reportGrainStore');
 const { backfillRequestRollups } = require('../src/services/requestRollupStore');
 const { query } = require('../src/db');
 
 const days = parseInt(process.argv[2] || '180', 10) || 180;
-const only = process.argv[3] ? String(process.argv[3]) : null;
+const only = process.argv[3] && process.argv[3] !== 'all' ? String(process.argv[3]) : null;
+const what = ['fill', 'requests'].includes(process.argv[4]) ? process.argv[4] : 'both';
 
 async function progress(clientId) {
   const { rows } = await query(
@@ -45,8 +48,9 @@ async function progress(clientId) {
     const t0 = Date.now();
     console.log(`[${tag}] start`, JSON.stringify(await runWithClient(client, () => progress(client.id))));
     await runWithClient(client, () => Promise.all([
-      backfillFillRollups(days),
-      backfillRequestRollups(days),
+      what !== 'requests' ? backfillFillRollups(days) : null,
+      what !== 'fill' ? backfillRequestRollups(days) : null,
+      what !== 'requests' && what !== 'fill' ? backfillRoiEarnRollups(days) : null,
     ]));
     console.log(
       `[${tag}] done in ${Math.round((Date.now() - t0) / 1000)}s`,

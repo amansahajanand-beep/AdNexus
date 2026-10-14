@@ -371,11 +371,88 @@ async function loadAdsLinkedGamEarn(clientId, start, end, spendOpts = {}) {
   return round2(earn);
 }
 
+
+/**
+ * Site / app earnings for ROI from the small daily summary tables instead of scanning report_grain
+ * (rollup_inventory_kpi_daily: date x site; rollup_kpi_daily: date x app). Checked against the raw
+ * scan: identical per-target totals. Returns null when any day in the range is not summarized yet,
+ * so the caller falls back to the raw scan. Not used with a country filter (summaries have no country).
+ */
+async function rollupEarnCovered(clientId, start, end) {
+  const { rows } = await query(
+    `SELECT
+       (SELECT COUNT(DISTINCT report_date) FROM rollup_kpi_daily
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date) AS need,
+       (SELECT COUNT(DISTINCT report_date) FROM rollup_inventory_kpi_daily
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date) AS site_days,
+       (SELECT COUNT(DISTINCT report_date) FROM rollup_kpi_daily
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date
+           AND inv_domain = '' AND inv_site = '' AND inv_ad_unit = '' AND inv_app <> '') AS app_days`,
+    [clientId, start, end]
+  );
+  const need = Number(rows[0]?.need) || 0;
+  const siteDays = Number(rows[0]?.site_days) || 0;
+  const appDays = Number(rows[0]?.app_days) || 0;
+  if (!need || siteDays < need) return false;
+  if (appDays >= need) return true;
+  if (appDays > 0) return false; // some app days missing: use the raw scan
+  // No app summary rows at all: fine only if the network really has no app traffic in the range.
+  const { rows: g } = await query(
+    `SELECT 1 FROM report_grain WHERE client_id = $1::uuid AND slice_key = 'app_id'
+       AND report_date BETWEEN $2::date AND $3::date LIMIT 1`,
+    [clientId, start, end]
+  );
+  return g.length === 0;
+}
+
+async function rollupTargetEarn(clientId, start, end, { perDay = false, apps = null, sites = null, wwwStrip = false } = {}) {
+  if (!(await rollupEarnCovered(clientId, start, end))) return null;
+  const siteExpr = wwwStrip
+    ? `LOWER(TRIM(REGEXP_REPLACE(inv_site, '^www\\.', '', 'i')))`
+    : `LOWER(TRIM(inv_site))`;
+  const sp = [clientId, start, end];
+  let siteFilter = '';
+  if (sites && sites.length) { sp.push(sites); siteFilter = ` AND ${siteExpr} = ANY($${sp.length}::text[])`; }
+  const dayCol = perDay ? 'report_date::text AS report_date,' : '';
+  const dayGroup = perDay ? '1, 2' : '1';
+  const siteRes = (sites && !sites.length) ? { rows: [] } : await query(
+    `SELECT ${dayCol} ${siteExpr} AS target_key,
+            COALESCE(SUM(revenue), 0)::float8 AS earn, COALESCE(SUM(impressions), 0)::float8 AS impressions
+     FROM rollup_inventory_kpi_daily
+     WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date
+       AND NULLIF(TRIM(inv_site), '') IS NOT NULL${siteFilter}
+     GROUP BY ${perDay ? '1, 2' : '1'}`,
+    sp
+  );
+  const ap = [clientId, start, end];
+  let appFilter = '';
+  if (apps && apps.length) { ap.push(apps); appFilter = ` AND LOWER(TRIM(inv_app)) = ANY($${ap.length}::text[])`; }
+  const appRes = (apps && !apps.length) ? { rows: [] } : await query(
+    `SELECT ${dayCol} LOWER(TRIM(inv_app)) AS target_key, COALESCE(SUM(revenue), 0)::float8 AS earn
+     FROM rollup_kpi_daily
+     WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date
+       AND inv_domain = '' AND inv_site = '' AND inv_ad_unit = '' AND inv_app <> ''${appFilter}
+     GROUP BY ${dayGroup}`,
+    ap
+  );
+  const mapRow = (r, coerce) => ({
+    ...(perDay ? { date: ymd(r.report_date) } : {}),
+    targetKey: r.target_key,
+    earn: coerce ? coerceWarehouseRevenue(r.earn, Number(r.impressions) || 0) : (Number(r.earn) || 0),
+  });
+  return {
+    sites: siteRes.rows.filter((r) => r.target_key).map((r) => mapRow(r, wwwStrip)),
+    apps: appRes.rows.filter((r) => r.target_key).map((r) => mapRow(r, false)),
+  };
+}
+
 /** Daily per site/app earn for ROI table rows (attribution), not for network summary. */
 async function loadGamEarnByTargetDaily(clientId, start, end, { countryNames = null } = {}) {
   if (!(Array.isArray(countryNames) && countryNames.length)) {
     const zoned = await zonedTargets(clientId, start, end, { perDay: true });
     if (zoned) return zoned;
+    const rolled = await rollupTargetEarn(clientId, start, end, { perDay: true });
+    if (rolled) return rolled;
   }
   const countryFilter = Array.isArray(countryNames) && countryNames.length
     ? countryNames.map((n) => String(n).trim().toLowerCase()).filter(Boolean)
@@ -445,6 +522,8 @@ async function loadGamEarnByTargetAggregated(clientId, start, end, { countryName
   if (!(Array.isArray(countryNames) && countryNames.length)) {
     const zoned = await zonedTargets(clientId, start, end);
     if (zoned) return zoned;
+    const rolled = await rollupTargetEarn(clientId, start, end);
+    if (rolled) return rolled;
   }
   const countryFilter = Array.isArray(countryNames) && countryNames.length
     ? countryNames.map((n) => String(n).trim().toLowerCase()).filter(Boolean)
@@ -527,6 +606,23 @@ async function loadGamEarnByTargetAggregatedScoped(clientId, start, end, {
       const merged = new Map();
       for (const r of zoned.sites) merged.set(r.targetKey, (merged.get(r.targetKey) || 0) + r.earn);
       return { sites: [...merged].map(([targetKey, earn]) => ({ targetKey, earn })), apps: zoned.apps };
+    }
+    const rolled = await rollupTargetEarn(clientId, start, end, {
+      apps,
+      sites: [...new Set(sites.map((k) => normSiteHost(k)).filter(Boolean))],
+      wwwStrip: true,
+    });
+    if (rolled) {
+      // Bare and www. spellings of one site are added up (same as the raw scan's GROUP BY).
+      const mergedSites = new Map();
+      for (const r of rolled.sites) {
+        const key = normSiteHost(r.targetKey);
+        mergedSites.set(key, (mergedSites.get(key) || 0) + r.earn);
+      }
+      return {
+        sites: [...mergedSites].map(([targetKey, earn]) => ({ targetKey, earn })),
+        apps: rolled.apps,
+      };
     }
   }
 
@@ -897,7 +993,77 @@ async function loadCountrySpendByTargetDaily(clientId, start, end, {
 }
 
 /** GAM earn by date × site/app target × country name. */
+
+/**
+ * Site/app x country earnings from rollup_roi_earn_daily (same rows the raw queries produce).
+ * Returns null unless every day that has data is summarized, so callers fall back to the raw scan.
+ */
+async function roiEarnRows(clientId, start, end, { perDay = false, siteKeys = null, appKeys = null, countryKeys = null } = {}) {
+  const { rows: cov } = await query(
+    `SELECT
+       (SELECT COUNT(DISTINCT report_date) FROM rollup_kpi_daily
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date) AS need,
+       (SELECT COUNT(DISTINCT report_date) FROM rollup_roi_earn_daily
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date) AS have`,
+    [clientId, start, end]
+  );
+  const need = Number(cov[0]?.need) || 0;
+  const have = Number(cov[0]?.have) || 0;
+  if (!need || have < need) return null;
+
+  const params = [clientId, start, end];
+  const conds = [];
+  const scoped = (siteKeys && siteKeys.length) || (appKeys && appKeys.length);
+  if (scoped) {
+    if (siteKeys && siteKeys.length) {
+      params.push(siteKeys);
+      const p = `$${params.length}`;
+      // exact host or its www-less spelling (no country filter on sites, as in the raw scoped query)
+      conds.push(`(target_type = 'site' AND (target_key = ANY(${p}::text[])
+        OR LOWER(TRIM(REGEXP_REPLACE(target_key, '^www\\.', '', 'i'))) = ANY(${p}::text[])))`);
+    }
+    if (appKeys && appKeys.length) {
+      params.push(appKeys);
+      let c = `(target_type = 'app' AND target_key = ANY($${params.length}::text[])`;
+      if (countryKeys && countryKeys.length) {
+        params.push(countryKeys);
+        c += ` AND country_key = ANY($${params.length}::text[])`;
+      }
+      conds.push(`${c})`);
+    }
+  } else if (countryKeys && countryKeys.length) {
+    params.push(countryKeys);
+    conds.push(`country_key = ANY($${params.length}::text[])`);
+  }
+  const where = conds.length ? ` AND (${conds.join(' OR ')})` : '';
+  const dayCol = perDay ? 'report_date::text AS report_date,' : '';
+  const { rows } = await query(
+    `SELECT ${dayCol} target_type, target_key, country_key, COALESCE(SUM(earn), 0)::float8 AS earn
+     FROM rollup_roi_earn_daily
+     WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date${where}
+     GROUP BY ${perDay ? '1, 2, 3, 4' : '1, 2, 3'}`,
+    params
+  );
+  return rows;
+}
+
+function mapTargetCountryEarnRowsDaily(rows) {
+  const map = new Map();
+  (rows || []).forEach((r) => {
+    const type = r.target_type;
+    const tKey = String(r.target_key || '').trim().toLowerCase();
+    const cKey = String(r.country_key || '').trim().toLowerCase();
+    const date = ymd(r.report_date);
+    if (!date || !type || !tKey || !cKey) return;
+    const k = `${date}:${type}:${tKey}:${cKey}`;
+    map.set(k, round2((map.get(k) || 0) + (Number(r.earn) || 0)));
+  });
+  return map;
+}
+
 async function loadGamEarnByTargetCountryDaily(clientId, start, end) {
+  const fast = await roiEarnRows(clientId, start, end, { perDay: true }).catch(() => null);
+  if (fast) return mapTargetCountryEarnRowsDaily(fast);
   const { rows } = await query(
     `SELECT report_date, target_type, target_key, country_key,
             COALESCE(SUM(earn), 0)::float8 AS earn
@@ -1456,6 +1622,8 @@ function mapTargetCountryEarnRows(rows) {
 
 /** Full scan — used only when no target/country scope is available. */
 async function loadGamEarnByTargetCountryFull(clientId, start, end, { countryKeys = null } = {}) {
+  const fast = await roiEarnRows(clientId, start, end, { countryKeys }).catch(() => null);
+  if (fast) return mapTargetCountryEarnRows(fast);
   const params = [clientId, start, end];
   let countryExtra = '';
   if (countryKeys?.length) {
@@ -1593,6 +1761,13 @@ async function loadGamEarnByTargetCountryScoped(clientId, start, end, scope = {}
     return new Map();
   }
 
+  const fast = await roiEarnRows(clientId, start, end, {
+    siteKeys: siteKeys.length ? siteKeys.map(normSiteHost) : null,
+    appKeys: appKeys.length ? appKeys : null,
+    countryKeys,
+  }).catch(() => null);
+  if (fast) return mapTargetCountryEarnRows(fast);
+
   const params = [clientId, start, end];
   const parts = [];
 
@@ -1662,6 +1837,14 @@ async function loadGamEarnByTargetCountryDailyScoped(clientId, start, end, scope
     if (!scope.allowFullScan && !countryKeys.length) return new Map();
     return loadGamEarnByTargetCountryDaily(clientId, start, end);
   }
+
+  const fast = await roiEarnRows(clientId, start, end, {
+    perDay: true,
+    siteKeys: siteKeys.length ? siteKeys.map(normSiteHost) : null,
+    appKeys: appKeys.length ? appKeys : null,
+    countryKeys,
+  }).catch(() => null);
+  if (fast) return mapTargetCountryEarnRowsDaily(fast);
 
   const params = [clientId, start, end];
   const parts = [];

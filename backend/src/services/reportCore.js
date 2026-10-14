@@ -4517,11 +4517,6 @@ async function handleDetailedReport(req, res) {
     filters.reportMetrics = metIds.filter((id) => classified.usedMetrics.includes(catalogIdToGamEnum(id)));
   }
 
-  logger.info(
-    `Reporting request dims=[${dimIds.join(',')}] metrics=[${originalMetIds.join(',')}]`
-    + ` adUnits=${toFilterArray(filters.domainName).length} apps=${toFilterArray(filters.domainId).length}`
-    + ` mode=${classified.mode}`
-  );
 
   const warehouseSubChips = (warehouseRewrite.substitutions || []).map(
     (s) => `${s.fromLabel} → ${s.toLabel}`
@@ -4710,11 +4705,6 @@ async function handleDetailedReport(req, res) {
       skipCharts: true,
     };
 
-    logger.info(
-      `Reporting scope opts domains=${invOpts.domains.length} sites=${invOpts.sites.length}`
-      + ` apps=${invOpts.apps.length} adUnits=${(invOpts.adUnitNames || []).length}`
-      + ` groupByApp=${invOpts.groupByApp} groupBySite=${invOpts.groupBySite} country=${invOpts.groupByCountry}`
-    );
 
     // ── Reporting fast path (rollup or ID-filtered grain — seconds, not minutes) ─
     if (useGrainSql && typeof svc?.fetchReportingBundleFromDB === 'function') {
@@ -4781,11 +4771,6 @@ async function handleDetailedReport(req, res) {
           const offeredRecords = scopedChild
             ? scopedRows.length
             : (bundle.grainCount || scopedRows.length);
-          logger.info(
-            `Reporting rows=${scopedRows.length} sample=${JSON.stringify((scopedRows.slice(0, 3)).map((r) => ({
-              site: r.site, AD_UNIT_NAME: r.AD_UNIT_NAME, appId: r.appId, unfilled: r.unfilled, fillRate: r.fillRate,
-            })))}`
-          );
           const composedPartial = Boolean(
             warehouseSkipChips.length
             || classified.skippedDims?.length
