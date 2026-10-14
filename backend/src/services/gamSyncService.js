@@ -3188,7 +3188,9 @@ async function fetchUnitCountryRollupBundle(startDate, endDate, opts = {}) {
   if (!rows.length) return null;
 
   // Names for the ids that actually appear (a few small dim reads) -> same row shape as grain rows.
-  const tableRows = await hydrateGrainIdRows(rows.map((r) => ({ ...r, device_id: 0, app_id: '' })));
+  // Summary rows carry no app; with exactly one App ID selected every ad unit belongs to it.
+  const singleApp = (opts.apps || []).length === 1 ? String(opts.apps[0] || '') : '';
+  const tableRows = await hydrateGrainIdRows(rows.map((r) => ({ ...r, device_id: 0, app_id: singleApp })));
   const trend = trendRows.map((t) => {
     const imps = Math.round(Number(t.impressions) || 0);
     return { date: t.date, earning: coerceWarehouseRevenue(t.earning, imps), impressions: imps };
@@ -3381,7 +3383,8 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     && !hasAppsOnly
     && wantsGeoTableDims(opts)
     && narrowFilter
-    && !((opts.apps || []).length > 0 || opts.groupByApp)
+    // App ID next to ad units: the ad unit ids already pin the inventory, so the rollup answers it too.
+    && (!((opts.apps || []).length > 0 || opts.groupByApp) || (opts.adUnitNames || []).length > 0)
   ) {
     try {
       const rolled = await fetchUnitCountryRollupBundle(startDate, endDate, opts);

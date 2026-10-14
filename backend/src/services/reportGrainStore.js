@@ -516,6 +516,7 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
   logger.info(`[${syncType}] Rebuilt rollups from grain for ${uniq.length} day(s); kpi rows≈${totalKpi}`);
   await rebuildInventoryRollupsFromGrain(uniq, syncType);
   await rebuildFillRollupsForDates(uniq, syncType);
+  await rebuildRoiEarnForDates(uniq, syncType);
   return totalKpi;
 }
 
@@ -620,6 +621,108 @@ async function rebuildFillRollupsForDates(dates, syncType = 'fill-rollup', { pau
     if (pauseMs > 0) await new Promise((r) => setTimeout(r, pauseMs));
   }
   return n;
+}
+
+
+/**
+ * ROI earnings summary: revenue per day x site (inventory_core) / app (app_id slice) x country.
+ * Aggregates by dim id first and joins the names afterwards (joining per raw row was far slower).
+ */
+async function rebuildRoiEarnForDates(dates, syncType = 'roi-earn') {
+  const uniq = [...new Set((dates || []).map((d) => String(d).slice(0, 10)).filter(Boolean))];
+  if (!uniq.length) return 0;
+  const clientId = requireClientId();
+  let n = 0;
+  for (const day of uniq) {
+    try {
+      n += await withTransaction(async (q) => {
+        await q(
+          'DELETE FROM rollup_roi_earn_daily WHERE client_id = $1::uuid AND report_date = $2::date',
+          [clientId, day]
+        );
+        const sites = await q(
+          `INSERT INTO rollup_roi_earn_daily (client_id, report_date, target_type, target_key, country_key, earn)
+           SELECT $1::uuid, $2::date, 'site', LOWER(TRIM(ds.name)), LOWER(TRIM(dc.name)), COALESCE(SUM(s.earn), 0)::float8
+           FROM (
+             SELECT g.site_id, g.country_id, SUM(g.revenue) AS earn
+             FROM report_grain g
+             WHERE g.client_id = $1::uuid AND g.report_date = $2::date
+               AND g.slice_key = 'inventory_core' AND g.site_id > 0
+             GROUP BY g.site_id, g.country_id
+           ) s
+           JOIN dim_site ds ON ds.id = s.site_id AND ds.client_id = $1::uuid
+           JOIN dim_country dc ON dc.id = s.country_id AND dc.id <> 0
+           WHERE NULLIF(TRIM(ds.name), '') IS NOT NULL
+           GROUP BY 4, 5
+           ON CONFLICT (client_id, report_date, target_type, target_key, country_key)
+           DO UPDATE SET earn = rollup_roi_earn_daily.earn + EXCLUDED.earn`,
+          [clientId, day]
+        );
+        const apps = await q(
+          `INSERT INTO rollup_roi_earn_daily (client_id, report_date, target_type, target_key, country_key, earn)
+           SELECT $1::uuid, $2::date, 'app', a.k, LOWER(TRIM(dc.name)), COALESCE(SUM(a.earn), 0)::float8
+           FROM (
+             SELECT LOWER(TRIM(COALESCE(NULLIF(g.app_id, ''), g.app_name))) AS k, g.country_id, SUM(g.revenue) AS earn
+             FROM report_grain g
+             WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'app_id'
+               AND NULLIF(TRIM(COALESCE(NULLIF(g.app_id, ''), g.app_name)), '') IS NOT NULL
+             GROUP BY 1, g.country_id
+           ) a
+           JOIN dim_country dc ON dc.id = a.country_id AND dc.id <> 0
+           GROUP BY a.k, LOWER(TRIM(dc.name))
+           ON CONFLICT (client_id, report_date, target_type, target_key, country_key)
+           DO UPDATE SET earn = rollup_roi_earn_daily.earn + EXCLUDED.earn`,
+          [clientId, day]
+        );
+        return (sites.rowCount || 0) + (apps.rowCount || 0);
+      });
+    } catch (e) {
+      logger.warn(`[${syncType}] roi earn rollup failed for ${day}: ${e.message}`);
+    }
+  }
+  return n;
+}
+
+let roiBackfillRunning = false;
+/** Background: build ROI earnings summaries for recent days that have none (newest first). */
+async function backfillRoiEarnRollups(days = parseInt(process.env.ROI_ROLLUP_BACKFILL_DAYS || '180', 10) || 180) {
+  if (roiBackfillRunning) return 0;
+  roiBackfillRunning = true;
+  try {
+    const clientId = requireClientId();
+    const { rows } = await query(
+      `SELECT to_char(d.day, 'YYYY-MM-DD') AS d
+       FROM generate_series(CURRENT_DATE - $2::int, CURRENT_DATE, '1 day'::interval) AS d(day)
+       CROSS JOIN LATERAL (
+         SELECT 1 FROM report_grain g
+         WHERE g.client_id = $1::uuid AND g.report_date = d.day::date AND g.slice_key = 'inventory_core'
+         LIMIT 1
+       ) has_grain
+       WHERE NOT EXISTS (
+         SELECT 1 FROM rollup_roi_earn_daily r
+         WHERE r.client_id = $1::uuid AND r.report_date = d.day::date
+       )
+       ORDER BY d.day DESC`,
+      [clientId, days]
+    );
+    const dates = rows.map((r) => r.d);
+    if (!dates.length) return 0;
+    logger.info(`[roi-earn] backfilling ${dates.length} day(s) client=${String(clientId).slice(0, 8)}`);
+    const pauseMs = Math.max(0, parseInt(process.env.FILL_BACKFILL_PAUSE_MS || '4000', 10) || 0);
+    let total = 0;
+    for (const day of dates) {
+      if (pauseMs > 0) await require('../utils/activityGate').waitForQuiet();
+      total += await rebuildRoiEarnForDates([day], 'roi-earn-backfill');
+      if (pauseMs > 0) await new Promise((r) => setTimeout(r, pauseMs));
+    }
+    logger.info(`[roi-earn] backfill done (${total} row(s)) client=${String(clientId).slice(0, 8)}`);
+    return total;
+  } catch (e) {
+    logger.warn('[roi-earn] backfill failed:', e.message);
+    return 0;
+  } finally {
+    roiBackfillRunning = false;
+  }
 }
 
 let fillBackfillRunning = false;
@@ -1357,6 +1460,8 @@ module.exports = {
   fetchGrainLeanRowsFromDB,
   fetchGrainDomainTableRows,
   rebuildFillRollupsForDates,
+  rebuildRoiEarnForDates,
+  backfillRoiEarnRollups,
   backfillFillRollups,
   reportingTableLimit,
   appendGrainInventoryFilters,

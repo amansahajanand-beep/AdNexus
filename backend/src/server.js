@@ -232,6 +232,7 @@ async function startServer() {
             await Promise.all([
               require('./services/reportGrainStore').backfillFillRollups(),
               require('./services/requestRollupStore').backfillRequestRollups(),
+              require('./services/reportGrainStore').backfillRoiEarnRollups(),
             ]);
           });
         }
