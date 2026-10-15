@@ -3166,15 +3166,19 @@ async function fetchUnitCountryRollupBundle(startDate, endDate, opts = {}) {
   if (ids.adUnitIds.length) { params.push(ids.adUnitIds); where += ` AND ad_unit_id = ANY($${params.length}::int[])`; }
   if (ids.siteIds.length) { params.push(ids.siteIds); where += ` AND site_id = ANY($${params.length}::int[])`; }
   if (ids.countryIds.length) { params.push(ids.countryIds); where += ` AND country_id = ANY($${params.length}::int[])`; }
-  const cap = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 25000, 1000), 100000);
+  // 30+ days x ad units x countries easily passes 15k rows; the old cap + date order cut off the
+  // LAST days of the range. Keep the biggest rows when truncating, and allow more of them.
+  const cap = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 25000, 50000), 100000);
 
   const [{ rows }, { rows: trendRows }] = await Promise.all([
     query(
-      `SELECT to_char(report_date, 'YYYY-MM-DD') AS report_date, ad_unit_id, country_id, site_id, domain_id,
-              impressions AS impression, revenue AS revenue_raw, clicks,
-              CASE WHEN impressions > 0 THEN viewable_weight / impressions ELSE 0 END AS viewable_raw, currency
-       FROM rollup_unit_country_daily WHERE ${where}
-       ORDER BY report_date ASC, revenue DESC LIMIT ${cap}`,
+      `SELECT * FROM (
+         SELECT to_char(report_date, 'YYYY-MM-DD') AS report_date, ad_unit_id, country_id, site_id, domain_id,
+                impressions AS impression, revenue AS revenue_raw, clicks,
+                CASE WHEN impressions > 0 THEN viewable_weight / impressions ELSE 0 END AS viewable_raw, currency
+         FROM rollup_unit_country_daily WHERE ${where}
+         ORDER BY revenue DESC LIMIT ${cap}
+       ) t ORDER BY report_date ASC, revenue_raw DESC`,
       params
     ),
     query(
