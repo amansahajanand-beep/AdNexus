@@ -3246,6 +3246,94 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     && !(opts.sites || []).length
     && !(opts.adUnitNames || []).length;
 
+  // Domain user whose whole assignment is apps + ad units (nothing picked in the request): answer each
+  // grant from its own fast path (app rollups / ad-unit-country rollup) and add them up, instead of the
+  // raw-grain web ∪ app merge. Ad units that sit inside an assigned app (name starts with the app
+  // id) are already in that app's numbers, so they are left out of the ad-unit part (no double count).
+  // Any part that cannot be answered quickly returns null -> fall through to the existing path.
+  if (
+    opts.scopeGrantSplit
+    && (opts.apps || []).length
+    && (opts.adUnitNames || []).length
+    && !(opts.domains || []).length
+    && !(opts.sites || []).length
+  ) {
+    try {
+      const appIds = opts.apps.map((a) => String(a).trim().toLowerCase()).filter(Boolean);
+      if (opts.wantsAdUnitCol) {
+        // Ad Unit column: one row per ad unit, from the ad-unit rollups only. The assigned apps' own
+        // units (same name prefix) are added, so an app grant still covers all of its units, and no app
+        // rows are added on top (that counted the same revenue twice).
+        const patterns = appIds.map((a) => `${a.replace(/[\\%_]/g, '\\$&')}%`);
+        const { rows: appUnits } = await query(
+          `SELECT name FROM dim_ad_unit WHERE client_id = $1::uuid AND LOWER(name) LIKE ANY($2::text[]) LIMIT 500`,
+          [requireClientId(), patterns]
+        );
+        const names = [...new Set([...opts.adUnitNames, ...appUnits.map((r) => r.name)])];
+        const unitOnly = await fetchReportingBundleFromDB(startDate, endDate, {
+          ...opts, scopeGrantSplit: false, wantsAdUnitCol: false, apps: [], adUnitNames: names, groupByApp: false,
+        });
+        if (unitOnly) {
+          logger.info(
+            `Reporting scope-units ${startDate}..${endDate} rows=${unitOnly.rows?.length || 0}`
+            + ` units=${names.length} in ${Date.now() - t0}ms`
+          );
+          return { ...unitOnly, source: 'reporting-scope-units' };
+        }
+      }
+      const extraUnits = opts.adUnitNames.filter((n) => {
+        const u = String(n).trim().toLowerCase();
+        return !appIds.some((a) => u.startsWith(a));
+      });
+      const sub = { ...opts, scopeGrantSplit: false };
+      const [appPart, unitPart] = await Promise.all([
+        fetchReportingBundleFromDB(startDate, endDate, { ...sub, adUnitNames: [] }),
+        extraUnits.length
+          ? fetchReportingBundleFromDB(startDate, endDate, { ...sub, apps: [], adUnitNames: extraUnits, groupByApp: false })
+          : Promise.resolve(undefined),
+      ]);
+      if (appPart && unitPart !== null) {
+        const merged = unitPart ? mergeReportingBundles(unitPart, appPart, opts) : appPart;
+        logger.info(
+          `Reporting scope-split ${startDate}..${endDate} app=${appPart.rows?.length || 0}`
+          + ` units=${unitPart ? unitPart.rows?.length || 0 : 0} (${extraUnits.length}/${opts.adUnitNames.length} extra) in ${Date.now() - t0}ms`
+        );
+        return { ...merged, source: 'reporting-scope-split' };
+      }
+    } catch (e) {
+      logger.warn('Reporting scope-split failed (falling back):', e.message);
+    }
+  }
+
+  // Domain user whose whole assignment is sites/domains + apps (no ad units): the web part and the app part
+  // are disjoint slices (inventory_core vs app_id), so each is answered by its own fast path and added up,
+  // instead of the two lean raw-grain legs of the web ∪ app branch below (27 s vs ~4 s for 2 days with country).
+  if (
+    opts.scopeGrantSplit
+    && (opts.apps || []).length
+    && ((opts.domains || []).length || (opts.sites || []).length)
+    && !(opts.adUnitNames || []).length
+  ) {
+    try {
+      const sub = { ...opts, scopeGrantSplit: false, wantsAdUnitCol: false };
+      const [webPart, appPart] = await Promise.all([
+        fetchReportingBundleFromDB(startDate, endDate, { ...sub, apps: [], groupByApp: false }),
+        fetchReportingBundleFromDB(startDate, endDate, {
+          ...sub, domains: [], sites: [], webInventoryOr: false, groupBySite: false, groupByApp: true, tableGrain: 'app',
+        }),
+      ]);
+      if (webPart && appPart) {
+        logger.info(
+          `Reporting scope-split(web+app) ${startDate}..${endDate} web=${webPart.rows?.length || 0}`
+          + ` app=${appPart.rows?.length || 0} in ${Date.now() - t0}ms`
+        );
+        return { ...mergeReportingBundles(webPart, appPart, opts), source: 'reporting-scope-split' };
+      }
+    } catch (e) {
+      logger.warn('Reporting scope-split(web+app) failed (falling back):', e.message);
+    }
+  }
+
   // App ID only, no country/device breakdown: same app rollups the Dashboard reads (date × app),
   // instead of aggregating the app_id grain (24s for 30 days, minutes for 90). Fill rate is
   // added afterwards from rollup_fill_daily.
@@ -3324,6 +3412,24 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     } catch (e) {
       logger.warn('Reporting rollup+inventory hybrid failed:', e.message);
     }
+  }
+
+  // Plain revenue/impressions by ad unit (no country/device/app, no fill-rate or request metrics): the Dashboard
+  // answers this from rollup_inventory_kpi_daily in ~2 s. The inventory_core grain scan below took 100-240 s on a
+  // cold cache for a few hundred rows. Return null so Reporting falls to the same lean/rollup path as the Dashboard.
+  if (
+    dayCount <= DASHBOARD_ROLLUP_FIRST_DAYS
+    && (opts.adUnitNames || []).length > 0
+    && !(opts.apps || []).length
+    && !opts.groupByApp
+    && !wantsGeoTableDims(opts)
+    && !opts.countryNames?.length
+    && !opts.groupByDevice
+    && !opts.needUnfilled
+    && !opts.needRequests
+  ) {
+    logger.info(`Reporting ad-unit report ${startDate}..${endDate} -> lean/rollup path (skipping inventory_core scan)`);
+    return null;
   }
 
   // Short ranges: inventory_core for GAM-accurate Site/Domain (incl. Site×Country).
@@ -3459,6 +3565,7 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     // unrelated rows), so skip it — the web leg already returns exactly the filtered inventory.
     const appLegWanted = (opts.apps || []).length > 0
       || !((opts.adUnitNames || []).length || (opts.sites || []).length || (opts.domains || []).length);
+    let webLegFailed = false;
     const [webBundle, appBundle] = await Promise.all([
       fetchLeanDashboardBundleFromDB(startDate, endDate, {
         ...opts,
@@ -3468,6 +3575,7 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
         reportingFast: true,
       }).catch((e) => {
         logger.warn('Reporting web lean leg failed:', e.message);
+        webLegFailed = true;
         return null;
       }),
       appLegWanted ? fetchLeanDashboardBundleFromDB(startDate, endDate, {
@@ -3492,19 +3600,26 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
       });
     }
     if (merged) {
-      const wantsSiteOrDomain = Boolean(
-        opts.groupBySite
-        || opts.tableGrain === 'site'
-        || opts.tableGrain === 'domain'
-        || (opts.domains || []).length
-        || (opts.sites || []).length
-      );
+      // A Site/Domain FILTER alone does not need labelled rows: when the report only asks for App columns,
+      // app rows are the full answer even if none of the filtered sites has data (the site leg is then null).
+      const wantsSiteOrDomain = opts.siteDomainColRequested !== undefined
+        ? Boolean(opts.siteDomainColRequested)
+        : Boolean(
+          opts.groupBySite
+          || opts.tableGrain === 'site'
+          || opts.tableGrain === 'domain'
+          || (opts.domains || []).length
+          || (opts.sites || []).length
+        );
       // Domain/Site columns need real hosts — app_id alone is not enough (shows "—").
       const hasDomainSiteLabels = (merged.rows || []).some((r) => (
         String(r.domainName || r.domain || r.gamDomain || '').trim()
         || String(r.siteUrl || r.siteName || r.gamSite || '').trim()
       ));
-      if (wantsSiteOrDomain && (merged.rows || []).length && !hasDomainSiteLabels) {
+      // Reject label-less rows only when the web leg ERRORED. A web leg that simply found nothing (null, e.g. the
+      // filtered sites have no data in the warehouse) leaves the app rows as the complete answer; falling through
+      // here ran a live GAM fetch (15-25 s) that then returned "no data" anyway.
+      if (wantsSiteOrDomain && (merged.rows || []).length && !hasDomainSiteLabels && webLegFailed) {
         logger.info(
           `Reporting web∪app lean incomplete ${startDate}..${endDate}`
           + ` table=${merged.rows?.length || 0} (no domain/site labels) — falling through`

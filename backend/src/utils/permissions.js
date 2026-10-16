@@ -341,6 +341,9 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
     webInventoryOr: domains.length > 0 && sites.length > 0,
     // Equality on inv_* — LIKE '%domain%' made Site filter equal Domain-wide.
     skipAdUnitLike: true,
+    // True when the lists above are the user's whole assignment (nothing picked in the request),
+    // so separate grants (apps / ad units) may be answered from separate rollups and added up.
+    scopeExpanded: !anyRequest,
   };
 }
 

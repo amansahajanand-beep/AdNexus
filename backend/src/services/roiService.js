@@ -2685,6 +2685,35 @@ async function buildRoiSummaryCards(clientId, {
 /**
  * Fast country tree breakdown — loads Ads spend first, then scoped GAM earn.
  */
+/**
+ * App earn this network holds that has no Ads spend row here (its spend is in another network). Returned so a
+ * multi-network merge can attach it to the other network's spend rows (mergeRoiParts / foldEarnOnly).
+ */
+async function collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRows, earnByTargetCountry, earnByTargetCountryDaily, end }) {
+  const norm = (v) => String(v || '').trim().toLowerCase();
+  const haveRange = new Set((countryTargetRows || []).map((r) => `${r.targetType}:${norm(r.targetKey)}:${norm(r.gamCountryKey || r.countryName)}`));
+  const haveDaily = new Set((countryTargetDailyRows || [])
+    .filter((r) => (Number(r.adsSpend) || 0) > 0)
+    .map((r) => `${r.date}:${r.targetType}:${norm(r.targetKey)}:${norm(r.countryName)}`));
+  const toDisplay = async (earn) => (await metricsFor(earn, 0, 0, {}, { endDate: end })).earn;
+  const range = [];
+  for (const [k, earn] of (earnByTargetCountry || new Map()).entries()) {
+    if (!k.startsWith('app:') || !(Number(earn) > 0) || haveRange.has(k)) continue;
+    const parsed = parseTargetCountryEarnKey(k);
+    if (parsed) range.push({ targetType: 'app', targetKey: parsed.targetKey, countryKey: parsed.countryKey, earn: await toDisplay(earn) });
+  }
+  const daily = [];
+  for (const [k, earn] of (earnByTargetCountryDaily || new Map()).entries()) {
+    const cut = k.indexOf(':');
+    if (cut <= 0 || !(Number(earn) > 0)) continue;
+    const rest = k.slice(cut + 1);
+    if (!rest.startsWith('app:') || haveDaily.has(k)) continue;
+    const parsed = parseTargetCountryEarnKey(rest);
+    if (parsed) daily.push({ date: k.slice(0, cut), targetType: 'app', targetKey: parsed.targetKey, countryKey: parsed.countryKey, earn: await toDisplay(earn) });
+  }
+  return { range, daily };
+}
+
 async function buildRoiCountryBreakdown(clientId, {
   start,
   end,
@@ -2698,6 +2727,7 @@ async function buildRoiCountryBreakdown(clientId, {
   countryNames,
   filterAttrTarget,
   needDaily,
+  crossNetworkEarn = false,
 }) {
   const [maps, countrySpendRows, countryTargetRowsRaw, countryTargetDailyRowsRaw, expenses] = await Promise.all([
     listCampaignMaps(clientId),
@@ -3047,10 +3077,15 @@ async function buildRoiCountryBreakdown(clientId, {
     };
   });
 
+  const earnOnlyTargets = crossNetworkEarn
+    ? await collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRows, earnByTargetCountry, earnByTargetCountryDaily, end })
+    : null;
+
   return {
     countryBreakdown,
     countryTargetBreakdown,
     countryTargetDailyBreakdown,
+    ...(earnOnlyTargets ? { earnOnlyTargets } : {}),
   };
 }
 
@@ -3071,11 +3106,12 @@ async function getRoiSummaryInner(clientId, {
   includeRows = false,
   summaryOnly = false,
   breakdownOnly = false,
+  crossNetworkEarn = false,
   includeDaily = null,
 } = {}) {
   const cacheKey = breakdownOnly
     ? `roi_bd_v17_${clientId}_${JSON.stringify({
-      start, end, targetType, accountIds, campaignIds, appKeys, siteKeys, countryCodes, includeDaily, zoneKey,
+      start, end, targetType, accountIds, campaignIds, appKeys, siteKeys, countryCodes, includeDaily, zoneKey, crossNetworkEarn,
     })}`
     : `roi_sum_v17_${clientId}_${JSON.stringify({
       start,
@@ -3091,6 +3127,7 @@ async function getRoiSummaryInner(clientId, {
       breakdownOnly,
       includeDaily,
       zoneKey,
+      crossNetworkEarn,
     })}`;
   const cached = cache.get(cacheKey);
   if (cached) return cached;
@@ -3174,6 +3211,7 @@ async function getRoiSummaryInner(clientId, {
       countryNames,
       filterAttrTarget,
       needDaily,
+      crossNetworkEarn,
     });
     cache.set(cacheKey, breakdown, ROI_BREAKDOWN_CACHE_TTL);
     return breakdown;
@@ -3737,6 +3775,13 @@ async function getRoiSummaryInner(clientId, {
       }));
   }
 
+  // Several networks of one domain user: an app's Ads spend can sit in one network while its GAM revenue is in
+  // another. This network has no spend row for such an app, so its earn would be dropped. Hand it back so the
+  // merge can attach it to the spend rows of the network that has them (see mergeRoiParts).
+  const earnOnlyTargets = crossNetworkEarn && (!summaryOnly || breakdownOnly)
+    ? await collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRows, earnByTargetCountry, earnByTargetCountryDaily, end })
+    : null;
+
   const accountsOut = (showAccountColumns ? columnAccounts : []).map((a) => ({
     id: a.id,
     name: a.descriptiveName || a.customerId,
@@ -3760,6 +3805,7 @@ async function getRoiSummaryInner(clientId, {
     countryBreakdown,
     countryTargetBreakdown,
     countryTargetDailyBreakdown,
+    ...(earnOnlyTargets ? { earnOnlyTargets } : {}),
     generalExpenses,
     expenses: listedExpenses,
     spendCurrency,

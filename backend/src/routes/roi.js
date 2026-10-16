@@ -67,9 +67,13 @@ router.get('/summary', async (req, res) => {
       const scope = await roiInventoryScope(req.user, id);
       if (!scope) return baseOpts;
       const host = (v) => String(v || '').trim().toLowerCase().replace(/^www\./, '');
+      // Sites are listed only when picked in the Site filter (same as the admin view). A user with no apps would see an
+      // empty page, so for them the assigned sites stay the default. Asking for nothing from a scope with sites
+      // but no pick = no site rows ('__none__'), never "all assigned sites".
+      const siteKeysOut = !siteKeys.length && scope.apps.length ? limitKeys([], [], host) : limitKeys(siteKeys, scope.sites, host);
       return {
         ...baseOpts,
-        siteKeys: limitKeys(siteKeys, scope.sites, host),
+        siteKeys: siteKeysOut,
         appKeys: limitKeys(appKeys, scope.apps, (v) => String(v).trim().toLowerCase()),
       };
     };
@@ -87,7 +91,8 @@ router.get('/summary', async (req, res) => {
         const runtime = id === String(clientId) ? (req.client || await getClientById(id)) : await getClientById(id);
         if (!runtime) return null;
         // Some loaders read the active network from the request context, so each runs inside its own.
-        const opts = await optsFor(id);
+        // crossNetworkEarn: also report earn this network has no spend row for (merged in mergeRoiParts).
+        const opts = { ...(await optsFor(id)), crossNetworkEarn: true };
         return runWithClient(runtime, () => getRoiSummary(id, opts));
       }));
       const parts = results.filter((r) => r.status === 'fulfilled').map((r) => r.value).filter(Boolean);
