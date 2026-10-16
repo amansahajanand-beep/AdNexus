@@ -94,6 +94,45 @@ function unifyCountries(parts) {
   }));
 }
 
+
+const cKey = (r) => String(r.countryName || r.countryCode || '').trim().toLowerCase().replace(/_/g, ' ');
+
+/**
+ * Earn one network holds for an app that another network has the Ads spend rows for (spend in network A, revenue in
+ * network B). Each network can only attach earn to its own spend rows, so B hands the earn back as `earnOnlyTargets`
+ * and it is added here to the matching spend rows (shared out by spend when several accounts spend on it).
+ * Earn with no spend row anywhere is dropped, as in a single network ("Ads-linked apps only").
+ */
+function foldEarnOnly(rows, entries, withDate) {
+  const addedByCountry = new Map();
+  if (!Array.isArray(rows) || !entries?.length) return addedByCountry;
+  const groups = new Map();
+  for (const r of rows) {
+    if (!(Number(r.adsSpend) > 0)) continue;
+    const k = `${withDate ? `${r.date}|` : ''}${r.targetType}|${String(r.targetKey || '').toLowerCase()}|${cKey(r)}`;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(r);
+  }
+  const touched = new Set();
+  for (const e of entries) {
+    const k = `${withDate ? `${e.date}|` : ''}${e.targetType}|${String(e.targetKey || '').toLowerCase()}|${String(e.countryKey || '').replace(/_/g, ' ')}`;
+    const list = groups.get(k);
+    if (!list) continue;
+    const total = list.reduce((a, r) => a + (Number(r.adsSpend) || 0), 0);
+    const cc = String(e.countryKey || '').replace(/_/g, ' ');
+    addedByCountry.set(cc, (addedByCountry.get(cc) || 0) + (Number(e.earn) || 0));
+    for (const r of list) {
+      const part = (Number(e.earn) || 0) * ((Number(r.adsSpend) || 0) / total);
+      r.earn = (Number(r.earn) || 0) + part;
+      r.profitSpend = (Number(r.profitSpend) || 0) + part;
+      r.profitExpense = (Number(r.profitExpense) || 0) + part;
+      touched.add(r);
+    }
+  }
+  for (const r of touched) redoRatios(r, r);
+  return addedByCountry;
+}
+
 /** parts: the getRoiSummary results of each network (any of summaryOnly, breakdownOnly or full). */
 function mergeRoiParts(parts) {
   const found = parts.filter(Boolean);
@@ -133,6 +172,23 @@ function mergeRoiParts(parts) {
   }
   for (const k of ['generalExpenses', 'expenses']) {
     if (ok.some((p) => Array.isArray(p[k]))) out[k] = dedupeBy(lists(k), (e) => String(e.id ?? JSON.stringify(e)));
+  }
+  const entries = (k) => ok.flatMap((p) => p.earnOnlyTargets?.[k] || []);
+  if (ok.some((p) => p.earnOnlyTargets)) {
+    const added = foldEarnOnly(out.countryTargetBreakdown, entries('range'), false);
+    foldEarnOnly(out.countryTargetDailyBreakdown, entries('daily'), true);
+    // The country rows' own totals must carry the same earn as the packages under them.
+    if (Array.isArray(out.countryBreakdown) && added.size) {
+      for (const r of out.countryBreakdown) {
+        const extra = added.get(cKey(r));
+        if (!extra) continue;
+        r.earn = (Number(r.earn) || 0) + extra;
+        if (r.profitSpend != null) r.profitSpend = (Number(r.profitSpend) || 0) + extra;
+        if (r.profitExpense != null) r.profitExpense = (Number(r.profitExpense) || 0) + extra;
+        redoRatios(r, r);
+      }
+    }
+    delete out.earnOnlyTargets;
   }
   return out;
 }

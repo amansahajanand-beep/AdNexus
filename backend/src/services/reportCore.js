@@ -2122,6 +2122,16 @@ function countAppAndWebsiteDomainsFromRows(rows = []) {
 /** Recompute KPI cards from scoped rows (SQL summary may be network-wide). */
 function summaryForScopedRows(rows, currency, baseSummary = {}) {
   const derived = deriveDashboardSummary(rows || [], [], currency, false);
+  // Rows reaching here already hold dollars in `revenue`. deriveDashboardSummary re-reads revenue through
+  // gamMoneyToDollars, which takes a whole-dollar value in 1..999 (e.g. exactly 545.00) for raw micros
+  // and counts it as ~0 — so a day could silently drop out of the scoped total.
+  if ((rows || []).length && rows.every((r) => Number.isFinite(Number(r.revenue)))) {
+    const revenue = +rows.reduce((a, r) => a + Number(r.revenue), 0).toFixed(2);
+    derived.revenue = revenue;
+    derived.selectRange = revenue;
+    derived.totalEarning = revenue;
+    derived.ecpm = derived.impressions > 0 ? +((revenue / derived.impressions) * 1000).toFixed(2) : 0;
+  }
   return {
     ...baseSummary,
     ...derived,
@@ -3012,6 +3022,23 @@ function emptyDashboardCompatPayload(filters, currency) {
  * match both). Fall back to web-only / app-only subsets — same idea as Reporting's
  * compatible dim/metric subset — and flag what could not be combined.
  */
+/**
+ * Domain user whose whole assignment is apps + ad units (nothing picked in the request): an ad unit that
+ * sits inside an assigned app (name starts with the app id) is already in that app's numbers, so it is
+ * dropped from the ad-unit list. Adding both legs counted the same revenue twice.
+ */
+function dedupeScopedAdUnits(scoped) {
+  if (!scoped?.scopeExpanded || !(scoped.apps || []).length || !(scoped.adUnitNames || []).length
+    || (scoped.domains || []).length || (scoped.sites || []).length) {
+    return scoped?.adUnitNames;
+  }
+  const appIds = scoped.apps.map((a) => String(a).trim().toLowerCase()).filter(Boolean);
+  return scoped.adUnitNames.filter((n) => {
+    const u = String(n).trim().toLowerCase();
+    return !appIds.some((a) => u.startsWith(a));
+  });
+}
+
 async function fetchLeanDashboardBundleCompatible(svc, startDate, endDate, baseOpts) {
   let clientKey = 'x';
   try {
@@ -3056,6 +3083,15 @@ async function fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, 
     apps: [],
     groupByApp: false,
   };
+  // App ID shown only as a COLUMN next to a Site/Domain/Ad-unit filter (no App filter): the app leg would list
+  // EVERY app in the network and be added on top of the filtered inventory (5,025 rows / $1.06M instead of the
+  // site's $15k). Only the filtered inventory is asked for, so only the web leg is wanted.
+  const hasWebFilter = (baseOpts.domains?.length || 0) + (baseOpts.sites?.length || 0) + (baseOpts.adUnitNames?.length || 0) > 0;
+  if (!(baseOpts.apps?.length || 0) && hasWebFilter) {
+    const webOnly = await svc.fetchLeanDashboardBundleFromDB(startDate, endDate, webOpts);
+    if (webOnly) return { bundle: webOnly, skipped: [], usedOpts: webOpts };
+    return null;
+  }
   const appOpts = {
     ...baseOpts,
     domains: [],
@@ -3078,12 +3114,19 @@ async function fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, 
     };
   }
   if (appBundle && !webBundle) {
-    const wantsSiteOrDomainDims = Boolean(
-      baseOpts.groupBySite
-      || baseOpts.tableGrain === 'site'
-      || baseOpts.tableGrain === 'domain'
-      || baseOpts.forceWebInventory
-    );
+    // Reporting passes siteDomainColRequested (a Site/Domain COLUMN in the report). A Site/Domain filter alone
+    // (groupBySite is switched on by the filter) is not a reason to discard the app rows: when the filtered sites
+    // have no data, falling through ran the slow 25k-row lean load (up to minutes) and still found nothing.
+    // Even with a Site/Domain COLUMN requested, an empty web leg means those sites have no data: the app rows
+    // (site cell blank) are the answer. Falling through ran the 25k-row lean load for minutes and found nothing.
+    const wantsSiteOrDomainDims = baseOpts.siteDomainColRequested !== undefined
+      ? Boolean(baseOpts.forceWebInventory)
+      : Boolean(
+        baseOpts.groupBySite
+        || baseOpts.tableGrain === 'site'
+        || baseOpts.tableGrain === 'domain'
+        || baseOpts.forceWebInventory
+      );
     // Do not label Domain/Site "incompatible" when those dims were requested —
     // web often fails only because assigned hosts are missing from dim_site.
     if (wantsSiteOrDomainDims) {
@@ -3637,7 +3680,7 @@ async function handleDashboardOverview(req, res) {
               domains: scoped.domains,
               sites: scoped.sites,
               apps: scoped.apps,
-              adUnitNames: scoped.adUnitNames,
+              adUnitNames: dedupeScopedAdUnits(scoped),
               webInventoryOr: scoped.webInventoryOr,
               skipAdUnitLike: scoped.skipAdUnitLike,
             };
@@ -3735,7 +3778,7 @@ async function handleDashboardOverview(req, res) {
               domains: scoped.domains,
               sites: scoped.sites,
               apps: scoped.apps,
-              adUnitNames: scoped.adUnitNames,
+              adUnitNames: dedupeScopedAdUnits(scoped),
               webInventoryOr: scoped.webInventoryOr,
               skipAdUnitLike: scoped.skipAdUnitLike,
               currency,
@@ -3937,7 +3980,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v25_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v27_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -3988,7 +4031,7 @@ async function handleDashboard(req, res) {
         sites = scoped.sites;
         apps = scoped.apps;
         // Assigned ad units bound the query (empty request → all assigned units).
-        dashAdUnitNames = scoped.adUnitNames || dashAdUnitNames;
+        dashAdUnitNames = dedupeScopedAdUnits(scoped) || dashAdUnitNames;
         webInventoryOr = !!scoped.webInventoryOr;
         skipAdUnitLike = scoped.skipAdUnitLike !== false;
       }
@@ -4531,7 +4574,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v47_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v64_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4623,9 +4666,11 @@ async function handleDetailedReport(req, res) {
     let adUnitNames = toFilterArray(filters.domainName);
     let webInventoryOr = false;
     let skipAdUnitLike = true;
+    let scopeGrantSplit = false;
     const isScopedChild = req.user?.role !== 'admin' && userHasAssignedInventory(req.user);
     if (isScopedChild) {
       const scoped = resolveScopedSqlInventoryOpts(req.user, filters);
+      scopeGrantSplit = Boolean(scoped.scopeExpanded);
       domains = scoped.domains;
       sites = scoped.sites;
       apps = scoped.apps;
@@ -4691,6 +4736,11 @@ async function handleDetailedReport(req, res) {
       selectedDomains: domains,
       webInventoryOr,
       skipAdUnitLike,
+      scopeGrantSplit,
+      // Site / Domain column asked for in the report (not just a Site/Domain filter).
+      siteDomainColRequested: reportDimIds.some((d) => ['site_name', 'site', 'url_name', 'domain', 'domain_name'].includes(String(d).toLowerCase())),
+      // Ad Unit column: ad-unit rows already cover the apps' units, so app rows are not added on top.
+      wantsAdUnitCol: reportDimIds.some((d) => String(d).toLowerCase() === 'ad_unit_name'),
       groupByCountry: wantsCountryCol,
       groupByDevice: wantsDeviceCol,
       groupBySite: wantsSiteCol && !appCountryTable,
