@@ -19,6 +19,8 @@ export const PRESET_PAGES = Object.freeze({
   dashboard: 'dashboard',
   reporting: 'reporting',
   roi: 'roi',
+  // One entry per Ads account the admin added as a "sheet" (sidebar link under ROI); synced like presets.
+  roiSheets: 'roi-sheets',
   admobRoi: 'admob-roi',
   adsenseRoi: 'adsense-roi',
   admob: 'admob',

@@ -5,7 +5,7 @@ const { getRoiSummary } = require('../services/roiService');
 const { todayInTZ } = require('../utils/datetime');
 const { resolveAdsAccountIdsForUser, getAllowedClientIds } = require('../utils/permissions');
 const { mergeRoiParts } = require('../services/roiMerge');
-const { roiInventoryScope, limitKeys } = require('../services/roiScope');
+const { roiInventoryScope, limitKeys, appsOfAccounts } = require('../services/roiScope');
 const logger = require('../utils/logger');
 
 router.use(requireAuth);
@@ -71,10 +71,17 @@ router.get('/summary', async (req, res) => {
       // empty page, so for them the assigned sites stay the default. Asking for nothing from a scope with sites
       // but no pick = no site rows ('__none__'), never "all assigned sites".
       const siteKeysOut = !siteKeys.length && scope.apps.length ? limitKeys([], [], host) : limitKeys(siteKeys, scope.sites, host);
+      // An Ads account picked and no app picked: the user's apps are narrowed to that account's apps, so the cards
+      // show the account's own spend and earn rather than every assigned app's.
+      let scopeApps = scope.apps;
+      if (!appKeys.length && requestedAccountIds.length && accountIds?.length && scopeApps.length) {
+        const own = await appsOfAccounts(accountIds, start, end).catch(() => null);
+        if (own) scopeApps = scopeApps.filter((a) => own.has(a));
+      }
       return {
         ...baseOpts,
         siteKeys: siteKeysOut,
-        appKeys: limitKeys(appKeys, scope.apps, (v) => String(v).trim().toLowerCase()),
+        appKeys: limitKeys(appKeys, scopeApps, (v) => String(v).trim().toLowerCase()),
       };
     };
 

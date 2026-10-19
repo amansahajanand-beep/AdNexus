@@ -3,6 +3,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import { useOutletContext, useSearchParams, Link } from 'react-router-dom';
 import PageHeader from '../components/ui/PageHeader';
 import RoiCountryTreeTable from '../components/roi/RoiCountryTreeTable';
+import RoiDateTable from '../components/roi/RoiDateTable';
 import TimezoneSwitcher from '../components/ui/TimezoneSwitcher';
 import useReportTimezone from '../hooks/useReportTimezone';
 import RoiSummaryBoards from '../components/roi/RoiSummaryBoards';
@@ -12,8 +13,11 @@ import SavePresetButton from '../components/ui/SavePresetButton';
 import ThresholdAlertBanner from '../components/ui/ThresholdAlertBanner';
 import { adsAPI, roiAPI, usersAPI } from '../utils/api';
 import MultiSelect from '../components/ui/MultiSelect';
+import { normalizeHostInput, isValidHost } from '../utils/filters/hostInput';
+import { addRoiSheet, sheetAccountId, useRoiSheets } from '../utils/report/roiSheets';
 import RoiFilterRow from '../components/roi/RoiFilterRow';
 import RoiFilterSection from '../components/roi/RoiFilterSection';
+import useFirebaseSiteDetect from '../hooks/useFirebaseSiteDetect';
 import {
   ALL_SENTINEL,
   isAllSelection,
@@ -65,6 +69,11 @@ import {
 
 const ROI_TIP_KEY = 'adnexus.guide.roi.v1';
 const ROI_POLL_MS = 30 * 60 * 1000;
+
+// "All selected" App IDs still auto-link Firebase subdomains while the list has at most this many apps.
+// 200 = what POST /ads/firebase/resolve-sites accepts per request (it resolves per Firebase project, cached), so an
+// account with a normal number of apps gets its subdomains filled in without picking each app by hand.
+const FIREBASE_AUTO_ALL_MAX_APPS = 200;
 
 function money(n, currency = 'USD') {
   return formatRoiMoney(n, currency);
@@ -367,6 +376,28 @@ function RoiView() {
     return opts;
   }, [roiSiteOptions, siteHosts]);
 
+  // Apps the user picked, and a way for Firebase to add / take back detected subdomains.
+  const firebaseAppKeys = useMemo(
+    // Apps the user picked. "All selected" only counts when the list is small (e.g. the account has one app);
+    // with many apps it would link every subdomain, so detection waits for a specific pick.
+    () => {
+      const picked = collapseFullSelection(filterAppKeys, roiAppOptions);
+      const apps = picked.length
+        ? picked
+        : (roiAppOptions.length <= FIREBASE_AUTO_ALL_MAX_APPS ? optionValues(roiAppOptions) : []);
+      return apps.map((v) => String(v).toLowerCase());
+    },
+    [filterAppKeys, roiAppOptions]
+  );
+  const addDetectedSites = useCallback((sites) => {
+    setFilterSiteKeys((prev) => (isAllSelection(prev) ? prev : [...new Set([...(prev || []), ...sites])]));
+  }, []);
+  const removeDetectedSites = useCallback((sites) => {
+    const drop = new Set(sites);
+    setFilterSiteKeys((prev) => (isAllSelection(prev) ? prev : (prev || []).filter((k) => !drop.has(k))));
+  }, []);
+  const firebaseDetect = useFirebaseSiteDetect(firebaseAppKeys, addDetectedSites, removeDetectedSites, mergedNetworkIds);
+
   const roiAccountsWithSpendInRange = useMemo(
     () => roiAccountOptions.filter((o) => Number(o.spend) > 0).length,
     [roiAccountOptions]
@@ -467,7 +498,14 @@ function RoiView() {
     const hasCached = Boolean(dataRef.current?.summary)
       || Boolean(dataRef.current?.countryTargetBreakdown?.length)
       || Boolean(dataRef.current?.countryBreakdown?.length);
-    if (!silent && !hasCached) {
+    if (!silent) {
+      // A new filter / range: the numbers on screen belong to the previous one, so drop them and show loading
+      // (the responses used to be merged onto them, which looked like fresh data while it was still loading).
+      if (hasCached) {
+        setData(null);
+        setThresholdBanners([]);
+      }
+      setPriorSummary(null);
       setLoading(true);
       setBreakdownLoading(true);
     }
@@ -547,7 +585,7 @@ function RoiView() {
           summaryErr || breakdownErr,
           'Could not load ROI summary.'
         ));
-        if (!hasCached) {
+        if (!hasCached || !silent) {
           setData(null);
           setThresholdBanners([]);
         }
@@ -930,13 +968,14 @@ function RoiView() {
             const allowed = new Set(opts.map((o) => o.value));
             const kept = pending.siteKeys
               .map((k) => String(k).toLowerCase())
-              .filter((id) => allowed.has(id));
+              .filter((id) => allowed.has(id) || isValidHost(id));
             pendingShareFiltersRef.current = { ...pending, siteKeys: [] };
             if (kept.length) return kept;
           }
           if (!prev?.length) return [];
           const allowed = new Set(opts.map((o) => o.value));
-          const kept = prev.filter((id) => id === ALL_SENTINEL || allowed.has(id));
+          // Hosts typed by hand are not in the loaded list; keep them (the server limits a domain user to their scope).
+          const kept = prev.filter((id) => id === ALL_SENTINEL || allowed.has(id) || isValidHost(id));
           return kept.length ? kept : [];
         });
       } catch (err) {
@@ -1346,6 +1385,15 @@ function RoiView() {
   const countryBreakdown = data?.countryBreakdown || [];
   const countryTargetDailyBreakdown = data?.countryTargetDailyBreakdown || [];
   const singleAccountMode = (applied?.accountIds || []).length === 1;
+  // Admin: turn the selected Ads account into a sheet (sidebar link under ROI with its own day / week / month / year view).
+  const roiSheets = useRoiSheets(user?.id);
+  const sheetAccount = singleAccountMode ? String(applied.accountIds[0]) : '';
+  const existingSheet = sheetAccount ? roiSheets.find((sh) => sheetAccountId(sh) === sheetAccount) : null;
+  const addSheet = () => {
+    if (!sheetAccount) return;
+    const opt = roiAccountOptions.find((o) => String(o.value) === sheetAccount);
+    addRoiSheet({ id: sheetAccount, label: opt?.label || sheetAccount }, user?.id);
+  };
   const countryTree = useMemo(
     () => buildCountryTree(
       countryBreakdown,
@@ -1383,6 +1431,17 @@ function RoiView() {
         <button type="button" className="btn-outline-action" onClick={openExpenseForm}>
           Add expenses
         </button>
+        {singleAccountMode ? (
+          existingSheet ? (
+            <Link className="btn-outline-action" to={`/roi/sheet/${existingSheet.id}`} title="This account already has a sheet in the sidebar">
+              Open sheet
+            </Link>
+          ) : (
+            <button type="button" className="btn-outline-action" onClick={addSheet} title="Add this Ads account as a sheet under ROI in the sidebar">
+              Add sheet
+            </button>
+          )
+        ) : null}
         <button type="button" className="btn-outline-action" onClick={handleCopyLink}>
           Copy link
         </button>
@@ -1575,16 +1634,41 @@ function RoiView() {
                     roiSitesLoading
                       ? 'Loading GAM subdomains…'
                       : (siteOptions.length
-                        ? 'Pick subdomains → Apply Filter to load their revenue (₹)…'
-                        : 'No GAM subdomains in inventory yet')
+                        ? 'Pick or type subdomains → Apply Filter to load their revenue (₹)…'
+                        : 'Type a subdomain, e.g. finance2.example.com')
                   }
-                  disabled={!siteOptions.length && !roiSitesLoading}
                   loading={roiSitesLoading}
                   searchable
                   showSelectAll
                   selectAllLabel="Select all subdomains"
+                  allowCustom
+                  normalizeCustom={normalizeHostInput}
+                  validateCustom={isValidHost}
                 />
               </RoiFilterRow>
+              {firebaseDetect.notInGam?.length > 0
+                && collapseFullSelection(filterAccountIds, roiAccountOptions).length === 1
+                && !isAllSelection(filterSiteKeys) && (
+                <div className="roi-filter-hint roi-filter-hint-warn" role="alert">
+                  Not in the GAM network (no revenue to show):{' '}
+                  {firebaseDetect.notInGam.map((n, i) => (
+                    <span key={n.host}>
+                      {i > 0 ? ', ' : ''}
+                      <strong>{n.host}</strong>
+                      {` (${n.apps.slice(0, 3).join(', ')}${n.apps.length > 3 ? ` +${n.apps.length - 3}` : ''})`}
+                    </span>
+                  ))}
+                </div>
+              )}
+              {firebaseDetect.loading && (
+                <div className="roi-filter-hint" role="status">Looking up subdomains from Firebase…</div>
+              )}
+              {firebaseDetect.done && firebaseDetect.connected && (firebaseDetect.linked > 0 || firebaseDetect.missing > 0) && (
+                <div className="roi-filter-hint" role="status">
+                  {firebaseDetect.linked > 0 && `Firebase linked subdomains for ${firebaseDetect.linked} app${firebaseDetect.linked === 1 ? '' : 's'} automatically. `}
+                  {firebaseDetect.missing > 0 && `${firebaseDetect.missing} app${firebaseDetect.missing === 1 ? ' has' : 's have'} no subdomain in the latest version — pick one above if needed.`}
+                </div>
+              )}
               <RoiFilterRow icon="countries" label="Countries">
                 <MultiSelect
                   options={roiCountryOptions}
@@ -1757,6 +1841,15 @@ function RoiView() {
           </div>
         </div>
       )}
+
+      {singleAccountMode ? (
+        <RoiDateTable
+          dailyRows={countryTargetDailyBreakdown}
+          loading={breakdownLoading}
+          currency={spendCurrency}
+          exportName={`roi_by_date_${applied?.startDate || startDate}_${applied?.endDate || endDate}`}
+        />
+      ) : null}
 
       <RoiCountryTreeTable
         tree={countryTree}

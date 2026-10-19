@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { createPortal } from 'react-dom';
-import { applyBulkSearchSelection, hasBulkSeparators } from '../../utils/bulkSelectMatch';
+import { applyBulkSearchSelection, hasBulkSeparators, parseBulkSearchTokens } from '../../utils/bulkSelectMatch';
 import { ALL_SENTINEL, isAllSelection, toAllSelection } from '../../utils/inventorySelection';
 
 /**
@@ -20,6 +20,11 @@ export default function MultiSelect({
   searchable = true,
   showSelectAll = true,
   selectAllLabel = 'Select All',
+  // Let the user add a value that is not in `options` (typed or pasted). normalizeCustom cleans each entry and
+  // validateCustom rejects what is not acceptable (both optional).
+  allowCustom = false,
+  normalizeCustom = (v) => String(v || '').trim(),
+  validateCustom = (v) => Boolean(v),
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -95,6 +100,25 @@ export default function MultiSelect({
     () => new Set(allMode ? [] : (value || []).filter((v) => v !== ALL_SENTINEL)),
     [value, allMode]
   );
+
+  const optionValueSet = useMemo(() => new Set(norm.map((o) => o.value)), [norm]);
+
+  // Selected values the loaded list does not know (added by hand) — shown on top so they can be unticked.
+  const customSelected = useMemo(
+    () => (allowCustom && !allMode ? [...selectedSet].filter((v) => !optionValueSet.has(v)) : []),
+    [allowCustom, allMode, selectedSet, optionValueSet]
+  );
+
+  // What the search box would add by hand: valid entries that are not an option and not already selected.
+  const customCandidates = useMemo(() => {
+    if (!allowCustom) return [];
+    const out = [];
+    parseBulkSearchTokens(query).forEach((token) => {
+      const v = normalizeCustom(token);
+      if (v && validateCustom(v) && !optionValueSet.has(v) && !selectedSet.has(v) && !out.includes(v)) out.push(v);
+    });
+    return out;
+  }, [allowCustom, query, normalizeCustom, validateCustom, optionValueSet, selectedSet]);
 
   const MAX_VISIBLE_OPTIONS = 300;
   const filtered = useMemo(() => {
@@ -198,6 +222,13 @@ export default function MultiSelect({
     emitChange([]);
   };
 
+  const addCustom = (values) => {
+    if (!values.length) return;
+    const base = allMode ? [] : value.filter((v) => v !== ALL_SENTINEL);
+    emitChange([...new Set([...base, ...values])]);
+    setQuery('');
+  };
+
   const applyBulkSearch = (text = query) => {
     const result = applyBulkSearchSelection({
       query: text,
@@ -206,8 +237,19 @@ export default function MultiSelect({
       fieldKeys: ['value', 'label'],
     });
     if (!result) return;
-    if (result.appliedCount > 0) emitChange(result.nextValues);
-    if (result.clearedQuery) setQuery('');
+    // Entries that match no option are added by hand when the field allows it.
+    const custom = [];
+    if (allowCustom) {
+      parseBulkSearchTokens(text).forEach((token) => {
+        const v = normalizeCustom(token);
+        if (v && validateCustom(v) && !optionValueSet.has(v) && !custom.includes(v)
+          && !norm.some((o) => String(o.label).toLowerCase() === String(token).trim().toLowerCase())) custom.push(v);
+      });
+    }
+    if (result.appliedCount > 0 || custom.length) {
+      emitChange([...new Set([...result.nextValues, ...custom])]);
+      setQuery('');
+    }
   };
 
   const handleSearchKeyDown = (e) => {
@@ -236,10 +278,10 @@ export default function MultiSelect({
 
   const menu = open && menuStyle ? (
     <div className="ms-menu ms-menu-portal" ref={menuRef} style={menuStyle}>
-      {searchable && norm.length > 0 && !loading && (
+      {searchable && (norm.length > 0 || allowCustom) && !loading && (
         <input
           className="ms-search"
-          placeholder="Paste exact values (comma-separated), press Enter…"
+          placeholder={allowCustom ? 'Type or paste values (comma-separated), press Enter…' : 'Paste exact values (comma-separated), press Enter…'}
           value={query}
           autoFocus
           onChange={(e) => setQuery(e.target.value)}
@@ -253,11 +295,24 @@ export default function MultiSelect({
             <span className="ms-spinner" aria-hidden />
             <span>Loading options…</span>
           </div>
-        ) : filtered.length === 0 ? (
+        ) : filtered.length === 0 && !customCandidates.length && !customSelected.length ? (
           <div className="ms-empty">{norm.length === 0 ? 'No options available' : 'No matches'}</div>
         ) : (
           <>
-            {showSelectAll && (
+            {customCandidates.length > 0 && (
+              <button type="button" className="ms-option ms-option-all" onClick={() => addCustom(customCandidates)}>
+                <span className="ms-option-text">
+                  {`+ Add ${customCandidates.length === 1 ? `“${customCandidates[0]}”` : `${customCandidates.length} values`}`}
+                </span>
+              </button>
+            )}
+            {customSelected.map((v) => (
+              <label key={`custom-${v}`} className="ms-option">
+                <input type="checkbox" checked onChange={() => toggle(v)} />
+                <span className="ms-option-text" title={v}>{v}</span>
+              </label>
+            ))}
+            {showSelectAll && filtered.length > 0 && (
               <label className="ms-option ms-option-all">
                 <input
                   type="checkbox"
@@ -286,7 +341,7 @@ export default function MultiSelect({
           </>
         )}
       </div>
-      {!loading && norm.length > 0 && (
+      {!loading && (norm.length > 0 || customSelected.length > 0) && (
         <div className="ms-footer">
           <span className="ms-count">
             {allMode ? `All ${norm.length}` : `${value.filter((v) => v !== ALL_SENTINEL).length} of ${norm.length}`} selected

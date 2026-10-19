@@ -39,4 +39,23 @@ function limitKeys(requested, allowed, normalise = (v) => v) {
   return kept.length ? kept : [NONE];
 }
 
-module.exports = { roiInventoryScope, limitKeys, NONE };
+/** App ids the given Ads accounts advertise (spend rows in the range, plus their campaign maps). */
+async function appsOfAccounts(accountIds, start, end) {
+  const { rows } = await query(
+    `SELECT LOWER(TRIM(s.app_id)) AS app
+     FROM ads_spend_daily s
+     WHERE s.report_date BETWEEN $1::date AND $2::date
+       AND s.ads_account_id = ANY($3::uuid[]) AND NULLIF(TRIM(s.app_id), '') IS NOT NULL
+     GROUP BY 1
+     UNION
+     SELECT LOWER(TRIM(m.target_key))
+     FROM ads_campaign_map m
+     WHERE m.target_type = 'app'
+       AND m.ads_account_id = ANY($3::uuid[]) AND NULLIF(TRIM(m.target_key), '') IS NOT NULL`,
+    [start, end, accountIds]
+  );
+  // Not limited to one network: the account's spend is in one network, its app's revenue may be in another.
+  return new Set(rows.map((r) => r.app).filter(Boolean));
+}
+
+module.exports = { roiInventoryScope, limitKeys, appsOfAccounts, NONE };

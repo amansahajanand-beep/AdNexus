@@ -301,12 +301,18 @@ function resolveScopedSqlInventoryOpts(user, filters = {}) {
   let domains = clampToScopeSet(reqDomains, scope.domains);
   let sites = clampToScopeSet(reqSites, scope.sites);
   let apps = clampToScopeSet(reqApps, scope.appIds);
-  // Assigned ad units always bound the request (empty/unmatched request → all assigned units).
-  let adUnitNames = scope.adUnits?.size
-    ? (clampToScopeSet(reqAdUnits, scope.adUnits).length
-      ? clampToScopeSet(reqAdUnits, scope.adUnits)
-      : [...scope.adUnits])
-    : reqAdUnits;
+  // Assigned ad units bound the request. Nothing picked at all → every assigned unit. When the request picks
+  // apps / sites / domains but no ad unit, the assigned units are NOT added on top: they usually sit inside a
+  // picked app, so adding them listed the same revenue twice (app $768 + its 12 units $745 = $1,513 for one app).
+  let adUnitNames;
+  if (!scope.adUnits?.size) {
+    adUnitNames = reqAdUnits;
+  } else {
+    const pickedUnits = clampToScopeSet(reqAdUnits, scope.adUnits);
+    if (pickedUnits.length) adUnitNames = pickedUnits;
+    else if (reqApps.length || reqSites.length || reqDomains.length) adUnitNames = [];
+    else adUnitNames = [...scope.adUnits];
+  }
 
   if (!anyRequest) {
     // Empty / "All selected" collapsed to [] → full assignment (domains ∪ sites ∪ apps).

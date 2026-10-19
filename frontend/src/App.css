@@ -6687,3 +6687,64 @@ a { color: var(--accent); }
 /* Which timezone a page's days are in */
 .tz-report-note { margin: 6px 0 0; color: var(--text-secondary); }
 .tz-report-note.is-warn { color: var(--warning); }
+/* ─── Admin → Firebase ────────────────────────────────────────────────────── */
+.fb { margin-top: 4px; display: flex; flex-direction: column; gap: 12px; }
+.fb-card { margin-bottom: 0; }
+.fb-status { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.fb-status-text { flex: 1 1 260px; min-width: 0; }
+.fb-title { font-size: 15px; font-weight: 700; color: var(--text); }
+.fb-sub { margin-top: 2px; font-size: 13px; color: var(--text-secondary); }
+.fb-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
+.fb-dot.on { background: var(--success); box-shadow: 0 0 0 4px var(--success-soft); }
+.fb-dot.off { background: var(--muted); box-shadow: 0 0 0 4px var(--bg-soft); }
+.fb-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.fb-benefits { list-style: none; margin: 14px 0 0; padding: 14px 0 0; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; font-size: 13px; color: var(--text-secondary); }
+.fb-benefits strong { color: var(--text); font-weight: 600; }
+.fb-alert { padding: 10px 14px; border-radius: 10px; font-size: 13px; border: 1px solid; }
+.fb-alert-error { background: var(--danger-soft); color: var(--danger); border-color: var(--danger); }
+.fb-alert-ok { background: var(--success-soft); color: var(--success); border-color: var(--success); }
+.fb-picker { display: flex; gap: 8px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+.fb-select { flex: 1 1 320px; min-width: 0; padding: 9px 12px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); color: var(--text); font: inherit; }
+.fb-params { display: flex; flex-direction: column; gap: 8px; }
+.fb-param { border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); overflow: hidden; }
+.fb-param-head { width: 100%; display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: none; border: 0; cursor: pointer; font: inherit; color: var(--text); text-align: left; }
+.fb-param-head:hover { background: var(--row-hover); }
+.fb-param-key { font-weight: 600; font-size: 13.5px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.fb-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+.fb-chevron { color: var(--muted); }
+.fb-param-body { border-top: 1px solid var(--border); padding: 8px 12px 12px; }
+.fb-param-actions { display: flex; justify-content: flex-end; margin-bottom: 6px; }
+.fb-json { margin: 0; max-height: 360px; overflow: auto; padding: 10px 12px; border-radius: 8px; background: var(--surface); border: 1px solid var(--border); font-size: 12px; line-height: 1.5; color: var(--text); }
+@media (max-width: 600px) { .fb-actions { width: 100%; } }
+.roi-filter-hint { padding: 6px 16px 10px 70px; font-size: 12.5px; color: var(--muted); }
+.fb-accounts { list-style: none; margin: 14px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.fb-account { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); font-size: 13px; }
+.fb-account-mail { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 600; color: var(--text); }
+.fb-account-count { color: var(--muted); font-size: 12px; }
+
+/* ROI Day-by-day: the Earn column is wide and lists each site / app with its earn under the day's total. */
+.roi-date-table td.roi-earn-cell { min-width: 280px; max-width: 460px; text-align: left; vertical-align: top; }
+.roi-date-table .roi-earn-main { font-size: 15px; font-weight: 700; color: var(--text); }
+.roi-date-table .roi-earn-parts { display: flex; flex-wrap: wrap; gap: 4px 6px; margin-top: 6px; }
+.roi-date-table .roi-earn-part { display: inline-flex; align-items: baseline; gap: 6px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); font-size: 11.5px; line-height: 1.5; max-width: 100%; }
+.roi-date-table .roi-earn-part-site { border-color: rgba(37, 99, 235, 0.35); }
+.roi-date-table .roi-earn-part-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 210px; color: var(--muted); }
+.roi-date-table .roi-earn-part-amt { font-weight: 600; color: var(--text); }
+.roi-filter-hint.roi-filter-hint-warn { color: #dc2626; }
+.roi-filter-hint.roi-filter-hint-warn strong { color: #dc2626; font-weight: 700; }
+
+/* ROI sheet page */
+.roi-sheet-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 14px; margin: 14px 0 4px; }
+.roi-sheet-controls-label { font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.roi-sheet-quick { display: inline-flex; gap: 4px; margin-left: auto; }
+
+/* Sidebar: ROI with its sheets (one per Ads account) underneath */
+.nav-group-row { display: flex; align-items: stretch; gap: 2px; }
+.nav-group-row > .nav-btn { flex: 1; min-width: 0; }
+.nav-group-toggle { flex: 0 0 auto; width: 30px; display: inline-flex; align-items: center; justify-content: center; border: none; background: transparent; color: inherit; opacity: 0.7; border-radius: 8px; cursor: pointer; }
+.nav-group-toggle:hover { opacity: 1; background: rgba(127, 127, 127, 0.14); }
+.nav-group-toggle svg { transition: transform 0.15s ease; transform: rotate(-90deg); }
+.nav-group-toggle.is-open svg { transform: rotate(0deg); }
+.nav-sub { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 4px 18px; padding-left: 10px; border-left: 1px solid var(--border); }
+.nav-sub-btn { font-size: 13px; padding-top: 7px; padding-bottom: 7px; }
+.nav-sub-btn .nav-btn-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

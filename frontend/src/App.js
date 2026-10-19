@@ -7,6 +7,7 @@ import Onboard from './pages/Onboard';
 import Dashboard from './pages/Dashboard';
 import Reporting from './pages/Reporting';
 import Roi from './pages/Roi';
+import RoiSheet from './pages/RoiSheet';
 import Presets from './pages/Presets';
 import Admin from './pages/Admin';
 import DomainUser from './pages/DomainUser';
@@ -128,6 +129,7 @@ function AppRoutes() {
         <Route path="/dashboard" element={<PermissionRoute page="dashboard"><Dashboard /></PermissionRoute>} />
         <Route path="/reporting" element={<PermissionRoute page="reporting"><Reporting /></PermissionRoute>} />
         <Route path="/roi" element={<PermissionRoute page="roi"><Roi /></PermissionRoute>} />
+        <Route path="/roi/sheet/:sheetId" element={<PermissionRoute page="roi"><RoiSheet /></PermissionRoute>} />
         <Route path="/presets" element={<PermissionRoute page="presets"><Presets /></PermissionRoute>} />
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />
