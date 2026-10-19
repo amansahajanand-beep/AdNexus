@@ -104,10 +104,13 @@ function withAssignedRoiTargets(user, payload) {
 
 /** Cache the shared payload, answer with the per-user merged one. */
 function sendRoiTargets(req, res, cacheKey, payload, ttl) {
+  // With an Ads account / campaign picked the list must be only that account's apps, not every assigned one.
+  const narrowed = Boolean(String(req.query.accountIds || '').trim() || String(req.query.campaignIds || '').trim());
+  const finish = (p) => res.json(narrowed ? p : withAssignedRoiTargets(req.user, p));
   const cached = cache.get(cacheKey);
-  if (cached) return res.json(withAssignedRoiTargets(req.user, cached));
+  if (cached) return finish(cached);
   cache.set(cacheKey, payload, ttl ?? ROI_FILTER_CACHE_TTL);
-  return res.json(withAssignedRoiTargets(req.user, payload));
+  return finish(payload);
 }
 
 router.use(requireAuth);
@@ -1177,6 +1180,174 @@ router.get('/roi-sites', async (req, res) => {
     return sendRoiTargets(req, res, cacheKey, payload, 300);
   } catch (err) {
     logger.error('ROI sites list:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const firebaseSvc = () => require('../services/firebaseRemoteConfigService');
+
+/** Valid-JSON Remote Config values from the Firebase project mapped to a subdomain (read-only). */
+router.get('/firebase-remote-config', async (req, res) => {
+  try {
+    const clientId = req.client?.id || req.user?.clientId;
+    if (!clientId) return res.status(400).json({ error: 'No client context' });
+    const svc = firebaseSvc();
+    const site = svc.normalizeSite(req.query.site);
+    if (!site) return res.status(400).json({ error: 'site is required' });
+    const scope = await require('../services/roiScope').roiInventoryScope(req.user, clientId);
+    if (scope && !scope.sites.includes(site)) return res.status(403).json({ error: 'Site not assigned to you' });
+    const data = await svc.getRemoteConfigJson(req.client, site, { refresh: req.query.refresh === '1' });
+    if (!data) return res.status(404).json({ error: 'Firebase is not connected for this subdomain' });
+    res.json(data);
+  } catch (err) {
+    logger.error('Firebase remote config:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Connection state + subdomain -> project mappings (a domain user sees only their sites). */
+router.get('/firebase/status', async (req, res) => {
+  try {
+    const clientId = req.client?.id || req.user?.clientId;
+    const status = await firebaseSvc().getStatus(clientId);
+    const scope = await require('../services/roiScope').roiInventoryScope(req.user, clientId);
+    if (scope) {
+      const ok = new Set(scope.sites);
+      status.mappings = status.mappings.filter((m) => ok.has(m.site));
+      status.email = '';
+    }
+    res.json(status);
+  } catch (err) {
+    logger.error('Firebase status:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Connect with Google: returns the consent URL. */
+router.post('/firebase/oauth-url', requireAdmin, async (req, res) => {
+  try {
+    const { signFirebaseState } = require('./authFirebase');
+    const url = firebaseSvc().buildAuthUrl(req.client, signFirebaseState({ clientId: req.client.id }));
+    res.json({ url });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+/** Firebase projects visible to the connected Google accounts (+ per-account errors). */
+router.get('/firebase/projects', requireAdmin, async (req, res) => {
+  try {
+    const listing = await firebaseSvc().listFirebaseProjects(req.client);
+    if (!listing) return res.status(404).json({ error: 'Connect Firebase with Google first' });
+    res.json(listing);
+  } catch (err) {
+    logger.error('Firebase projects list:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Remote Config JSON parameters of one Firebase project (Admin → Firebase explorer). */
+router.get('/firebase/project-config', requireAdmin, async (req, res) => {
+  try {
+    const projectId = String(req.query.projectId || '').trim();
+    if (!projectId) return res.status(400).json({ error: 'projectId is required' });
+    const data = await firebaseSvc().fetchProjectConfig(req.client, projectId, {
+      refresh: req.query.refresh === '1',
+      accountId: String(req.query.accountId || '') || null,
+    });
+    if (!data) return res.status(404).json({ error: 'Connect Firebase with Google first' });
+    res.json(data);
+  } catch (err) {
+    logger.error('Firebase project config:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Body: { site, projectId } maps a subdomain to a Firebase project. */
+router.put('/firebase/site-map', requireAdmin, async (req, res) => {
+  try {
+    const svc = firebaseSvc();
+    const site = svc.normalizeSite(req.body?.site);
+    const projectId = String(req.body?.projectId || '').trim();
+    if (!site || !projectId) return res.status(400).json({ error: 'site and projectId are required' });
+    await svc.mapSiteToProject(req.client.id, site, projectId);
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('Firebase site map:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/firebase/site-map', requireAdmin, async (req, res) => {
+  try {
+    const ok = await firebaseSvc().unmapSite(req.client.id, req.query.site);
+    res.status(ok ? 200 : 404).json({ ok });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Body: { apps: [package ids], refresh? } -> per app: Firebase project, manual + auto-detected subdomains. */
+router.post('/firebase/resolve-sites', async (req, res) => {
+  try {
+    const clientId = req.client?.id || req.user?.clientId;
+    if (!clientId) return res.status(400).json({ error: 'No client context' });
+    const apps = Array.isArray(req.body?.apps) ? req.body.apps.slice(0, 200) : [];
+    const connected = (await firebaseSvc().getStatus(clientId)).connected;
+    const resolved = await firebaseSvc().resolveSitesForApps(req.client, apps, { refresh: !!req.body?.refresh });
+    let { results } = resolved;
+    const scope = await require('../services/roiScope').roiInventoryScope(req.user, clientId);
+    if (scope) {
+      const ok = new Set(scope.sites);
+      results = results.map((r) => ({
+        ...r,
+        manualSites: r.manualSites.filter((s) => ok.has(s)),
+        autoSites: r.autoSites.filter((s) => ok.has(s)),
+      }));
+    }
+    res.json({ connected, results, warning: connected ? resolved.warning : '' });
+  } catch (err) {
+    logger.error('Firebase resolve sites:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/** Manual link when an app's subdomain is not detected. Body: { app, site }. Domain users: only their own sites. */
+router.put('/firebase/app-site', async (req, res) => {
+  try {
+    const clientId = req.client?.id || req.user?.clientId;
+    const svc = firebaseSvc();
+    const app = String(req.body?.app || '').trim();
+    const site = svc.normalizeSite(req.body?.site);
+    if (!app || !site) return res.status(400).json({ error: 'app and site are required' });
+    const scope = await require('../services/roiScope').roiInventoryScope(req.user, clientId);
+    if (scope && !scope.sites.includes(site)) return res.status(403).json({ error: 'Site not assigned to you' });
+    await svc.addAppSite(clientId, app, site);
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error('Firebase app-site save:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/firebase/app-site', async (req, res) => {
+  try {
+    const clientId = req.client?.id || req.user?.clientId;
+    const svc = firebaseSvc();
+    const site = svc.normalizeSite(req.query.site);
+    const scope = await require('../services/roiScope').roiInventoryScope(req.user, clientId);
+    if (scope && !scope.sites.includes(site)) return res.status(403).json({ error: 'Site not assigned to you' });
+    const ok = await svc.removeAppSite(clientId, req.query.app, site);
+    res.status(ok ? 200 : 404).json({ ok });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.delete('/firebase/connection', requireAdmin, async (req, res) => {
+  try {
+    res.json({ ok: await firebaseSvc().disconnect(req.client.id, String(req.query.accountId || '') || null) });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });

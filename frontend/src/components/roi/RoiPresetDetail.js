@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { EmptyIcon } from '../ui/Icon';
 import { useNavigate } from 'react-router-dom';
 import RoiCountryTreeTable from './RoiCountryTreeTable';
+import RoiDateTable from './RoiDateTable';
 import RoiSummaryBoards from './RoiSummaryBoards';
 import PresetDateToolbar from '../presets/PresetDateToolbar';
 import PresetAiAnalysis from '../presets/PresetAiAnalysis';
@@ -87,6 +88,8 @@ export default function RoiPresetDetail({
       return undefined;
     }
     let cancelled = false;
+    // New preset / date range: clear the previous numbers so they are not shown (or merged) while this one loads.
+    setData(null);
     setLoading(true);
     setBreakdownLoading(true);
     setError(null);
@@ -104,7 +107,7 @@ export default function RoiPresetDetail({
         return { __err: err };
       });
 
-    const breakdownPromise = roiAPI.summary({ ...params, breakdownOnly: '1' })
+    const breakdownPromise = roiAPI.summary({ ...params, breakdownOnly: '1', includeDaily: '1' })
       .then((breakdown) => {
         if (cancelled) return null;
         setData((prev) => mergeRoiBreakdownPayload(prev, breakdown));
@@ -301,6 +304,15 @@ export default function RoiPresetDetail({
           Unmapped Ads spend: {formatRoiMoney(summary.unmappedSpend, spendCurrency)} (hidden from table / ROI cards).
         </p>
       )}
+
+      {singleAccountMode ? (
+        <RoiDateTable
+          dailyRows={countryTargetDailyBreakdown}
+          loading={breakdownLoading}
+          currency={spendCurrency}
+          exportName={`roi_preset_by_date_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
+        />
+      ) : null}
 
       {(countryTree.length > 0 || loading) && (
         <div style={{ marginTop: 16 }}>

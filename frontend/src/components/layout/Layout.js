@@ -19,6 +19,7 @@ import { buildFreshnessLabel, buildPublisherFreshnessLabel, relativeFreshness } 
 import { applyTheme, isDarkTheme, readStoredTheme } from '../../utils/theme';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 import { syncPresetsFromServer } from '../../utils/reportPresets';
+import { sheetName, useRoiSheets } from '../../utils/report/roiSheets';
 import AiAlertsBell from './AiAlertsBell';
 import AskDataDrawer from '../ai/AskDataDrawer';
 import { loadAiStatus } from '../../utils/ai/presetAnalysis';
@@ -115,6 +116,17 @@ export default function Layout() {
   const [userOpen, setUserOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [focusMode, setFocusMode] = useState(readFocusMode);
+  // ROI sheets (one per Ads account, added by an admin) list under ROI in the sidebar.
+  const roiSheets = useRoiSheets(user?.id);
+  const [roiOpen, setRoiOpen] = useState(() => {
+    try { return localStorage.getItem('adnexus.roiSheetsOpen') !== '0'; } catch { return true; }
+  });
+  const toggleRoiOpen = useCallback(() => {
+    setRoiOpen((open) => {
+      try { localStorage.setItem('adnexus.roiSheetsOpen', open ? '0' : '1'); } catch { /* ignore */ }
+      return !open;
+    });
+  }, []);
   const [darkMode, setDarkMode] = useState(() => readStoredTheme() === 'dark');
   const [publisherFreshness, setPublisherFreshness] = useState(null);
   const [publisherAccountLabel, setPublisherAccountLabel] = useState(null);
@@ -594,20 +606,62 @@ export default function Layout() {
           </div>
 
           <nav className="sidebar-nav">
-            {navItems.map(item => (
-              <NavLink
-                key={item.to}
-                to={item.to}
-                title={item.label}
-                className={({ isActive }) => `nav-btn ${isActive ? 'active' : ''}`}
-                onClick={() => setMenuOpen(false)}
-              >
-                <span className="nav-btn-icon" aria-hidden>
-                  <NavIcon page={item.page} size={focusMode ? 20 : 18} />
-                </span>
-                <span className="nav-btn-label">{item.label}</span>
-              </NavLink>
-            ))}
+            {navItems.map((item) => {
+              const hasSheets = item.to === '/roi' && activeProduct === 'gam' && roiSheets.length > 0;
+              const link = (
+                <NavLink
+                  key={item.to}
+                  to={item.to}
+                  end={hasSheets}
+                  title={item.label}
+                  className={({ isActive }) => `nav-btn ${isActive ? 'active' : ''}`}
+                  onClick={() => setMenuOpen(false)}
+                >
+                  <span className="nav-btn-icon" aria-hidden>
+                    <NavIcon page={item.page} size={focusMode ? 20 : 18} />
+                  </span>
+                  <span className="nav-btn-label">{item.label}</span>
+                </NavLink>
+              );
+              if (!hasSheets) return link;
+              const open = roiOpen || location.pathname.startsWith('/roi/sheet/');
+              return (
+                <div key={item.to} className="nav-group">
+                  <div className="nav-group-row">
+                    {link}
+                    {!focusMode ? (
+                      <button
+                        type="button"
+                        className={`nav-group-toggle${open ? ' is-open' : ''}`}
+                        onClick={toggleRoiOpen}
+                        aria-expanded={open}
+                        aria-label={open ? 'Hide ROI sheets' : 'Show ROI sheets'}
+                        title={open ? 'Hide ROI sheets' : 'Show ROI sheets'}
+                      >
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                          <polyline points="6 9 12 15 18 9" />
+                        </svg>
+                      </button>
+                    ) : null}
+                  </div>
+                  {open && !focusMode ? (
+                    <div className="nav-sub">
+                      {roiSheets.map((sheet) => (
+                        <NavLink
+                          key={sheet.id}
+                          to={`/roi/sheet/${sheet.id}`}
+                          title={sheetName(sheet)}
+                          className={({ isActive }) => `nav-btn nav-sub-btn ${isActive ? 'active' : ''}`}
+                          onClick={() => setMenuOpen(false)}
+                        >
+                          <span className="nav-btn-label">{sheetName(sheet)}</span>
+                        </NavLink>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
           </nav>
 
           <div className="sidebar-foot">

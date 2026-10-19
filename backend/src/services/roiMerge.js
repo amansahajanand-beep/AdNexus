@@ -97,29 +97,80 @@ function unifyCountries(parts) {
 
 const cKey = (r) => String(r.countryName || r.countryCode || '').trim().toLowerCase().replace(/_/g, ' ');
 
+const titleCase = (v) => String(v || '').split(' ').map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(' ');
+
 /**
- * Earn one network holds for an app that another network has the Ads spend rows for (spend in network A, revenue in
- * network B). Each network can only attach earn to its own spend rows, so B hands the earn back as `earnOnlyTargets`
- * and it is added here to the matching spend rows (shared out by spend when several accounts spend on it).
- * Earn with no spend row anywhere is dropped, as in a single network ("Ads-linked apps only").
+ * App earn that has no Ads-spend row of its own to sit on: either the revenue is in another network than the spend, or
+ * it is in a country / on a day where the account spent nothing. The earn goes onto the spend rows of the same app and
+ * country when there are some (shared out by spend when several accounts spend on it). Otherwise, when the app has Ads
+ * spend elsewhere, a spend-less row is added for it, so the app's revenue is complete (not only where it was advertised).
+ * Earn of an app with no Ads spend at all stays out ("Ads-linked apps only").
+ * Returns Map(country key -> earn added), with `.created` = the new country keys ({ code, name }).
  */
 function foldEarnOnly(rows, entries, withDate) {
   const addedByCountry = new Map();
+  addedByCountry.created = new Map();
   if (!Array.isArray(rows) || !entries?.length) return addedByCountry;
   const groups = new Map();
+  const bestRow = new Map();
+  const countryOf = new Map();
   for (const r of rows) {
+    countryOf.set(cKey(r), { code: r.countryCode, name: r.countryName });
     if (!(Number(r.adsSpend) > 0)) continue;
     const k = `${withDate ? `${r.date}|` : ''}${r.targetType}|${String(r.targetKey || '').toLowerCase()}|${cKey(r)}`;
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(r);
+    const tk = `${r.targetType}|${String(r.targetKey || '').toLowerCase()}`;
+    if (!bestRow.has(tk) || (Number(r.adsSpend) || 0) > (Number(bestRow.get(tk).adsSpend) || 0)) bestRow.set(tk, r);
   }
   const touched = new Set();
+  const made = [];
   for (const e of entries) {
-    const k = `${withDate ? `${e.date}|` : ''}${e.targetType}|${String(e.targetKey || '').toLowerCase()}|${String(e.countryKey || '').replace(/_/g, ' ')}`;
-    const list = groups.get(k);
-    if (!list) continue;
-    const total = list.reduce((a, r) => a + (Number(r.adsSpend) || 0), 0);
     const cc = String(e.countryKey || '').replace(/_/g, ' ');
+    const k = `${withDate ? `${e.date}|` : ''}${e.targetType}|${String(e.targetKey || '').toLowerCase()}|${cc}`;
+    const list = groups.get(k);
+    if (!list) {
+      const tpl = bestRow.get(`${e.targetType}|${String(e.targetKey || '').toLowerCase()}`);
+      if (!tpl || !(Number(e.earn) > 0)) continue;
+      const known = countryOf.get(cc);
+      const name = known?.name || titleCase(cc);
+      const code = known?.code || String(e.countryKey || '').toUpperCase().replace(/\s+/g, '_');
+      const row = {
+        ...(withDate ? { date: e.date } : {}),
+        adsAccountId: tpl.adsAccountId,
+        accountName: tpl.accountName,
+        targetType: e.targetType,
+        targetKey: tpl.targetKey,
+        countryCode: code,
+        countryName: name,
+        adsSpend: 0,
+        earn: Number(e.earn) || 0,
+        otherExpenses: 0,
+        profitSpend: Number(e.earn) || 0,
+        profitExpense: Number(e.earn) || 0,
+        roiSpendPercent: null,
+        roiExpensePercent: null,
+        impressions: 0,
+        clicks: 0,
+        conversions: 0,
+        ctr: null,
+        ecpm: null,
+      };
+      made.push(row);
+      // later entries for the same app / country (and day) land on this row
+      groups.set(k, [row]);
+      row._spendless = true;
+      addedByCountry.set(cc, (addedByCountry.get(cc) || 0) + row.earn);
+      if (!known) addedByCountry.created.set(cc, { code, name });
+      continue;
+    }
+    if (list.length === 1 && list[0]._spendless) {
+      const r = list[0];
+      r.earn += Number(e.earn) || 0; r.profitSpend = r.earn; r.profitExpense = r.earn;
+      addedByCountry.set(cc, (addedByCountry.get(cc) || 0) + (Number(e.earn) || 0));
+      continue;
+    }
+    const total = list.reduce((a, r) => a + (Number(r.adsSpend) || 0), 0);
     addedByCountry.set(cc, (addedByCountry.get(cc) || 0) + (Number(e.earn) || 0));
     for (const r of list) {
       const part = (Number(e.earn) || 0) * ((Number(r.adsSpend) || 0) / total);
@@ -130,7 +181,38 @@ function foldEarnOnly(rows, entries, withDate) {
     }
   }
   for (const r of touched) redoRatios(r, r);
+  for (const r of made) { delete r._spendless; r.earn = round2(r.earn); r.profitSpend = round2(r.profitSpend); r.profitExpense = round2(r.profitExpense); rows.push(r); }
   return addedByCountry;
+}
+
+/** Fold a result's own `earnOnlyTargets` into its rows and country totals (single network or merged). */
+function applyEarnOnly(out) {
+  if (!out?.earnOnlyTargets) return out;
+  const entries = (k) => out.earnOnlyTargets?.[k] || [];
+  const added = foldEarnOnly(out.countryTargetBreakdown, entries('range'), false);
+  foldEarnOnly(out.countryTargetDailyBreakdown, entries('daily'), true);
+  // The country rows' own totals must carry the same earn as the packages under them.
+  if (Array.isArray(out.countryBreakdown) && added.size) {
+    const have = new Set(out.countryBreakdown.map((r) => cKey(r)));
+    for (const r of out.countryBreakdown) {
+      const extra = added.get(cKey(r));
+      if (!extra) continue;
+      r.earn = (Number(r.earn) || 0) + extra;
+      if (r.profitSpend != null) r.profitSpend = (Number(r.profitSpend) || 0) + extra;
+      if (r.profitExpense != null) r.profitExpense = (Number(r.profitExpense) || 0) + extra;
+      redoRatios(r, r);
+    }
+    for (const [cc, info] of added.created) {
+      if (have.has(cc)) continue;
+      const earn = round2(added.get(cc) || 0);
+      out.countryBreakdown.push({
+        countryCode: info.code, countryName: info.name, adsSpend: 0, earn, profitSpend: earn,
+        roiSpendPercent: null, impressions: 0, clicks: 0, conversions: 0, ctr: null, ecpm: null,
+      });
+    }
+  }
+  delete out.earnOnlyTargets;
+  return out;
 }
 
 /** parts: the getRoiSummary results of each network (any of summaryOnly, breakdownOnly or full). */
@@ -173,24 +255,14 @@ function mergeRoiParts(parts) {
   for (const k of ['generalExpenses', 'expenses']) {
     if (ok.some((p) => Array.isArray(p[k]))) out[k] = dedupeBy(lists(k), (e) => String(e.id ?? JSON.stringify(e)));
   }
-  const entries = (k) => ok.flatMap((p) => p.earnOnlyTargets?.[k] || []);
   if (ok.some((p) => p.earnOnlyTargets)) {
-    const added = foldEarnOnly(out.countryTargetBreakdown, entries('range'), false);
-    foldEarnOnly(out.countryTargetDailyBreakdown, entries('daily'), true);
-    // The country rows' own totals must carry the same earn as the packages under them.
-    if (Array.isArray(out.countryBreakdown) && added.size) {
-      for (const r of out.countryBreakdown) {
-        const extra = added.get(cKey(r));
-        if (!extra) continue;
-        r.earn = (Number(r.earn) || 0) + extra;
-        if (r.profitSpend != null) r.profitSpend = (Number(r.profitSpend) || 0) + extra;
-        if (r.profitExpense != null) r.profitExpense = (Number(r.profitExpense) || 0) + extra;
-        redoRatios(r, r);
-      }
-    }
-    delete out.earnOnlyTargets;
+    out.earnOnlyTargets = {
+      range: ok.flatMap((p) => p.earnOnlyTargets?.range || []),
+      daily: ok.flatMap((p) => p.earnOnlyTargets?.daily || []),
+    };
+    applyEarnOnly(out);
   }
   return out;
 }
 
-module.exports = { mergeRoiParts };
+module.exports = { mergeRoiParts, applyEarnOnly };

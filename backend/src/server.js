@@ -11,6 +11,7 @@ const logger = require('./utils/logger');
 
 const authRoutes = require('./routes/auth');
 const authAdsRoutes = require('./routes/authAds');
+const authFirebaseRoutes = require('./routes/authFirebase');
 const authAdmobRoutes = require('./routes/authAdmob');
 const authAdsenseRoutes = require('./routes/authAdsense');
 const sessionRoutes = require('./routes/session');
@@ -147,6 +148,7 @@ async function startServer() {
   // Routes
   app.use('/auth', authRoutes);              // GAM Google OAuth helper
   app.use('/auth/ads', authAdsRoutes);       // Google Ads OAuth
+  app.use('/auth/firebase', authFirebaseRoutes); // Firebase Remote Config OAuth
   app.use('/auth/admob', authAdmobRoutes);   // AdMob OAuth
   app.use('/auth/adsense', authAdsenseRoutes); // AdSense OAuth
   app.use('/api/onboard', onboardRoutes);    // Public client self-onboard

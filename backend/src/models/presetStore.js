@@ -6,7 +6,7 @@
 const { query } = require('../db');
 
 const PAGES = new Set([
-  'dashboard', 'reporting', 'roi',
+  'dashboard', 'reporting', 'roi', 'roi-sheets',
   'admob', 'admob-reporting', 'admob-roi',
   'adsense', 'adsense-reporting', 'adsense-roi',
 ]);

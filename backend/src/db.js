@@ -598,6 +598,50 @@ async function initSchema() {
       UNIQUE (client_id, ads_account_id, campaign_id)
     );
 
+    CREATE TABLE IF NOT EXISTS firebase_connections (
+      client_id UUID PRIMARY KEY REFERENCES gam_clients(id) ON DELETE CASCADE,
+      refresh_token_enc TEXT NOT NULL,
+      google_email TEXT NOT NULL DEFAULT '',
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS firebase_accounts (
+      id UUID PRIMARY KEY,
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      google_email TEXT NOT NULL,
+      refresh_token_enc TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (client_id, google_email)
+    );
+
+    -- One-time move of the single-account connections (firebase_connections is emptied as it is copied).
+    WITH moved AS (
+      DELETE FROM firebase_connections RETURNING client_id, google_email, refresh_token_enc
+    )
+    INSERT INTO firebase_accounts (id, client_id, google_email, refresh_token_enc)
+    SELECT md5(random()::text || clock_timestamp()::text || client_id::text)::uuid,
+           client_id, LOWER(NULLIF(google_email, '')), refresh_token_enc
+    FROM moved
+    WHERE NULLIF(google_email, '') IS NOT NULL
+    ON CONFLICT (client_id, google_email) DO NOTHING;
+
+    CREATE TABLE IF NOT EXISTS firebase_site_projects (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      site TEXT NOT NULL,
+      project_id TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, site)
+    );
+
+    CREATE TABLE IF NOT EXISTS firebase_app_sites (
+      client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
+      app_id TEXT NOT NULL,
+      site TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      PRIMARY KEY (client_id, app_id, site)
+    );
+
     CREATE TABLE IF NOT EXISTS ads_spend_daily (
       client_id UUID NOT NULL REFERENCES gam_clients(id) ON DELETE CASCADE,
       ads_account_id UUID NOT NULL REFERENCES ads_accounts(id) ON DELETE CASCADE,

@@ -81,6 +81,8 @@ export function usePresetDateRange(user, presetItemId) {
     customDatesIncomplete,
     onPreset,
     applyDates: () => applyDates('custom', startDate, endDate),
+    // Apply an explicit range at once (quick ranges such as This year); clamped like a custom range.
+    applyRange: (sd, ed) => applyDates('custom', sd, ed),
     setStartDate: (v) => setStartDate(clampDateValue(v, dateRestriction)),
     setEndDate: (v) => setEndDate(clampDateValue(v, dateRestriction)),
   };

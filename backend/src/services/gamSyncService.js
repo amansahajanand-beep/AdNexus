@@ -3270,9 +3270,23 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
           [requireClientId(), patterns]
         );
         const names = [...new Set([...opts.adUnitNames, ...appUnits.map((r) => r.name)])];
-        const unitOnly = await fetchReportingBundleFromDB(startDate, endDate, {
-          ...opts, scopeGrantSplit: false, wantsAdUnitCol: false, apps: [], adUnitNames: names, groupByApp: false,
-        });
+        // Plain by-date/ad-unit report: the same rollup-backed lean path the Dashboard uses (fast on a cold disk).
+        let unitOnly = null;
+        if (
+          dayCount <= DASHBOARD_ROLLUP_FIRST_DAYS
+          && !wantsGeoTableDims(opts) && !opts.countryNames?.length && !opts.groupByDevice
+          && !opts.needUnfilled && !opts.needRequests
+        ) {
+          unitOnly = await fetchLeanDashboardBundleFromDB(startDate, endDate, {
+            ...opts, apps: [], adUnitNames: names, groupByApp: false, skipCharts: true, reportingFast: true,
+          }).catch(() => null);
+        }
+        if (!unitOnly) {
+          unitOnly = await fetchReportingBundleFromDB(startDate, endDate, {
+            ...opts, scopeGrantSplit: false, wantsAdUnitCol: false, apps: [], adUnitNames: names, groupByApp: false,
+            skipLeanRedirect: true,
+          });
+        }
         if (unitOnly) {
           logger.info(
             `Reporting scope-units ${startDate}..${endDate} rows=${unitOnly.rows?.length || 0}`
@@ -3328,6 +3342,15 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
           + ` app=${appPart.rows?.length || 0} in ${Date.now() - t0}ms`
         );
         return { ...mergeReportingBundles(webPart, appPart, opts), source: 'reporting-scope-split' };
+      }
+      // The site/domain part has no rows in the warehouse for this report (e.g. no country-level rows): the app
+      // rows are the answer. Falling back ran a live GAM job ("building", minutes) that returned the same app data.
+      if (appPart && !webPart) {
+        logger.info(
+          `Reporting scope-split(app only; no web rows) ${startDate}..${endDate} app=${appPart.rows?.length || 0}`
+          + ` in ${Date.now() - t0}ms`
+        );
+        return { ...appPart, source: 'reporting-scope-split', partialSkipped: ['Site/Domain rows (none in the warehouse for this breakdown)'] };
       }
     } catch (e) {
       logger.warn('Reporting scope-split(web+app) failed (falling back):', e.message);
@@ -3419,16 +3442,16 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
   // cold cache for a few hundred rows. Return null so Reporting falls to the same lean/rollup path as the Dashboard.
   if (
     dayCount <= DASHBOARD_ROLLUP_FIRST_DAYS
-    && (opts.adUnitNames || []).length > 0
-    && !(opts.apps || []).length
-    && !opts.groupByApp
+    && ((opts.adUnitNames || []).length > 0 || (opts.sites || []).length > 0 || (opts.domains || []).length > 0)
+    && !hasAppsOnly
+    && !opts.skipLeanRedirect
     && !wantsGeoTableDims(opts)
     && !opts.countryNames?.length
     && !opts.groupByDevice
     && !opts.needUnfilled
     && !opts.needRequests
   ) {
-    logger.info(`Reporting ad-unit report ${startDate}..${endDate} -> lean/rollup path (skipping inventory_core scan)`);
+    logger.info(`Reporting ${startDate}..${endDate} -> lean/rollup path (no raw grain scan)`);
     return null;
   }
 

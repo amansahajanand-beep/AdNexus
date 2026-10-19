@@ -3980,7 +3980,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v27_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v28_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4574,7 +4574,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v64_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v72_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4825,6 +4825,7 @@ async function handleDetailedReport(req, res) {
             warehouseSkipChips.length
             || classified.skippedDims?.length
             || classified.skippedMets?.length
+            || bundle.partialSkipped?.length
           );
           const body = applyVisibility({
             summary: {
@@ -4845,6 +4846,7 @@ async function handleDetailedReport(req, res) {
             reportWarning: composedPartial ? 'partial' : null,
             reportWarningSkipped: [
               ...warehouseSkipChips,
+              ...(bundle.partialSkipped || []),
               ...(classified.skippedDims || []),
               ...(classified.skippedMets || []),
             ],

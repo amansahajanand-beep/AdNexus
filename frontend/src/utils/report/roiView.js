@@ -968,3 +968,127 @@ export function mergeRoiBreakdownPayload(prev, breakdownPayload) {
   }
   return next;
 }
+
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const roiPercentOf = (earn, cost) => (Number(cost) > 0 ? round2(((Number(earn) - Number(cost)) / Number(cost)) * 100) : null);
+
+function finishDateRow(r) {
+  return {
+    ...r,
+    adsSpend: round2(r.adsSpend),
+    earn: round2(r.earn),
+    otherExpenses: round2(r.otherExpenses),
+    profitSpend: round2(r.earn - r.adsSpend),
+    profitExpense: round2(r.earn - r.otherExpenses),
+    roiSpendPercent: roiPercentOf(r.earn, r.adsSpend),
+    roiExpensePercent: roiPercentOf(r.earn, r.otherExpenses),
+    ctr: r.impressions > 0 ? round2((r.clicks / r.impressions) * 100) : null,
+    ecpm: r.impressions > 0 ? round2((r.adsSpend / r.impressions) * 1000) : null,
+  };
+}
+
+const shiftYmd = (ymd, days) => {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+};
+// Monday of the week the date falls in.
+const weekStartOf = (ymd) => {
+  const d = new Date(`${ymd}T00:00:00Z`);
+  return shiftYmd(ymd, -((d.getUTCDay() + 6) % 7));
+};
+
+/**
+ * Roll the per-day rows of buildDateTable up to weeks (Mon-Sun), months or years, newest first. Amounts are added and
+ * every ratio is worked out again from the added amounts; each period lists its sites / apps with their summed earn.
+ */
+export function groupDateTableRows(rows = [], mode = 'day') {
+  if (mode !== 'week' && mode !== 'month' && mode !== 'year') return rows;
+  const groups = new Map();
+  (rows || []).forEach((r) => {
+    if (!r?.date) return;
+    const key = mode === 'week' ? weekStartOf(r.date) : (mode === 'month' ? String(r.date).slice(0, 7) : String(r.date).slice(0, 4));
+    if (!groups.has(key)) {
+      groups.set(key, { key, adsSpend: 0, earn: 0, otherExpenses: 0, impressions: 0, clicks: 0, conversions: 0, parts: new Map(), days: 0 });
+    }
+    const g = groups.get(key);
+    g.adsSpend += Number(r.adsSpend) || 0;
+    g.earn += Number(r.earn) || 0;
+    g.otherExpenses += Number(r.otherExpenses) || 0;
+    g.impressions += Number(r.impressions) || 0;
+    g.clicks += Number(r.clicks) || 0;
+    g.conversions += Number(r.conversions) || 0;
+    g.days += 1;
+    (r.parts || []).forEach((p) => {
+      const pk = `${p.type}|${String(p.name).toLowerCase()}`;
+      const cur = g.parts.get(pk) || { type: p.type, name: p.name, earn: 0 };
+      cur.earn += Number(p.earn) || 0;
+      g.parts.set(pk, cur);
+    });
+  });
+  return [...groups.values()]
+    .sort((a, b) => String(b.key).localeCompare(String(a.key)))
+    .map((g) => {
+      const { parts, key, days, ...sums } = g;
+      const date = mode === 'week' ? `${key} → ${shiftYmd(key, 6)}` : key;
+      const out = finishDateRow({ ...sums, date });
+      out.days = days;
+      out.parts = [...parts.values()].filter((p) => p.earn > 0).sort((a, b) => b.earn - a.earn);
+      return out;
+    });
+}
+
+/**
+ * One row per date from the per-day country × package/site rows, newest first, plus a totals row.
+ * A package/site appearing under several accounts or buckets for the same date and country counts once, and site
+ * rows add earnings only (no Ads spend), like everywhere else on the page.
+ */
+export function buildDateTable(dailyRows = []) {
+  const seen = new Set();
+  const byDate = new Map();
+  (dailyRows || []).forEach((r) => {
+    if (!r?.date) return;
+    const key = [r.date, String(r.countryCode || '').toUpperCase(), r.targetType || '', String(r.targetKey || '').toLowerCase()].join('|');
+    if (seen.has(key)) return;
+    seen.add(key);
+    const isSite = r.targetType === 'site' || Boolean(r.earnOnly);
+    if (!byDate.has(r.date)) {
+      byDate.set(r.date, { date: r.date, adsSpend: 0, earn: 0, otherExpenses: 0, impressions: 0, clicks: 0, conversions: 0 });
+    }
+    const d = byDate.get(r.date);
+    // Earn per site / app for this day (shown under the day's Earn).
+    const partKey = `${isSite ? 'site' : 'app'}|${String(r.targetKey || '').toLowerCase()}`;
+    if (r.targetKey) {
+      if (!d.partMap) d.partMap = new Map();
+      const prev = d.partMap.get(partKey) || { type: isSite ? 'site' : 'app', name: String(r.targetKey), earn: 0 };
+      prev.earn += Number(r.earn) || 0;
+      d.partMap.set(partKey, prev);
+    }
+    d.adsSpend += isSite ? 0 : (Number(r.adsSpend) || 0);
+    d.earn += Number(r.earn) || 0;
+    d.otherExpenses += Number(r.otherExpenses) || 0;
+    d.impressions += Number(r.impressions) || 0;
+    d.clicks += Number(r.clicks) || 0;
+    d.conversions += Number(r.conversions) || 0;
+  });
+  const rows = [...byDate.values()]
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+    .map((r) => {
+      const { partMap, ...rest } = r;
+      const out = finishDateRow(rest);
+      out.parts = partMap
+        ? [...partMap.values()].filter((p) => p.earn > 0).sort((a, b) => b.earn - a.earn)
+        : [];
+      return out;
+    });
+  const total = finishDateRow(rows.reduce((t, r) => ({
+    date: 'Total',
+    adsSpend: t.adsSpend + r.adsSpend,
+    earn: t.earn + r.earn,
+    otherExpenses: t.otherExpenses + r.otherExpenses,
+    impressions: t.impressions + r.impressions,
+    clicks: t.clicks + r.clicks,
+    conversions: t.conversions + r.conversions,
+  }), { date: 'Total', adsSpend: 0, earn: 0, otherExpenses: 0, impressions: 0, clicks: 0, conversions: 0 }));
+  return { rows, total };
+}
