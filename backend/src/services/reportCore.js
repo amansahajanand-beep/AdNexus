@@ -4268,15 +4268,18 @@ async function handleDomainUserReport(req, res) {
     || req.query.allRows === '1'
     || req.query.allRows === 'true';
 
-  const buildResponse = (allRows, currency, isMock, siteCtx = null) => {
+  const aggregateForUser = (allRows, siteCtx) => {
     const prepared = req.user?.role === 'admin'
       ? prepareDomainUserRows(allRows, req.user)
       : (userHasAssignedInventory(req.user)
         ? prepareScopedOverviewRows(allRows, req.user)
         : []);
-    const aggregated = wantAllRows
-      ? aggregateDomainUserRows(prepared, siteCtx)
-      : filterDomainUserRows(aggregateDomainUserRows(prepared, siteCtx), search);
+    return aggregateDomainUserRows(prepared, siteCtx);
+  };
+
+  const buildResponse = (allRows, currency, isMock, siteCtx = null, preAggregated = null) => {
+    const full = preAggregated || aggregateForUser(allRows, siteCtx);
+    const aggregated = wantAllRows ? full : filterDomainUserRows(full, search);
     const stats = summarizeDomainUserRows(aggregated);
     if (wantAllRows) {
       return applyVisibility({
@@ -4306,6 +4309,18 @@ async function handleDomainUserReport(req, res) {
   const currency = process.env.GAM_CURRENCY || null;
 
   try {
+    // Aggregated, per-user result (before search/paging). Search and paging reuse it, so only the
+    // first load of a range pays for raw-row load + catalog enrichment + aggregation.
+    const cacheGen = await currentCacheGen();
+    const aggKey = withTenantCacheKey(`report_domain_user_agg_v1_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+      startDate: filters.startDate,
+      endDate: filters.endDate,
+    })}`);
+    const aggHit = cache.get(aggKey);
+    if (Array.isArray(aggHit)) {
+      return res.json(buildResponse(null, currency, false, null, aggHit));
+    }
+
     const token = await getToken();
     let catalogPayload = cache.get(catalogCacheKey());
     if (!catalogPayload?.adUnitsByHost || !Object.keys(catalogPayload.adUnitsByHost).length) {
@@ -4317,8 +4332,13 @@ async function handleDomainUserReport(req, res) {
       }
     }
     const siteCtx = buildDomainUserSiteContext(catalogPayload || {});
-    const { rows } = await loadSharedDetailedReportRows(filters, token, req.user);
-    return res.json(buildResponse(rows, currency, false, siteCtx));
+    const loaded = await loadSharedDetailedReportRows(filters, token, req.user);
+    const aggregatedAll = aggregateForUser(loaded.rows, siteCtx);
+    // Never cache a partial/building result — it would pin incomplete totals.
+    if (loaded.status !== 'building' && aggregatedAll.length) {
+      cache.set(aggKey, aggregatedAll, 120);
+    }
+    return res.json(buildResponse(null, currency, false, siteCtx, aggregatedAll));
   } catch (err) {
     logger.error('Domain user report error:', err.message);
     res.status(500).json({ error: err.message });

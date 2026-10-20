@@ -4,6 +4,8 @@ import PageHeader from '../components/ui/PageHeader';
 import PresetDateToolbar from '../components/presets/PresetDateToolbar';
 import RoiSummaryBoards from '../components/roi/RoiSummaryBoards';
 import RoiInventoryEarnOverview from '../components/roi/RoiInventoryEarnOverview';
+import RoiCurrencySelect from '../components/roi/RoiCurrencySelect';
+import { useRoiDisplayCurrency } from '../utils/report/roiCurrency';
 import RoiDateTable from '../components/roi/RoiDateTable';
 import { useAuth } from '../store/useAuth';
 import { usePresetDateRange } from '../hooks/usePresetDateRange';
@@ -18,14 +20,6 @@ import {
 import { removeRoiSheet, sheetAccountId, sheetName, useRoiSheets } from '../utils/report/roiSheets';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
 import { confirmDialog } from '../hooks/useConfirmDialog';
-import { shiftYMD, todayInTZ } from '../utils/datetime';
-
-const GROUPS = [
-  { id: 'day', label: 'Day' },
-  { id: 'week', label: 'Week' },
-  { id: 'month', label: 'Month' },
-  { id: 'year', label: 'Year' },
-];
 
 /**
  * One Ads account's ROI as a sheet: cards, then a table by day / week / month / year for the chosen dates.
@@ -35,6 +29,7 @@ export default function RoiSheet() {
   const { sheetId } = useParams();
   const navigate = useNavigate();
   const { user } = useAuth();
+  useRoiDisplayCurrency();
   const outlet = useOutletContext() || {};
   // Domain user with several networks: an app's Firebase link can sit in any of them.
   const networkIds = user?.role === 'admin' ? [] : (Array.isArray(outlet.mergeNetworkIds) ? outlet.mergeNetworkIds : []).filter(Boolean);
@@ -46,10 +41,9 @@ export default function RoiSheet() {
 
   const {
     preset, startDate, endDate, applied, dateRestriction, dateFilterLocked, presetOptions, presetLabel,
-    customDatesIncomplete, onPreset, applyDates, applyRange, setStartDate, setEndDate,
+    customDatesIncomplete, onPreset, applyDates, setStartDate, setEndDate,
   } = usePresetDateRange(user, sheetId);
 
-  const [groupBy, setGroupBy] = useState('day');
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [breakdownLoading, setBreakdownLoading] = useState(false);
@@ -142,12 +136,6 @@ export default function RoiSheet() {
   const dailyRows = data?.countryTargetDailyBreakdown || [];
   const inventoryEarn = useMemo(() => sumInventoryEarnFromBreakdown(countryTargetBreakdown), [countryTargetBreakdown]);
 
-  const quickRange = (kind) => {
-    const today = todayInTZ();
-    if (kind === 'year') applyRange(`${today.slice(0, 4)}-01-01`, today);
-    else applyRange(shiftYMD(today, -364), today);
-  };
-
   const deleteSheet = async () => {
     const ok = await confirmDialog({
       title: 'Remove this sheet?',
@@ -178,6 +166,7 @@ export default function RoiSheet() {
         subtitle="ROI sheet — spend, earnings and ROI for this Ads account"
         summary={applied.startDate ? (applied.startDate === applied.endDate ? applied.startDate : `${applied.startDate} → ${applied.endDate}`) : null}
       >
+        <RoiCurrencySelect />
         <Link className="btn-outline-action" to="/roi">Open ROI</Link>
         <button type="button" className="btn-reset" onClick={deleteSheet}>Remove sheet</button>
       </PageHeader>
@@ -197,29 +186,6 @@ export default function RoiSheet() {
         onApply={applyDates}
       />
 
-      <div className="roi-sheet-controls">
-        <span className="roi-sheet-controls-label">Show by</span>
-        <div className="table-density-toggle" role="group" aria-label="Group the table by">
-          {GROUPS.map((g) => (
-            <button
-              key={g.id}
-              type="button"
-              className={`table-density-btn${groupBy === g.id ? ' active' : ''}`}
-              aria-pressed={groupBy === g.id}
-              onClick={() => setGroupBy(g.id)}
-            >
-              {g.label}
-            </button>
-          ))}
-        </div>
-        {!dateFilterLocked ? (
-          <span className="roi-sheet-quick">
-            <button type="button" className="btn-reset-link" onClick={() => quickRange('year')}>This year</button>
-            <button type="button" className="btn-reset-link" onClick={() => quickRange('12m')}>Last 12 months</button>
-          </span>
-        ) : null}
-      </div>
-
       {error ? <div className="login-error" style={{ marginTop: 12 }}>{error}</div> : null}
 
       <RoiSummaryBoards summary={summary} loading={loading} showLive={false} />
@@ -236,9 +202,9 @@ export default function RoiSheet() {
         dailyRows={dailyRows}
         loading={breakdownLoading}
         currency={spendCurrency}
-        groupBy={groupBy}
+        groupBy="day"
         titleSuffix={`for ${title}`}
-        exportName={`roi_sheet_${title.replace(/[^a-z0-9]+/gi, '_')}_${groupBy}_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
+        exportName={`roi_sheet_${title.replace(/[^a-z0-9]+/gi, '_')}_day_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
       />
     </div>
   );

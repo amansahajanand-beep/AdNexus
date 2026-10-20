@@ -510,6 +510,7 @@ export const adsenseAPI = {
 
 export const roiAPI = {
   summary: (params, config) => FAST_API.get('/roi/summary', { params, ...config }),
+  fxRates: () => FAST_API.get('/roi/fx-rates'),
 };
 
 /** Saved report presets (server copy; localStorage stays the fast local cache). */

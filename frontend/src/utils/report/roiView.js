@@ -1,10 +1,13 @@
+import { toDisplayMoney } from './roiCurrency';
+
 /**
  * Shared ROI table / summary helpers for Roi page and Presets live preview.
  */
 
 export function formatRoiMoney(n, currency = 'USD') {
-  const v = Number(n) || 0;
-  const cur = String(currency || 'USD').trim().toUpperCase();
+  const shown = toDisplayMoney(n, currency);
+  const v = shown.value;
+  const cur = shown.currency;
   if (cur === 'INR') {
     return `₹${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
   }
@@ -25,11 +28,12 @@ export function formatRoiMoney(n, currency = 'USD') {
 
 /** Compact money for KPI cards — e.g. ₹44.6k. Hover shows full via title. */
 export function formatRoiMoneyCompact(n, currency = 'USD') {
-  const v = Number(n) || 0;
+  const shown = toDisplayMoney(n, currency);
+  const v = shown.value;
   const abs = Math.abs(v);
   if (abs < 1000) return formatRoiMoney(n, currency);
 
-  const cur = String(currency || 'USD').trim().toUpperCase();
+  const cur = shown.currency;
   const sign = v < 0 ? '-' : '';
   const prefix = cur === 'INR' ? '₹' : (cur && cur !== 'USD' ? `${cur} ` : 'US$');
 

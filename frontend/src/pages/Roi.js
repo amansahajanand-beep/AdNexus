@@ -14,6 +14,8 @@ import ThresholdAlertBanner from '../components/ui/ThresholdAlertBanner';
 import { adsAPI, roiAPI, usersAPI } from '../utils/api';
 import MultiSelect from '../components/ui/MultiSelect';
 import { normalizeHostInput, isValidHost } from '../utils/filters/hostInput';
+import RoiCurrencySelect from '../components/roi/RoiCurrencySelect';
+import { useRoiDisplayCurrency } from '../utils/report/roiCurrency';
 import { addRoiSheet, sheetAccountId, useRoiSheets } from '../utils/report/roiSheets';
 import RoiFilterRow from '../components/roi/RoiFilterRow';
 import RoiFilterSection from '../components/roi/RoiFilterSection';
@@ -1386,6 +1388,7 @@ function RoiView() {
   const countryTargetDailyBreakdown = data?.countryTargetDailyBreakdown || [];
   const singleAccountMode = (applied?.accountIds || []).length === 1;
   // Admin: turn the selected Ads account into a sheet (sidebar link under ROI with its own day / week / month / year view).
+  useRoiDisplayCurrency();
   const roiSheets = useRoiSheets(user?.id);
   const sheetAccount = singleAccountMode ? String(applied.accountIds[0]) : '';
   const existingSheet = sheetAccount ? roiSheets.find((sh) => sheetAccountId(sh) === sheetAccount) : null;
@@ -1428,6 +1431,7 @@ function RoiView() {
         subtitle="Ads spend and other expenses vs GAM earn — separate ROI% for spend and expenses"
         summary={filterSummary}
       >
+        <RoiCurrencySelect />
         <button type="button" className="btn-outline-action" onClick={openExpenseForm}>
           Add expenses
         </button>
