@@ -6748,3 +6748,7 @@ a { color: var(--accent); }
 .nav-sub { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 4px 18px; padding-left: 10px; border-left: 1px solid var(--border); }
 .nav-sub-btn { font-size: 13px; padding-top: 7px; padding-bottom: 7px; }
 .nav-sub-btn .nav-btn-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.roi-currency-select, .roi-gst-input { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary, #5b6475); }
+.roi-currency-select select, .roi-gst-input input { height: 32px; border: 1px solid var(--border, #d9dee8); border-radius: 8px; padding: 0 8px; background: var(--surface, #fff); color: inherit; font: inherit; }
+.roi-gst-input input { width: 64px; }

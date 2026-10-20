@@ -10,6 +10,21 @@ const logger = require('../utils/logger');
 
 router.use(requireAuth);
 
+/** Units of each currency per 1 USD (latest rates), for the ROI page's display-currency switch. */
+const FX_CODES = ['USD', 'INR', 'EUR', 'GBP', 'JPY', 'CNY', 'AUD', 'CAD', 'CHF', 'SGD', 'HKD', 'NZD', 'AED', 'SAR', 'QAR', 'KWD', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'HUF', 'RON', 'TRY', 'RUB', 'UAH', 'ILS', 'ZAR', 'NGN', 'KES', 'EGP', 'MAD', 'BRL', 'MXN', 'ARS', 'CLP', 'COP', 'PEN', 'KRW', 'THB', 'VND', 'IDR', 'MYR', 'PHP', 'TWD', 'PKR', 'BDT', 'LKR', 'NPR'];
+router.get('/fx-rates', async (req, res) => {
+  try {
+    const { getUnitsPerUsd } = require('../utils/adsCurrency');
+    const rates = {};
+    for (const c of FX_CODES) rates[c] = await getUnitsPerUsd(c);
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.json({ base: 'USD', rates });
+  } catch (err) {
+    logger.error('ROI fx-rates:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/summary', async (req, res) => {
   try {
     // Always recompute — metrics (impressions/clicks/eCPM) change with Ads sync.

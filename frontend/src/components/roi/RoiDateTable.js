@@ -8,6 +8,7 @@ import {
   formatRoiEcpm,
   roiToneClass,
 } from '../../utils/report/roiView';
+import { convertRoi, useRoiDisplayCurrency } from '../../utils/report/roiCurrency';
 import { downloadCsv, downloadExcel } from '../../utils/tableExport';
 
 const COLS = [
@@ -30,11 +31,18 @@ const COLS = [
 
 // GST charged on the Ads spend. Profit after GST = earn - spend - GST; ROI after GST = that profit / (spend + GST).
 export const GST_RATE = 0.03;
+const GST_KEY = 'adnexus.roiGstPercent';
+const readGst = () => {
+  try {
+    const v = parseFloat(localStorage.getItem(GST_KEY));
+    return Number.isFinite(v) && v >= 0 && v <= 100 ? v : GST_RATE * 100;
+  } catch { return GST_RATE * 100; }
+};
 const r2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
-function withGst(row) {
+function withGst(row, rate = GST_RATE) {
   const spend = Number(row.adsSpend) || 0;
   const earn = Number(row.earn) || 0;
-  const gst = r2(spend * GST_RATE);
+  const gst = r2(spend * rate);
   const cost = spend + gst;
   const profitAfterGst = r2(earn - spend - gst);
   return { ...row, gst, profitAfterGst, roiAfterGst: cost > 0 ? r2((profitAfterGst / cost) * 100) : null };
@@ -62,20 +70,30 @@ export default function RoiDateTable({
   dailyRows, loading, currency = 'USD', exportName = 'roi_by_date', groupBy = 'day', titleSuffix = 'for the selected Ads account',
 }) {
   const labels = GROUP_LABELS[groupBy] || GROUP_LABELS.day;
+  useRoiDisplayCurrency();
   const [dir, setDir] = useState('desc');
+  // GST on the Ads spend: 3% unless changed here (remembered in this browser).
+  const [gstText, setGstText] = useState(() => String(readGst()));
+  const gstPct = (() => { const v = parseFloat(gstText); return Number.isFinite(v) && v >= 0 && v <= 100 ? v : readGst(); })();
+  const onGst = (e) => {
+    setGstText(e.target.value);
+    const v = parseFloat(e.target.value);
+    if (Number.isFinite(v) && v >= 0 && v <= 100) { try { localStorage.setItem(GST_KEY, String(v)); } catch { /* ignore */ } }
+  };
+  const cols = COLS.map((c) => (c.id === 'gst' ? { ...c, label: `GST (${gstPct}%)` } : c));
   const { rows, total } = useMemo(() => {
     const t = buildDateTable(dailyRows);
     const grouped = groupBy === 'day' ? t.rows : groupDateTableRows(t.rows, groupBy);
     // The total row is worked out from the total spend / earn, not by adding the period percentages.
-    return { rows: grouped.map(withGst), total: withGst(t.total) };
-  }, [dailyRows, groupBy]);
+    return { rows: grouped.map((r) => withGst(r, gstPct / 100)), total: withGst(t.total, gstPct / 100) };
+  }, [dailyRows, groupBy, gstPct]);
   const sorted = useMemo(() => (dir === 'desc' ? rows : [...rows].reverse()), [rows, dir]);
 
   const exportCsv = () => downloadCsv(
     exportName,
-    [...COLS.map((c) => (c.id === 'date' ? labels.date : c.label)), 'Earn by site / app'],
+    [...cols.map((c) => (c.id === 'date' ? labels.date : c.label)), 'Earn by site / app'],
     [...sorted, total].map((r) => [
-      ...COLS.map((c) => render(r, c, currency)),
+      ...cols.map((c) => render(r, c, currency)),
       (r.parts || []).map((p) => `${p.name}: ${formatRoiMoney(p.earn, currency)}`).join(' | '),
     ]),
   );
@@ -85,13 +103,13 @@ export default function RoiDateTable({
     if (c.id === 'date') return r.date || '';
     const v = r[c.id];
     if (v == null || !Number.isFinite(Number(v))) return '';
-    return Number(v);
+    return c.fmt === 'money' || c.fmt === 'ecpm' ? Math.round(convertRoi(v, currency) * 100) / 100 : Number(v);
   };
   const exportExcel = () => downloadExcel(
     exportName,
-    [...COLS.map((c) => (c.id === 'date' ? labels.date : c.label)), 'Earn by site / app'],
+    [...cols.map((c) => (c.id === 'date' ? labels.date : c.label)), 'Earn by site / app'],
     [...sorted, total].map((r) => [
-      ...COLS.map((c) => excelValue(r, c)),
+      ...cols.map((c) => excelValue(r, c)),
       (r.parts || []).map((p) => `${p.name}: ${formatRoiMoney(p.earn, currency)}`).join(' | '),
     ]),
     'ROI by date',
@@ -104,6 +122,10 @@ export default function RoiDateTable({
       <div className="filter-card-head">
         <span className="filter-card-title">{labels.title} — spend, earnings and ROI {titleSuffix}</span>
         <div className="filter-actions">
+          <label className="roi-gst-input" title="GST charged on Ads spend">
+            GST %
+            <input type="number" min="0" max="100" step="0.1" value={gstText} onChange={onGst} />
+          </label>
           {rows.length > 0 && (
             <>
               <button type="button" className="btn-reset table-tool-btn" onClick={exportCsv}>CSV</button>
@@ -116,7 +138,7 @@ export default function RoiDateTable({
         <table className="data-table responsive-table report-table reporting-table">
           <thead>
             <tr>
-              {COLS.map((c) => (
+              {cols.map((c) => (
                 <th key={c.id}>
                   {c.id === 'date' ? (
                     <button type="button" className="th-sort-btn" onClick={() => setDir((d) => (d === 'desc' ? 'asc' : 'desc'))}>
@@ -131,11 +153,11 @@ export default function RoiDateTable({
           <tbody>
             {loading && !rows.length ? (
               Array.from({ length: 6 }).map((_, i) => (
-                <tr key={i}>{COLS.map((c) => <td key={c.id}><div className="skeleton" style={{ height: 16 }} /></td>)}</tr>
+                <tr key={i}>{cols.map((c) => <td key={c.id}><div className="skeleton" style={{ height: 16 }} /></td>)}</tr>
               ))
             ) : sorted.map((r) => (
               <tr key={r.date}>
-                {COLS.map((c) => (
+                {cols.map((c) => (
                   <td
                     key={c.id}
                     data-label={c.label}
@@ -164,7 +186,7 @@ export default function RoiDateTable({
           {rows.length > 0 && (
             <tfoot>
               <tr className="report-total-row">
-                {COLS.map((c) => (
+                {cols.map((c) => (
                   <td key={c.id} className={c.tone ? roiToneClass(total[c.id]) || undefined : undefined}>
                     {render(total, c, currency)}
                   </td>

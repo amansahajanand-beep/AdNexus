@@ -22,6 +22,8 @@ import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingEr
 import { useMedia } from '../../hooks/useMedia';
 import RoiInventoryEarnOverview from './RoiInventoryEarnOverview';
 import RoiPresetCompare from './RoiPresetCompare';
+import RoiCurrencySelect from './RoiCurrencySelect';
+import { useRoiDisplayCurrency } from '../../utils/report/roiCurrency';
 
 const PAGE_SIZE = 50;
 
@@ -38,6 +40,7 @@ export default function RoiPresetDetail({
   onDuplicate,
   onExitCompare,
 }) {
+  useRoiDisplayCurrency();
   const navigate = useNavigate();
   const { user } = useAuth();
   const isNarrow = useMedia('(max-width: 768px)');
@@ -219,6 +222,7 @@ export default function RoiPresetDetail({
           </p>
         </div>
         <div className="presets-item-actions">
+          <RoiCurrencySelect />
           <button type="button" className="btn-generate" onClick={openInRoi}>
             Open in ROI
           </button>
