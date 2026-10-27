@@ -1621,16 +1621,73 @@ function ReportingView() {
     onReset: reset,
   });
 
-  const downloadCSV = () => {
-    const headers = reportColumns.map((c) => c.label);
-    const body = displayRows.map((r) => reportColumns.map((col) => exportCellValue(col, r)));
-    downloadCsv(`report_${applied.startDate}_${applied.endDate}`, headers, body);
+  /**
+   * Every row of the applied report for CSV / Excel. The table on screen is a capped sample of big reports
+   * (response.pagination.truncated), so the export asks the server again with exportAll, then runs the rows
+   * through the same enrich / roll-up steps as the table. Returns null when the rows on screen are all there is
+   * (merged networks and programmatic reports keep using them).
+   */
+  const fetchAllRowsForExport = useCallback(async () => {
+    const query = hasApplied ? resolveReportingQuery(applied) : null;
+    if (!query || tableConfig.mode !== 'inventory' || mergeIds?.length) return null;
+    const singleClientId = reportClientId && !String(reportClientId).startsWith('merge:') ? reportClientId : null;
+    const payload = await reportsAPI.getDetailed({
+      ...normalizeInventorySelections(applied || {}, {}, scopedNormOpts),
+      startDate: applied.startDate || todayInit.startDate,
+      endDate: applied.endDate || todayInit.endDate,
+      reportDimensions: query.dims,
+      reportMetrics: query.mets,
+      country: applied.country,
+      reportSettings: applied.reportSettings,
+      allRows: true,
+      exportAll: true,
+    }, { ...(singleClientId ? { clientId: singleClientId } : {}), timeout: 10 * 60 * 1000 });
+    if (!payload || payload.status === 'building' || !Array.isArray(payload.rows)) return null;
+    const enriched = enrichReportRows(payload.rows, tableConfig.dimensions, tableConfig.metrics);
+    let rows = aggregateRowsByColumns(enriched, reportColumns);
+    if (segmentFilter?.dimensionId && segmentFilter?.value) {
+      rows = rows.filter((row) => rowMatchesChartDimension(row, segmentFilter.dimensionId, segmentFilter.value));
+    }
+    return {
+      rows,
+      truncated: Boolean(payload.pagination?.truncated),
+      totalRows: payload.pagination?.offeredRecords ?? payload.pagination?.totalRows ?? rows.length,
+    };
+  }, [hasApplied, applied, tableConfig, mergeIds, reportClientId, scopedNormOpts, todayInit, reportColumns, segmentFilter]);
+
+  /** Rows to write: the full report when the screen shows a capped sample, else what is on screen. */
+  const exportBody = async () => {
+    let rows = displayRows;
+    let note = '';
+    if (data?.pagination?.truncated) {
+      showToast({ message: 'Preparing the full export…' });
+      try {
+        const full = await fetchAllRowsForExport();
+        if (full && full.rows.length >= displayRows.length) {
+          rows = full.rows;
+          if (full.truncated) {
+            note = ` — export limit reached, narrow the filters for the rest (${Number(full.totalRows).toLocaleString()} rows exist)`;
+          }
+        }
+      } catch (err) {
+        note = ' — could not fetch the full report, exported the rows on screen';
+      }
+    }
+    return { body: rows.map((r) => reportColumns.map((col) => exportCellValue(col, r))), note };
   };
 
-  const downloadXls = () => {
+  const downloadCSV = async () => {
     const headers = reportColumns.map((c) => c.label);
-    const body = displayRows.map((r) => reportColumns.map((col) => exportCellValue(col, r)));
+    const { body, note } = await exportBody();
+    downloadCsv(`report_${applied.startDate}_${applied.endDate}`, headers, body);
+    showToast({ message: `Downloaded ${body.length.toLocaleString()} rows (CSV)${note}` });
+  };
+
+  const downloadXls = async () => {
+    const headers = reportColumns.map((c) => c.label);
+    const { body, note } = await exportBody();
     downloadExcel(`report_${applied.startDate}_${applied.endDate}`, headers, body, 'Report');
+    showToast({ message: `Downloaded ${body.length.toLocaleString()} rows (Excel)${note}` });
   };
 
   if (!canGenerate) {
@@ -2137,6 +2194,7 @@ function ReportingView() {
         columnStorageKey="reporting-table"
         canDownload={canDownload}
         exportName={`report_${applied.startDate || 'start'}_${applied.endDate || 'end'}`}
+        onExportAll={fetchAllRowsForExport}
       />
       </>
       )}

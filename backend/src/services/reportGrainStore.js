@@ -517,6 +517,7 @@ async function rebuildRollupsFromGrain(dates, syncType = 'rollup') {
   await rebuildInventoryRollupsFromGrain(uniq, syncType);
   await rebuildFillRollupsForDates(uniq, syncType);
   await rebuildRoiEarnForDates(uniq, syncType);
+  await rebuildCountryGrainRollupsForDates(uniq, syncType);
   return totalKpi;
 }
 
@@ -722,6 +723,142 @@ async function backfillRoiEarnRollups(days = parseInt(process.env.ROI_ROLLUP_BAC
     return 0;
   } finally {
     roiBackfillRunning = false;
+  }
+}
+
+const COUNTRY_GRAIN_TABLES = ['rollup_site_country_daily', 'rollup_app_country_daily', 'rollup_country_device_daily'];
+let countryGrainReadyMemo = { at: 0, ok: false };
+
+/** True when the three country-grain tables exist (initSchema creates them); cached for a minute. */
+async function countryGrainTablesExist() {
+  if (Date.now() - countryGrainReadyMemo.at < 60000) return countryGrainReadyMemo.ok;
+  let ok = false;
+  try {
+    const { rows } = await query(
+      `SELECT bool_and(to_regclass(t) IS NOT NULL) AS ok FROM unnest($1::text[]) AS t`,
+      [COUNTRY_GRAIN_TABLES]
+    );
+    ok = Boolean(rows[0]?.ok);
+  } catch (_) {
+    ok = false;
+  }
+  countryGrainReadyMemo = { at: Date.now(), ok };
+  return ok;
+}
+
+/**
+ * Country-grain summaries per day (one transaction per day, replacing that day):
+ *   rollup_site_country_daily   date x site x domain x country   (inventory_core slice)
+ *   rollup_app_country_daily    date x app id x country          (app_id slice)
+ *   rollup_country_device_daily date x country x device          (inventory_core slice)
+ * Reporting reads these instead of aggregating raw report_grain when Country sits next to Site/Domain, App ID or
+ * Device. Skips quietly when the tables do not exist yet.
+ */
+async function rebuildCountryGrainRollupsForDates(dates, syncType = 'country-grain', { pauseMs = 0 } = {}) {
+  const uniq = [...new Set((dates || []).map((d) => String(d).slice(0, 10)).filter(Boolean))];
+  if (!uniq.length) return 0;
+  if (!(await countryGrainTablesExist())) return 0;
+  const clientId = requireClientId();
+  let n = 0;
+  for (const day of uniq) {
+    if (pauseMs > 0) await require('../utils/activityGate').waitForQuiet();
+    try {
+      n += await withTransaction(async (q) => {
+        // Own advisory key: a rebuild of this day never blocks (or is blocked by) the KPI rollup writers.
+        const [k1, k2] = rollupAdvisoryKeys(`${clientId}:country-grain`, day);
+        await q(`SELECT pg_advisory_xact_lock($1, $2)`, [k1, k2]);
+        const metricSums = `COALESCE(SUM(g.impressions), 0)::float8, COALESCE(SUM(g.revenue), 0)::float8,
+                  COALESCE(SUM(g.clicks), 0)::float8,
+                  COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8,
+                  COALESCE(MAX(g.currency), 'USD')`;
+        const hasData = `HAVING COALESCE(SUM(g.impressions), 0) > 0 OR COALESCE(SUM(g.revenue), 0) > 0`;
+        let rows = 0;
+
+        await q('DELETE FROM rollup_site_country_daily WHERE client_id = $1::uuid AND report_date = $2::date', [clientId, day]);
+        const site = await q(
+          `INSERT INTO rollup_site_country_daily
+             (client_id, report_date, site_id, domain_id, country_id, impressions, revenue, clicks, viewable_weight, currency)
+           SELECT $1::uuid, $2::date, g.site_id, g.domain_id, g.country_id, ${metricSums}
+           FROM report_grain g
+           WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'inventory_core'
+           GROUP BY g.site_id, g.domain_id, g.country_id
+           ${hasData}`,
+          [clientId, day]
+        );
+        rows += site.rowCount || 0;
+
+        await q('DELETE FROM rollup_app_country_daily WHERE client_id = $1::uuid AND report_date = $2::date', [clientId, day]);
+        const app = await q(
+          `INSERT INTO rollup_app_country_daily
+             (client_id, report_date, app_id, app_name, country_id, impressions, revenue, clicks, viewable_weight, currency)
+           SELECT $1::uuid, $2::date, LOWER(g.app_id), COALESCE(MAX(NULLIF(g.app_name, '')), ''), g.country_id, ${metricSums}
+           FROM report_grain g
+           WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'app_id'
+             AND NULLIF(TRIM(g.app_id), '') IS NOT NULL
+           GROUP BY LOWER(g.app_id), g.country_id
+           ${hasData}`,
+          [clientId, day]
+        );
+        rows += app.rowCount || 0;
+
+        await q('DELETE FROM rollup_country_device_daily WHERE client_id = $1::uuid AND report_date = $2::date', [clientId, day]);
+        const dev = await q(
+          `INSERT INTO rollup_country_device_daily
+             (client_id, report_date, country_id, device_id, impressions, revenue, clicks, viewable_weight, currency)
+           SELECT $1::uuid, $2::date, g.country_id, g.device_id, ${metricSums}
+           FROM report_grain g
+           WHERE g.client_id = $1::uuid AND g.report_date = $2::date AND g.slice_key = 'inventory_core'
+           GROUP BY g.country_id, g.device_id
+           ${hasData}`,
+          [clientId, day]
+        );
+        rows += dev.rowCount || 0;
+        return rows;
+      });
+    } catch (e) {
+      logger.warn(`[${syncType}] country-grain rollup failed for ${day}:`, e.message);
+    }
+    if (pauseMs > 0) await new Promise((r) => setTimeout(r, pauseMs));
+  }
+  return n;
+}
+
+let countryGrainBackfillRunning = false;
+/** Background: build the country-grain rollups for recent days that have none yet (newest first). */
+async function backfillCountryGrainRollups(days = parseInt(process.env.COUNTRY_ROLLUP_BACKFILL_DAYS || '60', 10) || 60) {
+  if (countryGrainBackfillRunning) return 0;
+  if (!(await countryGrainTablesExist())) return 0;
+  countryGrainBackfillRunning = true;
+  try {
+    const clientId = requireClientId();
+    const { rows } = await query(
+      `SELECT to_char(d.day, 'YYYY-MM-DD') AS d
+       FROM generate_series(CURRENT_DATE - $2::int, CURRENT_DATE, '1 day'::interval) AS d(day)
+       -- one index probe per day that has data (see backfillFillRollups for why LATERAL ... LIMIT 1)
+       CROSS JOIN LATERAL (
+         SELECT 1 FROM rollup_unit_country_daily u
+         WHERE u.client_id = $1::uuid AND u.report_date = d.day::date
+         LIMIT 1
+       ) has_day
+       WHERE NOT EXISTS (
+         SELECT 1 FROM rollup_site_country_daily s
+         WHERE s.client_id = $1::uuid AND s.report_date = d.day::date
+       )
+       ORDER BY d.day DESC`,
+      [clientId, days]
+    );
+    const dates = rows.map((r) => r.d);
+    if (!dates.length) return 0;
+    logger.info(`[country-grain] backfilling ${dates.length} day(s) client=${String(clientId).slice(0, 8)}`);
+    const pauseMs = Math.max(0, parseInt(process.env.FILL_BACKFILL_PAUSE_MS || '4000', 10) || 0);
+    const n = await rebuildCountryGrainRollupsForDates(dates, 'country-grain-backfill', { pauseMs });
+    logger.info(`[country-grain] backfill done (${n} row(s)) client=${String(clientId).slice(0, 8)}`);
+    return n;
+  } catch (e) {
+    logger.warn('[country-grain] backfill failed:', e.message);
+    return 0;
+  } finally {
+    countryGrainBackfillRunning = false;
   }
 }
 
@@ -1138,7 +1275,18 @@ function appendGrainInventoryFilters(params, extra, opts = {}) {
   return clause;
 }
 
-function reportingTableLimit(startDate, endDate, requested) {
+/**
+ * Most rows one Reporting export may return (CSV / Excel "all rows"). Normal page loads stay capped
+ * (15,000 table rows); only requests that carry exportAll lift the caps, up to this limit.
+ * Memory on the API host is the constraint (each row becomes a JS object plus JSON), so it is configurable.
+ */
+const EXPORT_ROW_LIMIT = Math.max(
+  15000,
+  parseInt(process.env.REPORTING_EXPORT_MAX_ROWS || '200000', 10) || 200000
+);
+
+function reportingTableLimit(startDate, endDate, requested, exportAll = false) {
+  if (exportAll) return EXPORT_ROW_LIMIT;
   const startMs = new Date(`${startDate}T12:00:00`).getTime();
   const endMs = new Date(`${endDate}T12:00:00`).getTime();
   const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
@@ -1255,19 +1403,22 @@ async function fetchGrainDomainTableRows(startDate, endDate, opts = {}) {
     selectDims += `,\n       '' AS device`;
   }
 
-  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
+  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit, opts.exportAll);
   const startMs = new Date(`${startDate}T12:00:00`).getTime();
   const endMs = new Date(`${endDate}T12:00:00`).getTime();
   const dayCount = Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
   const fullCountryTable = byCountry;
   const countryRowCap = fullCountryTable
-    ? Math.min(100000, Math.max(tableLimit, dayCount * 1000, 25000))
+    ? (opts.exportAll ? tableLimit : Math.min(100000, Math.max(tableLimit, dayCount * 1000, 25000)))
     : tableLimit;
-  const perDay = countryPrimary
-    ? Math.max(250, Math.min(500, Math.ceil(tableLimit / dayCount)))
-    : byCountry
-      ? Math.max(120, Math.min(400, Math.ceil(tableLimit / dayCount)))
-      : Math.max(8, Math.min(80, Math.ceil(tableLimit / dayCount)));
+  // Export: no per-day sampling, every grouped row up to the export limit.
+  const perDay = opts.exportAll
+    ? tableLimit
+    : countryPrimary
+      ? Math.max(250, Math.min(500, Math.ceil(tableLimit / dayCount)))
+      : byCountry
+        ? Math.max(120, Math.min(400, Math.ceil(tableLimit / dayCount)))
+        : Math.max(8, Math.min(80, Math.ceil(tableLimit / dayCount)));
   if (fullCountryTable) {
     params.push(countryRowCap);
   } else {
@@ -1461,9 +1612,13 @@ module.exports = {
   fetchGrainDomainTableRows,
   rebuildFillRollupsForDates,
   rebuildRoiEarnForDates,
+  rebuildCountryGrainRollupsForDates,
+  backfillCountryGrainRollups,
+  countryGrainTablesExist,
   backfillRoiEarnRollups,
   backfillFillRollups,
   reportingTableLimit,
+  EXPORT_ROW_LIMIT,
   appendGrainInventoryFilters,
   grainHasRichDimsForDate,
   listGrainDatesMissingRichDims,
