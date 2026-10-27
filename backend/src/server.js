@@ -236,6 +236,9 @@ async function startServer() {
               require('./services/requestRollupStore').backfillRequestRollups(),
               require('./services/reportGrainStore').backfillRoiEarnRollups(),
             ]);
+            // Country-grain summaries (Site / App ID / Device x Country). After the three above, not beside
+            // them: it reads raw grain per day, so it must not add to the startup disk stampede.
+            await require('./services/reportGrainStore').backfillCountryGrainRollups();
           });
         }
       } catch (e) {

@@ -82,6 +82,7 @@ const {
   fetchGrainLeanRowsFromDB,
   fetchGrainDomainTableRows,
   reportingTableLimit,
+  EXPORT_ROW_LIMIT,
   rollupInvDomainExprSql,
   grainHasRichDimsForDate,
   listGrainDatesMissingRichDims,
@@ -1388,6 +1389,20 @@ const DASHBOARD_ROLLUP_FIRST_DAYS = Math.max(
   parseInt(process.env.DASHBOARD_ROLLUP_FIRST_DAYS || '14', 10) || 14
 );
 
+/**
+ * Reporting: answer short unfiltered Site/Domain reports from the Dashboard rollups before raw grain.
+ * OFF by default: the summary totals of that path sum rollup_kpi_daily, which holds two overlapping row
+ * sets per day (with and without an app) and reads ~2x the true revenue on some databases. Turn on
+ * (REPORTING_ROLLUP_FIRST=true) only after checking the totals against rollup_inventory_kpi_daily.
+ */
+const REPORTING_ROLLUP_FIRST = process.env.REPORTING_ROLLUP_FIRST === 'true';
+
+/** Reporting Date x Ad Unit from rollup_unit_country_daily (matches raw grain; no raw scan). */
+const REPORTING_UNIT_ROLLUP = process.env.REPORTING_UNIT_ROLLUP !== 'false';
+
+/** Reporting Site / App ID / Device x Country from the country-grain rollups (reportGrainStore.js). */
+const REPORTING_COUNTRY_ROLLUP = process.env.REPORTING_COUNTRY_ROLLUP !== 'false';
+
 /** Build inventory_core WHERE clause + params (join-free, ID filters). */
 function buildInventoryCoreWhere(clientId, startDate, endDate, opts = {}, ids = {}) {
   const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
@@ -1495,7 +1510,7 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
 
   const dayCount = inclusiveDayCount(startDate, endDate);
   const tableLimit = Math.max(
-    reportingTableLimit(startDate, endDate, opts.tableLimit),
+    reportingTableLimit(startDate, endDate, opts.tableLimit, opts.exportAll),
     dayCount * ((effectiveOpts.sites || []).length ? Math.max(effectiveOpts.sites.length, 8) : 40),
     500
   );
@@ -1516,14 +1531,19 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
     && !(effectiveOpts.domains || []).length
     && !(effectiveOpts.groupBySite)
     && (effectiveOpts.tableGrain === 'country' || (!effectiveOpts.tableGrain && !effectiveOpts.groupBySite && !effectiveOpts.groupByApp));
-  const perDay = fullCountryTable
-    ? Math.max(250, Math.min(500, Math.ceil(tableLimit / Math.max(1, dayCount))))
-    : siteFilterCount > 0 && siteFilterCount <= 50
-      ? Math.max(siteFilterCount + 2, 10)
-      : Math.max(25, Math.min(150, Math.ceil(tableLimit / dayCount)));
-  const countryRowCap = fullCountryTable
-    ? Math.min(100000, Math.max(tableLimit, dayCount * 1000, 25000))
-    : Math.min(20000, Math.max(tableLimit, dayCount * perDay));
+  // Export (opts.exportAll): no per-day top-N and no 20k/100k ceiling; every grouped row up to the export limit.
+  const perDay = opts.exportAll
+    ? tableLimit
+    : fullCountryTable
+      ? Math.max(250, Math.min(500, Math.ceil(tableLimit / Math.max(1, dayCount))))
+      : siteFilterCount > 0 && siteFilterCount <= 50
+        ? Math.max(siteFilterCount + 2, 10)
+        : Math.max(25, Math.min(150, Math.ceil(tableLimit / dayCount)));
+  const countryRowCap = opts.exportAll
+    ? tableLimit
+    : fullCountryTable
+      ? Math.min(100000, Math.max(tableLimit, dayCount * 1000, 25000))
+      : Math.min(20000, Math.max(tableLimit, dayCount * perDay));
   const outerLimit = countryRowCap;
 
   let groupCols;
@@ -1668,33 +1688,34 @@ async function fetchInventoryCoreDashboardBundle(startDate, endDate, opts = {}) 
   );
   const dayCount = inclusiveDayCount(startDate, endDate);
 
-  const [totalsRes, trendRes, tableRows] = await Promise.all([
+  // Totals + daily trend in ONE pass over report_grain (GROUPING SETS): the per-day rows are the
+  // trend and the empty grouping set is the grand total. Was two separate scans of the same rows.
+  const [totalsTrendRes, tableRows] = await Promise.all([
     query(
       `SELECT
+         to_char(g.report_date, 'YYYY-MM-DD') AS date,
+         GROUPING(g.report_date)::int AS is_total,
          COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
          COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
          COALESCE(SUM(COALESCE(g.impressions, 0) * COALESCE(g.viewable_pct, 0)), 0)::float8 AS viewable_weight,
          COALESCE(SUM(g.clicks), 0)::float8 AS clicks,
          COUNT(*)::int AS row_count
        FROM report_grain g
-       WHERE ${whereRange}`,
-      params
-    ),
-    query(
-      `SELECT
-         to_char(g.report_date, 'YYYY-MM-DD') AS date,
-         COALESCE(SUM(g.revenue), 0)::float8 AS earning,
-         COALESCE(SUM(g.impressions), 0)::float8 AS impressions
-       FROM report_grain g
        WHERE ${whereRange}
-       GROUP BY g.report_date
-       ORDER BY g.report_date`,
+       GROUP BY GROUPING SETS ((g.report_date), ())`,
       params
     ),
     fetchInventoryCoreTableFast(startDate, endDate, effectiveOpts),
   ]);
 
-  const t = totalsRes.rows[0] || {};
+  const totalsTrendRows = totalsTrendRes.rows || [];
+  const t = totalsTrendRows.find((r) => Number(r.is_total) === 1) || {};
+  const trendRes = {
+    rows: totalsTrendRows
+      .filter((r) => Number(r.is_total) !== 1)
+      .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+      .map((r) => ({ date: r.date, earning: r.revenue, impressions: r.impressions })),
+  };
   const impressions = Number(t.impressions) || 0;
   const revenue = coerceWarehouseRevenue(t.revenue, impressions);
   const viewableWeight = Number(t.viewable_weight) || 0;
@@ -2459,7 +2480,7 @@ async function fetchInventoryRollupDashboardBundle(startDate, endDate, opts = {}
   const fromSql = `FROM rollup_inventory_kpi_daily WHERE TRUE${filterExtra}`;
   const domainExpr = rollupInvDomainExprSql();
   const tableLimit = Math.max(
-    reportingTableLimit(startDate, endDate, opts.tableLimit),
+    reportingTableLimit(startDate, endDate, opts.tableLimit, opts.exportAll),
     inclusiveDayCount(startDate, endDate) * Math.max((opts.sites || []).length + 2, 40),
     500
   );
@@ -2633,12 +2654,15 @@ async function fetchBundleDomainTableFromRollup(startDate, endDate, opts, limit)
     const siteCount = (opts.sites || []).length;
     // Filtered sites: keep every matching site every day (datewise, not period total).
     // Unfiltered: enough top sites/day so long presets still span the full range.
-    const perDayTarget = siteCount > 0 && siteCount <= 50
-      ? Math.max(siteCount + 5, 15)
-      : (table === 'rollup_inventory_kpi_daily'
-        ? Math.max(40, Math.min(200, Math.ceil(Math.max(limit, 8000) / dayCount)))
-        : Math.max(15, Math.min(100, Math.ceil(limit / dayCount))));
-    const outerLimit = Math.min(20000, Math.max(limit, dayCount * perDayTarget));
+    // Export (opts.exportAll): every site/day row up to the export limit, no top-N per day and no 20k ceiling.
+    const perDayTarget = opts.exportAll
+      ? limit
+      : siteCount > 0 && siteCount <= 50
+        ? Math.max(siteCount + 5, 15)
+        : (table === 'rollup_inventory_kpi_daily'
+          ? Math.max(40, Math.min(200, Math.ceil(Math.max(limit, 8000) / dayCount)))
+          : Math.max(15, Math.min(100, Math.ceil(limit / dayCount))));
+    const outerLimit = opts.exportAll ? limit : Math.min(20000, Math.max(limit, dayCount * perDayTarget));
     params.push(perDayTarget);
     const perDayIdx = params.length;
     params.push(outerLimit);
@@ -2709,8 +2733,11 @@ async function fetchBundleDomainTableFromRollup(startDate, endDate, opts, limit)
 
 /** Full domain-level table rows (SQL aggregates — no raw-row sampling). */
 async function fetchBundleTableRows(startDate, endDate, opts, tableLimit) {
-  const limit = Math.min(Math.max(parseInt(tableLimit, 10) || 2500, 50), 10000);
+  const limit = opts.exportAll
+    ? Math.max(parseInt(tableLimit, 10) || 0, 50)
+    : Math.min(Math.max(parseInt(tableLimit, 10) || 2500, 50), 10000);
   const tableOpts = {
+    exportAll: opts.exportAll,
     countryNames: opts.countryNames,
     adUnitNames: opts.adUnitNames,
     domains: opts.domains,
@@ -2746,7 +2773,7 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
   if (opts.countryNames && opts.countryNames.length) return null;
   if (wantsGeoTableDims(opts)) return null;
 
-  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit);
+  const tableLimit = reportingTableLimit(startDate, endDate, opts.tableLimit, opts.exportAll);
   const skipCharts = Boolean(opts.skipCharts || opts.reportingFast);
   const skipTable = Boolean(opts.skipTable);
   const filterParams = [startDate, endDate];
@@ -3003,6 +3030,47 @@ async function fetchDashboardBundleFromRollups(startDate, endDate, opts = {}) {
  * Resolve inventory filter names → typed dim IDs (one query per dim table).
  * Lets Reporting filter report_grain by integer IDs with no JOINs on the hot path.
  */
+/**
+ * name -> dim id cache. Only names that resolved are cached, so a site/ad unit added by a
+ * later sync is picked up on the next request instead of staying "not found" until expiry.
+ */
+const DIM_ID_CACHE_TTL_MS = Math.max(0, parseInt(process.env.DIM_ID_CACHE_TTL_MS || '600000', 10) || 0);
+const DIM_ID_CACHE_MAX = 20000;
+const dimIdCache = new Map(); // `${kind}|${clientId}|${name}` -> { id, exp }
+
+async function resolveDimIdsCached(kind, table, clientId, names) {
+  if (!names.length) return [];
+  const now = Date.now();
+  const ids = [];
+  const missing = [];
+  for (const n of names) {
+    const hit = DIM_ID_CACHE_TTL_MS ? dimIdCache.get(`${kind}|${clientId}|${n}`) : null;
+    if (hit && hit.exp > now) ids.push(hit.id);
+    else missing.push(n);
+  }
+  if (!missing.length) return ids;
+  const { rows } = table === 'dim_country'
+    ? await query(
+      `SELECT id, LOWER(TRIM(name)) AS n FROM dim_country WHERE LOWER(TRIM(name)) = ANY($1::text[])`,
+      [missing]
+    )
+    : await query(
+      `SELECT id, LOWER(TRIM(name)) AS n FROM ${table}
+       WHERE client_id = $1::uuid AND LOWER(TRIM(name)) = ANY($2::text[])`,
+      [clientId, missing]
+    );
+  for (const r of rows) {
+    const id = Number(r.id);
+    if (!(id > 0)) continue;
+    ids.push(id);
+    if (DIM_ID_CACHE_TTL_MS) {
+      if (dimIdCache.size >= DIM_ID_CACHE_MAX) dimIdCache.clear();
+      dimIdCache.set(`${kind}|${clientId}|${r.n}`, { id, exp: now + DIM_ID_CACHE_TTL_MS });
+    }
+  }
+  return ids;
+}
+
 async function resolveInventoryFilterIds(clientId, opts = {}) {
   const domains = (opts.domains || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const sites = expandSiteHostAliases(
@@ -3011,43 +3079,14 @@ async function resolveInventoryFilterIds(clientId, opts = {}) {
   const adUnits = (opts.adUnitNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
   const countries = (opts.countryNames || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
 
-  const [domainRows, siteRows, adUnitRows, countryRows] = await Promise.all([
-    domains.length
-      ? query(
-        `SELECT id, LOWER(TRIM(name)) AS n FROM dim_domain
-         WHERE client_id = $1::uuid AND LOWER(TRIM(name)) = ANY($2::text[])`,
-        [clientId, domains]
-      )
-      : Promise.resolve({ rows: [] }),
-    sites.length
-      ? query(
-        `SELECT id, LOWER(TRIM(name)) AS n FROM dim_site
-         WHERE client_id = $1::uuid AND LOWER(TRIM(name)) = ANY($2::text[])`,
-        [clientId, sites]
-      )
-      : Promise.resolve({ rows: [] }),
-    adUnits.length
-      ? query(
-        `SELECT id, LOWER(TRIM(name)) AS n FROM dim_ad_unit
-         WHERE client_id = $1::uuid AND LOWER(TRIM(name)) = ANY($2::text[])`,
-        [clientId, adUnits]
-      )
-      : Promise.resolve({ rows: [] }),
-    countries.length
-      ? query(
-        `SELECT id, LOWER(TRIM(name)) AS n FROM dim_country
-         WHERE LOWER(TRIM(name)) = ANY($1::text[])`,
-        [countries]
-      )
-      : Promise.resolve({ rows: [] }),
+  const [domainIds, siteIds, adUnitIds, countryIds] = await Promise.all([
+    resolveDimIdsCached('domain', 'dim_domain', clientId, domains),
+    resolveDimIdsCached('site', 'dim_site', clientId, sites),
+    resolveDimIdsCached('adunit', 'dim_ad_unit', clientId, adUnits),
+    resolveDimIdsCached('country', 'dim_country', 'all', countries),
   ]);
 
-  return {
-    domainIds: domainRows.rows.map((r) => Number(r.id)).filter((n) => n > 0),
-    siteIds: siteRows.rows.map((r) => Number(r.id)).filter((n) => n > 0),
-    adUnitIds: adUnitRows.rows.map((r) => Number(r.id)).filter((n) => n > 0),
-    countryIds: countryRows.rows.map((r) => Number(r.id)).filter((n) => n > 0),
-  };
+  return { domainIds, siteIds, adUnitIds, countryIds };
 }
 
 /**
@@ -3168,7 +3207,9 @@ async function fetchUnitCountryRollupBundle(startDate, endDate, opts = {}) {
   if (ids.countryIds.length) { params.push(ids.countryIds); where += ` AND country_id = ANY($${params.length}::int[])`; }
   // 30+ days x ad units x countries easily passes 15k rows; the old cap + date order cut off the
   // LAST days of the range. Keep the biggest rows when truncating, and allow more of them.
-  const cap = Math.min(Math.max(parseInt(opts.tableLimit, 10) || 25000, 50000), 100000);
+  const cap = opts.exportAll
+    ? reportingTableLimit(startDate, endDate, opts.tableLimit, true)
+    : Math.min(Math.max(parseInt(opts.tableLimit, 10) || 25000, 50000), 100000);
 
   const [{ rows }, { rows: trendRows }] = await Promise.all([
     query(
@@ -3227,6 +3268,241 @@ async function fetchUnitCountryRollupBundle(startDate, endDate, opts = {}) {
     grainCount: tableRows.length,
     source: 'reporting-unit-country-rollup',
   };
+}
+
+/**
+ * Date x Ad Unit (no country/device/app breakdown) from rollup_unit_country_daily, summed over country.
+ * Verified equal to the raw inventory_core totals per day. Replaces the raw-grain scan (minutes for 7 days)
+ * and, on long ranges, the Site/Domain rollup table that ignored the Ad Unit column.
+ * Returns null unless every day that has data is present in the table (caller falls back).
+ */
+async function fetchUnitDailyRollupBundle(startDate, endDate, opts = {}) {
+  const clientId = requireClientId();
+  const days = [];
+  for (let d = startDate; d <= endDate; d = shiftYMD(d, 1)) days.push(d);
+  if (!days.length || days.length > 400) return null;
+
+  // Grain of the answer: Date x Ad Unit, Date x Country, or Date x Ad Unit x Country.
+  const byUnit = Boolean(opts.wantsAdUnitCol);
+  const byCountry = Boolean(opts.groupByCountry || (opts.countryNames || []).length);
+  if (!byUnit && !byCountry) return null;
+
+  const ids = await resolveInventoryFilterIds(clientId, { ...opts, apps: [], domains: [], sites: [] });
+  if ((opts.adUnitNames || []).length && !ids.adUnitIds.length) return null;
+  if ((opts.countryNames || []).length && !ids.countryIds.length) return null;
+
+  // Coverage by per-day indexed probes (a COUNT(DISTINCT) over the range scans every row).
+  const { rows: cov } = await query(
+    `SELECT to_char(t.d, 'YYYY-MM-DD') AS d,
+            EXISTS (SELECT 1 FROM rollup_inventory_kpi_daily k WHERE k.client_id = $1::uuid AND k.report_date = t.d) AS need,
+            EXISTS (SELECT 1 FROM rollup_unit_country_daily u WHERE u.client_id = $1::uuid AND u.report_date = t.d) AS have
+     FROM unnest($2::date[]) AS t(d)`,
+    [clientId, days]
+  );
+  if (!cov.some((r) => r.have)) return null;
+  if (cov.some((r) => r.need && !r.have)) return null;
+  const haveDays = cov.filter((r) => r.have).map((r) => r.d);
+
+  const params = [clientId, haveDays];
+  let where = 'client_id = $1::uuid AND report_date = ANY($2::date[])';
+  if (ids.adUnitIds.length) { params.push(ids.adUnitIds); where += ` AND ad_unit_id = ANY($${params.length}::int[])`; }
+  if (ids.countryIds.length) { params.push(ids.countryIds); where += ` AND country_id = ANY($${params.length}::int[])`; }
+
+  // Only the columns the report asks for are grouped, so a Date x Country report sums over ad units.
+  const groupCols = ['report_date'];
+  const selectIds = ['to_char(report_date, \'YYYY-MM-DD\') AS report_date'];
+  if (byUnit) {
+    groupCols.push('ad_unit_id', 'site_id', 'domain_id');
+    selectIds.push('ad_unit_id', 'site_id', 'domain_id');
+  } else {
+    selectIds.push('0 AS ad_unit_id', '0 AS site_id', '0 AS domain_id');
+  }
+  if (byCountry) { groupCols.push('country_id'); selectIds.push('country_id'); } else { selectIds.push('0 AS country_id'); }
+
+  const { rows } = await query(
+    `SELECT ${selectIds.join(', ')},
+            SUM(impressions)::float8 AS impression, SUM(revenue)::float8 AS revenue_raw, SUM(clicks)::float8 AS clicks,
+            CASE WHEN SUM(impressions) > 0 THEN SUM(viewable_weight) / SUM(impressions) ELSE 0 END::float8 AS viewable_raw,
+            MAX(currency) AS currency
+     FROM rollup_unit_country_daily
+     WHERE ${where}
+     GROUP BY ${groupCols.join(', ')}`,
+    params,
+    { statementTimeoutMs: 90000 }
+  );
+  if (!rows.length) return null;
+
+  return finishGroupedRollupBundle(rows, startDate, endDate, opts, 'reporting-unit-daily-rollup');
+}
+
+/**
+ * Shared tail of the rollup-backed Reporting paths. rows: grouped result rows {report_date, [ad_unit_id, site_id,
+ * domain_id, country_id, device_id, app_id], impression, revenue_raw, clicks, viewable_raw, currency}. Totals and
+ * trend come from the COMPLETE set; only the table is cut to the biggest rows (or to the export limit).
+ */
+async function finishGroupedRollupBundle(rows, startDate, endDate, opts, source) {
+  // Totals + trend from the COMPLETE set, then truncate the table to the biggest rows.
+  let impressions = 0; let revenueRaw = 0; let clicks = 0; let viewWeight = 0;
+  const trendMap = new Map();
+  for (const r of rows) {
+    const imp = Number(r.impression) || 0;
+    const rev = Number(r.revenue_raw) || 0;
+    impressions += imp; revenueRaw += rev; clicks += Number(r.clicks) || 0;
+    viewWeight += (Number(r.viewable_raw) || 0) * imp;
+    const tr = trendMap.get(r.report_date) || { date: r.report_date, earning: 0, impressions: 0 };
+    tr.earning += rev; tr.impressions += imp;
+    trendMap.set(r.report_date, tr);
+  }
+  const cap = opts.exportAll
+    ? reportingTableLimit(startDate, endDate, opts.tableLimit, true)
+    : Math.min(Math.max(parseInt(opts.tableLimit, 10) || 25000, 50000), 100000);
+  const kept = rows.length > cap
+    ? [...rows].sort((a, b) => (Number(b.revenue_raw) || 0) - (Number(a.revenue_raw) || 0)).slice(0, cap)
+    : rows;
+  kept.sort((a, b) => String(a.report_date).localeCompare(String(b.report_date))
+    || (Number(b.revenue_raw) || 0) - (Number(a.revenue_raw) || 0));
+  const tableRows = await hydrateGrainIdRows(kept.map((r) => ({ ...r, country_id: r.country_id || 0, device_id: r.device_id || 0, app_id: r.app_id || '' })));
+  const trend = [...trendMap.values()]
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)))
+    .map((t) => ({ date: t.date, earning: coerceWarehouseRevenue(t.earning, Math.round(t.impressions)), impressions: Math.round(t.impressions) }));
+  const revenue = +coerceWarehouseRevenue(revenueRaw, Math.round(impressions)).toFixed(2);
+  const imp = Math.round(impressions);
+  return {
+    summary: {
+      totalEarning: revenue, totalEarningChange: 0, selectRange: revenue, selectRangeChange: 0,
+      last7Days: +trend.slice(-7).reduce((a, x) => a + (x.earning || 0), 0).toFixed(2), last7DaysChange: 0,
+      pageViews: imp, pageViewsChange: 0, impressions: imp, impressionsChange: 0,
+      clicks: Math.round(clicks), clicksChange: 0,
+      ctr: imp > 0 ? +((clicks / imp) * 100).toFixed(4) : 0,
+      revenue, revenueChange: 0,
+      ecpm: imp > 0 ? +((revenue / imp) * 1000).toFixed(2) : 0, ecpmChange: 0,
+      viewability: impressions > 0 ? +(viewWeight / impressions).toFixed(1) : 0, viewabilityChange: 0,
+      totalDomains: countAppAndWebsiteDomainsFromRows(tableRows),
+      currency: opts.currency || 'USD',
+    },
+    trend,
+    charts: { revenue: [], device: [], country: [], performance: [] },
+    rows: tableRows,
+    pagination: {
+      totalRows: rows.length, returnedRows: tableRows.length,
+      truncated: rows.length > tableRows.length, allRows: rows.length <= tableRows.length, compact: true,
+    },
+    grainCount: rows.length,
+    source,
+  };
+}
+
+
+/**
+ * Country next to Site/Domain, App ID or Device, from the country-grain rollups:
+ *   site   -> rollup_site_country_daily   (date x site x domain x country)
+ *   app    -> rollup_app_country_daily    (date x app id x country)
+ *   device -> rollup_country_device_daily (date x country x device)
+ * Returns null when the report is not one of those shapes (domain / ad-unit filters and mixed web+app are left to
+ * the raw-grain path), when the tables are missing, or when a day that has data is not in the table yet.
+ */
+async function fetchCountryGrainRollupBundle(startDate, endDate, opts = {}) {
+  const byCountry = Boolean(opts.groupByCountry || (opts.countryNames || []).length);
+  const hasSites = (opts.sites || []).length > 0;
+  const hasApps = (opts.apps || []).length > 0;
+  const hasDomains = (opts.domains || []).length > 0;
+  const hasUnit = Boolean(opts.wantsAdUnitCol) || (opts.adUnitNames || []).length > 0;
+  const siteDim = Boolean(opts.groupBySite || opts.siteDomainColRequested || hasSites
+    || opts.tableGrain === 'site' || opts.tableGrain === 'domain');
+  const appDim = Boolean(opts.groupByApp || hasApps);
+  if (hasUnit || hasDomains) return null;
+
+  let kind = null;
+  if (opts.groupByDevice) {
+    if (!siteDim && !appDim) kind = 'device';
+  } else if (byCountry) {
+    if (appDim && !siteDim) kind = 'app';
+    else if (siteDim && !appDim) kind = 'site';
+  }
+  if (!kind) return null;
+  if (!(await require('./reportGrainStore').countryGrainTablesExist())) return null;
+
+  const clientId = requireClientId();
+  const table = {
+    site: 'rollup_site_country_daily',
+    app: 'rollup_app_country_daily',
+    device: 'rollup_country_device_daily',
+  }[kind];
+  const days = [];
+  for (let d = startDate; d <= endDate; d = shiftYMD(d, 1)) days.push(d);
+  if (!days.length || days.length > 400) return null;
+
+  const ids = await resolveInventoryFilterIds(clientId, { ...opts, apps: [], domains: [], adUnitNames: [] });
+  if (hasSites && !ids.siteIds.length) return null;
+  if ((opts.countryNames || []).length && !ids.countryIds.length) return null;
+
+  // Coverage by per-day indexed probes: every day the country rollup knows about must be in this table too.
+  const { rows: cov } = await query(
+    `SELECT to_char(t.d, 'YYYY-MM-DD') AS d,
+            EXISTS (SELECT 1 FROM rollup_unit_country_daily u WHERE u.client_id = $1::uuid AND u.report_date = t.d) AS need,
+            EXISTS (SELECT 1 FROM ${table} r WHERE r.client_id = $1::uuid AND r.report_date = t.d) AS have
+     FROM unnest($2::date[]) AS t(d)`,
+    [clientId, days]
+  );
+  if (!cov.some((r) => r.have)) return null;
+  if (cov.some((r) => r.need && !r.have)) return null;
+  const haveDays = cov.filter((r) => r.have).map((r) => r.d);
+
+  const params = [clientId, haveDays];
+  let where = 'client_id = $1::uuid AND report_date = ANY($2::date[])';
+  if (ids.countryIds.length) {
+    params.push(ids.countryIds);
+    where += ` AND country_id = ANY($${params.length}::int[])`;
+  }
+
+  const groupCols = ['report_date'];
+  const selectIds = ["to_char(report_date, 'YYYY-MM-DD') AS report_date"];
+  if (kind === 'site') {
+    if (hasSites) {
+      params.push(ids.siteIds);
+      where += ` AND site_id = ANY($${params.length}::int[])`;
+    }
+    // A Site / Domain breakdown never shows uncategorised grain (no site and no domain): same rule as the raw path.
+    where += ' AND NOT (site_id = 0 AND domain_id = 0)';
+    groupCols.push('site_id', 'domain_id');
+    selectIds.push('site_id', 'domain_id');
+  } else if (kind === 'app') {
+    if (hasApps) {
+      const expanded = expandedAppFilterValues(opts.apps);
+      if (!expanded.length) return null;
+      const idLike = expanded.filter((v) => /^[\w-]+(\.[\w-]+)+$/.test(v) || /^\d+$/.test(v));
+      if (idLike.length) {
+        params.push(idLike);
+        where += ` AND app_id = ANY($${params.length}::text[])`;
+      } else {
+        params.push(expanded);
+        where += ` AND (app_id = ANY($${params.length}::text[]) OR LOWER(app_name) = ANY($${params.length}::text[]))`;
+      }
+    }
+    groupCols.push('app_id');
+    selectIds.push('app_id');
+  } else {
+    groupCols.push('device_id');
+    selectIds.push('device_id');
+  }
+  if (byCountry) {
+    groupCols.push('country_id');
+    selectIds.push('country_id');
+  }
+
+  const { rows } = await query(
+    `SELECT ${selectIds.join(', ')},
+            SUM(impressions)::float8 AS impression, SUM(revenue)::float8 AS revenue_raw, SUM(clicks)::float8 AS clicks,
+            CASE WHEN SUM(impressions) > 0 THEN SUM(viewable_weight) / SUM(impressions) ELSE 0 END::float8 AS viewable_raw,
+            MAX(currency) AS currency
+     FROM ${table}
+     WHERE ${where}
+     GROUP BY ${groupCols.join(', ')}`,
+    params,
+    { statementTimeoutMs: 90000 }
+  );
+  if (!rows.length) return null;
+  return finishGroupedRollupBundle(rows, startDate, endDate, opts, `reporting-${kind}-country-rollup`);
 }
 
 async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
@@ -3378,9 +3654,66 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     }
   }
 
+  // Date x Ad Unit / Country (no device / app / site-or-domain filter): rollup_unit_country_daily summed over
+  // country. Without this a 7-day report scans raw grain (minutes), and a >14-day one fell into the Site/Domain
+  // rollup below, which has no ad-unit grain. Falls through to the old paths when the rollup lacks a day.
+  if (
+    REPORTING_UNIT_ROLLUP
+    && (opts.wantsAdUnitCol || opts.groupByCountry || opts.countryNames?.length)
+    && !(opts.apps || []).length
+    && !(opts.domains || []).length
+    && !(opts.sites || []).length
+    && !opts.groupByApp
+    && !opts.groupByDevice
+    // A Site or Domain column without an Ad Unit column needs per-site rows, which this table does not have.
+    && !((opts.groupBySite || opts.siteDomainColRequested || opts.tableGrain === 'site' || opts.tableGrain === 'domain')
+      && !opts.wantsAdUnitCol)
+  ) {
+    try {
+      const unitBundle = await fetchUnitDailyRollupBundle(startDate, endDate, opts);
+      if (unitBundle?.rows?.length) {
+        logger.info(
+          `Reporting unit-daily rollup ${startDate}..${endDate} rows=${unitBundle.rows.length} in ${Date.now() - t0}ms`
+        );
+        return unitBundle;
+      }
+    } catch (e) {
+      logger.warn('Reporting unit-daily rollup failed (falling back):', e.message);
+    }
+  }
+
+  // Country next to Site/Domain, App ID or Device (and Device alone): the country-grain rollups.
+  if (REPORTING_COUNTRY_ROLLUP && (opts.groupByCountry || opts.countryNames?.length || opts.groupByDevice)) {
+    try {
+      const countryBundle = await fetchCountryGrainRollupBundle(startDate, endDate, opts);
+      if (countryBundle?.rows?.length) {
+        logger.info(
+          `Reporting ${countryBundle.source} ${startDate}..${endDate} rows=${countryBundle.rows.length} in ${Date.now() - t0}ms`
+        );
+        return countryBundle;
+      }
+    } catch (e) {
+      logger.warn('Reporting country-grain rollup failed (falling back):', e.message);
+    }
+  }
+
+  // Short, unfiltered, non-geo, non-app reports (e.g. Date x Site with revenue/impressions): try the same
+  // rollups the Dashboard reads before scanning raw grain (3 scans, 15-20 s cold). Only used when the rollup
+  // actually covers the last day of the range and yields table rows; otherwise the raw-grain path below runs
+  // unchanged. REPORTING_ROLLUP_FIRST=false switches this off.
+  const rollupFirstShort = REPORTING_ROLLUP_FIRST
+    && dayCount <= DASHBOARD_ROLLUP_FIRST_DAYS
+    && !(opts.domains || []).length
+    && !(opts.sites || []).length
+    && !(opts.adUnitNames || []).length
+    && !(opts.apps || []).length
+    && !opts.groupByApp
+    // The rollup table is Date x Site/Domain: an Ad Unit column needs the per-ad-unit rows from grain.
+    && !opts.wantsAdUnitCol;
+
   // Long ranges: rollup KPIs + inventory Site/Domain rollups (real SITE_NAME).
   if (
-    dayCount > DASHBOARD_ROLLUP_FIRST_DAYS
+    (dayCount > DASHBOARD_ROLLUP_FIRST_DAYS || rollupFirstShort)
     && !hasAppsOnly
     && !wantsGeoTableDims(opts)
     && !opts.countryNames?.length
@@ -3392,9 +3725,12 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
         reportingFast: true,
         skipTable: true,
       });
-      if (rolled) {
+      // Short range: rollup must already include the end day (today may not be rolled up yet).
+      const coversEndDay = dayCount > DASHBOARD_ROLLUP_FIRST_DAYS
+        || (rolled?.trend || []).some((t) => t.date === endDate && ((t.earning || 0) > 0 || (t.impressions || 0) > 0));
+      if (rolled && coversEndDay) {
         const tableLimit = Math.max(
-          reportingTableLimit(startDate, endDate, opts.tableLimit),
+          reportingTableLimit(startDate, endDate, opts.tableLimit, opts.exportAll),
           inclusiveDayCount(startDate, endDate) * 50,
           8000
         );
@@ -3424,13 +3760,16 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
           );
           return { ...rolled, source: 'reporting-rollup+inventory-core' };
         }
-        rolled.rows = [];
-        rolled.pagination = { ...rolled.pagination, returnedRows: 0, totalRows: 0 };
-        logger.info(
-          `Reporting rollup-first ${startDate}..${endDate}`
-          + ` grain≈${rolled.grainCount || 0} in ${Date.now() - t0}ms`
-        );
-        return { ...rolled, source: 'reporting-rollup' };
+        // Short ranges never answer "empty" from rollups: fall through to the raw-grain path.
+        if (dayCount > DASHBOARD_ROLLUP_FIRST_DAYS) {
+          rolled.rows = [];
+          rolled.pagination = { ...rolled.pagination, returnedRows: 0, totalRows: 0 };
+          logger.info(
+            `Reporting rollup-first ${startDate}..${endDate}`
+            + ` grain≈${rolled.grainCount || 0} in ${Date.now() - t0}ms`
+          );
+          return { ...rolled, source: 'reporting-rollup' };
+        }
       }
     } catch (e) {
       logger.warn('Reporting rollup+inventory hybrid failed:', e.message);
@@ -3806,9 +4145,11 @@ function mergeReportingBundles(webBundle, appBundle, opts = {}) {
   const webRows = webBundle.rows || [];
   const appRows = appBundle.rows || [];
   // Country reports: keep both legs (do not let high-revenue sites crowd out app×country).
-  const limit = opts.groupByCountry
-    ? Math.min(100000, Math.max(parseInt(opts.tableLimit, 10) || 25000, 25000))
-    : Math.min(15000, Math.max(parseInt(opts.tableLimit, 10) || 2500, 50));
+  const limit = opts.exportAll
+    ? EXPORT_ROW_LIMIT
+    : opts.groupByCountry
+      ? Math.min(100000, Math.max(parseInt(opts.tableLimit, 10) || 25000, 25000))
+      : Math.min(15000, Math.max(parseInt(opts.tableLimit, 10) || 2500, 50));
   let rows;
   if (opts.groupByCountry && webRows.length && appRows.length) {
     const webCap = Math.min(webRows.length, Math.max(Math.floor(limit / 2), limit - appRows.length));
@@ -3906,7 +4247,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
   if ((grainOpts.adUnitNames || []).length && !ids.adUnitIds.length) return null;
   if ((grainOpts.countryNames || []).length && !ids.countryIds.length) return null;
 
-  const tableLimit = reportingTableLimit(startDate, endDate, grainOpts.tableLimit);
+  const tableLimit = reportingTableLimit(startDate, endDate, grainOpts.tableLimit, grainOpts.exportAll);
 
   const hasWeb = (grainOpts.domains || []).length > 0
     || (grainOpts.sites || []).length > 0
@@ -4044,7 +4385,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
   // Country reports: full GROUP BY (no per-day LATERAL top-N) so table totals match overview.
   const fullCountryTable = byCountry;
   const countryRowCap = fullCountryTable
-    ? Math.min(100000, Math.max(tableLimit, dayCount * 1000, 25000))
+    ? (grainOpts.exportAll ? tableLimit : Math.min(100000, Math.max(tableLimit, dayCount * 1000, 25000)))
     : tableLimit;
 
   const tableParams = fullCountryTable
@@ -4320,7 +4661,7 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
           });
           if (rolled) {
             const tableLimit = Math.max(
-              reportingTableLimit(startDate, endDate, opts.tableLimit),
+              reportingTableLimit(startDate, endDate, opts.tableLimit, opts.exportAll),
               dayCount * 50,
               8000
             );
@@ -6198,6 +6539,7 @@ module.exports = {
   rebuildRollupsForDates,
   backfillAllRollups,
   enrichUnfilledFromAppSlice,
+  fetchUnitDailyRollupBundle,
   rowsHaveLeanMetrics,
   fetchFromGAM,
   streamSyncFromGAM,

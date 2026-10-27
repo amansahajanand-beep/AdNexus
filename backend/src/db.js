@@ -67,11 +67,55 @@ pool.query('SELECT 1').then(() => {
 });
 
 /**
+ * Heavy-read gate. One page load can start dozens of aggregations over report_grain at once (dashboard
+ * totals, trend, entity counts, reporting tables ...). On a small host they all fight over the same disk and
+ * every one of them finishes later than if they had run a few at a time (a local check showed 29 such queries
+ * active at once, nearly all waiting on disk reads). Only SELECT/WITH aggregations that read report_grain are
+ * gated; fast rollup reads, writes, sync transactions and everything else bypass it.
+ * PG_HEAVY_QUERY_MAX=0 turns the gate off.
+ */
+const HEAVY_MAX = Math.max(0, parseInt(process.env.PG_HEAVY_QUERY_MAX || '3', 10) || 0);
+const HEAVY_READ_RE = /^\s*(?:with|select)\b[\s\S]*\bfrom\s+report_grain\b[\s\S]*(?:\bgroup\s+by\b|\bsum\s*\(|\bcount\s*\()/i;
+let heavyActive = 0;
+const heavyWaiters = [];
+
+function isHeavyRead(sql) {
+  return HEAVY_MAX > 0 && typeof sql === 'string' && HEAVY_READ_RE.test(sql);
+}
+
+async function acquireHeavySlot() {
+  if (heavyActive < HEAVY_MAX) { heavyActive += 1; return; }
+  await new Promise((resolve) => heavyWaiters.push(resolve));
+}
+
+function releaseHeavySlot() {
+  const next = heavyWaiters.shift();
+  if (next) next(); // hand the slot straight to the next waiter
+  else heavyActive -= 1;
+}
+
+/** Waiting + running heavy reads (for diagnostics). */
+function heavyStats() {
+  return { running: heavyActive, waiting: heavyWaiters.length, max: HEAVY_MAX };
+}
+
+/**
  * Run a query. Returns { rows, rowCount }.
  * Sets app.client_id so FORCE RLS isolates each tenant's report rows.
  * opts.statementTimeoutMs — optional per-call statement_timeout (dashboard reads).
  */
 async function query(sql, params = [], opts = {}) {
+  if (!isHeavyRead(sql)) return runQuery(sql, params, opts);
+  // Take a slot BEFORE a pool connection so queued reads do not pin connections.
+  await acquireHeavySlot();
+  try {
+    return await runQuery(sql, params, opts);
+  } finally {
+    releaseHeavySlot();
+  }
+}
+
+async function runQuery(sql, params = [], opts = {}) {
   const client = await pool.connect();
   const timeoutMs = parseInt(opts.statementTimeoutMs, 10) || 0;
   try {
@@ -79,22 +123,23 @@ async function query(sql, params = [], opts = {}) {
     try {
       clientId = require('./utils/clientContext').getClientId();
     } catch (_) { /* module not ready */ }
-    if (clientId) {
-      await client.query(`SELECT set_config('app.client_id', $1, false)`, [String(clientId)]);
-    } else {
-      await client.query(`SELECT set_config('app.client_id', '', false)`);
-    }
+    // One round trip for tenant + timeout setup (was 2).
     if (timeoutMs > 0) {
-      await client.query(`SET statement_timeout = ${timeoutMs}`);
+      await client.query(
+        `SELECT set_config('app.client_id', $1, false), set_config('statement_timeout', $2, false)`,
+        [clientId ? String(clientId) : '', String(timeoutMs)]
+      );
+    } else {
+      await client.query(`SELECT set_config('app.client_id', $1, false)`, [clientId ? String(clientId) : '']);
     }
     return await client.query(sql, params);
   } finally {
-    if (timeoutMs > 0) {
-      try { await client.query('SET statement_timeout = 0'); } catch (_) { /* ignore */ }
-    }
-    try {
-      await client.query(`SELECT set_config('app.client_id', '', false)`);
-    } catch (_) { /* ignore */ }
+    // Reset in one statement and do not wait for it: pg queues queries per connection, so the next
+    // user of this pooled client runs after the reset. Saves one or two round trips per query.
+    const resetSql = timeoutMs > 0
+      ? `SELECT set_config('app.client_id', '', false), set_config('statement_timeout', '0', false)`
+      : `SELECT set_config('app.client_id', '', false)`;
+    client.query(resetSql).catch(() => { /* connection errored; pool will discard it */ });
     client.release();
   }
 }
@@ -334,6 +379,51 @@ async function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_rollup_unit_country_unit
       ON rollup_unit_country_daily (client_id, ad_unit_id, report_date);
+
+    -- Country-grain summaries so Reporting answers Country next to Site/Domain, App ID or Device from a small
+    -- table instead of aggregating raw report_grain per request (that took minutes per day on a small host).
+    -- Filled per day by rebuildCountryGrainRollupsForDates (reportGrainStore.js); see scripts/sql/rollup-country-grains.sql.
+    -- Date x Site x Domain x Country, from the inventory_core slice.
+    CREATE TABLE IF NOT EXISTS rollup_site_country_daily (
+      client_id        UUID             NOT NULL REFERENCES gam_clients(id),
+      report_date      DATE             NOT NULL,
+      site_id          INT              NOT NULL DEFAULT 0,
+      domain_id        INT              NOT NULL DEFAULT 0,
+      country_id       SMALLINT         NOT NULL DEFAULT 0,
+      impressions      DOUBLE PRECISION NOT NULL DEFAULT 0,
+      revenue          DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks           DOUBLE PRECISION NOT NULL DEFAULT 0,
+      viewable_weight  DOUBLE PRECISION NOT NULL DEFAULT 0,
+      currency         CHAR(3)          NOT NULL DEFAULT 'USD',
+      PRIMARY KEY (client_id, report_date, site_id, domain_id, country_id)
+    );
+    -- Date x App ID x Country, from the app_id slice (app_id stored lower-cased).
+    CREATE TABLE IF NOT EXISTS rollup_app_country_daily (
+      client_id        UUID             NOT NULL REFERENCES gam_clients(id),
+      report_date      DATE             NOT NULL,
+      app_id           TEXT             NOT NULL DEFAULT '',
+      app_name         TEXT             NOT NULL DEFAULT '',
+      country_id       SMALLINT         NOT NULL DEFAULT 0,
+      impressions      DOUBLE PRECISION NOT NULL DEFAULT 0,
+      revenue          DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks           DOUBLE PRECISION NOT NULL DEFAULT 0,
+      viewable_weight  DOUBLE PRECISION NOT NULL DEFAULT 0,
+      currency         CHAR(3)          NOT NULL DEFAULT 'USD',
+      PRIMARY KEY (client_id, report_date, app_id, country_id)
+    );
+    -- Date x Country x Device, from the inventory_core slice (also answers Date x Device).
+    CREATE TABLE IF NOT EXISTS rollup_country_device_daily (
+      client_id        UUID             NOT NULL REFERENCES gam_clients(id),
+      report_date      DATE             NOT NULL,
+      country_id       SMALLINT         NOT NULL DEFAULT 0,
+      device_id        SMALLINT         NOT NULL DEFAULT 0,
+      impressions      DOUBLE PRECISION NOT NULL DEFAULT 0,
+      revenue          DOUBLE PRECISION NOT NULL DEFAULT 0,
+      clicks           DOUBLE PRECISION NOT NULL DEFAULT 0,
+      viewable_weight  DOUBLE PRECISION NOT NULL DEFAULT 0,
+      currency         CHAR(3)          NOT NULL DEFAULT 'USD',
+      PRIMARY KEY (client_id, report_date, country_id, device_id)
+    );
 
     -- Fill-rate + Ad Exchange request inputs per (day, ad unit, country), by dim id. Compact
     -- replacement for the text-keyed 'ad_unit_country' rows in rollup_fill_daily /
@@ -1176,11 +1266,14 @@ async function initSchema() {
     `CREATE INDEX IF NOT EXISTS idx_report_present_client_date ON report_present (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_adhoc_client_date ON report_adhoc (client_id, report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_sync_log_client ON sync_log (client_id, started_at DESC)`,
-    `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date ON report_grain (client_id, report_date DESC)`,
+    // idx_report_grain_client_date (client_id, report_date) removed: 0 scans in production stats and
+    // it duplicates the primary key prefix. DROP INDEX idx_report_grain_client_date on the parent
+    // removes it from every partition (see scripts/sql/drop-redundant-grain-indexes.sql).
     `CREATE INDEX IF NOT EXISTS idx_report_grain_date ON report_grain (report_date DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date_slice ON report_grain (client_id, report_date, slice_key)`,
     `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date_site ON report_grain (client_id, report_date, site_id)`,
-    `CREATE INDEX IF NOT EXISTS idx_report_grain_client_date_domain ON report_grain (client_id, report_date, domain_id)`,
+    // idx_report_grain_client_date_domain removed: 0-209 scans, same leading columns as the
+    // inventory_core covering index and the PK.
     `CREATE INDEX IF NOT EXISTS idx_report_grain_inv_core_date
        ON report_grain (client_id, report_date)
        INCLUDE (domain_id, site_id, impressions, revenue, clicks, viewable_pct, currency)
@@ -1219,6 +1312,9 @@ const TENANT_TABLES = [
   'ads_campaign_map',
   'ads_spend_daily',
   'rollup_hourly',
+  'rollup_site_country_daily',
+  'rollup_app_country_daily',
+  'rollup_country_device_daily',
   'roi_other_expenses',
   'admob_accounts',
   'adsense_accounts',
@@ -1612,5 +1708,6 @@ module.exports = {
   ensureGrainMetricsColumn,
   isPoolSaturated,
   poolStats,
+  heavyStats,
   pool,
 };

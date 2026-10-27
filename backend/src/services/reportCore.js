@@ -8,6 +8,7 @@ const {
   canAccessPage,
   scopeCatalogOptionsForUser,
   getUserInventoryScope,
+  getInventoryScopeCacheKey,
   userHasAssignedInventory,
   resolveScopedSqlInventoryOpts,
   rowMatchesAllowedAdUnits,
@@ -419,6 +420,24 @@ function withTenantCacheKey(key) {
     return tenantKey(String(key || ''));
   } catch (_) {
     return String(key || '');
+  }
+}
+
+/**
+ * Cache-key part for "who sees this payload": users with the same role, inventory scope and
+ * visibility flags get identical responses, so they share one cache entry instead of one each.
+ */
+function userCacheScope(user) {
+  if (!user) return 'anon';
+  try {
+    const raw = [
+      user.role || '',
+      getInventoryScopeCacheKey(user),
+      JSON.stringify(buildVisibility(user)),
+    ].join('#');
+    return `u${crypto.createHash('sha1').update(raw).digest('hex').slice(0, 16)}`;
+  } catch (_) {
+    return String(user.id || 'anon');
   }
 }
 
@@ -3980,7 +3999,7 @@ async function handleDashboard(req, res) {
 
   // Compact response cache (fits Redis 10MB) — warm clicks return in ms.
   const cacheGen = await currentCacheGen();
-  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v28_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const dashRespKey = withTenantCacheKey(`report_dashboard_resp_v29_g${cacheGen}_${userCacheScope(req.user)}${forDomainUser ? 'd' : ''}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4312,7 +4331,7 @@ async function handleDomainUserReport(req, res) {
     // Aggregated, per-user result (before search/paging). Search and paging reuse it, so only the
     // first load of a range pays for raw-row load + catalog enrichment + aggregation.
     const cacheGen = await currentCacheGen();
-    const aggKey = withTenantCacheKey(`report_domain_user_agg_v1_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+    const aggKey = withTenantCacheKey(`report_domain_user_agg_v2_g${cacheGen}_${userCacheScope(req.user)}_${filterCacheKey({
       startDate: filters.startDate,
       endDate: filters.endDate,
     })}`);
@@ -4460,6 +4479,30 @@ async function handleDetailedReport(req, res) {
   }, req.user);
   const paginationOpts = parsePaginationQuery({ cursor, limit, sortColumn, sortDir });
 
+  // One structured line per Reporting request: which source answered, how long, what was asked.
+  // Used to find the slow dimension/metric combinations and decide which rollups are worth building.
+  const reqStartedAt = Date.now();
+  res.on('finish', () => {
+    try {
+      logger.info(
+        `[report-timing] page=reporting ms=${Date.now() - reqStartedAt}`
+        + ` status=${res.statusCode} source=${res.locals?.reportSource || 'cache-or-other'}`
+        + ` rows=${res.locals?.reportRows ?? '-'} prepMs=${res.locals?.reportPrepMs ?? '-'}`
+        + ` days=${inclusiveDayCount(filters.startDate, filters.endDate)}`
+        + ` scoped=${req.user?.role !== 'admin' && userHasAssignedInventory(req.user) ? 1 : 0}`
+        + ` dims=[${asArray(filters.reportDimensions).join(',')}]`
+        + ` mets=[${asArray(filters.reportMetrics).join(',')}]`
+        + ` filters=[${[
+          toFilterArray(filters.domain).length && 'domain',
+          toFilterArray(filters.site).length && 'site',
+          toFilterArray(filters.domainId).length && 'app',
+          toFilterArray(filters.domainName).length && 'adunit',
+          toFilterArray(filters.country).length && 'country',
+        ].filter(Boolean).join(',')}]`
+      );
+    } catch (_) { /* logging must never break a response */ }
+  });
+
   // POST JSON sends allRows:true (boolean); GET sends "true" string — accept both.
   // Without this, multi-filter POSTs paginate to 50 rows ordered by date DESC → "today only".
   let wantAllRows = req.query.allRows === true
@@ -4470,8 +4513,15 @@ async function handleDetailedReport(req, res) {
     || req.body?.allRows === 1
     || req.body?.allRows === '1'
     || req.body?.allRows === 'true';
+  // CSV / Excel "download all": the page asks again with exportAll to get every row (up to
+  // REPORTING_EXPORT_MAX_ROWS) instead of the capped table the screen shows. Never cached.
+  const truthyFlag = (v) => v === true || v === 1 || v === '1' || v === 'true';
+  const wantsExport = truthyFlag(req.query.exportAll) || truthyFlag(req.body?.exportAll);
+  if (wantsExport) wantAllRows = true;
   // Country reports must ship the full breakdown (overview = table).
-  const MAX_REPORTING_CLIENT_ROWS = 50000;
+  const MAX_REPORTING_CLIENT_ROWS = wantsExport
+    ? require('./reportGrainStore').EXPORT_ROW_LIMIT
+    : 50000;
 
   // Another timezone selected: rebuild the days from the stored hourly data when the report is one it can answer.
   if (await tryTimezoneReporting(req, res, { filters, wantAllRows, paginationOpts, maxRows: MAX_REPORTING_CLIENT_ROWS })) return;
@@ -4594,7 +4644,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v72_g${cacheGen}_${req.user?.id || 'anon'}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v73_g${cacheGen}_${userCacheScope(req.user)}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
@@ -4610,12 +4660,13 @@ async function handleDetailedReport(req, res) {
   })}_${pageKey}`);
 
   try {
-    const hit = cache.get(detailedRespKey);
+    // An export must not be answered from (or stored in) the capped on-screen response cache.
+    const hit = wantsExport ? null : cache.get(detailedRespKey);
     if (hit?.summary && hit?.status !== 'building') {
       logger.info(`Reporting from memory response cache ${filters.startDate}..${filters.endDate}`);
       return res.json(hit);
     }
-    const r = getRedis();
+    const r = wantsExport ? null : getRedis();
     if (r?.redisGet) {
       const rHit = await r.redisGet(detailedRespKey);
       if (rHit?.summary && rHit?.status !== 'building') {
@@ -4627,7 +4678,7 @@ async function handleDetailedReport(req, res) {
   } catch (_) { /* ignore */ }
 
   const cacheDetailedResponse = async (payload) => {
-    if (!payload || payload.status === 'building') return payload;
+    if (!payload || payload.status === 'building' || wantsExport) return payload;
     cache.set(detailedRespKey, payload, REPORT_CACHE_TTL);
     try {
       const r = getRedis();
@@ -4752,7 +4803,8 @@ async function handleDetailedReport(req, res) {
       apps,
       countryNames: resolveCountryNamesForDb(filters.country),
       currency,
-      tableLimit: countryTableLimit,
+      tableLimit: wantsExport ? MAX_REPORTING_CLIENT_ROWS : countryTableLimit,
+      exportAll: wantsExport,
       selectedDomains: domains,
       webInventoryOr,
       skipAdUnitLike,
@@ -4806,9 +4858,12 @@ async function handleDetailedReport(req, res) {
             domainName: toFilterArray(filters.domainName),
             domainId: apps,
           };
+          const prepT0 = Date.now();
           let scopedRows = stampWarehouseMetricsOnRows(
             rowsForReportBundle(bundle.rows || [], rowFilters, req.user, { sqlTrusted: true })
           );
+          res.locals.reportPrepMs = Date.now() - prepT0;
+          res.locals.reportRows = scopedRows.length;
           // Default Domain/Site report must not accept DATE-only / unlabeled totals when
           // the Dashboard lean path can still return inventory breakdown rows.
           const needsDomainSiteLabels = wantsSiteCol || wantsDomainCol;
@@ -4911,6 +4966,7 @@ async function handleDetailedReport(req, res) {
               offeredRecords: bundle.grainCount || scopedRows.length,
             };
           }
+          res.locals.reportSource = bundle.source || 'bundle';
           logger.info(
             `Reporting fast ${bundle.source || 'bundle'} ${filters.startDate}..${filters.endDate}`
             + ` grain≈${bundle.grainCount || 0}`
@@ -4967,10 +5023,13 @@ async function handleDetailedReport(req, res) {
           'grain',
           'site-merge',
         ]);
+        const prepT0 = Date.now();
         let scopedRows = rowsForReportBundle(bundle.rows || [], rowFilters, req.user, {
           sqlTrusted: sqlApplied.has(bundle.source),
         });
         scopedRows = stampWarehouseMetricsOnRows(scopedRows);
+        res.locals.reportPrepMs = Date.now() - prepT0;
+        res.locals.reportRows = scopedRows.length;
         scopedRows = applyMetricSubstitutionsToRows(
           scopedRows,
           warehouseRewrite.substitutions
@@ -5068,6 +5127,7 @@ async function handleDetailedReport(req, res) {
             offeredRecords,
           };
         }
+        res.locals.reportSource = `lean:${bundle.source || 'bundle'}`;
         logger.info(
           `Reporting lean/rollup bundle ${filters.startDate}..${filters.endDate}`
           + ` grain≈${bundle.grainCount || 0}`

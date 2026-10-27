@@ -1,4 +1,8 @@
 const Redis = require('ioredis');
+const zlib = require('zlib');
+const { promisify } = require('util');
+const gzipAsync = promisify(zlib.gzip);
+const gunzipAsync = promisify(zlib.gunzip);
 const logger = require('./utils/logger');
 
 // ============================================
@@ -17,7 +21,7 @@ const MAX_REDIS_VALUE_BYTES = Math.max(
 /** Never cache unbounded grain arrays — they burn commands + heap on stringify. */
 const MAX_REDIS_ARRAY_ITEMS = Math.max(
   100,
-  parseInt(process.env.REDIS_MAX_ARRAY_ITEMS || '3000', 10) || 3000
+  parseInt(process.env.REDIS_MAX_ARRAY_ITEMS || '60000', 10) || 60000
 );
 
 /** Cap SCAN loops so one invalidation cannot burn tens of thousands of commands. */
@@ -65,6 +69,7 @@ function createDisabledRedis() {
     quit: noop,
     duplicate() { return createDisabledRedis(); },
     get: async () => null,
+    getBuffer: async () => null,
     set: async () => 'OK',
     del: async () => 1,
     incr: async () => 1,
@@ -154,6 +159,8 @@ function createBullmqConnection(label = 'BullMQ Redis') {
   return conn;
 }
 
+const GZIP_MIN_CHARS = 64 * 1024;
+
 function shouldSkipLargeCacheValue(value) {
   if (Array.isArray(value) && value.length > MAX_REDIS_ARRAY_ITEMS) return true;
   if (value && typeof value === 'object') {
@@ -173,13 +180,17 @@ async function redisGet(key) {
       logger.warn(`Redis GET skipped: key too large (${Buffer.byteLength(String(key), 'utf8')} bytes)`);
       return null;
     }
-    const value = await redis.get(key);
+    const value = await redis.getBuffer(key);
 
-    if (!value) {
+    if (!value || !value.length) {
       return null;
     }
 
-    return JSON.parse(value);
+    // gzip magic bytes 1f 8b -> compressed entry; anything else is a plain JSON entry.
+    if (value[0] === 0x1f && value[1] === 0x8b) {
+      return JSON.parse((await gunzipAsync(value)).toString('utf8'));
+    }
+    return JSON.parse(value.toString('utf8'));
   } catch (err) {
     if (isRedisQuotaError(err)) {
       markRedisQuotaExhausted(err);
@@ -213,8 +224,12 @@ async function redisSet(key, value, ttlSeconds) {
       );
       return false;
     }
-    const payload = JSON.stringify(value);
-    const bytes = Buffer.byteLength(payload, 'utf8');
+    let payload = JSON.stringify(value);
+    // Large report payloads compress ~5-10x: far fewer bytes over the wire and under the size cap.
+    if (payload.length > GZIP_MIN_CHARS) {
+      payload = await gzipAsync(payload, { level: 1 });
+    }
+    const bytes = Buffer.isBuffer(payload) ? payload.length : Buffer.byteLength(payload, 'utf8');
     if (bytes > MAX_REDIS_VALUE_BYTES) {
       logger.warn(
         `Redis SET skipped for ${key}: ${bytes} bytes > ${MAX_REDIS_VALUE_BYTES} limit`

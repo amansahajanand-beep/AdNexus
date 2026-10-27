@@ -55,8 +55,15 @@ export default function DynamicReportTable({
   columnStorageKey = '',
   canDownload = true,
   exportName = 'report',
+  /**
+   * Optional: async () => { rows, truncated, totalRows } returning EVERY row of the report. Used by CSV / Excel
+   * when the rows on screen are only a capped sample (pagination.truncated), so a download is not limited
+   * to what the page loaded.
+   */
+  onExportAll = null,
 }) {
   const isMobile = useMedia('(max-width: 640px)');
+  const [exporting, setExporting] = useState(false);
   const allColumns = useMemo(
     () => (Array.isArray(customColumns) && customColumns.length
       ? customColumns
@@ -214,22 +221,50 @@ export default function DynamicReportTable({
     }
   };
 
-  const exportRows = () => {
+  /**
+   * Rows for a download. Every row of the report is exported (no row cap). When the screen only holds a capped
+   * sample and the page can fetch the full set, that is fetched first, then searched and sorted like the table.
+   */
+  const exportRows = async () => {
     const headers = columns.map((c) => c.label);
-    const body = filteredRows.slice(0, 10000).map((row) => columns.map((c) => exportCellValue(c, row)));
-    return { headers, body };
+    let source = filteredRows;
+    let note = '';
+    if (onExportAll && pagination?.truncated) {
+      setExporting(true);
+      showToast({ message: 'Preparing the full export…' });
+      try {
+        const full = await onExportAll();
+        if (full && Array.isArray(full.rows) && full.rows.length >= filteredRows.length) {
+          const sorted = serverPaginated || !sortColumn
+            ? full.rows
+            : sortRowsByColumn(full.rows, columns, sortColumn, sortDir);
+          source = filterRowsBySearch(sorted, search, (r) => [rowSearchText(r, columns)]);
+          if (full.truncated) {
+            note = ` — export limit reached, narrow the filters for the rest (${Number(full.totalRows || 0).toLocaleString()} rows exist)`;
+          }
+        }
+      } catch (err) {
+        note = ' — could not fetch the full report, exported the rows on screen';
+      } finally {
+        setExporting(false);
+      }
+    }
+    const body = source.map((row) => columns.map((c) => exportCellValue(c, row)));
+    return { headers, body, note };
   };
 
-  const downloadTableCsv = () => {
-    const { headers, body } = exportRows();
+  const downloadTableCsv = async () => {
+    if (exporting) return;
+    const { headers, body, note } = await exportRows();
     downloadCsv(exportName, headers, body);
-    showToast({ message: `Downloaded ${body.length} row${body.length === 1 ? '' : 's'} (CSV)` });
+    showToast({ message: `Downloaded ${body.length.toLocaleString()} row${body.length === 1 ? '' : 's'} (CSV)${note}` });
   };
 
-  const downloadTableExcel = () => {
-    const { headers, body } = exportRows();
+  const downloadTableExcel = async () => {
+    if (exporting) return;
+    const { headers, body, note } = await exportRows();
     downloadExcel(exportName, headers, body, title || 'Report');
-    showToast({ message: `Downloaded ${body.length} row${body.length === 1 ? '' : 's'} (Excel)` });
+    showToast({ message: `Downloaded ${body.length.toLocaleString()} row${body.length === 1 ? '' : 's'} (Excel)${note}` });
   };
 
   const toggleColumn = (id) => {
@@ -320,11 +355,11 @@ export default function DynamicReportTable({
           )}
           {canDownload && filteredRows.length > 0 && (
             <>
-              <button type="button" className="btn-reset table-tool-btn" onClick={downloadTableCsv}>
-                CSV
+              <button type="button" className="btn-reset table-tool-btn" onClick={downloadTableCsv} disabled={exporting}>
+                {exporting ? 'Preparing…' : 'CSV'}
               </button>
-              <button type="button" className="btn-reset table-tool-btn" onClick={downloadTableExcel}>
-                Excel
+              <button type="button" className="btn-reset table-tool-btn" onClick={downloadTableExcel} disabled={exporting}>
+                {exporting ? 'Preparing…' : 'Excel'}
               </button>
             </>
           )}
