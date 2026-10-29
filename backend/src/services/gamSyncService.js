@@ -1538,12 +1538,16 @@ async function fetchInventoryCoreTableFast(startDate, endDate, opts = {}) {
       ? Math.max(250, Math.min(500, Math.ceil(tableLimit / Math.max(1, dayCount))))
       : siteFilterCount > 0 && siteFilterCount <= 50
         ? Math.max(siteFilterCount + 2, 10)
-        : Math.max(25, Math.min(150, Math.ceil(tableLimit / dayCount)));
+        // Every site/day row (a day has several hundred): the old top-150 per day dropped the long tail, so the
+        // table listed fewer records and less revenue than the data holds.
+        : 2000;
   const countryRowCap = opts.exportAll
     ? tableLimit
     : fullCountryTable
       ? Math.min(100000, Math.max(tableLimit, dayCount * 1000, 25000))
-      : Math.min(20000, Math.max(tableLimit, dayCount * perDay));
+      : (siteFilterCount > 0 && siteFilterCount <= 50
+        ? Math.min(20000, Math.max(tableLimit, dayCount * perDay))
+        : 50000);
   const outerLimit = countryRowCap;
 
   let groupCols;
@@ -2660,9 +2664,15 @@ async function fetchBundleDomainTableFromRollup(startDate, endDate, opts, limit)
       : siteCount > 0 && siteCount <= 50
         ? Math.max(siteCount + 5, 15)
         : (table === 'rollup_inventory_kpi_daily'
-          ? Math.max(40, Math.min(200, Math.ceil(Math.max(limit, 8000) / dayCount)))
+          // Every site/day row (a day has ~100 sites): a top-N per day dropped the long tail, so the table
+          // showed fewer records and less revenue than the Dashboard for the same range.
+          ? 2000
           : Math.max(15, Math.min(100, Math.ceil(limit / dayCount))));
-    const outerLimit = opts.exportAll ? limit : Math.min(20000, Math.max(limit, dayCount * perDayTarget));
+    const outerLimit = opts.exportAll
+      ? limit
+      : (table === 'rollup_inventory_kpi_daily' && !(siteCount > 0 && siteCount <= 50)
+        ? 50000
+        : Math.min(20000, Math.max(limit, dayCount * perDayTarget)));
     params.push(perDayTarget);
     const perDayIdx = params.length;
     params.push(outerLimit);

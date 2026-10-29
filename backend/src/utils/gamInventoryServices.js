@@ -173,7 +173,7 @@ async function fetchSitesBySiteService(token) {
  * Returns {units, rootId, level2} where level2 = direct children of root.
  */
 async function fetchAdUnitHierarchy(token) {
-  const cacheKey = invCacheKey('gam_ad_unit_hierarchy_v2');
+  const cacheKey = invCacheKey('gam_ad_unit_hierarchy_v3');
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
@@ -188,12 +188,17 @@ async function fetchAdUnitHierarchy(token) {
       `<filterStatement><query>WHERE status = 'ACTIVE' ORDER BY id ASC LIMIT ${pageSize} OFFSET ${offset}</query></filterStatement>`,
       token
     );
-    const page = parseResults(xml).map(b => ({
-      id: extractTag(b, 'id'),
-      parentId: extractTag(b, 'parentId'),
-      name: extractTag(b, 'name'),
-      code: extractTag(b, 'adUnitCode'),
-    })).filter(u => u.id);
+    // A unit's own <name>/<adUnitCode> come AFTER its <parentPath> block, which carries the ancestors' names.
+    // Reading the first tag returned the root's name for every unit, so no ad unit was ever listed by its real name.
+    const page = parseResults(xml).map(b => {
+      const own = b.replace(/<parentPath>[\s\S]*?<\/parentPath>/gi, '');
+      return {
+        id: extractTag(own, 'id'),
+        parentId: extractTag(own, 'parentId'),
+        name: extractTag(own, 'name'),
+        code: extractTag(own, 'adUnitCode'),
+      };
+    }).filter(u => u.id);
     units.push(...page);
     if (page.length < pageSize) break;
   }
@@ -319,7 +324,7 @@ async function fetchMobileApps(token) {
  *   3. adUnitId→siteUrl map always comes from InventoryService hierarchy.
  */
 async function fetchGAMInventoryData(token) {
-  const cacheKey = invCacheKey('gam_inventory_data_v6');
+  const cacheKey = invCacheKey('gam_inventory_data_v7');
   const cached = cache.get(cacheKey);
   if (cached) return cached;
 
