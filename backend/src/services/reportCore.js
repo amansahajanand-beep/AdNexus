@@ -1993,6 +1993,54 @@ async function getFilterCatalog(token, { allowStale = true, forceRefresh = false
   return fresh;
 }
 
+const WAREHOUSE_UNIT_TTL_MS = 2 * 60 * 1000;
+const warehouseUnitCache = new Map(); // clientId -> { at, names }
+
+/**
+ * The saved catalog is rebuilt from GAM once a day, so ad units / apps added since then are missing from the
+ * dropdowns. The sync stores every ad unit it receives in dim_ad_unit within minutes, so merge those names in
+ * (one small indexed query, cached 2 minutes) without touching GAM. Returns a copy; the saved catalog is unchanged.
+ */
+async function topUpCatalogFromWarehouse(catalog) {
+  try {
+    const { requireClientId } = require('../utils/clientContext');
+    const clientId = requireClientId();
+    let hit = warehouseUnitCache.get(clientId);
+    if (!hit || Date.now() - hit.at > WAREHOUSE_UNIT_TTL_MS) {
+      const { rows } = await require('../db').query(
+        `SELECT name FROM dim_ad_unit WHERE client_id = $1::uuid AND name IS NOT NULL AND name <> ''`,
+        [clientId]
+      );
+      hit = { at: Date.now(), names: rows.map((r) => String(r.name).trim()).filter(Boolean) };
+      warehouseUnitCache.set(clientId, hit);
+    }
+    const byHost = { ...(catalog?.adUnitsByHost || {}) };
+    const have = new Set();
+    Object.values(byHost).forEach((v) => (v || []).forEach((n) => have.add(n)));
+    const stripId = (n) => n.replace(/\s*\(\d+\)\s*$/, '').trim();
+    const extra = hit.names.filter((n) => !have.has(n) && !(stripId(n) !== n && (have.has(stripId(n)) || hit.names.includes(stripId(n)))));
+    const pkgRe = /^[a-z][a-z0-9]*(\.[a-z0-9_-]+){2,}$/i;
+    const knownPkgs = new Set((catalog?.appPackages || []).map((p) => String(p?.packageName || p?.id || p).toLowerCase()));
+    const newPkgs = [...new Set(extra.map((n) => n.split('_')[0]).filter((p) => pkgRe.test(p)))]
+      .filter((p) => !knownPkgs.has(p.toLowerCase()));
+    if (!extra.length && !newPkgs.length) return catalog;
+    logger.info(`[catalog] warehouse top-up: +${extra.length} ad unit(s), +${newPkgs.length} app package(s) not in the saved catalog`);
+    if (extra.length) {
+      byHost.__app_ad_units__ = [...new Set([...(byHost.__app_ad_units__ || []), ...extra])]
+        .sort((a, b) => a.localeCompare(b));
+    }
+    const first = (catalog?.appPackages || [])[0];
+    const appPackages = [
+      ...(catalog?.appPackages || []),
+      ...newPkgs.map((p) => (first && typeof first === 'object' ? { packageName: p, id: p, name: p } : p)),
+    ];
+    return { ...catalog, adUnitsByHost: byHost, appPackages };
+  } catch (err) {
+    logger.warn(`[catalog] warehouse top-up skipped: ${err.message}`);
+    return catalog;
+  }
+}
+
 /** Site-resolution context for scoped child users (catalog + assigned sites). */
 function buildScopeSiteContextForUser(user) {
   const catalogPayload = cache.get(catalogCacheKey()) || {};
@@ -4436,7 +4484,9 @@ async function handleFilterCatalog(req, res) {
     const token = await getToken();
     const wantsRefresh = req.user?.role === 'admin'
       && ['1', 'true'].includes(String(req.query?.refresh || '').toLowerCase());
-    const result = await getFilterCatalog(token, { allowStale: true, forceRefresh: wantsRefresh });
+    const result = await topUpCatalogFromWarehouse(
+      await getFilterCatalog(token, { allowStale: true, forceRefresh: wantsRefresh })
+    );
     const scoped = scopeCatalogOptionsForUser(
       {
         rows: result.rows || [],
@@ -4644,7 +4694,7 @@ async function handleDetailedReport(req, res) {
     ? 'all'
     : `${paginationOpts.cursor || 0}_${paginationOpts.limit || 50}_${paginationOpts.sortColumn || ''}_${paginationOpts.sortDir || ''}`;
   const cacheGen = await currentCacheGen();
-  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v73_g${cacheGen}_${userCacheScope(req.user)}_${filterCacheKey({
+  const detailedRespKey = withTenantCacheKey(`report_detailed_resp_v75_g${cacheGen}_${userCacheScope(req.user)}_${filterCacheKey({
     startDate: filters.startDate,
     endDate: filters.endDate,
     country: filters.country,
