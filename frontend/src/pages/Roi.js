@@ -1389,7 +1389,11 @@ function RoiView() {
   // Admin: turn the selected Ads account into a sheet (sidebar link under ROI with its own day / week / month / year view).
   useRoiDisplayCurrency();
   const roiSheets = useRoiSheets(user?.id);
-  const sheetAccount = singleAccountMode ? String(applied.accountIds[0]) : '';
+  // "All" collapses to no account filter, so a user who can see exactly one account (a domain user's usual case) has
+  // none selected explicitly; that one account is still the sheet's account.
+  const soleAccountOption = !(applied?.accountIds || []).length && roiAccountOptions.length === 1
+    ? String(roiAccountOptions[0].value) : '';
+  const sheetAccount = singleAccountMode ? String(applied.accountIds[0]) : soleAccountOption;
   const existingSheet = sheetAccount ? roiSheets.find((sh) => sheetAccountId(sh) === sheetAccount) : null;
   const addSheet = () => {
     if (!sheetAccount) return;
@@ -1434,7 +1438,7 @@ function RoiView() {
         <button type="button" className="btn-outline-action" onClick={openExpenseForm}>
           Add expenses
         </button>
-        {singleAccountMode ? (
+        {sheetAccount ? (
           existingSheet ? (
             <Link className="btn-outline-action" to={`/roi/sheet/${existingSheet.id}`} title="This account already has a sheet in the sidebar">
               Open sheet

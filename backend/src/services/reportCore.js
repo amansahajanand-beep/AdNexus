@@ -3523,14 +3523,29 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
     const wantsCountry = countryDims.length > 0 || countryFilterAsked;
     const baseSupported = !other.length && !(web.length && app.length) && metricsOk
       && !(app.length && (toFilterArray(filters.domain).length || toFilterArray(filters.site).length));
-    // Country needs the country slices, which carry no hour-of-day report, no domain-user scoping and no unmapped ids.
-    const countrySupported = !wantsCountry || (!hourMode && req.user?.role === 'admin' && !(countryFilterAsked && !countryNames.length));
+    // Country needs the country slices, which carry no hour-of-day report and no unmapped country ids.
+    const countrySupported = !wantsCountry || (!hourMode && !(countryFilterAsked && !countryNames.length));
     const supported = baseSupported && countrySupported;
     const countryOn = wantsCountry && supported;
+    // A domain user only ever sees their assigned inventory, resolved the way the normal pages resolve it.
+    const isScopedUser = req.user?.role !== 'admin';
+    const countryScope = countryOn && isScopedUser
+      ? resolveScopedSqlInventoryOpts(req.user, {
+        domain: filters.domain, site: filters.site, domainId: filters.domainId, domainName: filters.domainName,
+      })
+      : null;
+    const scopeHasWeb = Boolean(countryScope && (countryScope.domains.length || countryScope.sites.length));
     const wantCountryApp = app.length > 0 || (!web.length && toFilterArray(filters.domainId).length > 0);
-    const countryKind = !countryOn ? 'network'
-      : wantCountryApp ? 'country_app'
-        : (web.length || toFilterArray(filters.domain).length || toFilterArray(filters.site).length) ? 'country_site' : 'country_net';
+    let countryKind = 'network';
+    if (countryOn) {
+      if (countryScope) {
+        countryKind = app.length ? 'country_app' : (web.length || scopeHasWeb) ? 'country_site' : 'country_app';
+      } else if (wantCountryApp) {
+        countryKind = 'country_app';
+      } else {
+        countryKind = (web.length || toFilterArray(filters.domain).length || toFilterArray(filters.site).length) ? 'country_site' : 'country_net';
+      }
+    }
     // An Hour report is only answerable from the stored hourly data, so it is built from it in the network's own zone too.
     const ctx = await prepareTimezoneView(req, res, 'reporting', {
       startDate: filters.startDate,
@@ -3594,25 +3609,67 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
         return row;
       });
     } else if (countryOn) {
-      const base = {
-        clientId, startDate: hourlyStart, endDate, tz, srcTz, kind: countryKind, countries: countryNames,
-        filter: { domains: toFilterArray(filters.domain), sites: toFilterArray(filters.site), apps: toFilterArray(filters.domainId) },
-      };
       const siteCol = web.includes('site_name') || web.includes('url_name');
-      const [countryRows, countryTrend] = await Promise.all([
-        hv.hourlyCountry({
-          ...base, perDay, byCountry: countryDims.length > 0, byDomain: countryKind === 'country_site' && web.length > 0,
-          bySite: countryKind === 'country_site' && siteCol, byApp: countryKind === 'country_app' && app.length > 0, limit: maxRows,
-        }),
-        hv.hourlyCountry({ ...base, perDay: true, byCountry: false }),
-      ]);
-      hourlyTrend = countryTrend.map((d) => ({
+      // Admin: one slice with the report's filters. Domain user: their assigned sites and/or apps; with no domain/site
+      // or app column both slices are added together (access to either grants the revenue).
+      const slices = [];
+      if (ctx.isScoped) {
+        const sc = ctx.scope;
+        const webScope = sc.domains.length > 0 || sc.sites.length > 0;
+        if ((app.length || !web.length) && sc.apps.length) {
+          slices.push({ kind: 'country_app', filter: { apps: sc.apps, scoped: true } });
+        }
+        if ((web.length || !app.length) && webScope) {
+          slices.push({ kind: 'country_site', filter: { domains: sc.domains, sites: sc.sites, scoped: true, webOr: Boolean(sc.webInventoryOr) } });
+        }
+      } else {
+        slices.push({
+          kind: countryKind,
+          filter: { domains: toFilterArray(filters.domain), sites: toFilterArray(filters.site), apps: toFilterArray(filters.domainId) },
+        });
+      }
+      const common = { clientId, startDate: hourlyStart, endDate, tz, srcTz, countries: countryNames };
+      const pulled = await Promise.all(slices.map(async ({ kind, filter }) => {
+        const [rows, trend] = await Promise.all([
+          hv.hourlyCountry({
+            ...common, kind, filter, perDay, byCountry: countryDims.length > 0, byDomain: kind === 'country_site' && web.length > 0,
+            bySite: kind === 'country_site' && siteCol, byApp: kind === 'country_app' && app.length > 0, limit: maxRows,
+          }),
+          hv.hourlyCountry({ ...common, kind, filter, perDay: true, byCountry: false }),
+        ]);
+        return { kind, rows, trend };
+      }));
+      const countryRows = [];
+      const rowIndex = new Map();
+      const trendByDate = new Map();
+      for (const { kind, rows: part, trend } of pulled) {
+        for (const r of part) {
+          const key = `${r.date}|${r.country}|${r.domain}|${r.item}|${kind === 'country_app' ? 'a' : 'w'}`;
+          // Without an item column the two slices describe the same country/day, so they add up.
+          const mergeKey = (web.length || app.length) ? key : `${r.date}|${r.country}`;
+          const cur = rowIndex.get(mergeKey);
+          if (cur) {
+            cur.revenue += r.revenue; cur.impressions += r.impressions; cur.clicks += r.clicks;
+          } else {
+            const copy = { ...r, kind };
+            rowIndex.set(mergeKey, copy);
+            countryRows.push(copy);
+          }
+        }
+        for (const d of trend) {
+          const cur = trendByDate.get(d.date) || { date: d.date, revenue: 0, impressions: 0, clicks: 0 };
+          cur.revenue += d.revenue; cur.impressions += d.impressions; cur.clicks += d.clicks;
+          trendByDate.set(d.date, cur);
+        }
+      }
+      countryRows.sort((x, y) => (x.date || '').localeCompare(y.date || '') || y.revenue - x.revenue);
+      hourlyTrend = [...trendByDate.values()].sort((x, y) => x.date.localeCompare(y.date)).map((d) => ({
         date: d.date, earning: +d.revenue.toFixed(2), impressions: Math.round(d.impressions), clicks: Math.round(d.clicks),
       }));
       // Only a country filter (no Country column): label the rows with the filtered country, as the normal report does.
       const filterLabel = !countryDims.length && countryNames.length ? countryNames.join(', ') : '';
       hourlyRows = countryRows.map((r) => {
-        const item = countryKind === 'country_app'
+        const item = r.kind === 'country_app'
           ? { appId: r.item }
           : { domain: r.domain, site: siteCol ? r.item : '' };
         const row = hv.rowFor({ date: r.date || '', revenue: r.revenue, impressions: r.impressions, clicks: r.clicks, ...(web.length || app.length ? item : {}) });
