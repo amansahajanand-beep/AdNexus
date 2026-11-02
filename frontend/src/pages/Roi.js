@@ -709,7 +709,6 @@ function RoiView() {
         const res = await adsAPI.listRoiAccounts({ start, end });
         if (cancelled) return;
         const opts = (res.accounts || [])
-          .filter((a) => (Number(a.spend) || 0) > 0)
           .map((a) => ({
           value: a.id,
           label: a.descriptiveName || a.customerId || a.id,
@@ -1589,12 +1588,12 @@ function RoiView() {
                   onChange={setFilterAccountIds}
                   placeholder={
                     roiAccountOptions.length
-                      ? 'Accounts with spend in this period…'
-                      : 'No Ads spend in this period — try another date or run Ads sync'
+                      ? 'Search Ads accounts…'
+                      : 'No Ads accounts found — connect accounts under Admin → Google Ads accounts'
                   }
                   searchable
                   showSelectAll
-                  selectAllLabel="Select all accounts with spend"
+                  selectAllLabel="Select all accounts"
                 />
               </RoiFilterRow>
               <RoiFilterRow icon="campaigns" label="Campaigns">

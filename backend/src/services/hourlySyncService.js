@@ -31,9 +31,16 @@ const SLICES = [
   { kind: 'network', dims: ['DATE', 'HOUR'], cols: TOTAL_COLS, chunkDays: 31, a: null, b: null },
   { kind: 'inventory', dims: ['DATE', 'HOUR', 'DOMAIN', 'SITE_NAME'], cols: ADX_COLS, chunkDays: 2, a: 'DOMAIN', b: 'SITE_NAME' },
   { kind: 'app', dims: ['DATE', 'HOUR', 'MOBILE_APP_RESOLVED_ID'], cols: ADX_COLS, chunkDays: 2, a: null, b: 'MOBILE_APP_RESOLVED_ID' },
+  // Country slices (dim_a = country name) let a Country report be regrouped into another timezone's days.
+  { kind: 'country_net', dims: ['DATE', 'HOUR', 'COUNTRY_NAME'], cols: TOTAL_COLS, chunkDays: 7, a: 'COUNTRY_NAME', b: null },
+  { kind: 'country_site', dims: ['DATE', 'HOUR', 'COUNTRY_NAME', 'SITE_NAME'], cols: ADX_COLS, chunkDays: 1, a: 'COUNTRY_NAME', b: 'SITE_NAME' },
+  { kind: 'country_app', dims: ['DATE', 'HOUR', 'COUNTRY_NAME', 'MOBILE_APP_RESOLVED_ID'], cols: ADX_COLS, chunkDays: 1, a: 'COUNTRY_NAME', b: 'MOBILE_APP_RESOLVED_ID' },
 ];
 // Resolved id is not always allowed with HOUR; the app name is a safe fallback.
 const APP_FALLBACK = { kind: 'app', dims: ['DATE', 'HOUR', 'MOBILE_APP_NAME'], cols: ADX_COLS, chunkDays: 2, a: null, b: 'MOBILE_APP_NAME' };
+const COUNTRY_APP_FALLBACK = { kind: 'country_app', dims: ['DATE', 'HOUR', 'COUNTRY_NAME', 'MOBILE_APP_NAME'], cols: ADX_COLS, chunkDays: 1, a: 'COUNTRY_NAME', b: 'MOBILE_APP_NAME' };
+const FALLBACKS = { app: APP_FALLBACK, country_app: COUNTRY_APP_FALLBACK };
+const COUNTRY_NET = SLICES.find((s) => s.kind === 'country_net');
 
 const clean = (v) => {
   const s = String(v == null ? '' : v).trim();
@@ -65,12 +72,15 @@ function toHourlyRows(raw, slice) {
     const date = clean(r['Dimension.DATE']);
     const hour = parseInt(r['Dimension.HOUR'], 10);
     if (!date || !Number.isInteger(hour) || hour < 0 || hour > 23) continue;
-    const a = slice.a ? clean(r[`Dimension.${slice.a}`]).toLowerCase() : '';
+    const isCountry = slice.kind.startsWith('country_');
+    const aRaw = slice.a ? clean(r[`Dimension.${slice.a}`]) : '';
+    // Country names keep their case (they are shown as-is); domains are matched lower-cased.
+    const a = isCountry ? aRaw : aRaw.toLowerCase();
     const b = slice.b ? clean(r[`Dimension.${slice.b}`]) : '';
     if (slice.kind !== 'network' && !a && !b) continue;
     const key = `${date}|${hour}|${a}|${b}`;
     const cur = merged.get(key) || {
-      date, hour, a, b: slice.kind === 'inventory' ? b.toLowerCase() : b, imp: 0, clicks: 0, rev: 0,
+      date, hour, a, b: slice.kind === 'inventory' || slice.kind === 'country_site' ? b.toLowerCase() : b, imp: 0, clicks: 0, rev: 0,
     };
     cur.imp += parseGamRawColumnValue(slice.cols.imp, r[`Column.${slice.cols.imp}`]);
     cur.clicks += parseGamRawColumnValue(slice.cols.clicks, r[`Column.${slice.cols.clicks}`]);
@@ -115,9 +125,10 @@ async function syncSlice(client, token, slice, start, end) {
     try {
       raw = await pullSlice(token, slice, from, to);
     } catch (err) {
-      if (slice.kind !== 'app') throw err;
-      used = APP_FALLBACK;
-      raw = await pullSlice(token, APP_FALLBACK, from, to);
+      const fallback = FALLBACKS[slice.kind];
+      if (!fallback) throw err;
+      used = fallback;
+      raw = await pullSlice(token, fallback, from, to);
     }
     const rows = toHourlyRows(raw, used);
     await replaceHourly(client.id, slice.kind, from, to, rows);
@@ -180,7 +191,15 @@ function refreshNetworkHours(client) {
     const { getToken } = require('../gam/reportTransport');
     const end = todayInTZ(await getNetworkTz(client));
     const start = shiftYMD(end, -1);
-    const wrote = await runWithClient(client, async () => syncSlice(client, await getToken(), SLICES[0], start, end));
+    const wrote = await runWithClient(client, async () => {
+      const token = await getToken();
+      const network = await syncSlice(client, token, SLICES[0], start, end);
+      // Small report; lets a Country report in another timezone see the latest hours too.
+      await syncSlice(client, token, COUNTRY_NET, start, end).catch((err) => {
+        logger.warn(`Quick country hourly refresh client=${String(client.id).slice(0, 8)}: ${err.message}`);
+      });
+      return network;
+    });
     // Site and app hours: not needed for the totals, so they must not block the response.
     setImmediate(() => syncHourlyForClient(client, { startDate: start, endDate: end }).catch(() => {}));
     return wrote > 0;
@@ -216,17 +235,22 @@ async function syncHourlyRecent({ days = 2 } = {}) {
   }
 }
 
-/** Dates in the window that have fewer than 24 network hours stored (today is allowed to be partial). */
+/**
+ * Dates in the window that have fewer than 24 hours stored for the network total or the country total
+ * (today is allowed to be partial). The country total is what a Country report in another timezone needs.
+ */
 async function missingDates(clientId, start, end) {
   const { rows } = await query(
     `SELECT to_char(d::date, 'YYYY-MM-DD') AS day
      FROM generate_series($2::date, $3::date, interval '1 day') d
      LEFT JOIN (
-       SELECT report_date, COUNT(DISTINCT hour) AS hrs FROM rollup_hourly
-       WHERE client_id = $1::uuid AND kind = 'network' AND report_date BETWEEN $2::date AND $3::date
+       SELECT report_date, COUNT(DISTINCT hour) FILTER (WHERE kind = 'network') AS hrs,
+              COUNT(DISTINCT hour) FILTER (WHERE kind = 'country_net') AS country_hrs
+       FROM rollup_hourly
+       WHERE client_id = $1::uuid AND kind IN ('network', 'country_net') AND report_date BETWEEN $2::date AND $3::date
        GROUP BY report_date
      ) h ON h.report_date = d::date
-     WHERE COALESCE(h.hrs, 0) < 24
+     WHERE COALESCE(h.hrs, 0) < 24 OR COALESCE(h.country_hrs, 0) < 24
      ORDER BY d`,
     [clientId, start, end]
   );

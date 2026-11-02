@@ -296,6 +296,76 @@ async function hourlyRows({
     : rowFor({ ...r, domain: r.dim_a, site: r.dim_b })));
 }
 
+/** Root domain of a stored country_site host (the same rule as DOMAIN_SQL, but there is no GAM domain column). */
+const COUNTRY_SITE_DOMAIN_SQL = `LOWER(COALESCE(NULLIF(SUBSTRING(TRIM(COALESCE(h.dim_b, '')) FROM '[^.]+\\.[^.]+$'), ''), NULLIF(TRIM(h.dim_b), '')))`;
+
+/**
+ * Country report over the local days of `tz`, from the country slices of the hourly data.
+ *  kind: 'country_net' (country only), 'country_site' (dim_b = site host) or 'country_app' (dim_b = app id).
+ *  countries: limit to these country names. filter: { domains[], sites[], apps[] } (admin filters, exact like hourlyRows).
+ *  by*: which columns to keep as separate rows; perDay adds the local date. Biggest earners first.
+ */
+async function hourlyCountry({
+  clientId, startDate, endDate, tz, srcTz = SRC_TZ, kind = 'country_net', countries = null, filter = null,
+  perDay = true, byCountry = true, byDomain = false, bySite = false, byApp = false, limit = 50000,
+}) {
+  const params = zonedParams(clientId, startDate, endDate, srcTz, tz);
+  let extra = '';
+  const names = norm(countries);
+  if (names.length) {
+    params.push(names);
+    extra += ` AND LOWER(TRIM(h.dim_a)) = ANY($${params.length}::text[])`;
+  }
+  if (kind === 'country_site' && filter) {
+    const domains = norm(filter.domains);
+    const sites = norm(filter.sites);
+    if (domains.length) {
+      params.push(domains);
+      extra += ` AND ${COUNTRY_SITE_DOMAIN_SQL} = ANY($${params.length}::text[])`;
+    }
+    if (sites.length) {
+      params.push(sites);
+      extra += ` AND LOWER(TRIM(h.dim_b)) = ANY($${params.length}::text[])`;
+    }
+  } else if (kind === 'country_app' && filter) {
+    const apps = norm(filter.apps);
+    if (apps.length) {
+      params.push(apps);
+      extra += ` AND LOWER(h.dim_b) = ANY($${params.length}::text[])`;
+    }
+  }
+  params.push(limit);
+  const lim = params.length;
+  const cols = [];
+  if (perDay) cols.push('ld');
+  if (byCountry) cols.push('country');
+  if (byDomain) cols.push('dom');
+  if (bySite || byApp) cols.push('item');
+  const { rows } = await query(
+    withZones(`SELECT ${perDay ? "to_char(ld, 'YYYY-MM-DD')" : 'NULL'} AS date,
+                      ${byCountry ? 'country' : "''"} AS country, ${byDomain ? 'dom' : "''"} AS dom, ${bySite || byApp ? 'item' : "''"} AS item,
+                      SUM(revenue)::float8 AS revenue, SUM(impressions)::float8 AS impressions, SUM(clicks)::float8 AS clicks
+               FROM (
+                 SELECT ${LOCAL_TS()}::date AS ld, h.dim_a AS country,
+                        ${kind === 'country_site' ? COUNTRY_SITE_DOMAIN_SQL : "''"} AS dom, h.dim_b AS item,
+                        h.revenue * 0.5 AS revenue, h.impressions * 0.5 AS impressions, h.clicks * 0.5 AS clicks
+                 FROM rollup_hourly h ${HALVES}
+                 WHERE h.client_id = $1::uuid AND h.kind = '${kind}'
+                   AND h.report_date BETWEEN $2::date AND $3::date${extra}
+               ) x
+               WHERE ld BETWEEN $4::date AND $5::date
+               ${cols.length ? `GROUP BY ${cols.join(', ')}` : ''}
+               HAVING SUM(impressions) > 0 OR SUM(revenue) > 0
+               ORDER BY ${perDay ? 'ld ASC, ' : ''}SUM(revenue) DESC
+               LIMIT $${lim}`, 6),
+    params
+  );
+  return rows.map((r) => ({
+    date: r.date, country: r.country, domain: r.dom, item: r.item,
+    revenue: Number(r.revenue) || 0, impressions: Number(r.impressions) || 0, clicks: Number(r.clicks) || 0,
+  }));
+}
+
 /**
  * Revenue, impressions and clicks per local hour of `tz` (the Reporting page's Hour field), one row per local day and
  * hour, or per hour of the day added up over the range when perDay is false. A zone whose offset from the network is
@@ -449,5 +519,5 @@ function summaryFromTrend(trend, rows, { viewability = 0, currency = 'USD' } = {
   };
 }
 
-module.exports = { SRC_TZ, timezoneOptions, isValidTz, coverage, coverageFrom, wallToInstant, localMidnight, buildHourlyView, buildScopedHourlyView, hourlyTrend, hourlyRows, hourlyByHour, hourlyTargets, rowFor, summaryFromTrend,
+module.exports = { SRC_TZ, timezoneOptions, isValidTz, coverage, coverageFrom, wallToInstant, localMidnight, buildHourlyView, buildScopedHourlyView, hourlyTrend, hourlyRows, hourlyCountry, hourlyByHour, hourlyTargets, rowFor, summaryFromTrend,
 };

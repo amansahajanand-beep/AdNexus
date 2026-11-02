@@ -1383,6 +1383,25 @@ function inclusiveDayCount(startDate, endDate) {
   return Math.max(1, Math.round((endMs - startMs) / 86400000) + 1);
 }
 
+/**
+ * True when rollup_inventory_kpi_daily has rows for every day of the range. An empty site/domain answer from it is then
+ * a real "no data" — the raw-grain site scan that used to follow ran 100+ s on this month-sized table and found nothing.
+ */
+async function inventoryRollupCoversRange(startDate, endDate) {
+  try {
+    const { rows } = await query(
+      `SELECT COUNT(DISTINCT report_date)::int AS n
+       FROM rollup_inventory_kpi_daily
+       WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date`,
+      [requireClientId(), startDate, endDate],
+      { statementTimeoutMs: 5000 }
+    );
+    return (rows?.[0]?.n || 0) >= inclusiveDayCount(startDate, endDate);
+  } catch (_) {
+    return false;
+  }
+}
+
 /** Ranges longer than this use rollup_kpi_daily only (fast). inventory_core for ≤ this many days. */
 const DASHBOARD_ROLLUP_FIRST_DAYS = Math.max(
   7,
@@ -2471,6 +2490,148 @@ function countAppAndWebsiteDomainsFromRows(rows = []) {
     if (app) keys.add(`app:${app}`);
   }
   return keys.size;
+}
+
+/**
+ * Days of the range (YYYY-MM-DD) that `table` (a rollup table, fixed list) has no rows for, for the active network.
+ * null when the check itself failed.
+ */
+async function rollupMissingDays(table, startDate, endDate) {
+  if (!['rollup_inventory_kpi_daily', 'rollup_kpi_daily'].includes(table)) return null;
+  try {
+    const { rows } = await query(
+      `SELECT to_char(d, 'YYYY-MM-DD') AS day
+       FROM generate_series($2::date, $3::date, '1 day') AS d
+       WHERE NOT EXISTS (SELECT 1 FROM ${table} WHERE client_id = $1::uuid AND report_date = d::date)
+       ORDER BY d`,
+      [requireClientId(), startDate, endDate],
+      { statementTimeoutMs: 5000 }
+    );
+    return rows.map((r) => r.day);
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Domain User table (one row per App ID + domain + site) straight from the daily rollups, grouped in SQL:
+ * sites/domains from rollup_inventory_kpi_daily, apps from rollup_kpi_daily. The old path loaded every raw
+ * line-item row of the range and grouped them in JS (minutes for a week).
+ *
+ * scope: { unrestricted } for the whole network, or { domains, sites, apps, adUnitNames, webInventoryOr } for a scoped user.
+ * Returns { rows, missingDays }: days the rollups have not synced are listed (the rows then cover the other days only).
+ * Returns null when it cannot answer at all (ad-unit grants, a failed coverage check, or no day synced) so the
+ * caller keeps the raw path.
+ */
+async function fetchDomainUserRowsFromRollup(startDate, endDate, scope = {}) {
+  const { rootDomainFromHost } = require('../utils/adUnit');
+  const norm = (a) => (a || []).map((s) => String(s || '').trim().toLowerCase()).filter(Boolean);
+  const unrestricted = Boolean(scope.unrestricted);
+  const domains = unrestricted ? [] : norm(scope.domains);
+  const sites = unrestricted ? [] : norm(scope.sites);
+  const apps = unrestricted ? [] : norm(scope.apps);
+  const units = unrestricted ? [] : norm(scope.adUnitNames);
+  // Ad-unit grants next to site/domain grants would need OR across two different slices: leave that to the raw path.
+  if (units.length && (domains.length || sites.length)) return null;
+  if (!unrestricted && !domains.length && !sites.length && !apps.length && !units.length) return { rows: [], missingDays: [] };
+
+  const webWanted = unrestricted || domains.length > 0 || sites.length > 0;
+  const appWanted = unrestricted || apps.length > 0;
+  const unitWanted = units.length > 0;
+  const [webMissing, appMissing] = await Promise.all([
+    webWanted ? rollupMissingDays('rollup_inventory_kpi_daily', startDate, endDate) : [],
+    (appWanted || unitWanted) ? rollupMissingDays('rollup_kpi_daily', startDate, endDate) : [],
+  ]);
+  if (webMissing === null || appMissing === null) return null;
+  const missingDays = [...new Set([...webMissing, ...appMissing])].sort();
+  // Nothing synced at all: the raw path is the only thing that could still answer.
+  if (missingDays.length >= inclusiveDayCount(startDate, endDate)) return null;
+
+  const timeout = { statementTimeoutMs: 20000 };
+  const domainExpr = rollupInvDomainExprSql();
+  const toRow = (r, base) => {
+    const impression = Math.round(Number(r.impression) || 0);
+    const clicks = Number(r.clicks) || 0;
+    return {
+      ...base,
+      revenue: coerceWarehouseRevenue(r.revenue, impression),
+      impression,
+      fillRate: 0,
+      ctr: impression > 0 && clicks > 0 ? +((clicks / impression) * 100).toFixed(2) : 0,
+    };
+  };
+
+  const jobs = [];
+  if (webWanted) {
+    const params = [startDate, endDate];
+    let extra = ' AND report_date BETWEEN $1::date AND $2::date';
+    extra = appendRollupInventoryFilters(params, extra, {
+      domains, sites, apps: [], adUnitNames: [], webInventoryOr: Boolean(scope.webInventoryOr), skipAdUnitLike: true,
+    });
+    // App-only rows carry no web dims; they come from the app part below.
+    extra += ` AND (NULLIF(LOWER(TRIM(COALESCE(inv_site, ''))), '') IS NOT NULL OR COALESCE(${domainExpr}, '') <> '')`;
+    jobs.push(query(
+      `SELECT ${domainExpr} AS domain_name,
+              COALESCE(NULLIF(LOWER(TRIM(COALESCE(inv_site, ''))), ''), '') AS site_url,
+              COALESCE(SUM(impressions), 0)::float8 AS impression,
+              COALESCE(SUM(revenue), 0)::float8 AS revenue,
+              COALESCE(SUM(clicks), 0)::float8 AS clicks
+       FROM rollup_inventory_kpi_daily WHERE TRUE${extra}
+       GROUP BY 1, 2`,
+      params,
+      timeout
+    ).then(({ rows }) => rows.map((r) => {
+      const siteUrl = r.site_url || '';
+      const domainName = (siteUrl && rootDomainFromHost(siteUrl)) || r.domain_name || '—';
+      return toRow(r, { appId: '', domainName, siteName: siteUrl || '—', siteUrl });
+    })));
+  }
+  if (appWanted) {
+    const params = [startDate, endDate];
+    let extra = ' AND report_date BETWEEN $1::date AND $2::date';
+    extra = appendRollupInventoryFilters(params, extra, {
+      domains: [], sites: [], adUnitNames: [], apps, skipAdUnitLike: true,
+    });
+    extra += ` AND COALESCE(inv_domain, '') = '' AND COALESCE(inv_site, '') = '' AND COALESCE(inv_ad_unit, '') = ''
+      AND NULLIF(TRIM(COALESCE(inv_app, '')), '') IS NOT NULL`;
+    jobs.push(query(
+      `SELECT TRIM(inv_app) AS app_id,
+              COALESCE(SUM(impressions), 0)::float8 AS impression,
+              COALESCE(SUM(revenue), 0)::float8 AS revenue,
+              COALESCE(SUM(clicks), 0)::float8 AS clicks
+       FROM rollup_kpi_daily WHERE TRUE${extra}
+       GROUP BY 1`,
+      params,
+      timeout
+    ).then(({ rows }) => rows.map((r) => toRow(r, { appId: r.app_id, domainName: '—', siteName: '—', siteUrl: '' }))));
+  }
+  if (unitWanted) {
+    // Ad-unit rows live in rollup_kpi_daily. An ad unit is named "<app package or website>_<slot>": group by that
+    // root and show it as an App ID row (package) or a domain row (website). The caller has already dropped units
+    // that sit inside an assigned app (they are in that app's row).
+    const params = [startDate, endDate];
+    let extra = ' AND report_date BETWEEN $1::date AND $2::date';
+    extra = appendRollupInventoryFilters(params, extra, {
+      domains: [], sites: [], apps: [], adUnitNames: units, skipAdUnitLike: true,
+    });
+    jobs.push(query(
+      `SELECT ${domainExpr} AS root,
+              COALESCE(SUM(impressions), 0)::float8 AS impression,
+              COALESCE(SUM(revenue), 0)::float8 AS revenue,
+              COALESCE(SUM(clicks), 0)::float8 AS clicks
+       FROM rollup_kpi_daily WHERE TRUE${extra}
+       GROUP BY 1`,
+      params,
+      timeout
+    ).then(({ rows }) => rows.map((r) => {
+      const root = String(r.root || '').trim();
+      return root && root.includes('.') && isLikelyAppPackage(root)
+        ? toRow(r, { appId: root, domainName: '—', siteName: '—', siteUrl: '' })
+        : toRow(r, { appId: '', domainName: root || '—', siteName: '—', siteUrl: '' });
+    })));
+  }
+  const parts = await Promise.all(jobs);
+  return { rows: parts.flat().filter((r) => r.impression > 0 || r.revenue > 0), missingDays };
 }
 
 /**
@@ -3616,12 +3777,25 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
   ) {
     try {
       const sub = { ...opts, scopeGrantSplit: false, wantsAdUnitCol: false };
-      const [webPart, appPart] = await Promise.all([
-        fetchReportingBundleFromDB(startDate, endDate, { ...sub, apps: [], groupByApp: false }),
+      const webOpts = { ...sub, apps: [], groupByApp: false };
+      // The app part is app rows only: the user's Site/Domain column belongs to the web part. Leaving
+      // siteDomainColRequested on made the app part look like a site report, which skipped the app×country rollup
+      // and scanned raw grain (2 minutes for a week).
+      let [webPart, appPart] = await Promise.all([
+        fetchReportingBundleFromDB(startDate, endDate, webOpts),
         fetchReportingBundleFromDB(startDate, endDate, {
           ...sub, domains: [], sites: [], webInventoryOr: false, groupBySite: false, groupByApp: true, tableGrain: 'app',
+          siteDomainColRequested: false,
         }),
       ]);
+      // A short Site/Domain range is handed to the lean path by returning null (see "no raw grain scan" below).
+      // That null is "answer it elsewhere", not "no web data" — without this the site rows were dropped and only
+      // the app rows came back.
+      if (!webPart && appPart) {
+        webPart = await fetchLeanDashboardBundleFromDB(startDate, endDate, {
+          ...webOpts, skipCharts: true, reportingFast: true,
+        }).catch(() => null);
+      }
       if (webPart && appPart) {
         logger.info(
           `Reporting scope-split(web+app) ${startDate}..${endDate} web=${webPart.rows?.length || 0}`
@@ -3646,7 +3820,14 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
   // App ID only, no country/device breakdown: same app rollups the Dashboard reads (date × app),
   // instead of aggregating the app_id grain (24s for 30 days, minutes for 90). Fill rate is
   // added afterwards from rollup_fill_daily.
-  if (hasAppsOnly && dayCount > 1 && !wantsGeoTableDims(opts) && !opts.countryNames?.length) {
+  // One day used to be excluded and read the raw app_id grain (10 s for 5 apps). It is only needed when the report
+  // asks for fill-rate / request metrics, which the one-day grain path computes exactly.
+  if (
+    hasAppsOnly
+    && (dayCount > 1 || !(opts.needUnfilled || opts.needRequests))
+    && !wantsGeoTableDims(opts)
+    && !opts.countryNames?.length
+  ) {
     try {
       const rolled = await fetchAppSliceDashboardFromRollup(startDate, endDate, {
         ...opts,
@@ -4653,11 +4834,19 @@ async function fetchLeanDashboardBundleFromDB(startDate, endDate, opts = {}) {
     if (wantsInvTable) {
       // Site / domain filters: KPIs + daily table from inventory rollups (fast + datewise).
       if ((opts.sites || []).length || (opts.domains || []).length) {
+        let invFailed = false;
         const invBundle = await fetchInventoryRollupDashboardBundle(startDate, endDate, opts).catch((e) => {
+          invFailed = true;
           logger.warn(`Dashboard inventory-rollup (${dayCount}d) failed:`, e.message);
           return null;
         });
         if (invBundle?.rows?.length) return invBundle;
+        // The rollup answered and covers every day: nothing matches these sites/domains. Do not fall back to the
+        // raw-grain scan (100+ s) just to find that out again.
+        if (!invFailed && await inventoryRollupCoversRange(startDate, endDate)) {
+          logger.info(`Lean inventory-rollup ${startDate}..${endDate}: no rows for these sites/domains — skipping grain fallback`);
+          return null;
+        }
         if ((opts.sites || []).length) {
           enqueueInventoryRollupBackfill(startDate, endDate).catch(() => {});
         }
@@ -6532,6 +6721,8 @@ async function fetchFullReportBundleFromDB(startDate, endDate, opts = {}) {
 }
 
 module.exports = {
+  fetchDomainUserRowsFromRollup,
+  rollupMissingDays,
   upsertRows,
   replacePresentRows,
   replaceHistoricalRows,
