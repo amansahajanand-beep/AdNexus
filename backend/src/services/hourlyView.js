@@ -317,20 +317,32 @@ async function hourlyCountry({
     extra += ` AND LOWER(TRIM(h.dim_a)) = ANY($${params.length}::text[])`;
   }
   if (kind === 'country_site' && filter) {
+    // Same matching as filterSql: a domain user's grant matches the root domain, and a domain OR a site grants access
+    // when `webOr` is set; plain admin filters need both.
     const domains = norm(filter.domains);
     const sites = norm(filter.sites);
+    const parts = [];
     if (domains.length) {
       params.push(domains);
-      extra += ` AND ${COUNTRY_SITE_DOMAIN_SQL} = ANY($${params.length}::text[])`;
+      parts.push(`(${COUNTRY_SITE_DOMAIN_SQL} = ANY($${params.length}::text[]))`);
     }
     if (sites.length) {
       params.push(sites);
-      extra += ` AND LOWER(TRIM(h.dim_b)) = ANY($${params.length}::text[])`;
+      parts.push(`(LOWER(TRIM(h.dim_b)) = ANY($${params.length}::text[]))`);
     }
+    if (parts.length) extra += ` AND ${parts.length === 1 ? parts[0] : `(${parts.join(filter.webOr ? ' OR ' : ' AND ')})`}`;
   } else if (kind === 'country_app' && filter) {
     const apps = norm(filter.apps);
     if (apps.length) {
-      params.push(apps);
+      let wanted = apps;
+      if (filter.scoped) {
+        // A domain user's app grants may name an app by package, name or resolved id; match any of its spellings.
+        try {
+          const { expandAppFilterAliases, loadCachedAppPackageMaps } = require('../utils/appIdentity');
+          wanted = norm(expandAppFilterAliases(apps, loadCachedAppPackageMaps()));
+        } catch { /* aliases are optional */ }
+      }
+      params.push(wanted.length ? wanted : apps);
       extra += ` AND LOWER(h.dim_b) = ANY($${params.length}::text[])`;
     }
   }
