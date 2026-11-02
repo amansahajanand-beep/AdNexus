@@ -1084,7 +1084,10 @@ router.get('/roi-campaigns', async (req, res) => {
   }
 });
 
-/** Ads client accounts for ROI filter — only accounts with spend in the selected range. */
+/**
+ * Ads client accounts for the ROI filter — every active assigned account, with its spend in the selected range
+ * (0 when none). Accounts with spend come first.
+ */
 router.get('/roi-accounts', async (req, res) => {
   try {
     const clientId = req.client?.id || req.user?.clientId;
@@ -1107,7 +1110,7 @@ router.get('/roi-accounts', async (req, res) => {
       `SELECT a.id, a.customer_id, a.descriptive_name,
               COALESCE(SUM(s.cost), 0)::float8 AS spend
        FROM ads_accounts a
-       INNER JOIN ads_spend_daily s
+       LEFT JOIN ads_spend_daily s
          ON s.ads_account_id = a.id
         AND s.client_id = a.client_id
         AND s.report_date BETWEEN $2::date AND $3::date
@@ -1116,7 +1119,6 @@ router.get('/roi-accounts', async (req, res) => {
          AND a.is_active = true
          ${scopeClause}
        GROUP BY a.id
-       HAVING COALESCE(SUM(s.cost), 0) > 0
        ORDER BY spend DESC, a.descriptive_name ASC`,
       params
     );
@@ -1131,7 +1133,7 @@ router.get('/roi-accounts', async (req, res) => {
       })),
     };
     const scopeKey = allowed === null ? 'all' : [...allowed].sort().join(',');
-    const cacheKey = roiFilterCacheKey('accounts', clientId, { start, end, spendOnly: true, scope: scopeKey });
+    const cacheKey = roiFilterCacheKey('accounts', clientId, { start, end, allActive: true, scope: scopeKey });
     const cached = cache.get(cacheKey);
     if (cached) return res.json(cached);
     return sendCachedJson(res, cacheKey, payload);

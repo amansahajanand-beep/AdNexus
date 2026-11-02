@@ -2001,7 +2001,7 @@ const warehouseUnitCache = new Map(); // clientId -> { at, names }
  * dropdowns. The sync stores every ad unit it receives in dim_ad_unit within minutes, so merge those names in
  * (one small indexed query, cached 2 minutes) without touching GAM. Returns a copy; the saved catalog is unchanged.
  */
-async function topUpCatalogFromWarehouse(catalog) {
+async function topUpCatalogFromWarehouse(catalog, token = null) {
   try {
     const { requireClientId } = require('../utils/clientContext');
     const clientId = requireClientId();
@@ -2011,7 +2011,27 @@ async function topUpCatalogFromWarehouse(catalog) {
         `SELECT name FROM dim_ad_unit WHERE client_id = $1::uuid AND name IS NOT NULL AND name <> ''`,
         [clientId]
       );
-      hit = { at: Date.now(), names: rows.map((r) => String(r.name).trim()).filter(Boolean) };
+      const names = rows.map((r) => String(r.name).trim()).filter(Boolean);
+      // Active ad units straight from GAM's inventory (cached 10 minutes), so a unit created in GAM shows up
+      // before it has any traffic and before the daily catalog rebuild. Soft-fails after 8 s; the fetch keeps
+      // running and fills the cache for the next request.
+      if (token) {
+        try {
+          const { fetchAdUnitHierarchy } = require('../utils/gamInventoryServices');
+          const h = await Promise.race([
+            fetchAdUnitHierarchy(token),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('GAM inventory timeout')), 8000)),
+          ]);
+          const parentIds = new Set((h.units || []).map((u) => String(u.parentId || '')).filter(Boolean));
+          (h.units || []).forEach((u) => {
+            const n = String(u.name || '').trim();
+            if (n && u.parentId && !parentIds.has(String(u.id))) names.push(n);
+          });
+        } catch (err) {
+          logger.warn(`[catalog] GAM inventory top-up skipped: ${err.message}`);
+        }
+      }
+      hit = { at: Date.now(), names: [...new Set(names)] };
       warehouseUnitCache.set(clientId, hit);
     }
     const byHost = { ...(catalog?.adUnitsByHost || {}) };
@@ -3168,10 +3188,18 @@ async function fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, 
     groupBySite: false,
     tableGrain: 'app',
   };
-  const [webBundle, appBundle] = await Promise.all([
-    svc.fetchLeanDashboardBundleFromDB(startDate, endDate, webOpts),
-    svc.fetchLeanDashboardBundleFromDB(startDate, endDate, appOpts),
-  ]);
+  const legT0 = Date.now();
+  const legMs = {};
+  const timedLeg = (name, o) => svc.fetchLeanDashboardBundleFromDB(startDate, endDate, o)
+    .finally(() => { legMs[name] = Date.now() - legT0; });
+  const [webBundle, appBundle] = await Promise.all([timedLeg('web', webOpts), timedLeg('app', appOpts)]);
+  logger.info(
+    `Lean compat ${startDate}..${endDate} web=${legMs.web}ms(${webBundle?.source || 'null'}/${webBundle?.rows?.length ?? '-'})`
+    + ` app=${legMs.app}ms(${appBundle?.source || 'null'}/${appBundle?.rows?.length ?? '-'})`
+    + ` domains=${(webOpts.domains || []).length} sites=${(webOpts.sites || []).length}`
+    + ` apps=${(appOpts.apps || []).length} [${(appOpts.apps || []).slice(0, 3).join('|')}]`
+    + ` or=${Boolean(baseOpts.webInventoryOr)} siteCol=${baseOpts.siteDomainColRequested} forceWeb=${Boolean(baseOpts.forceWebInventory)}`
+  );
 
   if (webBundle && !appBundle) {
     return {
@@ -3276,7 +3304,9 @@ async function fetchLeanDashboardBundleCompatibleInner(svc, startDate, endDate, 
  * hourly data cannot express, or hourly data that does not cover the range). In the last case the normal response
  * says the zone was not applied, so network-timezone figures are never mistaken for the selected zone's days.
  */
-async function prepareTimezoneView(req, res, page, { startDate: sd, endDate: ed, bailOnFilters = ['country', 'domainName'], hourly = false } = {}) {
+async function prepareTimezoneView(req, res, page, {
+  startDate: sd, endDate: ed, bailOnFilters = ['country', 'domainName'], hourly = false, coverageKind = 'network',
+} = {}) {
   if (req.query._tzDone) return null;
   const hv = require('./hourlyView');
   let tz = String(req.headers['x-report-tz'] || req.query.tz || '').trim();
@@ -3303,13 +3333,13 @@ async function prepareTimezoneView(req, res, page, { startDate: sd, endDate: ed,
   );
   const { startDate, endDate } = asked;
 
-  let coverage = await hv.coverage(clientId, tz, today, srcTz);
+  let coverage = await hv.coverage(clientId, tz, today, srcTz, Date.now(), coverageKind);
   // The range reaches hours the hourly sync has not stored yet (it only runs while the backend is up): fetch the
   // network's latest hours now instead of answering with another timezone's days.
   if ((!coverage || endDate > coverage.through) && endDate >= shiftYMD(today, -2)) {
     const refresh = require('./hourlySyncService').refreshNetworkHours(client);
     const done = await Promise.race([refresh, new Promise((resolve) => setTimeout(() => resolve(false), 30000))]);
-    if (done) coverage = await hv.coverage(clientId, tz, today, srcTz);
+    if (done) coverage = await hv.coverage(clientId, tz, today, srcTz, Date.now(), coverageKind);
   }
   const cov = coverage?.from || null;
   if (!cov || endDate < cov || endDate > coverage.through) {
@@ -3465,6 +3495,8 @@ async function tryTimezoneView(req, res, kind, handler) {
 // revenue, impressions and clicks. Anything else (country, ad unit, other metrics) stays in the network timezone.
 const TZ_REPORT_WEB_DIMS = new Set(['domain', 'site_name', 'url_name']);
 const TZ_REPORT_APP_DIMS = new Set(['mobile_app_resolved_id', 'mobile_app_name']);
+// Country is answered from the country slices of the hourly data (country × site, country × app, or country alone).
+const TZ_REPORT_COUNTRY_DIMS = new Set(['country_name', 'country']);
 const TZ_REPORT_METRICS = new Set([
   'total_line_item_level_cpm_and_cpc_revenue', 'total_line_item_level_all_revenue', 'total_line_item_level_impressions',
   'total_line_item_level_clicks', 'total_line_item_level_ctr', 'total_line_item_level_without_cpd_average_ecpm',
@@ -3480,14 +3512,34 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
     const mets = asArray(filters.reportMetrics).map((m) => String(m).toLowerCase());
     const web = dims.filter((d) => TZ_REPORT_WEB_DIMS.has(d));
     const app = dims.filter((d) => TZ_REPORT_APP_DIMS.has(d));
-    const other = dims.filter((d) => d !== 'date' && d !== 'hour' && !TZ_REPORT_WEB_DIMS.has(d) && !TZ_REPORT_APP_DIMS.has(d));
+    const countryDims = dims.filter((d) => TZ_REPORT_COUNTRY_DIMS.has(d));
+    const other = dims.filter((d) => d !== 'date' && d !== 'hour' && !TZ_REPORT_WEB_DIMS.has(d) && !TZ_REPORT_APP_DIMS.has(d)
+      && !TZ_REPORT_COUNTRY_DIMS.has(d));
     // Hour (with or without Date, and with a domain/site or app column) is answered per local hour of the viewing zone.
     const hourMode = dims.includes('hour');
     const metricsOk = mets.every((m) => TZ_REPORT_METRICS.has(m));
-    const supported = !other.length && !(web.length && app.length) && metricsOk
+    const countryFilterAsked = toFilterArray(filters.country).length > 0;
+    const countryNames = countryFilterAsked ? resolveCountryNamesForDb(filters.country) : [];
+    const wantsCountry = countryDims.length > 0 || countryFilterAsked;
+    const baseSupported = !other.length && !(web.length && app.length) && metricsOk
       && !(app.length && (toFilterArray(filters.domain).length || toFilterArray(filters.site).length));
+    // Country needs the country slices, which carry no hour-of-day report, no domain-user scoping and no unmapped ids.
+    const countrySupported = !wantsCountry || (!hourMode && req.user?.role === 'admin' && !(countryFilterAsked && !countryNames.length));
+    const supported = baseSupported && countrySupported;
+    const countryOn = wantsCountry && supported;
+    const wantCountryApp = app.length > 0 || (!web.length && toFilterArray(filters.domainId).length > 0);
+    const countryKind = !countryOn ? 'network'
+      : wantCountryApp ? 'country_app'
+        : (web.length || toFilterArray(filters.domain).length || toFilterArray(filters.site).length) ? 'country_site' : 'country_net';
     // An Hour report is only answerable from the stored hourly data, so it is built from it in the network's own zone too.
-    const ctx = await prepareTimezoneView(req, res, 'reporting', { startDate: filters.startDate, endDate: filters.endDate, hourly: hourMode && supported });
+    const ctx = await prepareTimezoneView(req, res, 'reporting', {
+      startDate: filters.startDate,
+      endDate: filters.endDate,
+      hourly: hourMode && supported,
+      coverageKind: countryKind,
+      // A country the hourly data can answer is not a reason to leave the timezone view.
+      ...(countryOn ? { bailOnFilters: ['domainName'] } : {}),
+    });
     if (!ctx) return false;
     if (!supported) {
       markTimezoneNotApplied(res, { tz: ctx.tz, srcTz: ctx.srcTz, reason: 'unsupported_report' });
@@ -3539,6 +3591,37 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
         const row = hv.rowFor({ date: h.date || '', revenue: h.revenue, impressions: h.impressions, clicks: h.clicks, ...(web.length || app.length ? item : {}) });
         row.hour = h.hour;
         row.dimensions = { ...(h.date ? { date: h.date } : {}), hour: String(h.hour) };
+        return row;
+      });
+    } else if (countryOn) {
+      const base = {
+        clientId, startDate: hourlyStart, endDate, tz, srcTz, kind: countryKind, countries: countryNames,
+        filter: { domains: toFilterArray(filters.domain), sites: toFilterArray(filters.site), apps: toFilterArray(filters.domainId) },
+      };
+      const siteCol = web.includes('site_name') || web.includes('url_name');
+      const [countryRows, countryTrend] = await Promise.all([
+        hv.hourlyCountry({
+          ...base, perDay, byCountry: countryDims.length > 0, byDomain: countryKind === 'country_site' && web.length > 0,
+          bySite: countryKind === 'country_site' && siteCol, byApp: countryKind === 'country_app' && app.length > 0, limit: maxRows,
+        }),
+        hv.hourlyCountry({ ...base, perDay: true, byCountry: false }),
+      ]);
+      hourlyTrend = countryTrend.map((d) => ({
+        date: d.date, earning: +d.revenue.toFixed(2), impressions: Math.round(d.impressions), clicks: Math.round(d.clicks),
+      }));
+      // Only a country filter (no Country column): label the rows with the filtered country, as the normal report does.
+      const filterLabel = !countryDims.length && countryNames.length ? countryNames.join(', ') : '';
+      hourlyRows = countryRows.map((r) => {
+        const item = countryKind === 'country_app'
+          ? { appId: r.item }
+          : { domain: r.domain, site: siteCol ? r.item : '' };
+        const row = hv.rowFor({ date: r.date || '', revenue: r.revenue, impressions: r.impressions, clicks: r.clicks, ...(web.length || app.length ? item : {}) });
+        const country = r.country || filterLabel;
+        if (country) {
+          row.country = country;
+          row.COUNTRY_NAME = country;
+          row.dimensions = { ...(r.date ? { date: r.date } : {}), country_name: country };
+        }
         return row;
       });
     } else if (networkOnly) {
@@ -4344,7 +4427,7 @@ async function handleDomainUserReport(req, res) {
     return aggregateDomainUserRows(prepared, siteCtx);
   };
 
-  const buildResponse = (allRows, currency, isMock, siteCtx = null, preAggregated = null) => {
+  const buildResponse = (allRows, currency, isMock, siteCtx = null, preAggregated = null, extra = null) => {
     const full = preAggregated || aggregateForUser(allRows, siteCtx);
     const aggregated = wantAllRows ? full : filterDomainUserRows(full, search);
     const stats = summarizeDomainUserRows(aggregated);
@@ -4354,6 +4437,7 @@ async function handleDomainUserReport(req, res) {
         rows: aggregated,
         isMock,
         pagination: { totalRows: aggregated.length, allRows: true },
+        ...(extra || {}),
       }, req.user, { domainUserView: true });
     }
     const { rows: pageRows, pagination } = paginateRows(aggregated, paginationOpts);
@@ -4362,6 +4446,7 @@ async function handleDomainUserReport(req, res) {
       rows: pageRows,
       isMock,
       pagination,
+      ...(extra || {}),
     }, req.user, { domainUserView: true });
   };
 
@@ -4386,6 +4471,56 @@ async function handleDomainUserReport(req, res) {
     const aggHit = cache.get(aggKey);
     if (Array.isArray(aggHit)) {
       return res.json(buildResponse(null, currency, false, null, aggHit));
+    }
+
+    // Fast path: group straight from the daily rollups in SQL (seconds). Returns null when it cannot answer exactly
+    // (ad-unit grants, or a rollup missing days), and then the raw-row path below runs as before.
+    try {
+      const isScopedChild = req.user?.role !== 'admin' && userHasAssignedInventory(req.user);
+      if (req.user?.role === 'admin' || isScopedChild) {
+        const t0 = Date.now();
+        const s = isScopedChild ? resolveScopedSqlInventoryOpts(req.user, {}) : null;
+        const fromRollup = await require('./gamSyncService').fetchDomainUserRowsFromRollup(
+          filters.startDate,
+          filters.endDate,
+          s
+            ? {
+              domains: s.domains,
+              sites: s.sites,
+              apps: s.apps,
+              // Units inside an assigned app are already in that app's row.
+              adUnitNames: dedupeScopedAdUnits(s) || [],
+              webInventoryOr: s.webInventoryOr,
+            }
+            : { unrestricted: true }
+        );
+        if (fromRollup && Array.isArray(fromRollup.rows)) {
+          const missing = fromRollup.missingDays || [];
+          logger.info(
+            `Domain user from rollups ${filters.startDate}..${filters.endDate} rows=${fromRollup.rows.length}`
+            + (missing.length ? ` missingDays=${missing.join(',')}` : '')
+            + ` user=${req.user?.username} in ${Date.now() - t0}ms`
+          );
+          // Days the warehouse has not synced yet: answer now with the other days, say so, and queue the sync —
+          // instead of a minutes-long raw scan that finds nothing for those days either.
+          if (missing.length) {
+            enqueueRangeSync(filters.startDate, filters.endDate).catch(() => {});
+          } else if (fromRollup.rows.length) {
+            cache.set(aggKey, fromRollup.rows, 120);
+          }
+          return res.json(buildResponse(null, currency, false, null, fromRollup.rows, missing.length
+            ? {
+              reportWarning: 'partial',
+              reportWarningSkipped: [`Not synced yet: ${missing.join(', ')}`],
+              reportWarningUsed: [],
+              reportWarningUsedIds: [],
+              reportWarningUsedMetricIds: [],
+            }
+            : null));
+        }
+      }
+    } catch (rollupErr) {
+      logger.warn('Domain user rollup path failed, using raw rows:', rollupErr.message);
     }
 
     const token = await getToken();
@@ -4485,7 +4620,8 @@ async function handleFilterCatalog(req, res) {
     const wantsRefresh = req.user?.role === 'admin'
       && ['1', 'true'].includes(String(req.query?.refresh || '').toLowerCase());
     const result = await topUpCatalogFromWarehouse(
-      await getFilterCatalog(token, { allowStale: true, forceRefresh: wantsRefresh })
+      await getFilterCatalog(token, { allowStale: true, forceRefresh: wantsRefresh }),
+      token
     );
     const scoped = scopeCatalogOptionsForUser(
       {
@@ -5188,6 +5324,36 @@ async function handleDetailedReport(req, res) {
         return res.json(await cacheDetailedResponse(body));
         } // hasDomainSiteLabels
         } // countryOk
+      }
+    }
+
+    // ── Confirmed empty: every fast path answered with nothing AND the rollups hold every day of the range.
+    // The raw-row load below would find nothing either (it took 6-8 s, then a live Ad Manager attempt), so say so now.
+    // Only for the plain site/domain/app/ad-unit tables the rollups answer (no country/device/fill-rate metrics/export).
+    if (
+      useGrainSql
+      && isScopedChild
+      && !wantsCountryCol && !wantsDeviceCol && !wantsExport
+      && !invOpts.needUnfilled && !invOpts.needRequests
+      && typeof svc?.rollupMissingDays === 'function'
+      && (domains.length || sites.length || apps.length || adUnitNames.length)
+    ) {
+      try {
+        const tables = [];
+        if (domains.length || sites.length) tables.push('rollup_inventory_kpi_daily');
+        if (apps.length || adUnitNames.length) tables.push('rollup_kpi_daily');
+        const missing = await Promise.all(tables.map((t) => svc.rollupMissingDays(t, filters.startDate, filters.endDate)));
+        if (missing.every((m) => Array.isArray(m) && m.length === 0)) {
+          logger.info(
+            `Reporting no data ${filters.startDate}..${filters.endDate} (rollups cover the range, nothing matches)`
+            + ` user=${req.user?.username}`
+          );
+          const payload = noDataPayload({});
+          cache.set(detailedRespKey, payload, NO_DATA_RESPONSE_TTL);
+          return res.json(payload);
+        }
+      } catch (emptyErr) {
+        logger.warn('Reporting empty-check failed, continuing:', emptyErr.message);
       }
     }
 
