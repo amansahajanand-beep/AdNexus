@@ -377,11 +377,12 @@ const isLinkPath = (path) => {
 };
 
 /** GAM subdomain hosts of the network (same rule as /roi-sites: at least two dots). */
+/** clientId: one network, or null for the subdomains of every network. */
 async function listKnownSubdomains(clientId) {
   const { rows } = await query(
     `SELECT DISTINCT LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www[.]', '', 'i'))) AS host
      FROM dim_site ds
-     WHERE ds.client_id = $1::uuid AND ds.id > 0 AND NULLIF(TRIM(ds.name), '') IS NOT NULL`,
+     WHERE ($1::uuid IS NULL OR ds.client_id = $1::uuid) AND ds.id > 0 AND NULLIF(TRIM(ds.name), '') IS NOT NULL`,
     [clientId]
   );
   return new Set(rows.map((r) => r.host).filter((h) => (h.match(/\./g) || []).length >= 2));
@@ -424,14 +425,14 @@ function latestVersionParam(params) {
  * For each app package: the subdomains users saved manually, plus the subdomains found in the Remote Config JSON of
  * the Firebase project that owns the package. Auto hosts are kept only when they are GAM subdomains of the network.
  */
-async function resolveSitesForApps(gamClient, apps, { refresh = false } = {}) {
+async function resolveSitesForApps(gamClient, apps, { refresh = false, allNetworks = false } = {}) {
   const list = [...new Set((apps || []).map(normApp).filter(Boolean))];
   if (!list.length) return { results: [], warning: '' };
   const warnings = new Set();
   const [manualRes, index, known] = await Promise.all([
     query('SELECT app_id, site FROM firebase_app_sites WHERE client_id = $1::uuid AND app_id = ANY($2::text[])', [gamClient.id, list]),
     getAppProjectIndex(gamClient, { refresh }).catch((err) => { warnings.add(err.message); return null; }),
-    listKnownSubdomains(gamClient.id),
+    listKnownSubdomains(allNetworks ? null : gamClient.id),
   ]);
   const projectIds = [...new Set(list.map((a) => index?.apps?.[a]).filter(Boolean))];
   const configs = {};

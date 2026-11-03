@@ -2992,6 +2992,7 @@ async function buildRoiCountryBreakdown(clientId, {
     return {
       adsAccountId: row.adsAccountId,
       accountName: row.accountName || account?.descriptiveName || account?.customerId || row.adsAccountId,
+      customerId: row.customerId || account?.customerId || null,
       targetType: row.targetType,
       targetKey: row.targetKey,
       countryCode: row.countryCode,

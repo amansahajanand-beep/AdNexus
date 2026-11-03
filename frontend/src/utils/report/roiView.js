@@ -623,6 +623,7 @@ export function buildCountryTree(
           id: `acc:${code}:${accId}`,
           level: 'account',
           adsAccountId: row.adsAccountId,
+          customerId: row.customerId || '',
           label: row.accountName || '—',
           dateLabel: rangeLabel,
           packages: [],
