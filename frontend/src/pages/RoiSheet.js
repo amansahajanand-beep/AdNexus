@@ -17,7 +17,9 @@ import {
   snapshotToRoiSummaryParams,
   sumInventoryEarnFromBreakdown,
 } from '../utils/report/roiView';
-import { removeRoiSheet, sheetAccountId, sheetName, useRoiSheets } from '../utils/report/roiSheets';
+import {
+  COMBINED_SHEET_ID, COMBINED_SHEET_TITLE, removeRoiSheet, sheetAccountId, sheetName, useRoiSheets,
+} from '../utils/report/roiSheets';
 import { getUserFacingMessage, logErrorForDebug } from '../utils/userFacingError';
 import { confirmDialog } from '../hooks/useConfirmDialog';
 
@@ -35,8 +37,19 @@ export default function RoiSheet() {
   const networkIds = user?.role === 'admin' ? [] : (Array.isArray(outlet.mergeNetworkIds) ? outlet.mergeNetworkIds : []).filter(Boolean);
   const netKey = networkIds.join(',');
   const sheets = useRoiSheets(user?.id);
-  const sheet = useMemo(() => sheets.find((s) => s.id === sheetId) || null, [sheets, sheetId]);
-  const accountId = sheetAccountId(sheet);
+  // 'combined' is not a saved sheet: it adds up every sheet's Ads account (one sheet per account, all in one view).
+  const combined = sheetId === COMBINED_SHEET_ID;
+  const accountIdsKey = sheets.map(sheetAccountId).join(',');
+  const sheet = useMemo(() => {
+    if (!combined) return sheets.find((s) => s.id === sheetId) || null;
+    if (!sheets.length) return null;
+    return {
+      id: COMBINED_SHEET_ID,
+      name: COMBINED_SHEET_TITLE,
+      snapshot: { accountIds: sheets.map(sheetAccountId), accountLabels: [COMBINED_SHEET_TITLE] },
+    };
+  }, [sheets, sheetId, combined]);
+  const accountId = combined ? accountIdsKey : sheetAccountId(sheet);
   const title = sheet ? sheetName(sheet) : '';
 
   const {
@@ -73,7 +86,7 @@ export default function RoiSheet() {
     // looked up first and their subdomains are part of every request: cards, tables and exports then agree.
     const findSites = async () => {
       try {
-        const rel = await adsAPI.listRoiRelatedTargets({ start: base.start, end: base.end, accountIds: accountId });
+        const rel = await adsAPI.listRoiRelatedTargets({ start: base.start, end: base.end, accountIds: base.accountIds || accountId });
         const apps = [...new Set(((rel?.data !== undefined ? rel.data : rel)?.apps || []).map((a) => String(a.id || '').toLowerCase()).filter(Boolean))].slice(0, 200);
         if (!apps.length) return [];
         const replies = networkIds.length > 1
@@ -163,12 +176,14 @@ export default function RoiSheet() {
     <div className="presets-roi-detail roi-sheet">
       <PageHeader
         title={title}
-        subtitle="ROI sheet — spend, earnings and ROI for this Ads account"
+        subtitle={combined
+          ? `ROI of all your sheets together — ${sheets.length} Ads account${sheets.length === 1 ? '' : 's'}`
+          : 'ROI sheet — spend, earnings and ROI for this Ads account'}
         summary={applied.startDate ? (applied.startDate === applied.endDate ? applied.startDate : `${applied.startDate} → ${applied.endDate}`) : null}
       >
         <RoiCurrencySelect />
         <Link className="btn-outline-action" to="/roi">Open ROI</Link>
-        <button type="button" className="btn-reset" onClick={deleteSheet}>Remove sheet</button>
+        {combined ? null : <button type="button" className="btn-reset" onClick={deleteSheet}>Remove sheet</button>}
       </PageHeader>
 
       <PresetDateToolbar

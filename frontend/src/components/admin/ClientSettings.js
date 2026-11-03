@@ -34,6 +34,7 @@ export default function ClientSettings() {
   const [error, setError] = useState(null);
   const [okMsg, setOkMsg] = useState(null);
   const [connecting, setConnecting] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [picker, setPicker] = useState(null);
   const [pickingCode, setPickingCode] = useState(null);
 
@@ -102,6 +103,24 @@ export default function ClientSettings() {
       setError(getUserFacingMessage(err, 'Could not select network.'));
     } finally {
       setPickingCode(null);
+    }
+  };
+
+  // Reload the linked networks in place (no Google sign-in, no full-page spinner).
+  const refreshNetworks = async () => {
+    setRefreshing(true);
+    setError(null);
+    setOkMsg(null);
+    try {
+      const data = await clientsAPI.me();
+      setInfo(data);
+      setNetworks(Array.isArray(data?.networks) ? data.networks : []);
+      setOkMsg('Linked networks refreshed.');
+    } catch (err) {
+      logErrorForDebug(err, 'Refresh linked networks');
+      setError(getUserFacingMessage(err, 'Could not refresh the linked networks.'));
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -194,9 +213,14 @@ export default function ClientSettings() {
             <div className="filter-card ads-form-card" style={{ marginBottom: 16 }}>
               <div className="filter-card-head">
                 <span className="filter-card-title">Linked networks</span>
-                <Button type="button" variant="secondary" loading={connecting} onClick={startConnect}>
-                  Connect another / refresh
-                </Button>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <Button type="button" variant="secondary" loading={refreshing} disabled={connecting} onClick={refreshNetworks}>
+                    Refresh
+                  </Button>
+                  <Button type="button" variant="secondary" loading={connecting} disabled={refreshing} onClick={startConnect}>
+                    Connect another account
+                  </Button>
+                </div>
               </div>
               <p className="reporting-sub" style={{ margin: '0 0 12px' }}>
                 All linked networks appear together on the Dashboard — no switching required.

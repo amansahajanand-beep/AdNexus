@@ -186,6 +186,17 @@ const METRIC_DEFS = {
     visKey: 'ecpm',
     aggregate: 'weightedKnownFill',
   },
+  total_line_item_level_targeted_impressions: {
+    label: 'Total targeted impressions',
+    // impressions + unfilled; unknown (no unfilled synced for the row) stays empty, not 0.
+    getValue: (r) => {
+      const v = r.metrics?.total_line_item_level_targeted_impressions;
+      return v == null || v === '' || !Number.isFinite(Number(v)) ? null : Number(v);
+    },
+    format: 'num',
+    visKey: 'impressions',
+    aggregate: 'sum',
+  },
   total_line_item_level_without_cpd_average_ecpm: {
     label: 'eCPM',
     getValue: (r) => {

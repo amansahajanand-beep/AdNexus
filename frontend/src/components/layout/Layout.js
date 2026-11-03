@@ -19,7 +19,7 @@ import { buildFreshnessLabel, buildPublisherFreshnessLabel, relativeFreshness } 
 import { applyTheme, isDarkTheme, readStoredTheme } from '../../utils/theme';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
 import { syncPresetsFromServer } from '../../utils/reportPresets';
-import { sheetName, useRoiSheets } from '../../utils/report/roiSheets';
+import { COMBINED_SHEET_ID, COMBINED_SHEET_TITLE, sheetName, useRoiSheets } from '../../utils/report/roiSheets';
 import AiAlertsBell from './AiAlertsBell';
 import AskDataDrawer from '../ai/AskDataDrawer';
 import { loadAiStatus } from '../../utils/ai/presetAnalysis';
@@ -647,6 +647,16 @@ export default function Layout() {
                   </div>
                   {open && !focusMode ? (
                     <div className="nav-sub">
+                      {roiSheets.length > 1 ? (
+                        <NavLink
+                          to={`/roi/sheet/${COMBINED_SHEET_ID}`}
+                          title={COMBINED_SHEET_TITLE}
+                          className={({ isActive }) => `nav-btn nav-sub-btn ${isActive ? 'active' : ''}`}
+                          onClick={() => setMenuOpen(false)}
+                        >
+                          <span className="nav-btn-label">{COMBINED_SHEET_TITLE}</span>
+                        </NavLink>
+                      ) : null}
                       {roiSheets.map((sheet) => (
                         <NavLink
                           key={sheet.id}

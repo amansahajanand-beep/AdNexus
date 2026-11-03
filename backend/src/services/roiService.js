@@ -1401,6 +1401,7 @@ function buildCountryMetaIndex(countrySpendRows = []) {
 function buildSiteAccountLookup(maps = [], {
   accountFilter = null,
   campaignFilter = null,
+  targetType = 'site',
 } = {}) {
   const accountFilterSet = accountFilter?.length
     ? new Set(accountFilter.map(String))
@@ -1411,7 +1412,7 @@ function buildSiteAccountLookup(maps = [], {
   const bySite = new Map();
   for (const m of maps || []) {
     const type = m.targetType || m.target_type;
-    if (type !== 'site') continue;
+    if (type !== targetType) continue;
     const key = String(m.targetKey || m.target_key || '').trim().toLowerCase();
     if (!key) continue;
     const adsAccountId = String(m.adsAccountId || m.ads_account_id || '');
@@ -2690,8 +2691,13 @@ async function buildRoiSummaryCards(clientId, {
  * App earn this network holds that has no Ads spend row here (its spend is in another network). Returned so a
  * multi-network merge can attach it to the other network's spend rows (mergeRoiParts / foldEarnOnly).
  */
-async function collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRows, earnByTargetCountry, earnByTargetCountryDaily, end }) {
+async function collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRows, earnByTargetCountry, earnByTargetCountryDaily, end, appAccounts = null }) {
   const norm = (v) => String(v || '').trim().toLowerCase();
+  // The Ads account an app is linked to (campaign map): where its revenue goes when the account spent nothing on it.
+  const accountOf = (key) => {
+    const a = appAccounts?.get(norm(key));
+    return a?.adsAccountId ? { adsAccountId: a.adsAccountId, accountName: a.accountName, customerId: a.customerId } : undefined;
+  };
   const haveRange = new Set((countryTargetRows || []).map((r) => `${r.targetType}:${norm(r.targetKey)}:${norm(r.gamCountryKey || r.countryName)}`));
   const haveDaily = new Set((countryTargetDailyRows || [])
     .filter((r) => (Number(r.adsSpend) || 0) > 0)
@@ -2701,7 +2707,7 @@ async function collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRow
   for (const [k, earn] of (earnByTargetCountry || new Map()).entries()) {
     if (!k.startsWith('app:') || !(Number(earn) > 0) || haveRange.has(k)) continue;
     const parsed = parseTargetCountryEarnKey(k);
-    if (parsed) range.push({ targetType: 'app', targetKey: parsed.targetKey, countryKey: parsed.countryKey, earn: await toDisplay(earn) });
+    if (parsed) range.push({ targetType: 'app', targetKey: parsed.targetKey, countryKey: parsed.countryKey, earn: await toDisplay(earn), account: accountOf(parsed.targetKey) });
   }
   const daily = [];
   for (const [k, earn] of (earnByTargetCountryDaily || new Map()).entries()) {
@@ -2710,7 +2716,7 @@ async function collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRow
     const rest = k.slice(cut + 1);
     if (!rest.startsWith('app:') || haveDaily.has(k)) continue;
     const parsed = parseTargetCountryEarnKey(rest);
-    if (parsed) daily.push({ date: k.slice(0, cut), targetType: 'app', targetKey: parsed.targetKey, countryKey: parsed.countryKey, earn: await toDisplay(earn) });
+    if (parsed) daily.push({ date: k.slice(0, cut), targetType: 'app', targetKey: parsed.targetKey, countryKey: parsed.countryKey, earn: await toDisplay(earn), account: accountOf(parsed.targetKey) });
   }
   return { range, daily };
 }
@@ -2768,6 +2774,12 @@ async function buildRoiCountryBreakdown(clientId, {
     countryFilter,
     countryNames,
   });
+  // With an Ads account picked, an app linked to it keeps its revenue in the table even on a day / range with no spend.
+  const appAccounts = accountFilter?.length
+    ? buildSiteAccountLookup(maps, { accountFilter, campaignFilter, targetType: 'app' })
+    : null;
+  const linkedApps = appAccounts && !appKeyFilter?.size ? [...appAccounts.keys()] : [];
+  if (linkedApps.length) earnScope.appKeys = [...new Set([...earnScope.appKeys, ...linkedApps])];
   const hasScopeKeys = earnScope.appKeys.length > 0;
   const needsNetworkCountryEarn = !hasScopeKeys
     && !appKeyFilter?.size
@@ -3159,7 +3171,7 @@ async function buildRoiCountryBreakdown(clientId, {
     }
   }
 
-  const earnOnlyTargets = await collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRows, earnByTargetCountry, earnByTargetCountryDaily, end });
+  const earnOnlyTargets = await collectEarnOnlyTargets({ countryTargetRows, countryTargetDailyRows, earnByTargetCountry, earnByTargetCountryDaily, end, appAccounts });
   const built = {
     countryBreakdown,
     countryTargetBreakdown,

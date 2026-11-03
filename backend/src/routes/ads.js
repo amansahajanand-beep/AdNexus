@@ -1149,7 +1149,7 @@ router.get('/roi-sites', async (req, res) => {
     const clientId = req.client?.id || req.user?.clientId;
     if (!clientId) return res.status(400).json({ error: 'No client context' });
     const { query } = require('../db');
-    // Subdomains only: host must have at least two dots (a.b.tld). Exclude apex (b.tld).
+    // Hosts with at least one dot: subdomains (a.b.tld) and sites served from the main domain itself (b.tld).
     const { rows } = await query(
       `SELECT site_key, MAX(site_name) AS site_name
        FROM (
@@ -1161,7 +1161,7 @@ router.get('/roi-sites', async (req, res) => {
            AND NULLIF(TRIM(ds.name), '') IS NOT NULL
          GROUP BY 1
        ) x
-       WHERE (LENGTH(site_key) - LENGTH(REPLACE(site_key, '.', ''))) >= 2
+       WHERE (LENGTH(site_key) - LENGTH(REPLACE(site_key, '.', ''))) >= 1
          AND site_key ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
        GROUP BY site_key
        ORDER BY site_name ASC`,
@@ -1179,7 +1179,7 @@ router.get('/roi-sites', async (req, res) => {
       sites = sites.filter((s) => ok.has(s.id));
     }
     const payload = { sites };
-    const cacheKey = roiFilterCacheKey('sites', clientId, { source: 'dim_site_subdomains_v2', user: scope ? req.user.id : (req.user?.role === 'admin' ? 'admin' : 'all') });
+    const cacheKey = roiFilterCacheKey('sites', clientId, { source: 'dim_site_subdomains_v3', user: scope ? req.user.id : (req.user?.role === 'admin' ? 'admin' : 'all') });
     return sendRoiTargets(req, res, cacheKey, payload, 300);
   } catch (err) {
     logger.error('ROI sites list:', err.message);
