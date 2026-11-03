@@ -130,7 +130,9 @@ function foldEarnOnly(rows, entries, withDate) {
     const k = `${withDate ? `${e.date}|` : ''}${e.targetType}|${String(e.targetKey || '').toLowerCase()}|${cc}`;
     const list = groups.get(k);
     if (!list) {
-      const tpl = bestRow.get(`${e.targetType}|${String(e.targetKey || '').toLowerCase()}`);
+      let tpl = bestRow.get(`${e.targetType}|${String(e.targetKey || '').toLowerCase()}`);
+      // No spend row for the app at all: sit on the Ads account it is linked to (the entry says which).
+      if (!tpl && e.account) tpl = { ...e.account, targetKey: e.targetKey };
       if (!tpl || !(Number(e.earn) > 0)) continue;
       const known = countryOf.get(cc);
       const name = known?.name || titleCase(cc);

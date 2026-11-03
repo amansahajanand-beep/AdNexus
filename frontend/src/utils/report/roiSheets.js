@@ -16,6 +16,10 @@ import {
  */
 const PAGE = PRESET_PAGES.roiSheets;
 
+/** The page that adds up every sheet's Ads account (shown in the sidebar once there are two or more sheets). */
+export const COMBINED_SHEET_ID = 'combined';
+export const COMBINED_SHEET_TITLE = 'All sheets (combined)';
+
 export const sheetAccountId = (sheet) => String(sheet?.snapshot?.accountIds?.[0] || '');
 
 /**

@@ -793,6 +793,7 @@ const APP_AD_REQUEST_SUBSTITUTIONS = {
  * Labels stay honest via reportWarningSubstitutions when a rewrite still runs.
  */
 const UNFILLED_METRIC_ID = 'total_inventory_level_unfilled_impressions';
+const TARGETED_METRIC_ID = 'total_line_item_level_targeted_impressions';
 
 const WAREHOUSE_METRIC_ALIASES = {
   // Niche Ad Exchange variants not yet in EXTENDED_GRAIN_METRICS
@@ -888,7 +889,8 @@ function rewriteUnsupportedMetricsToWarehouse(dimensionIds = [], metricIds = [])
     }
     // Total fill rate is not stored, but unfilled impressions are: the rate is derived from
     // impressions + unfilled in stampWarehouseMetricsOnRows (no value copy, so no substitution).
-    if (key === 'total_fill_rate') {
+    // Total targeted impressions = impressions + unfilled (GAM does not return the column for any dimension).
+    if (key === 'total_fill_rate' || key === TARGETED_METRIC_ID) {
       if (!seen.has(UNFILLED_METRIC_ID)) {
         seen.add(UNFILLED_METRIC_ID);
         out.push(UNFILLED_METRIC_ID);
@@ -955,6 +957,12 @@ function stampWarehouseMetricsOnRows(rows = []) {
       const unfilled = Number(unfilledRaw);
       if (unfilledRaw != null && unfilledRaw !== '' && Number.isFinite(unfilled) && imp + unfilled > 0) {
         metrics.total_fill_rate = +((imp / (imp + unfilled)) * 100).toFixed(2);
+      }
+    }
+    if (metrics[TARGETED_METRIC_ID] == null) {
+      const unfilledRaw = metrics[UNFILLED_METRIC_ID] ?? row.unfilled;
+      if (unfilledRaw != null && unfilledRaw !== '' && Number.isFinite(Number(unfilledRaw))) {
+        metrics[TARGETED_METRIC_ID] = imp + Number(unfilledRaw);
       }
     }
     if (row.viewableRate != null && metrics.total_active_view_viewable_impressions_rate == null) {
@@ -5079,7 +5087,7 @@ async function handleDetailedReport(req, res) {
       )
       : tableLimit;
     const invOpts = {
-      needUnfilled: originalMetIds.some((m) => String(m).toLowerCase() === 'total_fill_rate'),
+      needUnfilled: originalMetIds.some((m) => ['total_fill_rate', TARGETED_METRIC_ID].includes(String(m).toLowerCase())),
       needRequests: originalMetIds.some((m) => ['ad_exchange_match_rate', 'ad_exchange_total_requests'].includes(String(m).toLowerCase())),
       domains,
       sites,

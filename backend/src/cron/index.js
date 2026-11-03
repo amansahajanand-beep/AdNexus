@@ -740,6 +740,20 @@ function startCron() {
     });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── :25 every 3 h: refresh site fill rate / targeted impressions (site_fill_daily) for the last 3 days ──
+  cron.schedule('25 */3 * * *', async () => {
+    const { runWithClient } = require('../utils/clientContext');
+    const { syncSiteFill, addDays } = require('../services/siteFillSync');
+    const end = todayInTZ();
+    await eachActiveClient(async (client) => {
+      try {
+        await runWithClient(client, () => syncSiteFill(addDays(end, -2), end));
+      } catch (e) {
+        logger.warn(`Cron: site fill refresh failed client=${String(client.id).slice(0, 8)}: ${e.message}`);
+      }
+    });
+  }, { timezone: 'Asia/Singapore' });
+
   // ── 03:30 daily: trim derived summary tables + the background-report cache (batched deletes) ──
   cron.schedule('30 3 * * *', async () => {
     try {

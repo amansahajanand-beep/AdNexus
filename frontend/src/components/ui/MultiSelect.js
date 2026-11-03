@@ -123,9 +123,12 @@ export default function MultiSelect({
   const MAX_VISIBLE_OPTIONS = 300;
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
+    // Also match with dashes/spaces ignored, so a customer id typed as 1234567890 finds "(123-456-7890)".
+    const compact = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const qc = compact(q);
     const base = !q
       ? norm
-      : norm.filter((o) => String(o.label).toLowerCase().includes(q));
+      : norm.filter((o) => String(o.label).toLowerCase().includes(q) || (qc && compact(o.label).includes(qc)));
 
     // Pin selected / pasted values to the top so they stay visible in long lists.
     if (allMode || selectedSet.size === 0) return base;

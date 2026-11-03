@@ -4290,7 +4290,68 @@ function applyFillToRow(r, hit) {
     ...(r.metrics || {}),
     total_inventory_level_unfilled_impressions: hit.unfilled,
     total_fill_rate: fill,
+    total_line_item_level_targeted_impressions: hit.imp + hit.unfilled,
   };
+}
+
+/**
+ * Site / domain rows: fill rate + targeted impressions from site_fill_daily (GAM unfilled summed per ad-unit domain,
+ * see scripts/sync-site-fill.js). The table is domain-keyed, so a sub-host row gets its share of the domain's unfilled
+ * (its impressions over the domain's) and the domain's fill rate. Rows already scoped to the user's inventory.
+ */
+async function enrichSiteFill(rows = [], startDate, endDate) {
+  const { rootDomainFromHost } = require('../utils/adUnit');
+  const clean = (v) => String(v || '').trim().toLowerCase();
+  const dayOf = (r) => String(r.date || r.report_date || '').slice(0, 10);
+  const domainOf = (r) => {
+    const host = clean(r.siteUrl || r.gamSite || r.siteName);
+    return clean((host && host !== '—' && rootDomainFromHost(host)) || r.domainName || r.gamDomain);
+  };
+  const open = (rows || []).filter((r) => (
+    r.unfilled == null && !r.device && !r.country
+    && !String(r.AD_UNIT_NAME || r.ad_unit_name || '').trim()
+    && !(r.appId && r.appId !== '—' && r.appId !== '-' && r.appId !== '–')
+    && domainOf(r) && domainOf(r) !== '—'
+  ));
+  if (!open.length) return 0;
+  const domains = [...new Set(open.map(domainOf))];
+  const { rows: fills } = await query(
+    `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, site_name, impressions AS imp, unfilled
+     FROM site_fill_daily
+     WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date AND site_name = ANY($4::text[])`,
+    [requireClientId(), startDate, endDate, domains]
+  ).catch(() => ({ rows: [] }));
+  const byDay = new Map();
+  const byRange = new Map();
+  for (const f of fills) {
+    const imp = Number(f.imp) || 0;
+    const unfilled = Number(f.unfilled) || 0;
+    byDay.set(`${f.d}|${f.site_name}`, { imp, unfilled });
+    const t = byRange.get(f.site_name) || { imp: 0, unfilled: 0 };
+    t.imp += imp; t.unfilled += unfilled;
+    byRange.set(f.site_name, t);
+  }
+  let filled = 0;
+  for (const r of open) {
+    const dom = domainOf(r);
+    const day = dayOf(r);
+    const hit = day ? byDay.get(`${day}|${dom}`) : byRange.get(dom);
+    if (!hit || !(hit.imp + hit.unfilled > 0)) continue;
+    const rowImp = Number(r.impression ?? r.impressions) || 0;
+    const share = hit.imp > 0 && rowImp > 0 ? Math.min(1, rowImp / hit.imp) : 1;
+    const unfilled = Math.round(hit.unfilled * share);
+    const fill = +((hit.imp / (hit.imp + hit.unfilled)) * 100).toFixed(2);
+    r.unfilled = unfilled;
+    r.fillRate = fill;
+    r.metrics = {
+      ...(r.metrics || {}),
+      total_inventory_level_unfilled_impressions: unfilled,
+      total_fill_rate: fill,
+      total_line_item_level_targeted_impressions: Math.round(rowImp) + unfilled,
+    };
+    filled += 1;
+  }
+  return filled;
 }
 
 /**
@@ -4325,6 +4386,9 @@ async function enrichUnfilledFromAppSlice(rows = [], startDate, endDate) {
     const m = countryOf(r) ? appCFill : appFill;
     applyFillToRow(r, m.get(`${dayOf(r)}|${appKey(r)}`));
   }
+  await enrichSiteFill(rows, startDate, endDate).catch((e) => {
+    logger.warn('Site fill enrich failed:', e.message);
+  });
 }
 
 /** Merge two Reporting bundles (web + app) into one table payload. */

@@ -361,9 +361,8 @@ function RoiView() {
     const opts = [];
     const isSubdomainHost = (raw) => {
       const host = String(raw || '').trim().toLowerCase().replace(/^www\./, '');
-      if (!host || !host.includes('.')) return false;
-      // Apex = one dot (arenapro6.com). Subdomain = two+ (finance2.arenapro6.com).
-      return (host.match(/\./g) || []).length >= 2;
+      // Any real host: a subdomain (finance2.arenapro6.com) or a site on the main domain itself (arenapro6.com).
+      return Boolean(host) && host.includes('.');
     };
     const add = (value, label) => {
       const id = String(value || '').trim().toLowerCase().replace(/^www\./, '');
