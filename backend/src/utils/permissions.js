@@ -520,6 +520,7 @@ const DEFAULT_CHILD_PERMISSIONS = {
   canSeeProgrammatic: true,
   canSeeOrders: false,
   canSeeInventory: false,
+  canManageUsers: false,
   allowedDomains: [],
   allowedSites: [],
   allowedAppIds: [],
@@ -533,7 +534,7 @@ const FLAG_KEYS = [
   'canAccessAdMob', 'canAccessAdSense',
   'canLogin', 'canGenerateReports', 'canDownloadReports', 'canUseFilters', 'canUseReportBuilder',
   'canSeeRevenue', 'canSeeImpressions', 'canSeeCTR', 'canSeeECPM', 'canSeeProgrammatic',
-  'canSeeOrders', 'canSeeInventory',
+  'canSeeOrders', 'canSeeInventory', 'canManageUsers',
 ];
 
 const INVENTORY_SCOPE_KEYS = [
@@ -825,6 +826,7 @@ function buildVisibility(user) {
     reportBuilder: p.canUseReportBuilder !== false,
     orders: p.canSeeOrders === true,
     inventory: p.canSeeInventory === true,
+    manageUsers: p.canManageUsers === true,
   };
 }
 

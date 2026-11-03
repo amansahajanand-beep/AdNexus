@@ -34,6 +34,7 @@ const {
   grainScopeCatalog,
 } = require('../models/admobGrainStore');
 const { ADMOB_SCOPE_FILTERS, getAdmobScope, hasAdmobAccess } = require('../utils/permissions');
+const { scopeProductCatalogForActor } = require('../utils/subAdmin');
 const { createPublisherApiRouter, sparkFromTrend, pctChange } = require('./publisherApiFactory');
 
 function buildAdMobKpis(curr, prev, trend) {
@@ -101,7 +102,7 @@ function addAdMobRoiRoutes(router, { resolveAccountContext, resolveRange, parseC
       const accounts = await store.listAccounts(req.client.id);
       const catalog = await grainScopeCatalog(req.client.id, accounts.map((a) => a.id));
       res.set('Cache-Control', 'no-store');
-      res.json({
+      const payload = {
         accounts: accounts.map((a) => ({
           id: a.id,
           publisherId: a.accountId,
@@ -110,7 +111,8 @@ function addAdMobRoiRoutes(router, { resolveAccountContext, resolveRange, parseC
         })),
         ...catalog,
         filters: ADMOB_SCOPE_FILTERS,
-      });
+      };
+      res.json(req.user.role === 'admin' ? payload : scopeProductCatalogForActor(req.user, 'admob', payload));
     } catch (err) {
       logger.error('admob scope-catalog:', err.message);
       res.status(500).json({ error: err.message });

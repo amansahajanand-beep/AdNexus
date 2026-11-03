@@ -8,7 +8,7 @@ const express = require('express');
 
 const router = express.Router();
 
-const { requireAdmin } = require('../middleware/auth');
+const { requireAuth } = require('../middleware/auth');
 
 const {
 
@@ -41,8 +41,14 @@ const logger = require('../utils/logger');
 const { validatePassword } = require('../utils/passwordPolicy');
 const { validateUsername, validateSavedName } = require('../utils/namePolicy');
 
-const { normalizePermissions, FLAG_KEYS, INVENTORY_SCOPE_KEYS } = require('../utils/permissions');
+const { normalizePermissions, FLAG_KEYS, INVENTORY_SCOPE_KEYS, isAdmin } = require('../utils/permissions');
 const { cache } = require('../gam/client');
+const {
+  canManageUsers,
+  clampBodyToActor,
+  ownsUser,
+  scopePickerForActor,
+} = require('../utils/subAdmin');
 const {
   findCachedInventoryRows,
   buildCatalogFilterOptions,
@@ -109,7 +115,29 @@ function mergePermissionsFromBody(existingPerms, body = {}) {
 }
 
 
-router.use(requireAdmin);
+/** Admins manage everyone; a sub-admin (canManageUsers) manages only the users they created. */
+function requireUserManager(req, res, next) {
+  requireAuth(req, res, () => {
+    if (isAdmin(req.user)) return next();
+    if (canManageUsers(req.user)) {
+      req.isSubAdmin = true;
+      return next();
+    }
+    return res.status(403).json({ error: 'Admin access required' });
+  });
+}
+
+router.use(requireUserManager);
+
+/** Body the caller may apply: sub-admins are clamped to their own assignment. */
+function bodyFor(req) {
+  const body = req.body || {};
+  return req.isSubAdmin ? clampBodyToActor(req.user, body) : body;
+}
+
+function canTouch(req, target) {
+  return !req.isSubAdmin || ownsUser(req.user, target);
+}
 
 
 
@@ -144,13 +172,14 @@ router.get('/inventory-picker', (req, res) => {
     });
   }
   appIds.sort((a, b) => a.localeCompare(b));
-  res.json({
+  const picker = {
     siteHosts: filterOpts.siteHosts || [],
     appIds,
     domainRoots: filterOpts.domainRoots || [],
     domains: rowsToDomainOptions(rows),
     hasCatalog: rows.length > 0,
-  });
+  };
+  res.json(req.isSubAdmin ? scopePickerForActor(req.user, picker) : picker);
 });
 
 
@@ -243,7 +272,8 @@ router.get('/', async (req, res) => {
       ? await getUsersByClientIds(ids)
       : await getUsersByClientId(fallbackId);
     const byId = Object.fromEntries(networks.map((n) => [n.id, n]));
-    res.json(users.map((u) => {
+    const visible = req.isSubAdmin ? users.filter((u) => ownsUser(req.user, u)) : users;
+    res.json(visible.map((u) => {
       const net = byId[u.clientId];
       const allowedRaw = u.permissions?.allowedClientIds;
       const allowedIds = Array.isArray(allowedRaw) && allowedRaw.length
@@ -291,19 +321,20 @@ router.post('/', async (req, res) => {
 
   }
 
-  const userRole = role === 'admin' ? 'admin' : 'child';
+  const userRole = role === 'admin' && !req.isSubAdmin ? 'admin' : 'child';
 
   try {
     const networks = await accountNetworksFor(req);
     const fallbackId = req.user.clientId || req.client?.id;
     const allowedIds = userRole === 'admin'
       ? []
-      : resolveAllowedClientIds(req.body, networks, fallbackId);
+      : resolveAllowedClientIds(bodyFor(req), networks, fallbackId);
     const primaryClientId = allowedIds[0] || fallbackId;
 
+    const scopedBody = bodyFor(req);
     const bodyForPerms = userRole === 'admin'
-      ? req.body
-      : { ...req.body, allowedClientIds: allowedIds };
+      ? scopedBody
+      : { ...scopedBody, allowedClientIds: allowedIds };
 
     const user = await createUser({
       username: username.trim(),
@@ -335,9 +366,11 @@ router.put('/:id', async (req, res) => {
 
   const existing = await getUserById(req.params.id);
 
-  if (!existing || !await assertSameAccount(req, existing)) return res.status(404).json({ error: 'User not found' });
+  if (!existing || !await assertSameAccount(req, existing) || !canTouch(req, existing)) {
+    return res.status(404).json({ error: 'User not found' });
+  }
 
-
+  const reqBody = bodyFor(req);
 
   const updates = {};
 
@@ -363,7 +396,7 @@ router.put('/:id', async (req, res) => {
 
 
 
-  const nextRole = role === 'admin' ? 'admin' : role === 'child' ? 'child' : existing.role;
+  const nextRole = req.isSubAdmin ? 'child' : role === 'admin' ? 'admin' : role === 'child' ? 'child' : existing.role;
 
   if (existing.role === 'admin' && nextRole !== 'admin') {
     return res.status(400).json({ error: 'Admin role cannot be changed to Domain User.' });
@@ -373,21 +406,21 @@ router.put('/:id', async (req, res) => {
 
 
 
-  const permsTouched = permissionsTouched(req.body || {});
-  const networksTouched = Array.isArray(req.body?.allowedClientIds) || ('clientId' in (req.body || {}));
+  const permsTouched = permissionsTouched(reqBody);
+  const networksTouched = Array.isArray(reqBody.allowedClientIds) || ('clientId' in reqBody);
 
   if (nextRole === 'admin') {
     updates.permissions = null;
   } else if (permsTouched || networksTouched || (role && nextRole === 'child')) {
-    let bodyForPerms = req.body || {};
+    let bodyForPerms = reqBody;
     if (networksTouched) {
       const networks = await accountNetworksFor(req);
       const allowedIds = resolveAllowedClientIds(
-        req.body,
+        reqBody,
         networks,
         existing.clientId || req.user.clientId || req.client?.id
       );
-      bodyForPerms = { ...req.body, allowedClientIds: allowedIds };
+      bodyForPerms = { ...reqBody, allowedClientIds: allowedIds };
       if (allowedIds[0] && allowedIds[0] !== existing.clientId) {
         updates.clientId = allowedIds[0];
       } else if (allowedIds[0]) {
@@ -428,7 +461,9 @@ router.put('/:id/permissions', async (req, res) => {
 
   const existing = await getUserById(req.params.id);
 
-  if (!existing || !await assertSameAccount(req, existing)) return res.status(404).json({ error: 'User not found' });
+  if (!existing || !await assertSameAccount(req, existing) || !canTouch(req, existing)) {
+    return res.status(404).json({ error: 'User not found' });
+  }
 
 
 
@@ -442,7 +477,7 @@ router.put('/:id/permissions', async (req, res) => {
 
   try {
     const user = await updateUser(req.params.id, {
-      permissions: mergePermissionsFromBody(existing.permissions, req.body),
+      permissions: mergePermissionsFromBody(existing.permissions, bodyFor(req)),
     });
     res.json(typeof toAdminSafeUser === 'function' ? toAdminSafeUser(user) : user);
   } catch (err) {
@@ -459,7 +494,7 @@ router.delete('/:id', async (req, res) => {
 
   try {
     const existing = await getUserById(req.params.id);
-    if (!existing || !await assertSameAccount(req, existing)) {
+    if (!existing || !await assertSameAccount(req, existing) || !canTouch(req, existing)) {
       return res.status(404).json({ error: 'User not found' });
     }
 

@@ -10,6 +10,8 @@ import Roi from './pages/Roi';
 import RoiSheet from './pages/RoiSheet';
 import Presets from './pages/Presets';
 import Admin from './pages/Admin';
+import TeamUsers from './pages/TeamUsers';
+import UserManagerRoute from './components/routing/UserManagerRoute';
 import DomainUser from './pages/DomainUser';
 import MyAds from './pages/MyAds';
 import Help from './pages/Help';
@@ -132,6 +134,7 @@ function AppRoutes() {
         <Route path="/roi/sheet/:sheetId" element={<PermissionRoute page="roi"><RoiSheet /></PermissionRoute>} />
         <Route path="/presets" element={<PermissionRoute page="presets"><Presets /></PermissionRoute>} />
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
+        <Route path="/team" element={<UserManagerRoute><TeamUsers /></UserManagerRoute>} />
         <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
         <Route path="/help" element={<Help />} />

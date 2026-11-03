@@ -82,10 +82,11 @@ router.get('/summary', async (req, res) => {
       const scope = await roiInventoryScope(req.user, id);
       if (!scope) return baseOpts;
       const host = (v) => String(v || '').trim().toLowerCase().replace(/^www\./, '');
-      // Sites are listed only when picked in the Site filter (same as the admin view). A user with no apps would see an
-      // empty page, so for them the assigned sites stay the default. Asking for nothing from a scope with sites
-      // but no pick = no site rows ('__none__'), never "all assigned sites".
-      const siteKeysOut = !siteKeys.length && scope.apps.length ? limitKeys([], [], host) : limitKeys(siteKeys, scope.sites, host);
+      // Sites are listed when picked in the Subdomains filter. With no pick the assigned sites are the default, unless
+      // the user narrowed the page to an account, campaign or app: then site earn would swamp that selection, so no
+      // site rows ('__none__') are added.
+      const narrowed = requestedAccountIds.length || campaignIds.length || appKeys.length;
+      const siteKeysOut = !siteKeys.length && scope.apps.length && narrowed ? limitKeys([], [], host) : limitKeys(siteKeys, scope.sites, host);
       // An Ads account picked and no app picked: the user's apps are narrowed to that account's apps, so the cards
       // show the account's own spend and earn rather than every assigned app's.
       let scopeApps = scope.apps;

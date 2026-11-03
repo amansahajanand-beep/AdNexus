@@ -102,6 +102,11 @@ export function isAdmin(user) {
   return user?.role === 'admin';
 }
 
+/** Sub-admin: a domain user the admin allowed to add and manage their own users. */
+export function canManageUsers(user) {
+  return !isAdmin(user) && user?.permissions?.canManageUsers === true;
+}
+
 export const ADMOB_FILTER_DIMS = ['app', 'ad_unit', 'format', 'country', 'platform'];
 export const ADSENSE_FILTER_DIMS = ['site', 'ad_unit', 'country', 'platform'];
 
