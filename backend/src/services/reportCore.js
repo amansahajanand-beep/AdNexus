@@ -3521,14 +3521,18 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
     const countryFilterAsked = toFilterArray(filters.country).length > 0;
     const countryNames = countryFilterAsked ? resolveCountryNamesForDb(filters.country) : [];
     const wantsCountry = countryDims.length > 0 || countryFilterAsked;
-    const baseSupported = !other.length && !(web.length && app.length) && metricsOk
-      && !(app.length && (toFilterArray(filters.domain).length || toFilterArray(filters.site).length));
+    const isScopedUser = req.user?.role !== 'admin';
+    // A domain user's filters only narrow their own assignment, so a site/domain filter next to an app column, or a
+    // report with both site and app columns, is answered from their site hours and app hours together. For an admin
+    // those combinations are ambiguous and stay in the network timezone.
+    const baseSupported = !other.length && metricsOk
+      && (isScopedUser || !(web.length && app.length))
+      && (isScopedUser || !(app.length && (toFilterArray(filters.domain).length || toFilterArray(filters.site).length)));
     // Country needs the country slices, which carry no hour-of-day report and no unmapped country ids.
     const countrySupported = !wantsCountry || (!hourMode && !(countryFilterAsked && !countryNames.length));
     const supported = baseSupported && countrySupported;
     const countryOn = wantsCountry && supported;
     // A domain user only ever sees their assigned inventory, resolved the way the normal pages resolve it.
-    const isScopedUser = req.user?.role !== 'admin';
     const countryScope = countryOn && isScopedUser
       ? resolveScopedSqlInventoryOpts(req.user, {
         domain: filters.domain, site: filters.site, domainId: filters.domainId, domainName: filters.domainName,
@@ -3698,21 +3702,43 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
       const kind = wantApp ? 'app' : 'inventory';
       let filter;
       if (ctx.isScoped) {
-        filter = kind === 'app'
-          ? { apps: ctx.scope.apps }
-          : { domains: ctx.scope.domains, sites: ctx.scope.sites, scoped: true, webOr: Boolean(ctx.scope.webInventoryOr) };
-        if (kind === 'inventory' && !ctx.scope.domains.length && !ctx.scope.sites.length) filter = { domains: ['__none__'], scoped: true };
-        if (kind === 'app' && !ctx.scope.apps.length) filter = { apps: ['__none__'] };
+        // Domain user: their assigned sites and apps, as the normal report adds them together (access to either grants
+        // the revenue). A site/domain column wants the site hours, an app column the app hours, neither wants both.
+        const sc = ctx.scope;
+        const slices = [];
+        if ((web.length || !app.length) && (sc.domains.length || sc.sites.length)) {
+          slices.push({ kind: 'inventory', filter: { domains: sc.domains, sites: sc.sites, scoped: true, webOr: Boolean(sc.webInventoryOr) } });
+        }
+        if ((app.length || !web.length) && sc.apps.length) slices.push({ kind: 'app', filter: { apps: sc.apps } });
+        const pulled = await Promise.all(slices.map(async (s) => {
+          const base = { clientId, startDate: hourlyStart, endDate, tz, srcTz, kind: s.kind, filter: s.filter };
+          const [rows, trend] = await Promise.all([hv.hourlyRows({ ...base, perDay, limit: maxRows }), hv.hourlyTrend(base)]);
+          return { rows, trend };
+        }));
+        const byDate = new Map();
+        for (const { trend } of pulled) {
+          for (const d of trend) {
+            const cur = byDate.get(d.date) || { date: d.date, earning: 0, impressions: 0, clicks: 0 };
+            cur.earning = +(cur.earning + d.earning).toFixed(2);
+            cur.impressions += d.impressions;
+            cur.clicks += d.clicks;
+            byDate.set(d.date, cur);
+          }
+        }
+        hourlyTrend = [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+        hourlyRows = pulled.flatMap((p) => p.rows)
+          .sort((a, b) => (a.date || '').localeCompare(b.date || '') || b.revenue - a.revenue)
+          .slice(0, maxRows);
       } else {
         filter = {
           domains: toFilterArray(filters.domain), sites: toFilterArray(filters.site), apps: toFilterArray(filters.domainId), exactApps: true,
         };
+        const base = { clientId, startDate: hourlyStart, endDate, tz, srcTz, kind, filter };
+        [hourlyRows, hourlyTrend] = await Promise.all([
+          hv.hourlyRows({ ...base, perDay, limit: maxRows }),
+          hv.hourlyTrend(base),
+        ]);
       }
-      const base = { clientId, startDate: hourlyStart, endDate, tz, srcTz, kind, filter };
-      [hourlyRows, hourlyTrend] = await Promise.all([
-        hv.hourlyRows({ ...base, perDay, limit: maxRows }),
-        hv.hourlyTrend(base),
-      ]);
     }
 
     let legacy = null;
