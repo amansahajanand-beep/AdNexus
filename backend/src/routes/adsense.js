@@ -34,6 +34,7 @@ const {
   grainScopeCatalog,
 } = require('../models/adsenseGrainStore');
 const { ADSENSE_SCOPE_FILTERS, getAdsenseScope, hasAdsenseAccess } = require('../utils/permissions');
+const { scopeProductCatalogForActor } = require('../utils/subAdmin');
 const { createPublisherApiRouter, sparkFromTrend, pctChange } = require('./publisherApiFactory');
 
 function buildAdSenseKpis(curr, prev, trend) {
@@ -92,12 +93,12 @@ function addAdSenseRoiRoutes(router, { resolveAccountContext, resolveRange, pars
   });
 
   /** Admin → Users: publishers + their sites / ad units for domain-user AdSense scope. */
-  router.get('/scope-catalog', adminOnly, async (req, res) => {
+  router.get('/scope-catalog', async (req, res) => {
     try {
       const accounts = await store.listAccounts(req.client.id);
       const catalog = await grainScopeCatalog(req.client.id, accounts.map((a) => a.id));
       res.set('Cache-Control', 'no-store');
-      res.json({
+      const payload = {
         accounts: accounts.map((a) => ({
           id: a.id,
           publisherId: a.accountId,
@@ -106,7 +107,8 @@ function addAdSenseRoiRoutes(router, { resolveAccountContext, resolveRange, pars
         })),
         ...catalog,
         filters: ADSENSE_SCOPE_FILTERS,
-      });
+      };
+      res.json(req.user.role === 'admin' ? payload : scopeProductCatalogForActor(req.user, 'adsense', payload));
     } catch (err) {
       logger.error('adsense scope-catalog:', err.message);
       res.status(500).json({ error: err.message });

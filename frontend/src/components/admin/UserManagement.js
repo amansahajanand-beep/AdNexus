@@ -115,6 +115,7 @@ export default function UserManagement({
   onCreate, onUpdate, onSavePermissions, onDelete,
   currentUserId,
   onLoadDomains,
+  subAdmin = false,
 }) {
   const [formOpen, setFormOpen] = useState(false);
   const [editingUser, setEditingUser] = useState(null);
@@ -362,7 +363,7 @@ export default function UserManagement({
                 <td className="td-name" data-label="User Name">{u.username}</td>
                 <td data-label="Role">
                   <span className={`role-badge ${u.role === 'admin' ? 'admin' : 'child'}`}>
-                    {u.role === 'admin' ? 'Admin' : 'Domain User'}
+                    {u.role === 'admin' ? 'Admin' : u.permissions?.canManageUsers ? 'Sub-admin' : 'Domain User'}
                   </span>
                 </td>
                 <td data-label="Networks">
@@ -424,6 +425,7 @@ export default function UserManagement({
         adsAccountOptions={adsAccountOptions}
         adsAccountsLoading={adsAccountsLoading}
         networks={networks}
+        subAdmin={subAdmin}
       />
 
       <EditChannelsModal

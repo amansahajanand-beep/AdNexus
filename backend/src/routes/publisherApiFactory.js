@@ -48,6 +48,7 @@ function createPublisherApiRouter({
   extendRouter = null,
   scoped = null,
 }) {
+  const { canManageUsers } = require('../utils/subAdmin');
   const router = express.Router();
   router.use(requireAuth);
   router.use(usePublisherTenant);
@@ -63,6 +64,10 @@ function createPublisherApiRouter({
     router.use((req, res, next) => {
       if (req.user?.role === 'admin') return next();
       if (scoped && req.method === 'GET' && SCOPED_READ_PATHS.has(req.path) && scoped.hasAccess(req.user)) {
+        return next();
+      }
+      // Sub-admins pick from the scopes they hold when assigning access to their own users.
+      if (req.method === 'GET' && req.path === '/scope-catalog' && canManageUsers(req.user)) {
         return next();
       }
       return res.status(403).json({ error: 'Admin access required' });

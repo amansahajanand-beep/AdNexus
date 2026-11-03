@@ -68,7 +68,7 @@ export function productFromPath(pathname = '') {
  */
 export function resolveActiveProduct(pathname = '') {
   const path = String(pathname || '').split('?')[0];
-  if (path === '/admin' || path === '/help' || path === '/ai-report' || path === '/ai-forecast') {
+  if (path === '/admin' || path === '/team' || path === '/help' || path === '/ai-report' || path === '/ai-forecast') {
     return readStoredProduct();
   }
   return productFromPath(path);
@@ -87,6 +87,7 @@ export const GAM_NAV_ITEMS = [
   { to: '/ai-forecast', label: 'Forecast', page: 'ai-forecast', adminOnly: true, requiresAi: true },
   { to: '/ai-report', label: 'Weekly report', page: 'ai-report', adminOnly: true, requiresAi: true },
   { to: '/admin', label: 'Admin', page: 'admin', adminOnly: true },
+  { to: '/team', label: 'Team', page: 'team', managerOnly: true },
   { to: '/domain-user', label: 'Domain User', page: 'domain-user' },
   { to: '/help', label: 'Help', page: 'help', always: true },
 ];

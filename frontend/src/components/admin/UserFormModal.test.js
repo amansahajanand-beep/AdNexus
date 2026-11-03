@@ -3,6 +3,10 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import { act } from 'react';
 
+jest.mock('../../store/useAuth', () => ({
+  useAuth: () => ({ user: { id: 'admin-1', role: 'admin' }, isAdmin: true }),
+}));
+
 jest.mock('../../utils/api', () => ({
   admobAPI: { scopeCatalog: jest.fn() },
   adsenseAPI: { scopeCatalog: jest.fn() },

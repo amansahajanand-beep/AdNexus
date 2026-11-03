@@ -13,6 +13,7 @@ import { readDateRestrictionFromUser, dateRestrictionPayload } from '../../utils
 import { PERMISSION_SECTIONS } from '../../utils/permissions';
 import { isAllSelection } from '../../utils/inventorySelection';
 import { reportsAPI, usersAPI } from '../../utils/api';
+import { useAuth } from '../../store/useAuth';
 import { catalogRowsToDomainOptions, catalogRowsToAppIdOptions } from '../../utils/domainCatalog';
 import { isLikelyAppPackage } from '../../utils/appPackage';
 
@@ -67,6 +68,7 @@ export default function UserFormModal({
   domains = [], domainsLoading, catalogLoading = false, catalogRows = [], catalogLists = {},
   adsAccountOptions = [], adsAccountsLoading = false,
   networks = [],
+  subAdmin = false,
 }) {
   const isEdit = !!user;
   const editingAdmin = isEdit && isAdminRole(user);
@@ -88,6 +90,7 @@ export default function UserFormModal({
   const [role, setRole] = useState('child');
   const [allowedClientIds, setAllowedClientIds] = useState([]);
   const [flags, setFlags] = useState(defaultFlags);
+  const [canManageUsers, setCanManageUsers] = useState(false);
   const [allowedDomains, setAllowedDomains] = useState([]);
   const [allowedSites, setAllowedSites] = useState([]);
   const [allowedAppIds, setAllowedAppIds] = useState([]);
@@ -106,6 +109,34 @@ export default function UserFormModal({
   const [scopeCatalogLoading, setScopeCatalogLoading] = useState(false);
   const [scopeDomainsLoading, setScopeDomainsLoading] = useState(false);
   const networksKey = allowedClientIds.slice().sort().join(',');
+  const { user: actor } = useAuth();
+
+  // The catalog can be empty or stale: always offer what is already assigned to the edited user,
+  // and (for a sub-admin) everything the sub-admin holds, so those scopes stay visible and selected.
+  const { effectiveDomains, effectiveLists } = useMemo(() => {
+    const own = subAdmin ? (actor?.permissions || {}) : {};
+    const saved = user?.permissions || {};
+    const union = (key) => [...new Set([...(saved[key] || []), ...(own[key] || [])].map(String).filter(Boolean))];
+    const mergeList = (base, extra) => {
+      const seen = new Set((base || []).map((v) => String(v).toLowerCase()));
+      return [...(base || []), ...extra.filter((v) => !seen.has(v.toLowerCase()))];
+    };
+    const domainId = (d) => String(d.id || d.domainName || d.label || d).toLowerCase();
+    const haveDomains = new Set((scopeDomains || []).map(domainId));
+    return {
+      effectiveDomains: [
+        ...(scopeDomains || []),
+        ...union('allowedDomains')
+          .filter((d) => !haveDomains.has(d.toLowerCase()))
+          .map((d) => ({ id: d, label: d, domainName: d })),
+      ],
+      effectiveLists: {
+        ...scopeCatalogLists,
+        siteHosts: mergeList(scopeCatalogLists.siteHosts, union('allowedSites')),
+        appIds: mergeList(scopeCatalogLists.appIds, union('allowedAppIds')),
+      },
+    };
+  }, [scopeDomains, scopeCatalogLists, user, subAdmin, actor]);
 
   useEffect(() => {
     if (!open) return;
@@ -116,8 +147,12 @@ export default function UserFormModal({
     setLocalError(null);
     setSuccessMsg(null);
     setRole(isAdminRole(user) ? 'admin' : (user?.role || 'child'));
-    setAllowedClientIds(allowedClientIdsFromUser(user, linkedNetworks));
+    // Sub-admins don't pick networks: their users span every network the sub-admin holds.
+    setAllowedClientIds(subAdmin
+      ? linkedNetworks.map((n) => String(n.id))
+      : allowedClientIdsFromUser(user, linkedNetworks));
     setFlags(flagsFromUser(user));
+    setCanManageUsers(user?.permissions?.canManageUsers === true);
     setAllowedDomains(user?.permissions?.allowedDomains || []);
     setAllowedSites(user?.permissions?.allowedSites || []);
     setAllowedAppIds(user?.permissions?.allowedAppIds || []);
@@ -128,7 +163,7 @@ export default function UserFormModal({
     const dr = readDateRestrictionFromUser(user);
     setDateRestrictionStart(dr.start);
     setDateRestrictionEnd(dr.end);
-  }, [open, user, linkedNetworks]);
+  }, [open, user, linkedNetworks, subAdmin]);
 
   // Inventory catalog follows selected network permissions (one network or merged).
   useEffect(() => {
@@ -194,10 +229,10 @@ export default function UserFormModal({
   useEffect(() => {
     if (!open || role === 'admin' || scopeCatalogLoading) return;
     const domainSet = new Set(
-      (scopeDomains || []).map((d) => String(d.id || d.domainName || d.label || d).toLowerCase())
+      (effectiveDomains || []).map((d) => String(d.id || d.domainName || d.label || d).toLowerCase())
     );
-    const siteSet = new Set((scopeCatalogLists.siteHosts || []).map((s) => String(s).toLowerCase()));
-    const appSet = new Set((scopeCatalogLists.appIds || []).map((a) => String(a).toLowerCase()));
+    const siteSet = new Set((effectiveLists.siteHosts || []).map((s) => String(s).toLowerCase()));
+    const appSet = new Set((effectiveLists.appIds || []).map((a) => String(a).toLowerCase()));
     if (domainSet.size) {
       setAllowedDomains((prev) => prev.filter((d) => domainSet.has(String(d).toLowerCase())));
     }
@@ -207,7 +242,7 @@ export default function UserFormModal({
     if (appSet.size) {
       setAllowedAppIds((prev) => prev.filter((a) => appSet.has(String(a).toLowerCase())));
     }
-  }, [open, role, scopeCatalogLoading, networksKey, scopeDomains, scopeCatalogLists]);
+  }, [open, role, scopeCatalogLoading, networksKey, effectiveDomains, effectiveLists]);
 
   const handleDateRestrictionChange = (start, end) => {
     setDateRestrictionStart(start);
@@ -280,6 +315,7 @@ export default function UserFormModal({
         allowedAppIds,
         allowedAdUnits,
         allowedAdsAccountIds,
+        ...(subAdmin ? {} : { canManageUsers }),
         admobScope,
         ...(ADSENSE_ENABLED ? { adsenseScope } : {}),
         ...dateRestrictionPayload(dateRestrictionStart, dateRestrictionEnd),
@@ -290,7 +326,7 @@ export default function UserFormModal({
   };
 
   const displayError = localError || error;
-  const showNetworkPicker = !editingAdmin && role !== 'admin' && linkedNetworks.length > 0;
+  const showNetworkPicker = !subAdmin && !editingAdmin && role !== 'admin' && linkedNetworks.length > 0;
 
   const footer = (
     <>
@@ -353,13 +389,26 @@ export default function UserFormModal({
         autoComplete="new-password"
       />
       <p className="form-note" style={{ marginTop: -8 }}>{PASSWORD_RULES_HINT}</p>
-      {editingAdmin ? (
+      {subAdmin ? null : editingAdmin ? (
         <>
           <TextField label="Role" value="Admin" readOnly />
           <div className="form-note">Admin role cannot be changed to Domain User.</div>
         </>
       ) : (
         <SelectField label="Role" value={role} onChange={setRole} options={ROLE_OPTIONS} />
+      )}
+      {!subAdmin && role !== 'admin' && (
+        <label style={{ display: 'flex', flexDirection: 'row', gap: 8, alignItems: 'center', marginBottom: 14, cursor: 'pointer' }}>
+          <input
+            type="checkbox"
+            style={{ flex: '0 0 auto', margin: 0 }}
+            checked={canManageUsers}
+            onChange={(e) => setCanManageUsers(e.target.checked)}
+          />
+          <span>
+            <strong>Sub-admin</strong> — can add and manage their own users for the sites assigned below
+          </span>
+        </label>
       )}
 
       {role === 'admin' ? (
@@ -379,11 +428,11 @@ export default function UserFormModal({
           allowedAdsAccountIds={allowedAdsAccountIds}
           onAdsAccountsChange={setAllowedAdsAccountIds}
           showDateRange={false}
-          domains={scopeDomains}
+          domains={effectiveDomains}
           domainsLoading={scopeDomainsLoading || domainsLoading}
           catalogLoading={scopeCatalogLoading || catalogLoading}
           catalogRows={scopeCatalogRows}
-          catalogLists={scopeCatalogLists}
+          catalogLists={effectiveLists}
           adsAccountOptions={adsAccountOptions}
           adsAccountsLoading={adsAccountsLoading}
         />

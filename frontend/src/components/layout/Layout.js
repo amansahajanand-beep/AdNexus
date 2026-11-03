@@ -6,7 +6,7 @@ import { useAuth } from '../../store/useAuth';
 import { authSuccess } from '../../store/actions/authActions';
 import { clearReportPages } from '../../store/slices/reportSlice';
 import { usePermissions } from '../../hooks/usePermissions';
-import { NO_DOMAINS_MSG, NO_DOMAINS_TITLE, hasAssignedInventory } from '../../utils/permissions';
+import { NO_DOMAINS_MSG, NO_DOMAINS_TITLE, hasAssignedInventory, canManageUsers } from '../../utils/permissions';
 import BrandLogo from '../ui/BrandLogo';
 import ToastStack from '../ui/ToastStack';
 import CommandPalette from '../ui/CommandPalette';
@@ -447,6 +447,7 @@ export default function Layout() {
   const navItems = navItemsForProduct(activeProduct).filter((i) => {
     if (i.requiresAi && !aiEnabled) return false;
     if (i.adminOnly) return isAdmin;
+    if (i.managerOnly) return canManageUsers(user);
     if (i.always) return true;
     if (i.page) return canPage(i.page);
     return true;
@@ -734,6 +735,12 @@ export default function Layout() {
                     <button type="button" className="user-dd-item" onClick={() => go('/admin')}>
                       <Settings size={15} strokeWidth={1.75} aria-hidden />
                       Admin Settings
+                    </button>
+                  )}
+                  {canManageUsers(user) && (
+                    <button type="button" className="user-dd-item" onClick={() => go('/team')}>
+                      <Settings size={15} strokeWidth={1.75} aria-hidden />
+                      Manage Team
                     </button>
                   )}
                   {canPage('domain-user') && (
