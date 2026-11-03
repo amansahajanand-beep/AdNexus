@@ -486,7 +486,11 @@ export default function RoiCountryTreeTable({
                     aria-expanded={hasPackages ? accountOpen : undefined}
                   >
                     <TreeChevron open={accountOpen} hasChildren={hasPackages} />
-                    <span className="roi-tree-label-text">{account.label}</span>
+                    <span className="roi-tree-label-text">
+                      {account.customerId && account.customerId !== account.label
+                        ? `${account.label} (${account.customerId})`
+                        : account.label}
+                    </span>
                     <span className="roi-tree-kind">Ads account</span>
                   </button>
                 </td>

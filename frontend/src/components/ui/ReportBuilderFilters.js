@@ -57,14 +57,14 @@ function FilterCategory({
       </button>
       {open && (
         <div className="gam-filter-list">
-          <label className="gam-filter-check gam-filter-check-selectall" style={{ borderBottom: '1px solid #e8eaed', marginBottom: 4, paddingBottom: 4 }}>
+          <label className="gam-filter-check gam-filter-check-selectall" style={{ borderBottom: '1px solid var(--border)', marginBottom: 4, paddingBottom: 4 }}>
             <input
               type="checkbox"
               checked={allSelected}
               disabled={disabled}
               onChange={() => onToggleAll(ids, allSelected)}
             />
-            <span className="gam-filter-check-label" style={{ fontWeight: 600, color: '#3c4043' }}>Select All</span>
+            <span className="gam-filter-check-label" style={{ fontWeight: 600, color: 'var(--text-secondary)' }}>Select All</span>
           </label>
           {category.items.map(item => (
             <label key={item.id} className="gam-filter-check">

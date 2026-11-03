@@ -4,9 +4,32 @@ const { requireAuth } = require('../middleware/auth');
 const { getRoiSummary } = require('../services/roiService');
 const { todayInTZ } = require('../utils/datetime');
 const { resolveAdsAccountIdsForUser, getAllowedClientIds } = require('../utils/permissions');
-const { mergeRoiParts } = require('../services/roiMerge');
+const { mergeRoiParts, applyEarnOnly } = require('../services/roiMerge');
 const { roiInventoryScope, limitKeys, appsOfAccounts } = require('../services/roiScope');
 const logger = require('../utils/logger');
+
+/**
+ * Options for the networks other than the active one, for an admin: only the apps and sites the filters name (or the
+ * Ads account's apps), with the Ads accounts switched off so a network adds revenue but never spend. A network with
+ * nothing to look up is left out.
+ */
+async function adminOtherNetworkOpts(clientId, baseOpts, { requestedAccountIds, accountIds, start, end }) {
+  if (!baseOpts.appKeys && !baseOpts.siteKeys && !requestedAccountIds.length) return [];
+  const { listActiveClients } = require('../models/clientStore');
+  const { NO_ADS_ACCOUNT_SCOPE_ID } = require('../utils/permissions');
+  const others = (await listActiveClients()).filter((c) => String(c.id) !== String(clientId));
+  if (!others.length) return [];
+  let appKeys = baseOpts.appKeys;
+  if (!appKeys && requestedAccountIds.length && accountIds?.length) {
+    const own = await appsOfAccounts(accountIds, start, end).catch(() => null);
+    appKeys = own && own.size ? [...own] : null;
+  }
+  if (!appKeys && !baseOpts.siteKeys) return [];
+  return others.map((runtime) => ({
+    runtime,
+    opts: { ...baseOpts, appKeys, accountIds: [NO_ADS_ACCOUNT_SCOPE_ID], campaignIds: null },
+  }));
+}
 
 router.use(requireAuth);
 
@@ -129,7 +152,24 @@ router.get('/summary', async (req, res) => {
       // One note for the combined view: the first network whose earnings could not follow the zone, else the zone.
       if (metas.length) data.earnTimezone = metas.find((m) => m.applied === false) || metas[0];
     } else {
-      data = await getRoiSummary(clientId, await optsFor(clientId));
+      // An admin on one network also sees the revenue of apps and sites that live in another network: the ones picked
+      // in the filters, plus the apps of a picked Ads account. The other networks add revenue only (no Ads spend).
+      const extra = req.user.role === 'admin'
+        ? await adminOtherNetworkOpts(clientId, baseOpts, { requestedAccountIds, accountIds, start, end })
+        : [];
+      if (extra.length) {
+        const { runWithClient } = require('../utils/clientContext');
+        const own = getRoiSummary(clientId, { ...baseOpts, crossNetworkEarn: true });
+        const others = extra.map(({ runtime, opts }) => runWithClient(runtime, () => getRoiSummary(runtime.id, { ...opts, crossNetworkEarn: true })));
+        const results = await Promise.allSettled([own, ...others]);
+        if (results[0].status === 'rejected') throw results[0].reason;
+        results.slice(1).filter((r) => r.status === 'rejected').forEach((r) => logger.warn(`ROI other network skipped: ${r.reason?.message}`));
+        data = mergeRoiParts(results.filter((r) => r.status === 'fulfilled').map((r) => r.value).filter(Boolean));
+        // A single remaining part is returned as is by the merge: fold its earn-only rows itself.
+        applyEarnOnly(data);
+      } else {
+        data = await getRoiSummary(clientId, await optsFor(clientId));
+      }
     }
     res.json({
       start,

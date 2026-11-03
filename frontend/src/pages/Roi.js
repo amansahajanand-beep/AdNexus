@@ -711,7 +711,9 @@ function RoiView() {
         const opts = (res.accounts || [])
           .map((a) => ({
           value: a.id,
-          label: a.descriptiveName || a.customerId || a.id,
+          label: a.descriptiveName && a.customerId && a.descriptiveName !== a.customerId
+            ? `${a.descriptiveName} (${a.customerId})`
+            : (a.descriptiveName || a.customerId || a.id),
           spend: Number(a.spend) || 0,
         }));
         setRoiAccountOptions(opts);

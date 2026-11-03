@@ -1156,7 +1156,7 @@ router.get('/roi-sites', async (req, res) => {
          SELECT LOWER(TRIM(REGEXP_REPLACE(ds.name, '^www\\.', '', 'i'))) AS site_key,
                 MAX(ds.name) AS site_name
          FROM dim_site ds
-         WHERE ds.client_id = $1::uuid
+         WHERE ($2::boolean OR ds.client_id = $1::uuid)
            AND ds.id > 0
            AND NULLIF(TRIM(ds.name), '') IS NOT NULL
          GROUP BY 1
@@ -1165,7 +1165,8 @@ router.get('/roi-sites', async (req, res) => {
          AND site_key ~ '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$'
        GROUP BY site_key
        ORDER BY site_name ASC`,
-      [clientId]
+      // An admin's ROI page also shows revenue of sites in the other networks, so they are all offered.
+      [clientId, req.user?.role === 'admin']
     );
     let sites = (rows || []).map((r) => ({
       id: String(r.site_key || '').toLowerCase(),
@@ -1178,7 +1179,7 @@ router.get('/roi-sites', async (req, res) => {
       sites = sites.filter((s) => ok.has(s.id));
     }
     const payload = { sites };
-    const cacheKey = roiFilterCacheKey('sites', clientId, { source: 'dim_site_subdomains_v1', user: scope ? req.user.id : 'all' });
+    const cacheKey = roiFilterCacheKey('sites', clientId, { source: 'dim_site_subdomains_v2', user: scope ? req.user.id : (req.user?.role === 'admin' ? 'admin' : 'all') });
     return sendRoiTargets(req, res, cacheKey, payload, 300);
   } catch (err) {
     logger.error('ROI sites list:', err.message);
@@ -1296,7 +1297,11 @@ router.post('/firebase/resolve-sites', async (req, res) => {
     if (!clientId) return res.status(400).json({ error: 'No client context' });
     const apps = Array.isArray(req.body?.apps) ? req.body.apps.slice(0, 200) : [];
     const connected = (await firebaseSvc().getStatus(clientId)).connected;
-    const resolved = await firebaseSvc().resolveSitesForApps(req.client, apps, { refresh: !!req.body?.refresh });
+    const resolved = await firebaseSvc().resolveSitesForApps(req.client, apps, {
+      refresh: !!req.body?.refresh,
+      // An admin's ROI page also shows revenue of other networks' sites, so a host from any network counts as known.
+      allNetworks: req.user?.role === 'admin',
+    });
     let { results } = resolved;
     const scope = await require('../services/roiScope').roiInventoryScope(req.user, clientId);
     if (scope) {
