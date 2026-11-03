@@ -3312,19 +3312,25 @@ async function prepareTimezoneView(req, res, page, {
   let tz = String(req.headers['x-report-tz'] || req.query.tz || '').trim();
   if (tz && !hv.isValidTz(tz)) return null;
   if (!tz && !hourly) return null;
+  // One line per skipped timezone request, so a view that fell back to the network timezone can be explained from the logs.
+  const skip = (reason) => {
+    logger.info(`[tz-view] page=${page} tz=${tz || '-'} role=${req.user?.role || '-'} skipped: ${reason}`);
+    return null;
+  };
   if (req.query.for === 'domain-user' && page === 'dashboard') return null;
-  if (!canAccessPage(req.user, page)) return null;
+  if (!canAccessPage(req.user, page)) return skip('no_page_access');
   const isScoped = req.user?.role !== 'admin';
-  if (isScoped && !userHasAssignedInventory(req.user)) return null;
+  if (isScoped && !userHasAssignedInventory(req.user)) return skip('no_assigned_inventory');
 
   const client = req.client || getClient();
   // Ad Manager cuts days in the network's own timezone; viewing that zone needs no regrouping.
   const srcTz = await require('./networkTimezone').getNetworkTz(client);
   if (!tz) tz = srcTz;
   if (tz === srcTz && !hourly) return null;
-  if (bailOnFilters.some((k) => req.query[k])) return null;
+  const bailed = bailOnFilters.filter((k) => req.query[k]);
+  if (bailed.length) return skip(`unsupported_filter(${bailed.join(',')})`);
   const clientId = getClientId();
-  if (!clientId) return null;
+  if (!clientId) return skip('no_client');
 
   const today = todayInTZ(tz); // today in the zone being viewed
   const asked = applyDateRestrictionToFilters(
@@ -3389,6 +3395,7 @@ async function prepareTimezoneView(req, res, page, {
 
 /** Make the normal handler's response say that the selected timezone could not be applied. */
 function markTimezoneNotApplied(res, { tz, srcTz, reason }) {
+  logger.info(`[tz-view] not applied tz=${tz} networkTz=${srcTz} reason=${reason}`);
   const send = res.json.bind(res);
   res.json = (body) => send(body && typeof body === 'object' && !Array.isArray(body)
     ? { ...body, timezone: { tz, networkTz: srcTz, applied: false, reason } }
@@ -3519,6 +3526,11 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
     const hourMode = dims.includes('hour');
     const metricsOk = mets.every((m) => TZ_REPORT_METRICS.has(m));
     const countryFilterAsked = toFilterArray(filters.country).length > 0;
+    // The filter carries GAM criteria ids; they map to names through the cached country list. A cold cache (restart,
+    // another instance) must not silently send the report back to the network timezone, so load the list first.
+    if (countryFilterAsked && !cache.get('report_countries') && asArray(filters.country).some((c) => /^\d+$/.test(String(c)))) {
+      await Promise.race([loadCountryList().catch(() => null), new Promise((resolve) => setTimeout(resolve, 20000))]);
+    }
     const countryNames = countryFilterAsked ? resolveCountryNamesForDb(filters.country) : [];
     const wantsCountry = countryDims.length > 0 || countryFilterAsked;
     const isScopedUser = req.user?.role !== 'admin';
@@ -3530,6 +3542,9 @@ async function tryTimezoneReporting(req, res, { filters, wantAllRows, pagination
       && (isScopedUser || !(app.length && (toFilterArray(filters.domain).length || toFilterArray(filters.site).length)));
     // Country needs the country slices, which carry no hour-of-day report and no unmapped country ids.
     const countrySupported = !wantsCountry || (!hourMode && !(countryFilterAsked && !countryNames.length));
+    if (wantsCountry && !countrySupported) {
+      logger.info(`[tz-view] country report not answerable from hourly data: ${hourMode ? 'hour_dimension' : 'country_ids_not_mapped'}`);
+    }
     const supported = baseSupported && countrySupported;
     const countryOn = wantsCountry && supported;
     // A domain user only ever sees their assigned inventory, resolved the way the normal pages resolve it.
@@ -5677,15 +5692,12 @@ async function handleProgrammaticReport(req, res) {
   return res.json(applyProgrammaticVisibility({ ...building, currency }, req.user));
 }
 
-async function handleCountries(req, res) {
-  if (isMockClient()) {
-    const list = Array.from(new Set(MOCK_SITES.map(s => s.country))).sort().map(c => ({ id: c, name: c }));
-    return res.json(list);
-  }
+/** Country id → name list (GAM criteria ids), cached for a day. Throws when Ad Manager cannot be reached. */
+async function loadCountryList() {
   const cacheKey = 'report_countries';
   const cached = cache.get(cacheKey);
-  if (cached) return res.json(cached);
-  try {
+  if (cached) return cached;
+  {
     const token = await getToken();
     const { startDate, endDate } = getDateRange(30);
     const reportQueryXML = `
@@ -5705,7 +5717,17 @@ async function handleCountries(req, res) {
     });
     list.sort((a, b) => a.name.localeCompare(b.name));
     cache.set(cacheKey, list, 86400); // country list barely changes — cache 24h
-    res.json(list);
+    return list;
+  }
+}
+
+async function handleCountries(req, res) {
+  if (isMockClient()) {
+    const list = Array.from(new Set(MOCK_SITES.map(s => s.country))).sort().map(c => ({ id: c, name: c }));
+    return res.json(list);
+  }
+  try {
+    res.json(await loadCountryList());
   } catch (err) {
     logger.error('Countries list error:', err.message);
     res.json([]);
