@@ -5087,7 +5087,7 @@ async function handleDetailedReport(req, res) {
       )
       : tableLimit;
     const invOpts = {
-      needUnfilled: originalMetIds.some((m) => ['total_fill_rate', TARGETED_METRIC_ID].includes(String(m).toLowerCase())),
+      needUnfilled: originalMetIds.some((m) => ['total_fill_rate', TARGETED_METRIC_ID, UNFILLED_METRIC_ID].includes(String(m).toLowerCase())),
       needRequests: originalMetIds.some((m) => ['ad_exchange_match_rate', 'ad_exchange_total_requests'].includes(String(m).toLowerCase())),
       domains,
       sites,
@@ -5466,7 +5466,16 @@ async function handleDetailedReport(req, res) {
     // ── Miss: sync grain + for Country use live GAM with country-safe dim sets ─
     // (never Site-only fallback that drops Country from the report).
     const token = await getToken().catch(() => null);
-    const loaded = await loadReportRowsCacheAside(filters, token, {
+    // Fill rate / targeted impressions are derived from the stored site fill data (enrichUnfilledFromAppSlice), and
+    // GAM rejects those columns next to Site/Country: the live fallback asks GAM only for what it can return.
+    const derivedFillIds = new Set(['total_fill_rate', TARGETED_METRIC_ID]);
+    const liveFilters = invOpts.needUnfilled
+      ? {
+        ...filters,
+        reportMetrics: asArray(filters.reportMetrics).filter((m) => !derivedFillIds.has(String(m).toLowerCase())),
+      }
+      : filters;
+    const loaded = await loadReportRowsCacheAside(liveFilters, token, {
       cachePrefix: (classified.mode === 'adhoc' || wantsCountryCol)
         ? 'report_detailed_custom_v2'
         : 'report_detailed_raw_v3',
@@ -5522,6 +5531,14 @@ async function handleDetailedReport(req, res) {
       // A failed job is never cached so "Run again" retries immediately.
       if (!loaded.jobFailed) cache.set(detailedRespKey, payload, NO_DATA_RESPONSE_TTL);
       return res.json(payload);
+    }
+
+    if (loaded.rows?.length && invOpts.needUnfilled && svc.enrichUnfilledFromAppSlice) {
+      // Copies: loaded rows can be the shared per-range cache, which must not carry one report's fill values.
+      loaded.rows = loaded.rows.map((r) => ({ ...r }));
+      await svc.enrichUnfilledFromAppSlice(loaded.rows, filters.startDate, filters.endDate)
+        .catch((e) => logger.warn('Reporting live-fallback fill enrich failed:', e.message));
+      loaded.rows = stampWarehouseMetricsOnRows(loaded.rows);
     }
 
     if (loaded.rows?.length) {

@@ -4307,36 +4307,69 @@ async function enrichSiteFill(rows = [], startDate, endDate) {
     const host = clean(r.siteUrl || r.gamSite || r.siteName);
     return clean((host && host !== '—' && rootDomainFromHost(host)) || r.domainName || r.gamDomain);
   };
+  const countryOf = (r) => clean(r.country);
+  // A stored unfilled of 0 on a site row is not a measurement: GAM books unfilled to ad units / apps, never to a
+  // SITE_NAME, so those rows would read as a 100% fill rate. Treat 0 like "unknown" and take the site fill data.
   const open = (rows || []).filter((r) => (
-    r.unfilled == null && !r.device && !r.country
+    (r.unfilled == null || Number(r.unfilled) === 0) && !r.device
     && !String(r.AD_UNIT_NAME || r.ad_unit_name || '').trim()
     && !(r.appId && r.appId !== '—' && r.appId !== '-' && r.appId !== '–')
     && domainOf(r) && domainOf(r) !== '—'
   ));
   if (!open.length) return 0;
   const domains = [...new Set(open.map(domainOf))];
-  const { rows: fills } = await query(
-    `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, site_name, impressions AS imp, unfilled
-     FROM site_fill_daily
-     WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date AND site_name = ANY($4::text[])`,
-    [requireClientId(), startDate, endDate, domains]
-  ).catch(() => ({ rows: [] }));
+  const clientId = requireClientId();
+  // Rows without a Country read the site table; rows with one read the site x country table.
+  const [siteRes, countryRes] = await Promise.all([
+    open.some((r) => !countryOf(r))
+      ? query(
+        `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, site_name, '' AS country, impressions AS imp, unfilled
+         FROM site_fill_daily
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date AND site_name = ANY($4::text[])`,
+        [clientId, startDate, endDate, domains]
+      ).catch(() => ({ rows: [] }))
+      : { rows: [] },
+    open.some((r) => countryOf(r))
+      ? query(
+        `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, site_name, LOWER(country) AS country, impressions AS imp, unfilled
+         FROM site_country_fill_daily
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date AND site_name = ANY($4::text[])`,
+        [clientId, startDate, endDate, domains]
+      ).catch(() => ({ rows: [] }))
+      : { rows: [] },
+  ]);
   const byDay = new Map();
   const byRange = new Map();
-  for (const f of fills) {
+  for (const f of [...siteRes.rows, ...countryRes.rows]) {
     const imp = Number(f.imp) || 0;
     const unfilled = Number(f.unfilled) || 0;
-    byDay.set(`${f.d}|${f.site_name}`, { imp, unfilled });
-    const t = byRange.get(f.site_name) || { imp: 0, unfilled: 0 };
+    byDay.set(`${f.d}|${f.site_name}|${f.country}`, { imp, unfilled });
+    const rk = `${f.site_name}|${f.country}`;
+    const t = byRange.get(rk) || { imp: 0, unfilled: 0 };
     t.imp += imp; t.unfilled += unfilled;
-    byRange.set(f.site_name, t);
+    byRange.set(rk, t);
   }
   let filled = 0;
   for (const r of open) {
     const dom = domainOf(r);
     const day = dayOf(r);
-    const hit = day ? byDay.get(`${day}|${dom}`) : byRange.get(dom);
-    if (!hit || !(hit.imp + hit.unfilled > 0)) continue;
+    const ctry = countryOf(r);
+    const hit = day ? byDay.get(`${day}|${dom}|${ctry}`) : byRange.get(`${dom}|${ctry}`);
+    if (!hit || !(hit.imp + hit.unfilled > 0)) {
+      // No site fill data for this row (yet): show it as unknown rather than keep the false 0 / 100%.
+      if (r.unfilled != null) {
+        delete r.unfilled;
+        delete r.fillRate;
+        if (r.metrics) {
+          const {
+            total_inventory_level_unfilled_impressions: _u, total_fill_rate: _f, total_line_item_level_targeted_impressions: _t,
+            ...rest
+          } = r.metrics;
+          r.metrics = rest;
+        }
+      }
+      continue;
+    }
     const rowImp = Number(r.impression ?? r.impressions) || 0;
     const share = hit.imp > 0 && rowImp > 0 ? Math.min(1, rowImp / hit.imp) : 1;
     const unfilled = Math.round(hit.unfilled * share);

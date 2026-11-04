@@ -17,6 +17,7 @@ const logger = require('../utils/logger');
 const M_IMP = 'TOTAL_LINE_ITEM_LEVEL_IMPRESSIONS';
 const M_UNF = 'TOTAL_INVENTORY_LEVEL_UNFILLED_IMPRESSIONS';
 const WINDOW_DAYS = 14;
+const COUNTRY_WINDOW_DAYS = 4;
 
 const ymd = (d) => d.toISOString().slice(0, 10);
 const addDays = (s, n) => { const d = new Date(`${s}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return ymd(d); };
@@ -63,6 +64,8 @@ async function ensureSiteFillTables() {
   await schemaQuery('CREATE UNIQUE INDEX IF NOT EXISTS adunit_fill_daily_pk ON adunit_fill_daily (client_id, report_date, ad_unit_name, site_name)');
   await tenantTable('site_fill_daily', 'site_name TEXT NOT NULL,');
   await schemaQuery('CREATE UNIQUE INDEX IF NOT EXISTS site_fill_daily_pk ON site_fill_daily (client_id, report_date, site_name)');
+  await tenantTable('site_country_fill_daily', 'site_name TEXT NOT NULL, country TEXT NOT NULL,');
+  await schemaQuery('CREATE UNIQUE INDEX IF NOT EXISTS site_country_fill_daily_pk ON site_country_fill_daily (client_id, report_date, site_name, country)');
   tablesReady = true;
 }
 
@@ -132,12 +135,58 @@ async function store(clientId, units) {
   return { units: unitRows.length, sites: siteRows.length };
 }
 
+/**
+ * DATE x AD_UNIT_NAME x COUNTRY_NAME, streamed (tens of thousands of rows a day) and summed to
+ * domain x country x day, so only the small rollup is held in memory.
+ */
+async function pullCountryWindow(token, start, end) {
+  const xml = `<dimensions>DATE</dimensions><dimensions>AD_UNIT_NAME</dimensions><dimensions>COUNTRY_NAME</dimensions>
+    <columns>${M_IMP}</columns><columns>${M_UNF}</columns>
+    ${buildDateXML(start, end)}<dateRangeType>CUSTOM_DATE</dateRangeType>`;
+  const out = new Map();
+  await runReportAndDownload(xml, token, {
+    onBatch: async (rows) => {
+      for (const r of rows) {
+        const date = r['Dimension.DATE'];
+        const country = (r['Dimension.COUNTRY_NAME'] || '').trim();
+        const unit = (r['Dimension.AD_UNIT_NAME'] || '').trim();
+        if (!date || !unit || !country) continue;
+        const site = domainOfAdUnit(unit) || '(unknown)';
+        const k = `${date}|${site}|${country}`;
+        const o = out.get(k) || { date, site, country, imp: 0, unf: 0 };
+        o.imp += num(r[`Column.${M_IMP}`]);
+        o.unf += num(r[`Column.${M_UNF}`]);
+        out.set(k, o);
+      }
+    },
+  });
+  return [...out.values()];
+}
+
+async function storeCountry(clientId, rows) {
+  const out = rows.map((s) => {
+    const [tgt, fill] = withFill(s.imp, s.unf);
+    return [clientId, s.date, s.site, s.country, s.imp, s.unf, tgt, fill];
+  });
+  await insertChunks('site_country_fill_daily', ['site_name', 'country'], out);
+  return out.length;
+}
+
 /** Pull startDate..endDate (YYYY-MM-DD) for the current client and upsert. Returns row counts. */
 async function syncSiteFill(startDate, endDate) {
   await ensureSiteFillTables();
   const clientId = requireClientId();
   const token = await getToken();
-  const total = { units: 0, sites: 0, failed: 0 };
+  const total = { units: 0, sites: 0, siteCountry: 0, failed: 0 };
+  for (let s = startDate; s <= endDate; s = addDays(s, COUNTRY_WINDOW_DAYS)) {
+    const e = addDays(s, COUNTRY_WINDOW_DAYS - 1) < endDate ? addDays(s, COUNTRY_WINDOW_DAYS - 1) : endDate;
+    try {
+      total.siteCountry += await storeCountry(clientId, await pullCountryWindow(token, s, e));
+    } catch (err) {
+      total.failed += 1;
+      logger.warn(`[site-fill] country ${s}..${e} failed: ${String(err.message).slice(0, 160)}`);
+    }
+  }
   for (let s = startDate; s <= endDate; s = addDays(s, WINDOW_DAYS)) {
     const e = addDays(s, WINDOW_DAYS - 1) < endDate ? addDays(s, WINDOW_DAYS - 1) : endDate;
     try {
