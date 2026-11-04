@@ -3978,9 +3978,11 @@ async function fetchReportingBundleFromDB(startDate, endDate, opts = {}) {
     && !wantsGeoTableDims(opts)
     && !opts.countryNames?.length
     && !opts.groupByDevice
-    && !opts.needUnfilled
     && !opts.needRequests
   ) {
+    // Fill rate / targeted impressions (opts.needUnfilled) no longer need the raw inventory_core scan: the lean path
+    // adds them from site_fill_daily. That scan only holds the days inventory_core was synced for, so a fill report
+    // through it returned a fraction of the days a plain report returns.
     logger.info(`Reporting ${startDate}..${endDate} -> lean/rollup path (no raw grain scan)`);
     return null;
   }
@@ -4303,9 +4305,21 @@ async function enrichSiteFill(rows = [], startDate, endDate) {
   const { rootDomainFromHost } = require('../utils/adUnit');
   const clean = (v) => String(v || '').trim().toLowerCase();
   const dayOf = (r) => String(r.date || r.report_date || '').slice(0, 10);
+  // Per-row domain/country are read several times (filter, grouping, lookup, apply): compute each once.
+  const rootMemo = new Map();
+  const domMemo = new WeakMap();
   const domainOf = (r) => {
+    let d = domMemo.get(r);
+    if (d !== undefined) return d;
     const host = clean(r.siteUrl || r.gamSite || r.siteName);
-    return clean((host && host !== '—' && rootDomainFromHost(host)) || r.domainName || r.gamDomain);
+    let root = '';
+    if (host && host !== '—') {
+      root = rootMemo.get(host);
+      if (root === undefined) { root = rootDomainFromHost(host) || ''; rootMemo.set(host, root); }
+    }
+    d = clean(root || r.domainName || r.gamDomain);
+    domMemo.set(r, d);
+    return d;
   };
   const countryOf = (r) => clean(r.country);
   // A stored unfilled of 0 on a site row is not a measurement: GAM books unfilled to ad units / apps, never to a
@@ -4317,37 +4331,46 @@ async function enrichSiteFill(rows = [], startDate, endDate) {
     && domainOf(r) && domainOf(r) !== '—'
   ));
   if (!open.length) return 0;
-  const domains = [...new Set(open.map(domainOf))];
   const clientId = requireClientId();
-  // Rows without a Country read the site table; rows with one read the site x country table.
-  const [siteRes, countryRes] = await Promise.all([
-    open.some((r) => !countryOf(r))
-      ? query(
-        `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, site_name, '' AS country, impressions AS imp, unfilled
-         FROM site_fill_daily
-         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date AND site_name = ANY($4::text[])`,
-        [clientId, startDate, endDate, domains]
-      ).catch(() => ({ rows: [] }))
-      : { rows: [] },
-    open.some((r) => countryOf(r))
-      ? query(
-        `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, site_name, LOWER(country) AS country, impressions AS imp, unfilled
-         FROM site_country_fill_daily
-         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date AND site_name = ANY($4::text[])`,
-        [clientId, startDate, endDate, domains]
-      ).catch(() => ({ rows: [] }))
-      : { rows: [] },
+  // Rows without a Country read the site table; rows with one read the site x country table. Rows with no date
+  // (a report not split by day) need range totals, so Postgres sums those: shipping every per-day row (hundreds of
+  // thousands for a month of site x country) into Node took seconds. Dated rows read only their own days.
+  const groups = { site: { dated: [], range: [] }, country: { dated: [], range: [] } };
+  for (const r of open) groups[countryOf(r) ? 'country' : 'site'][dayOf(r) ? 'dated' : 'range'].push(r);
+  const fetchFill = (kind, mode, list) => {
+    if (!list.length) return Promise.resolve({ rows: [] });
+    const country = kind === 'country';
+    const table = country ? 'site_country_fill_daily' : 'site_fill_daily';
+    const params = [clientId, startDate, endDate, [...new Set(list.map(domainOf))]];
+    let countryFilter = '';
+    if (country) {
+      params.push([...new Set(list.map(countryOf))]);
+      countryFilter = ` AND LOWER(country) = ANY($${params.length}::text[])`;
+    }
+    const countryCol = country ? 'LOWER(country)' : `''`;
+    const sql = mode === 'dated'
+      ? `SELECT to_char(report_date, 'YYYY-MM-DD') AS d, site_name, ${countryCol} AS country, impressions AS imp, unfilled
+         FROM ${table}
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date AND site_name = ANY($4::text[])${countryFilter}`
+      : `SELECT NULL AS d, site_name, ${countryCol} AS country, SUM(impressions) AS imp, SUM(unfilled) AS unfilled
+         FROM ${table}
+         WHERE client_id = $1::uuid AND report_date BETWEEN $2::date AND $3::date AND site_name = ANY($4::text[])${countryFilter}
+         GROUP BY site_name${country ? ', LOWER(country)' : ''}`;
+    return query(sql, params).catch(() => ({ rows: [] }));
+  };
+  const [siteDated, siteRange, countryDated, countryRange] = await Promise.all([
+    fetchFill('site', 'dated', groups.site.dated),
+    fetchFill('site', 'range', groups.site.range),
+    fetchFill('country', 'dated', groups.country.dated),
+    fetchFill('country', 'range', groups.country.range),
   ]);
   const byDay = new Map();
   const byRange = new Map();
-  for (const f of [...siteRes.rows, ...countryRes.rows]) {
-    const imp = Number(f.imp) || 0;
-    const unfilled = Number(f.unfilled) || 0;
-    byDay.set(`${f.d}|${f.site_name}|${f.country}`, { imp, unfilled });
-    const rk = `${f.site_name}|${f.country}`;
-    const t = byRange.get(rk) || { imp: 0, unfilled: 0 };
-    t.imp += imp; t.unfilled += unfilled;
-    byRange.set(rk, t);
+  for (const f of [...siteDated.rows, ...countryDated.rows]) {
+    byDay.set(`${f.d}|${f.site_name}|${f.country}`, { imp: Number(f.imp) || 0, unfilled: Number(f.unfilled) || 0 });
+  }
+  for (const f of [...siteRange.rows, ...countryRange.rows]) {
+    byRange.set(`${f.site_name}|${f.country}`, { imp: Number(f.imp) || 0, unfilled: Number(f.unfilled) || 0 });
   }
   let filled = 0;
   for (const r of open) {
@@ -4419,9 +4442,12 @@ async function enrichUnfilledFromAppSlice(rows = [], startDate, endDate) {
     const m = countryOf(r) ? appCFill : appFill;
     applyFillToRow(r, m.get(`${dayOf(r)}|${appKey(r)}`));
   }
-  await enrichSiteFill(rows, startDate, endDate).catch((e) => {
+  const siteT0 = Date.now();
+  const siteFilled = await enrichSiteFill(rows, startDate, endDate).catch((e) => {
     logger.warn('Site fill enrich failed:', e.message);
+    return 0;
   });
+  if (siteFilled) logger.info(`Site fill enrich rows=${siteFilled}/${rows.length} in ${Date.now() - siteT0}ms`);
 }
 
 /** Merge two Reporting bundles (web + app) into one table payload. */

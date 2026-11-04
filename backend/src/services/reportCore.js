@@ -794,6 +794,23 @@ const APP_AD_REQUEST_SUBSTITUTIONS = {
  */
 const UNFILLED_METRIC_ID = 'total_inventory_level_unfilled_impressions';
 const TARGETED_METRIC_ID = 'total_line_item_level_targeted_impressions';
+// Asked for by the user but served from the stored Unfilled metric (see rewriteUnsupportedMetricsToWarehouse).
+const FILL_DERIVED_IDS = new Set(['total_fill_rate', TARGETED_METRIC_ID]);
+
+/**
+ * Metric ids the page should keep. The warehouse rewrite swaps Fill rate / Targeted impressions for the stored Unfilled
+ * metric, and the page restricts its columns to this list whenever a response carries a warning: report the ids the
+ * user asked for, not the stand-in, or those columns vanish and an unrequested Unfilled column appears.
+ */
+function metricIdsForPage(ids = [], askedIds = []) {
+  const asked = new Set((askedIds || []).map((m) => String(m).toLowerCase()));
+  const out = (ids || []).filter((id) => String(id).toLowerCase() !== UNFILLED_METRIC_ID || asked.has(UNFILLED_METRIC_ID));
+  for (const id of askedIds || []) {
+    const k = String(id).toLowerCase();
+    if (FILL_DERIVED_IDS.has(k) && !out.some((o) => String(o).toLowerCase() === k)) out.push(id);
+  }
+  return out;
+}
 
 const WAREHOUSE_METRIC_ALIASES = {
   // Niche Ad Exchange variants not yet in EXTENDED_GRAIN_METRICS
@@ -5222,10 +5239,10 @@ async function handleDetailedReport(req, res) {
               const api = catalogIdToGamEnum(id);
               return !api || classified.usedDims.includes(api) || api === 'DATE';
             }),
-            reportWarningUsedMetricIds: metIds.filter((id) => {
+            reportWarningUsedMetricIds: metricIdsForPage(metIds.filter((id) => {
               const api = catalogIdToGamEnum(id);
               return !api || classified.usedMetrics.includes(api) || isGrainMetric(api);
-            }),
+            }), originalMetIds),
             reportWarningSubstitutions: warehouseRewrite.substitutions || [],
             pagination: wantAllRows
               ? {
@@ -5282,7 +5299,14 @@ async function handleDetailedReport(req, res) {
         invOpts
       );
       if (compat?.bundle) {
-        const bundle = compat.bundle;
+        let bundle = compat.bundle;
+        // Lean/rollup rows carry no unfilled: add fill rate / targeted impressions from the stored fill data.
+        // Copies: the bundle can be a shared cached object that must not carry one report's fill values.
+        if (invOpts.needUnfilled && bundle.rows?.length && svc.enrichUnfilledFromAppSlice) {
+          bundle = { ...bundle, rows: bundle.rows.map((r) => ({ ...r })) };
+          await svc.enrichUnfilledFromAppSlice(bundle.rows, filters.startDate, filters.endDate)
+            .catch((e) => logger.warn('Reporting lean fill enrich failed:', e.message));
+        }
         const countryOk = !wantsCountryCol
           || (bundle?.rows || []).some((r) => String(r.country || r.COUNTRY_NAME || '').trim());
         if (!countryOk) {
@@ -5389,10 +5413,10 @@ async function handleDetailedReport(req, res) {
             const api = catalogIdToGamEnum(id);
             return !api || classified.usedDims.includes(api) || api === 'DATE';
           }),
-          reportWarningUsedMetricIds: metIds.filter((id) => {
+          reportWarningUsedMetricIds: metricIdsForPage(metIds.filter((id) => {
             const api = catalogIdToGamEnum(id);
             return !api || classified.usedMetrics.includes(api) || isGrainMetric(api);
-          }),
+          }), originalMetIds),
           reportWarningSubstitutions: warehouseRewrite.substitutions || [],
           pagination: wantAllRows
             ? {
@@ -5594,7 +5618,7 @@ async function handleDetailedReport(req, res) {
         skipped,
         loaded.reportWarningUsed,
         loaded.reportWarningUsedIds?.length ? loaded.reportWarningUsedIds : dimIds,
-        usedMetIds,
+        metricIdsForPage(usedMetIds, originalMetIds),
         null,
         subs,
       );
