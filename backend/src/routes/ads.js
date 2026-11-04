@@ -28,7 +28,7 @@ const {
   listAccountsWithSyncProblems,
 } = require('../models/adsAccountStore');
 const { getPendingSessionPublic, getPendingSession, deletePendingSession } = require('../models/oauthPendingStore');
-const { listCampaigns, isAdsOAuthConfigured, resolveOAuthApp, adsRedirectUri } = require('../ads/client');
+const { listCampaigns, fetchCampaignAppIds, isAdsOAuthConfigured, resolveOAuthApp, adsRedirectUri } = require('../ads/client');
 const {
   resolveRefreshForAccount,
   syncAllAccountsForClient,
@@ -1445,8 +1445,8 @@ router.get('/roi-related-targets', async (req, res) => {
 
     const { query } = require('../db');
 
-    async function loadAppsFromSpend() {
-      const params = [clientId, start, end];
+    async function loadAppsFromSpend(rangeStart = start, rangeEnd = end) {
+      const params = [clientId, rangeStart, rangeEnd];
       let extra = '';
       if (accountIds.length) {
         params.push(accountIds);
@@ -1478,6 +1478,44 @@ router.get('/roi-related-targets', async (req, res) => {
     }
 
     let apps = await loadAppsFromSpend();
+
+    // No spend synced inside the picked dates: widen to the last 90 days, so an account that is idle on
+    // the chosen day (or only synced earlier) still lists the apps its campaigns advertise.
+    if (!apps.length && accountIds.length) {
+      apps = await loadAppsFromSpend(shiftYMD(end, -90), end);
+    }
+
+    // Still nothing and exactly one Ads account is picked (never synced, or its spend rows carry no app id):
+    // read the app ids straight from its App campaign settings. One bounded call, never for several accounts.
+    if (!apps.length && accountIds.length === 1) {
+      try {
+        const account = await getAccountById(accountIds[0]);
+        if (account && account.clientId === clientId) {
+          const refreshToken = await resolveRefreshForAccount(account);
+          if (refreshToken) {
+            const live = await Promise.race([
+              fetchCampaignAppIds(req.client, {
+                customerId: account.customerId,
+                refreshToken,
+                loginCustomerId: account.loginCustomerId,
+              }),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 10000)),
+            ]);
+            const seen = new Map();
+            (live || []).forEach((r) => {
+              const id = String(r.appId || '').trim().toLowerCase();
+              if (!id) return;
+              const hit = seen.get(id) || { id, label: id, campaignCount: 0, spend: 0 };
+              hit.campaignCount += 1;
+              seen.set(id, hit);
+            });
+            apps = [...seen.values()];
+          }
+        }
+      } catch (e) {
+        logger.warn(`ROI related apps live lookup failed for account ${accountIds[0]}: ${e.message}`);
+      }
+    }
 
     // App ID backfill runs during Ads sync — never block filter dropdowns on live API calls.
     const mapParams = [clientId];

@@ -203,21 +203,13 @@ export default function Layout() {
     };
 
     (async () => {
-      // Retry transient failures — falling back too early leaves a multi-network user on a single network.
-      const delays = [0, 1000, 2500, 5000];
-      for (const delay of delays) {
-        if (delay) await new Promise((r) => setTimeout(r, delay));
-        if (cancelled) return;
-        try {
-          const d = await clientsAPI.accessibleNetworks();
-          applyList(d?.networks, d?.activeClientId || user?.clientId);
-          return;
-        } catch (err) {
-          const status = err?.response?.status;
-          if (status === 401 || status === 403 || status === 404) break;
-        }
+      try {
+        const d = await clientsAPI.accessibleNetworks();
+        applyList(d?.networks, d?.activeClientId || user?.clientId);
+        return;
+      } catch (_) {
+        /* fall through */
       }
-      if (cancelled) return;
       if (isAdmin) {
         try {
           const d = await clientsAPI.networks();
