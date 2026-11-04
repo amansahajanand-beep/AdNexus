@@ -990,6 +990,22 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
           setDetailData(null);
           return;
         }
+        // Networks whose warehouse data for this range hasn't synced yet answer "empty + building".
+        // Flag the merged result so the page polls and says so, instead of silently showing fewer networks.
+        const buildingNetworks = parts
+          .filter((p) => p && p.status === 'building' && !summaryHasMetrics(p.summary))
+          .map((p) => p._networkName || p._clientId);
+        if (buildingNetworks.length) {
+          res = { ...res, status: 'building', _buildingNetworks: buildingNetworks };
+        }
+        const failedNetworks = mergeIds
+          .map((id, i) => (parts[i] ? null : (byId.get(String(id))?.name || byId.get(String(id))?.networkCode || id)))
+          .filter(Boolean);
+        if (failedNetworks.length) {
+          setError(`Some data is missing: could not load ${failedNetworks.join(', ')}. Totals shown cover only the other networks — try again.`);
+        } else if (buildingNetworks.length) {
+          setError(`Still syncing today's data for ${buildingNetworks.join(', ')}. Totals shown cover only the other networks and will refresh automatically.`);
+        }
       } else {
         const singleClientId = expectedClientId && !String(expectedClientId).startsWith('merge:')
           ? expectedClientId
@@ -1420,7 +1436,7 @@ function DashboardSingle({ networks = [], viewClientId = null, mergeNetworkIds =
     const detailEmpty = !summaryHasMetrics(detailData?.summary);
     const waitingOnSync = (
       (overviewData?.status === 'building' && overviewEmpty)
-      || (detailData?.status === 'building' && detailEmpty)
+      || (detailData?.status === 'building' && (detailEmpty || detailData?._buildingNetworks?.length > 0))
     );
     if (!waitingOnSync) buildingPollCountRef.current = 0;
     const allowBuildingPoll = waitingOnSync

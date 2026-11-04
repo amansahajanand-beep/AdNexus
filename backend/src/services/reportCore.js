@@ -4418,6 +4418,10 @@ async function handleDashboard(req, res) {
           charts: { revenue: [], device: [], country: [], performance: [] },
           isMock: false,
           pagination: { totalRows: 0, truncated: false },
+          // Tell the UI this is a not-yet-synced network, not a real "no data" — it polls and warns.
+          status: 'building',
+          reportWarning: 'partial',
+          reportWarningSkipped: ['Warehouse data still loading for this date range'],
         }, req.user, visibilityOpts);
         cache.set(dashRespKey, empty, Math.min(60, REPORT_CACHE_TTL));
         return res.json(empty);
