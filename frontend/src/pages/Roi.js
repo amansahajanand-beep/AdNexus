@@ -822,7 +822,14 @@ function RoiView() {
             pendingShareFiltersRef.current = { ...pending, appKeys: [] };
             if (kept.length) return kept;
           }
-          return opts.length ? toAllSelection() : [];
+          if (!opts.length) return [];
+          // One Ads account (picked, or the only one the user can see): tick the apps linked to it
+          // instead of "All selected". Full selections still collapse to "no app filter" on Apply.
+          const singleAccount = accountIds.length === 1
+            || (!accountIds.length && roiAccountOptions.length === 1);
+          return singleAccount && opts.length <= FIREBASE_AUTO_ALL_MAX_APPS
+            ? opts.map((o) => o.value)
+            : toAllSelection();
         });
       } catch (err) {
         logErrorForDebug(err, 'ROI related apps');
