@@ -195,7 +195,7 @@ const METRIC_DEFS = {
     },
     format: 'num',
     visKey: 'impressions',
-    aggregate: 'sum',
+    aggregate: 'sumKnown',
   },
   total_line_item_level_without_cpd_average_ecpm: {
     label: 'eCPM',
@@ -568,9 +568,13 @@ export function aggregateColumn(rows, col) {
     if (col.aggregate === 'label') return col.id === 'date' ? 'Total' : '—';
     return '—';
   }
-  const nums = rows.map((r) => col.getValue(r)).filter((v) => Number.isFinite(Number(v)));
+  // sumKnown: rows with no value (null) are left out, so an all-empty column totals "—" instead of 0.
+  const known = col.aggregate === 'sumKnown';
+  const nums = rows.map((r) => col.getValue(r)).filter((v) => (
+    Number.isFinite(Number(v)) && !(known && (v == null || v === ''))
+  ));
   if (!nums.length) return '—';
-  if (col.aggregate === 'sum') {
+  if (col.aggregate === 'sum' || known) {
     return nums.reduce((a, v) => a + Number(v), 0);
   }
   if (col.aggregate === 'avg') {
