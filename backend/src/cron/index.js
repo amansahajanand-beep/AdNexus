@@ -1021,6 +1021,22 @@ function startCron() {
     if (!(days > 2)) return null;
     return require('../services/hourlySyncService').syncHourlyRecent({ days: Math.min(31, days) });
   }), { timezone: 'Asia/Singapore' });
+  // Gap-fill the derived rollups (fill rate, Ad Exchange requests, ROI earnings, country grain) once a night
+  // instead of at every restart (see STARTUP_HEAVY_BACKFILL_DISABLED in server.js). They only build days that have
+  // no rollup rows yet. NIGHTLY_ROLLUP_GAPFILL=false turns this off.
+  cron.schedule('30 4 * * *', hourlySafe('rollup gap-fill', async () => {
+    if (process.env.NIGHTLY_ROLLUP_GAPFILL === 'false') return;
+    const { listActiveClients } = require('../models/clientStore');
+    const { runWithClient } = require('../utils/clientContext');
+    const grain = require('../services/reportGrainStore');
+    const requests = require('../services/requestRollupStore');
+    for (const client of await listActiveClients()) {
+      await runWithClient(client, async () => {
+        await Promise.all([grain.backfillFillRollups(), requests.backfillRequestRollups(), grain.backfillRoiEarnRollups()]);
+        await grain.backfillCountryGrainRollups();
+      });
+    }
+  }), { timezone: 'Asia/Singapore' });
   cron.schedule('50 */3 * * *', hourlySafe('backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })),
     { timezone: 'Asia/Singapore' });
   setTimeout(hourlySafe('boot backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })), 600000);
