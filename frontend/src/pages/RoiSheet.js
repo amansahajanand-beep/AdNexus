@@ -143,6 +143,54 @@ export default function RoiSheet() {
     return () => { cancelled = true; };
   }, [sheetId, accountId, netKey, activeSnapshot?.startDate, activeSnapshot?.endDate]);
 
+  // Combined view only: the same day table for each Ads account on its own (one request per account).
+  const [perAccount, setPerAccount] = useState([]);
+  const [perAccountLoading, setPerAccountLoading] = useState(false);
+  const sheetsKey = sheets.map((s) => `${s.id}:${sheetAccountId(s)}`).join(',');
+  useEffect(() => {
+    if (!combined || !activeSnapshot || sheets.length < 2) {
+      setPerAccount([]);
+      setPerAccountLoading(false);
+      return undefined;
+    }
+    let cancelled = false;
+    setPerAccount([]);
+    setPerAccountLoading(true);
+    (async () => {
+      const out = await Promise.all(sheets.map(async (s) => {
+        const id = sheetAccountId(s);
+        const base = snapshotToRoiSummaryParams({ ...activeSnapshot, accountIds: [id] });
+        if (!base) return { id, name: sheetName(s), rows: [] };
+        try {
+          // Same as the sheet itself: this account's apps' Firebase subdomains are part of the request.
+          let sites = [];
+          try {
+            const rel = await adsAPI.listRoiRelatedTargets({ start: base.start, end: base.end, accountIds: id });
+            const apps = [...new Set(((rel?.data !== undefined ? rel.data : rel)?.apps || []).map((a) => String(a.id || '').toLowerCase()).filter(Boolean))].slice(0, 200);
+            if (apps.length) {
+              const replies = networkIds.length > 1
+                ? await Promise.all(networkIds.map((nid) => adsAPI.resolveFirebaseSites(apps, false, nid).catch(() => null)))
+                : [await adsAPI.resolveFirebaseSites(apps)];
+              const bodies = replies.filter(Boolean).map((r) => (r && r.data !== undefined ? r.data : r));
+              sites = [...new Set(bodies.flatMap((b) => (b?.results || []).flatMap((r) => [...(r.manualSites || []), ...(r.autoSites || [])])))];
+            }
+          } catch (err) { logErrorForDebug(err, 'ROI combined sheet sites'); }
+          const params = sites.length ? { ...base, siteKeys: sites.join(','), targetType: 'all' } : base;
+          const res = await roiAPI.summary({ ...params, breakdownOnly: '1', includeDaily: '1' });
+          const body = res && res.data !== undefined ? res.data : res;
+          return { id, name: sheetName(s), rows: body?.countryTargetDailyBreakdown || [] };
+        } catch (err) {
+          logErrorForDebug(err, 'ROI combined sheet account');
+          return { id, name: sheetName(s), rows: [] };
+        }
+      }));
+      if (cancelled) return;
+      setPerAccount(out);
+      setPerAccountLoading(false);
+    })();
+    return () => { cancelled = true; };
+  }, [combined, sheetsKey, activeSnapshot?.startDate, activeSnapshot?.endDate]);
+
   const summary = data?.summary || {};
   const spendCurrency = summary.adsSpendCurrency || data?.spendCurrency || 'USD';
   const countryTargetBreakdown = data?.countryTargetBreakdown || [];
@@ -221,6 +269,16 @@ export default function RoiSheet() {
         titleSuffix={`for ${title}`}
         exportName={`roi_sheet_${title.replace(/[^a-z0-9]+/gi, '_')}_day_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
       />
+
+      {combined && sheets.length > 1 ? (
+        <RoiDateTable
+          accountRows={perAccount}
+          loading={perAccountLoading}
+          currency={spendCurrency}
+          titleSuffix={`for ${applied.startDate === applied.endDate ? applied.startDate : `${applied.startDate} → ${applied.endDate}`}`}
+          exportName={`roi_sheet_accounts_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
+        />
+      ) : null}
     </div>
   );
 }
