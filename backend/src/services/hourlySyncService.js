@@ -131,6 +131,12 @@ async function syncSlice(client, token, slice, start, end) {
       raw = await pullSlice(token, fallback, from, to);
     }
     const rows = toHourlyRows(raw, used);
+    // replaceHourly deletes the whole chunk before inserting. An empty GAM answer (a hiccup, not a real
+    // zero-traffic stretch) must not wipe hours that are already stored, or the timezone view loses those days.
+    if (!rows.length) {
+      logger.warn(`Hourly sync ${slice.kind} client=${String(client.id).slice(0, 8)} ${from}..${to}: GAM returned no rows - kept stored hours`);
+      continue;
+    }
     await replaceHourly(client.id, slice.kind, from, to, rows);
     written += rows.length;
   }

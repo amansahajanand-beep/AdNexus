@@ -18,46 +18,41 @@ jobs:
           password: ${{ secrets.VPS_PASSWORD }}
           port: 22
           script: |
-            echo "SSH Connected Successfully"
-            whoami
-            hostname
             set -e
+            echo "SSH Connected: $(whoami)@$(hostname)"
+
+            APP_DIR=/opt/adnexus/AdNexus
 
             echo "===== AdNexus Deployment Started ====="
 
-            cd /var/www
-            # Agar folder nahi hai ya git repository nahi hai
-            if [ ! -d "/var/www/AdNexus/.git" ]; then
+            if [ ! -d "$APP_DIR/.git" ]; then
               echo "===== Cloning Repository ====="
-              rm -rf /var/www/AdNexus
-              git clone https://github.com/amansahajanand-beep/AdNexus.git AdNexus
+              mkdir -p /opt/adnexus
+              rm -rf "$APP_DIR"
+              git clone https://github.com/amansahajanand-beep/AdNexus.git "$APP_DIR"
             fi
 
-            cd /var/www/AdNexus
-
-            echo "===== Fetching Latest Code ====="
-            git fetch origin master
+            cd "$APP_DIR"
 
             echo "===== Updating to Latest Master ====="
+            git fetch origin master
             git reset --hard origin/master
-
-            echo "===== Latest Commit ====="
             git log -1 --oneline
 
             echo "===== Installing Frontend Dependencies ====="
-            cd frontend
-            npm install
+            cd "$APP_DIR/frontend"
+            npm install --no-audit --no-fund
 
             echo "===== Building Frontend ====="
             npm run build
 
             echo "===== Installing Backend Dependencies ====="
-            cd ../backend
-            npm install
+            cd "$APP_DIR/backend"
+            npm install --no-audit --no-fund
 
-            echo "===== Restarting Backend ====="
-            pm2 restart adNexuss
-            
+            echo "===== Restarting Backend (web + worker) ====="
+            pm2 restart adnexus adnexus-worker --update-env
+
             echo "===== Saving PM2 ====="
             pm2 save
 
