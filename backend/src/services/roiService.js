@@ -316,9 +316,25 @@ async function loadAdsLinkedGamEarn(clientId, start, end, spendOpts = {}) {
     params
   );
 
+  // An Ads account / campaign picked explicitly: its mapped apps & sites carry earnings even with no spend in the range.
+  let mapRows = [];
+  if (spendOpts.accountIds?.length || spendOpts.campaignIds?.length) {
+    const mapFilter = spendFilterSql({ accountIds: spendOpts.accountIds, campaignIds: spendOpts.campaignIds }, 'm', 1);
+    const res = await query(
+      `SELECT LOWER(TRIM(m.target_type)) AS target_type, LOWER(TRIM(m.target_key)) AS target_key
+       FROM ads_campaign_map m
+       WHERE m.client_id = $1
+         AND NULLIF(TRIM(m.target_key), '') IS NOT NULL
+         ${mapFilter.extra}
+       GROUP BY 1, 2`,
+      [clientId, ...mapFilter.params]
+    );
+    mapRows = res.rows || [];
+  }
+
   const appKeys = [];
   const siteKeys = [];
-  (linkRows || []).forEach((r) => {
+  [...(linkRows || []), ...mapRows].forEach((r) => {
     const type = String(r.target_type || '').toLowerCase();
     const key = String(r.target_key || '').trim().toLowerCase();
     if (!key) return;

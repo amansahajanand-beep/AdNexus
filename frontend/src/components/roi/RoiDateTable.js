@@ -68,8 +68,13 @@ const GROUP_LABELS = {
 
 export default function RoiDateTable({
   dailyRows, loading, currency = 'USD', exportName = 'roi_by_date', groupBy = 'day', titleSuffix = 'for the selected Ads account',
+  accountRows = null,
 }) {
-  const labels = GROUP_LABELS[groupBy] || GROUP_LABELS.day;
+  // accountRows [{ id, name, rows }]: one table row per Ads account (its total for the dates), instead of one per day.
+  const byAccount = Array.isArray(accountRows);
+  const labels = byAccount
+    ? { date: 'Ads account', title: 'Ads account wise' }
+    : (GROUP_LABELS[groupBy] || GROUP_LABELS.day);
   useRoiDisplayCurrency();
   const [dir, setDir] = useState('desc');
   // GST on the Ads spend: 3% unless changed here (remembered in this browser).
@@ -82,12 +87,30 @@ export default function RoiDateTable({
   };
   const cols = COLS.map((c) => (c.id === 'gst' ? { ...c, label: `GST (${gstPct}%)` } : c));
   const { rows, total } = useMemo(() => {
+    if (byAccount) {
+      const per = accountRows.map((a) => ({ ...buildDateTable(a.rows).total, date: a.name, id: a.id })).filter((r) => r.date);
+      // Total = the account rows added up (not re-deduplicated, so an app linked to two accounts counts for both).
+      const sum = (k) => per.reduce((s, r) => s + (Number(r[k]) || 0), 0);
+      const t = { date: 'Total', adsSpend: sum('adsSpend'), earn: sum('earn'), otherExpenses: sum('otherExpenses'), impressions: sum('impressions'), clicks: sum('clicks'), conversions: sum('conversions') };
+      const profitSpend = t.earn - t.adsSpend;
+      const profitExpense = t.earn - t.adsSpend - t.otherExpenses;
+      const all = {
+        ...t,
+        ctr: t.impressions > 0 ? (t.clicks / t.impressions) * 100 : null,
+        ecpm: t.impressions > 0 ? (t.adsSpend / t.impressions) * 1000 : null,
+        profitSpend,
+        profitExpense,
+        roiSpendPercent: t.adsSpend > 0 ? (profitSpend / t.adsSpend) * 100 : null,
+        roiExpensePercent: t.adsSpend + t.otherExpenses > 0 ? (profitExpense / (t.adsSpend + t.otherExpenses)) * 100 : null,
+      };
+      return { rows: per.map((r) => withGst(r, gstPct / 100)), total: withGst(all, gstPct / 100) };
+    }
     const t = buildDateTable(dailyRows);
     const grouped = groupBy === 'day' ? t.rows : groupDateTableRows(t.rows, groupBy);
     // The total row is worked out from the total spend / earn, not by adding the period percentages.
     return { rows: grouped.map((r) => withGst(r, gstPct / 100)), total: withGst(t.total, gstPct / 100) };
-  }, [dailyRows, groupBy, gstPct]);
-  const sorted = useMemo(() => (dir === 'desc' ? rows : [...rows].reverse()), [rows, dir]);
+  }, [dailyRows, groupBy, gstPct, accountRows, byAccount]);
+  const sorted = useMemo(() => (byAccount || dir === 'desc' ? rows : [...rows].reverse()), [rows, dir, byAccount]);
 
   const exportCsv = () => downloadCsv(
     exportName,
@@ -156,7 +179,7 @@ export default function RoiDateTable({
                 <tr key={i}>{cols.map((c) => <td key={c.id}><div className="skeleton" style={{ height: 16 }} /></td>)}</tr>
               ))
             ) : sorted.map((r) => (
-              <tr key={r.date}>
+              <tr key={r.id || r.date}>
                 {cols.map((c) => (
                   <td
                     key={c.id}

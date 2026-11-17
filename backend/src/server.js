@@ -231,6 +231,12 @@ async function startServer() {
             // Fill-rate rollups for recent days (Reporting Total fill rate on long ranges).
             // Fill-rate (Postgres) and Ad Exchange requests (GAM) backfills are independent:
             // run them side by side so one does not wait hours for the other.
+            // Local/dev: STARTUP_HEAVY_BACKFILL_DISABLED=true skips these (they hammer GAM + Postgres on every
+            // restart and slow every page while they run). Hourly cron / manual backfill still cover recent days.
+            if (process.env.STARTUP_HEAVY_BACKFILL_DISABLED === 'true') {
+              logger.info('[startup] Heavy rollup backfills skipped (STARTUP_HEAVY_BACKFILL_DISABLED=true)');
+              return;
+            }
             await Promise.all([
               require('./services/reportGrainStore').backfillFillRollups(),
               require('./services/requestRollupStore').backfillRequestRollups(),

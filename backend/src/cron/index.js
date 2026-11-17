@@ -287,6 +287,45 @@ async function enqueueLeanYesterdayAndFullToday({ reason } = {}) {
 }
 
 /**
+ * Re-download the last N days (default 7, newest-but-one first) in full - every lean slice incl. app_id and
+ * inventory_core. GAM keeps revising recent days (invalid-traffic deductions, late Ad Exchange data and
+ * app-ID attribution), but the hourly reconcile only repairs the network_kpi totals and "today + yesterday".
+ * Without this, per-app / per-site numbers older than yesterday stay at whatever the first sync saw.
+ * Yesterday is already covered by enqueueLeanYesterdayAndFullToday, so it is included here only once.
+ */
+async function enqueueResyncRecentDays({ reason, days: daysOverride, clientIds } = {}) {
+  const today = todayInTZ();
+  // Nightly default is RESYNC_RECENT_DAYS (7). A manual repair run may pass `days` (up to 90) and `clientIds`.
+  const days = Math.min(90, Math.max(1, parseInt(daysOverride || process.env.RESYNC_RECENT_DAYS || '7', 10) || 7));
+  const tag = reason ? ` (${reason})` : '';
+  await eachActiveClient(async (client) => {
+    if (Array.isArray(clientIds) && !clientIds.includes(client.id)) return;
+    const cid = client.id;
+    for (let back = 1; back <= days; back += 1) {
+      const day = shiftYMD(today, -back);
+      try {
+        await gamSyncQueue.add('sync-day', {
+          date: day,
+          includeFull: false,
+          clientId: cid,
+        }, {
+          // One resync per client/day/calendar day; low priority so today's sync always goes first.
+          jobId: `resync-recent-${cid.slice(0, 8)}-${day}-${today}`,
+          priority: 5,
+          attempts: 2,
+          backoff: { type: 'exponential', delay: 60000 },
+        });
+      } catch (e) {
+        if (!/JobId|already exists|duplicat/i.test(e.message || '')) {
+          logger.error(`Cron: failed to enqueue resync-recent ${day}:`, e.message);
+        }
+      }
+    }
+    logger.info(`Cron: enqueued resync-recent ${shiftYMD(today, -days)}..${shiftYMD(today, -1)} client=${cid.slice(0, 8)}${tag}`);
+  });
+}
+
+/**
  * Ad Exchange + Ad Server + Active View → merge into report_grain.metrics.
  * Lower priority than sync-today; skipped/deferred while today-priority is active.
  * Today is enqueued first; yesterday is delayed so they never stampede the PG pool.
@@ -694,6 +733,14 @@ function startCron() {
     await enqueueExtendedMetricsSync({ reason: 'extended-90m' });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── 05:30 daily: re-pull the last RESYNC_RECENT_DAYS (default 7) in full ──────
+  // GAM revises recent days after we first synced them; this keeps app/site grain equal to GAM.
+  // Set RESYNC_RECENT_CRON=false to turn it off.
+  cron.schedule('30 5 * * *', async () => {
+    if (process.env.RESYNC_RECENT_CRON === 'false') return;
+    await enqueueResyncRecentDays({ reason: 'daily-resync-recent' });
+  }, { timezone: 'Asia/Singapore' });
+
   // ── Every 6 hours: yesterday lean + Ads spend yesterday ─────────────────
   cron.schedule('15 */6 * * *', async () => {
     await enqueueLeanYesterdayAndFullToday({ reason: '6h' });
@@ -966,6 +1013,14 @@ function startCron() {
   }), { timezone: 'Asia/Singapore' });
   cron.schedule('40 * * * *', hourlySafe('recent', () => require('../services/hourlySyncService').syncHourlyRecent({ days: 2 })),
     { timezone: 'Asia/Singapore' });
+  // Timezone-view data is hourly and only the last 2 days are refreshed above; GAM keeps revising older days
+  // (invalid-traffic deductions), so re-pull the last HOURLY_RESYNC_DAYS (default 7) once a night.
+  // HOURLY_RESYNC_DAYS=0 turns it off.
+  cron.schedule('30 6 * * *', hourlySafe('resync-7d', () => {
+    const days = parseInt(process.env.HOURLY_RESYNC_DAYS || '7', 10);
+    if (!(days > 2)) return null;
+    return require('../services/hourlySyncService').syncHourlyRecent({ days: Math.min(31, days) });
+  }), { timezone: 'Asia/Singapore' });
   cron.schedule('50 */3 * * *', hourlySafe('backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })),
     { timezone: 'Asia/Singapore' });
   setTimeout(hourlySafe('boot backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })), 600000);
@@ -1010,6 +1065,7 @@ module.exports = {
   enqueueMonthCompleteBackfill,
   enqueueReconcileRecent,
   enqueueReconcileHistorical,
+  enqueueResyncRecentDays,
   enqueueAdsSyncToday,
   enqueueAdsSyncYesterday,
   enqueueAdsReconcileRecent,
