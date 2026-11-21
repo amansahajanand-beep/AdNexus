@@ -1037,6 +1037,21 @@ function startCron() {
       });
     }
   }), { timezone: 'Asia/Singapore' });
+  // Per-app audit vs live GAM (last 14 complete days in each network's own timezone). Re-syncs any day whose
+  // per-app revenue differs, so late GAM revisions / pre-empted resyncs / end-of-day gaps heal within ~3h.
+  // The network-total reconcile above does not look at per-app rows. APP_GRAIN_AUDIT=false turns this off.
+  cron.schedule('10 */3 * * *', hourlySafe('app-grain audit', () => require('../services/appGrainAuditService').auditAllClients()),
+    { timezone: 'Asia/Singapore' });
+  // Nightly deep pass: same audit over ~6 months (APP_GRAIN_AUDIT_DEEP_DAYS, default 180), repairing up to
+  // APP_GRAIN_AUDIT_DEEP_MAX_FIX (default 60) divergent days per client per night, worst first. Old drift heals
+  // over successive nights without hammering GAM. APP_GRAIN_AUDIT_DEEP=false turns this off.
+  cron.schedule('40 4 * * *', hourlySafe('app-grain deep audit', () => {
+    if (process.env.APP_GRAIN_AUDIT_DEEP === 'false') return null;
+    return require('../services/appGrainAuditService').auditAllClients({
+      days: parseInt(process.env.APP_GRAIN_AUDIT_DEEP_DAYS || '180', 10) || 180,
+      maxFix: parseInt(process.env.APP_GRAIN_AUDIT_DEEP_MAX_FIX || '60', 10) || 60,
+    });
+  }), { timezone: 'Asia/Singapore' });
   cron.schedule('50 */3 * * *', hourlySafe('backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })),
     { timezone: 'Asia/Singapore' });
   setTimeout(hourlySafe('boot backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })), 600000);
