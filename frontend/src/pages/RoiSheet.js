@@ -1,9 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useOutletContext, useParams } from 'react-router-dom';
-import PageHeader from '../components/ui/PageHeader';
 import PresetDateToolbar from '../components/presets/PresetDateToolbar';
-import RoiSummaryBoards from '../components/roi/RoiSummaryBoards';
-import RoiInventoryEarnOverview from '../components/roi/RoiInventoryEarnOverview';
+import RoiAppSheetView from '../components/roi/RoiAppSheetView';
 import RoiCurrencySelect from '../components/roi/RoiCurrencySelect';
 import { useRoiDisplayCurrency } from '../utils/report/roiCurrency';
 import RoiDateTable from '../components/roi/RoiDateTable';
@@ -15,7 +13,6 @@ import {
   mergeRoiBreakdownPayload,
   mergeRoiSummaryPayload,
   snapshotToRoiSummaryParams,
-  sumInventoryEarnFromBreakdown,
 } from '../utils/report/roiView';
 import {
   COMBINED_SHEET_ID, COMBINED_SHEET_TITLE, removeRoiSheet, sheetAccountId, sheetName, useRoiSheets,
@@ -61,6 +58,10 @@ export default function RoiSheet() {
   const [loading, setLoading] = useState(false);
   const [breakdownLoading, setBreakdownLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [siteApp, setSiteApp] = useState({});
+  const [appKey, setAppKey] = useState('');
+  const [tab, setTab] = useState('report');
+  useEffect(() => { setAppKey(''); setTab('report'); }, [sheetId]);
 
   const activeSnapshot = useMemo(
     () => (sheet ? mergePresetWithDates(sheet.snapshot, { startDate: applied.startDate, endDate: applied.endDate, preset }) : null),
@@ -78,6 +79,7 @@ export default function RoiSheet() {
     let cancelled = false;
     // New account / dates: drop the previous numbers so they are not shown (or merged) while these load.
     setData(null);
+    setSiteApp({});
     setLoading(true);
     setBreakdownLoading(true);
     setError(null);
@@ -88,21 +90,27 @@ export default function RoiSheet() {
       try {
         const rel = await adsAPI.listRoiRelatedTargets({ start: base.start, end: base.end, accountIds: base.accountIds || accountId });
         const apps = [...new Set(((rel?.data !== undefined ? rel.data : rel)?.apps || []).map((a) => String(a.id || '').toLowerCase()).filter(Boolean))].slice(0, 200);
-        if (!apps.length) return [];
+        if (!apps.length) return { sites: [], map: {} };
         const replies = networkIds.length > 1
           ? await Promise.all(networkIds.map((id) => adsAPI.resolveFirebaseSites(apps, false, id).catch(() => null)))
           : [await adsAPI.resolveFirebaseSites(apps)];
         const bodies = replies.filter(Boolean).map((res) => (res && res.data !== undefined ? res.data : res));
-        return [...new Set(bodies.flatMap((b) => (b?.results || []).flatMap((r) => [...(r.manualSites || []), ...(r.autoSites || [])])))];
+        const map = {};
+        bodies.forEach((b) => (b?.results || []).forEach((r) => [...(r.manualSites || []), ...(r.autoSites || [])].forEach((site) => {
+          if (r.app) map[String(site).toLowerCase()] = String(r.app).toLowerCase();
+        })));
+        const sites = [...new Set(bodies.flatMap((b) => (b?.results || []).flatMap((r) => [...(r.manualSites || []), ...(r.autoSites || [])])))];
+        return { sites, map };
       } catch (err) {
         logErrorForDebug(err, 'ROI sheet sites');
-        return [];
+        return { sites: [], map: {} };
       }
     };
 
     (async () => {
-      const sites = await findSites();
+      const { sites, map } = await findSites();
       if (cancelled) return;
+      setSiteApp(map);
       const params = sites.length ? { ...base, siteKeys: sites.join(','), targetType: 'all' } : base;
       const failed = {};
       const summaryPromise = roiAPI.summary({ ...params, summaryOnly: '1' })
@@ -191,11 +199,9 @@ export default function RoiSheet() {
     return () => { cancelled = true; };
   }, [combined, sheetsKey, activeSnapshot?.startDate, activeSnapshot?.endDate]);
 
-  const summary = data?.summary || {};
-  const spendCurrency = summary.adsSpendCurrency || data?.spendCurrency || 'USD';
+  const spendCurrency = data?.summary?.adsSpendCurrency || data?.spendCurrency || 'USD';
   const countryTargetBreakdown = data?.countryTargetBreakdown || [];
   const dailyRows = data?.countryTargetDailyBreakdown || [];
-  const inventoryEarn = useMemo(() => sumInventoryEarnFromBreakdown(countryTargetBreakdown), [countryTargetBreakdown]);
 
   const deleteSheet = async () => {
     const ok = await confirmDialog({
@@ -222,18 +228,6 @@ export default function RoiSheet() {
 
   return (
     <div className="presets-roi-detail roi-sheet">
-      <PageHeader
-        title={title}
-        subtitle={combined
-          ? `ROI of all your sheets together — ${sheets.length} Ads account${sheets.length === 1 ? '' : 's'}`
-          : 'ROI sheet — spend, earnings and ROI for this Ads account'}
-        summary={applied.startDate ? (applied.startDate === applied.endDate ? applied.startDate : `${applied.startDate} → ${applied.endDate}`) : null}
-      >
-        <RoiCurrencySelect />
-        <Link className="btn-outline-action" to="/roi">Open ROI</Link>
-        {combined ? null : <button type="button" className="btn-reset" onClick={deleteSheet}>Remove sheet</button>}
-      </PageHeader>
-
       <PresetDateToolbar
         preset={preset}
         startDate={startDate}
@@ -251,23 +245,26 @@ export default function RoiSheet() {
 
       {error ? <div className="login-error" style={{ marginTop: 12 }}>{error}</div> : null}
 
-      <RoiSummaryBoards summary={summary} loading={loading} showLive={false} />
-
-      <RoiInventoryEarnOverview
-        appEarn={inventoryEarn.appEarn}
-        siteEarn={inventoryEarn.siteEarn}
-        totalEarn={inventoryEarn.totalEarn}
-        currency={spendCurrency}
-        loading={(loading || breakdownLoading) && !countryTargetBreakdown.length}
-      />
-
-      <RoiDateTable
+      <RoiAppSheetView
+        title={title}
+        subtitle={combined ? `${sheets.length} Ads account${sheets.length === 1 ? '' : 's'} together` : 'Ads account'}
         dailyRows={dailyRows}
-        loading={breakdownLoading}
+        countryRows={countryTargetBreakdown}
+        siteApp={siteApp}
         currency={spendCurrency}
-        groupBy="day"
-        titleSuffix={`for ${title}`}
-        exportName={`roi_sheet_${title.replace(/[^a-z0-9]+/gi, '_')}_day_${applied.startDate || 'x'}_${applied.endDate || 'y'}`}
+        loading={loading || breakdownLoading}
+        appKey={appKey}
+        onAppKey={setAppKey}
+        tab={tab}
+        onTab={setTab}
+        range={applied}
+        actions={(
+          <>
+            <RoiCurrencySelect />
+            <Link className="btn-outline-action" to="/roi">Open ROI</Link>
+            {combined ? null : <button type="button" className="btn-reset" onClick={deleteSheet}>Remove sheet</button>}
+          </>
+        )}
       />
 
       {combined && sheets.length > 1 ? (
