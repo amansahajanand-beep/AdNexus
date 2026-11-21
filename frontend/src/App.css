@@ -6752,3 +6752,64 @@ a { color: var(--accent); }
 .roi-currency-select, .roi-gst-input { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary, #5b6475); }
 .roi-currency-select select, .roi-gst-input input { height: 32px; border: 1px solid var(--border, #d9dee8); border-radius: 8px; padding: 0 8px; background: var(--surface, #fff); color: inherit; font: inherit; }
 .roi-gst-input input { width: 64px; }
+
+/* ROI sheet, app-page style */
+.rs { display: flex; flex-direction: column; gap: 14px; margin-top: 14px; }
+.rs-dim { color: var(--muted); }
+.rs-mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+.rs-pad { padding: 14px 4px; }
+.rs-switch { display: flex; align-items: center; gap: 10px; padding: 10px; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; }
+.rs-nav { width: 34px; height: 34px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); cursor: pointer; font-size: 18px; line-height: 1; }
+.rs-nav:disabled { opacity: .4; cursor: default; }
+.rs-select { flex: 1; min-width: 0; height: 34px; padding: 0 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface-2); color: var(--text); font-weight: 600; font-size: 13px; display: inline-flex; align-items: center; }
+.rs-select-sm { flex: 0 0 auto; padding: 0 10px; }
+.rs-count { font-size: 12px; color: var(--muted); white-space: nowrap; }
+.rs-header { background: var(--surface); border: 1px solid var(--border); border-radius: 18px; padding: 20px 22px 14px; }
+.rs-header-top { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.rs-badge { width: 56px; height: 56px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 17px; flex: 0 0 auto; }
+.rs-header-main { flex: 1; min-width: 220px; }
+.rs-title { margin: 0; font-size: 22px; font-weight: 800; word-break: break-word; }
+.rs-sub { margin-top: 4px; font-size: 12.5px; color: var(--muted); }
+.rs-header-side { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }
+.rs-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.rs-live { font-size: 12px; font-weight: 700; color: var(--success); display: inline-flex; align-items: center; gap: 6px; }
+.rs-live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
+.rs-tabs { display: flex; gap: 6px; margin-top: 18px; flex-wrap: wrap; }
+.rs-tab { padding: 8px 14px; border-radius: 10px; border: none; background: transparent; color: var(--text-secondary); font-weight: 600; font-size: 13.5px; cursor: pointer; }
+.rs-tab:hover { background: var(--surface-2); }
+.rs-tab.is-active { background: var(--text); color: var(--surface); }
+.rs-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.rs-kpi, .rs-card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; }
+.rs-kpi { padding: 18px 20px; }
+.rs-kpi-label, .rs-eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.rs-kpi-value { margin-top: 10px; font-size: 26px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.rs-kpi-sub { margin-top: 6px; font-size: 12px; color: var(--muted); }
+.rs-card { padding: 16px 18px; overflow: hidden; }
+.rs-card-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.rs-card-head h3 { margin: 0; font-size: 14px; font-weight: 700; }
+.rs-pulse { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 20px; }
+.rs-pulse-value { margin: 10px 0; font-size: 40px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.rs-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.rs-chip { padding: 4px 10px; border-radius: 999px; background: var(--success-soft); color: var(--success); font-size: 12px; font-weight: 600; }
+.rs-bars { display: flex; align-items: flex-end; gap: 3px; height: 96px; margin-top: 12px; }
+.rs-bar-col { flex: 1; height: 100%; display: flex; align-items: flex-end; gap: 1px; }
+.rs-bar { flex: 1; min-height: 1px; border-radius: 2px 2px 0 0; }
+.rs-bar-rev, .rs-sw-rev { background: var(--success); }
+.rs-bar-exp, .rs-sw-exp { background: var(--warning); }
+.rs-legend { margin-top: 10px; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.rs-sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+.rs-insight { display: flex; gap: 12px; align-items: center; padding: 10px 0; border-top: 1px solid var(--border); font-size: 13px; }
+.rs-insight-head { font-weight: 700; }
+.rs-pill { min-width: 38px; text-align: center; padding: 6px 8px; border-radius: 10px; background: var(--surface-2); font-size: 11px; font-weight: 700; color: var(--muted); }
+.rs-pill.bad { background: var(--danger-soft); color: var(--danger); }
+.rs-pill.good { background: var(--success-soft); color: var(--success); }
+.rs-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.rs-table th { text-align: right; padding: 8px 10px; font-size: 11px; letter-spacing: .05em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--border); white-space: nowrap; }
+.rs-table td { text-align: right; padding: 10px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.rs-table th:first-child, .rs-table td:first-child { text-align: left; }
+.rs-total-row td { font-weight: 800; background: var(--surface-2); }
+.rs-empty-row td { color: var(--muted); }
+.rs-month-nav { display: flex; align-items: center; gap: 6px; }
+.rs-note { font-size: 12px; color: var(--muted); margin: 0; }
+.rs-link-row { display: flex; justify-content: space-between; padding: 10px 0; border-top: 1px solid var(--border); font-size: 13px; }
+@media (max-width: 900px) { .rs-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } .rs-pulse { grid-template-columns: 1fr; } }

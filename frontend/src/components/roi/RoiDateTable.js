@@ -32,7 +32,7 @@ const COLS = [
 // GST charged on the Ads spend. Profit after GST = earn - spend - GST; ROI after GST = that profit / (spend + GST).
 export const GST_RATE = 0.03;
 const GST_KEY = 'adnexus.roiGstPercent';
-const readGst = () => {
+export const readGst = () => {
   try {
     const v = parseFloat(localStorage.getItem(GST_KEY));
     return Number.isFinite(v) && v >= 0 && v <= 100 ? v : GST_RATE * 100;
