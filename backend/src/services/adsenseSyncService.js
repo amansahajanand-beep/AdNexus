@@ -46,7 +46,7 @@ async function syncAdSenseDims(account, gamClient, { startDate, endDate } = {}) 
   return total;
 }
 
-async function syncAdSenseAccount(account, { startDate, endDate, gamClient, lookbackDays, skipDims = false } = {}) {
+async function syncAdSenseAccount(account, { startDate, endDate, gamClient, lookbackDays, skipDims = false, fullDims = false } = {}) {
   if (!account?.refreshToken || !account?.accountId) {
     throw new Error('AdSense account missing refresh token or account id');
   }
@@ -68,7 +68,7 @@ async function syncAdSenseAccount(account, { startDate, endDate, gamClient, look
     let dimRows = 0;
     if (!skipDims) {
       const dimWin = dimLookbackWindow(end);
-      const dimStart = dimWin.start < start ? start : dimWin.start;
+      const dimStart = fullDims || dimWin.start < start ? start : dimWin.start;
       dimRows = await syncAdSenseDims(account, gamClient, { startDate: dimStart, endDate: end });
     }
 

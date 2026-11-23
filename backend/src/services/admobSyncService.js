@@ -69,7 +69,7 @@ async function syncAdMobGrain(account, gamClient, { startDate, endDate }) {
   return upsertAdMobGrainRows(account.clientId, account.id, rows);
 }
 
-async function syncAdMobAccount(account, { startDate, endDate, gamClient, lookbackDays, skipDims = false } = {}) {
+async function syncAdMobAccount(account, { startDate, endDate, gamClient, lookbackDays, skipDims = false, fullDims = false } = {}) {
   if (!account?.refreshToken || !account?.accountId) {
     throw new Error('AdMob account missing refresh token or account id');
   }
@@ -114,7 +114,7 @@ async function syncAdMobAccount(account, { startDate, endDate, gamClient, lookba
     let dimRows = 0;
     if (!skipDims) {
       const dimWin = dimLookbackWindow(end);
-      const dimStart = dimWin.start < start ? start : dimWin.start;
+      const dimStart = fullDims || dimWin.start < start ? start : dimWin.start;
       dimRows = await syncAdMobDims(account, gamClient, { startDate: dimStart, endDate: end });
     }
 
