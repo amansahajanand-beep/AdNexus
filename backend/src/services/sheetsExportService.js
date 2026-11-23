@@ -19,8 +19,12 @@ const {
 } = require('../utils/permissions');
 const { getDateRestriction, clampDateRange } = require('../utils/dateRestriction');
 const { shiftYMD } = require('../utils/datetime');
-const { getClientById } = require('../models/clientStore');
+const { getClientById, getAccountIdForClient, listClientsByAccountId } = require('../models/clientStore');
+const { getAllowedClientIds } = require('../utils/permissions');
 const { resolvePublisherClient } = require('../utils/publisherTenant');
+const { admobAccountStore, adsenseAccountStore } = require('../models/publisherAccountStore');
+const admobGrain = require('../models/admobGrainStore');
+const adsenseGrain = require('../models/adsenseGrainStore');
 
 const CATALOG_DAYS = 90; // the Catalog tab lists everything that had traffic in this many days
 
@@ -45,7 +49,7 @@ const SOURCES = {
     kind: 'domains',
     header: ['Date', 'Client', 'Revenue', 'Impressions', 'Clicks', 'eCPM', 'Currency'],
     keyCols: 2,
-    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.domains],
+    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.domains, sc.sites],
     sql: `
       SELECT r.report_date::text AS d, c.name AS client,
              SUM(r.revenue) AS revenue, SUM(r.impressions) AS impressions, SUM(r.clicks) AS clicks,
@@ -53,7 +57,7 @@ const SOURCES = {
         FROM rollup_kpi_daily r
         JOIN gam_clients c ON c.id = r.client_id
        WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid AND r.inv_app = ''
-         AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]))
+         AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]) OR lower(r.inv_site) = ANY($5::text[]))
        GROUP BY r.report_date, c.name
        ORDER BY r.report_date, c.name`,
     row: (x) => [x.d, x.client, num(x.revenue), num(x.impressions), num(x.clicks),
@@ -64,7 +68,7 @@ const SOURCES = {
     kind: 'domains',
     header: ['Date', 'Client', 'Domain', 'Site', 'Revenue', 'Impressions', 'Clicks', 'eCPM', 'Currency'],
     keyCols: 4,
-    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.domains],
+    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.domains, sc.sites],
     sql: `
       SELECT r.report_date::text AS d, c.name AS client, r.inv_domain AS domain, r.inv_site AS site,
              SUM(r.revenue) AS revenue, SUM(r.impressions) AS impressions, SUM(r.clicks) AS clicks,
@@ -73,7 +77,7 @@ const SOURCES = {
         JOIN gam_clients c ON c.id = r.client_id
        WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid
          AND (r.inv_domain <> '' OR r.inv_site <> '')
-         AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]))
+         AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]) OR lower(r.inv_site) = ANY($5::text[]))
        GROUP BY r.report_date, c.name, r.inv_domain, r.inv_site
        ORDER BY r.report_date, c.name, r.inv_domain, r.inv_site`,
     row: (x) => [x.d, x.client, x.domain, x.site, num(x.revenue), num(x.impressions), num(x.clicks),
@@ -125,7 +129,7 @@ const SOURCES = {
     kind: 'catalog', // a list, not daily numbers: everything that had traffic in the last CATALOG_DAYS days
     header: ['Type', 'Client', 'Domain', 'Site', 'App ID', 'App Name', 'Ad Unit'],
     keyCols: 7,
-    params: (r, client, sc) => [shiftYMD(r.endDate, -(CATALOG_DAYS - 1)), r.endDate, client, sc.domains, sc.appIds],
+    params: (r, client, sc) => [shiftYMD(r.endDate, -(CATALOG_DAYS - 1)), r.endDate, client, sc.domains, sc.sites, sc.appIds],
     sql: `
       SELECT 'Site' AS type, c.name AS client, r.inv_domain AS domain, r.inv_site AS site,
              '' AS app_id, '' AS app_name, r.inv_ad_unit AS ad_unit
@@ -133,7 +137,7 @@ const SOURCES = {
         JOIN gam_clients c ON c.id = r.client_id
        WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid AND r.inv_app = ''
          AND (r.inv_domain <> '' OR r.inv_site <> '' OR r.inv_ad_unit <> '')
-         AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]))
+         AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]) OR lower(r.inv_site) = ANY($5::text[]))
        GROUP BY c.name, r.inv_domain, r.inv_site, r.inv_ad_unit
       UNION ALL
       SELECT 'App', c.name, '', '', a.inv_app, COALESCE(n.app_name, ''), ''
@@ -141,7 +145,7 @@ const SOURCES = {
           SELECT DISTINCT client_id, inv_app FROM rollup_kpi_daily
            WHERE report_date BETWEEN $1 AND $2 AND client_id = $3::uuid
              AND inv_domain = '' AND inv_site = '' AND inv_ad_unit = '' AND inv_app <> ''
-             AND ($5::text[] IS NULL OR lower(inv_app) = ANY($5::text[]))
+             AND ($6::text[] IS NULL OR lower(inv_app) = ANY($6::text[]))
         ) a
         JOIN gam_clients c ON c.id = a.client_id
         LEFT JOIN (
@@ -154,6 +158,7 @@ const SOURCES = {
   AdMob: {
     tab: 'AdMob',
     kind: 'admob',
+    scopedRows: scopedAdmobRows,
     header: ['Date', 'Client', 'Account', 'Earnings', 'Impressions', 'Clicks', 'Ad Requests',
       'Matched Requests', 'CTR', 'eCPM', 'Match Rate', 'Currency'],
     keyCols: 3,
@@ -175,6 +180,7 @@ const SOURCES = {
   AdSense: {
     tab: 'AdSense',
     kind: 'adsense',
+    scopedRows: scopedAdsenseRows,
     header: ['Date', 'Client', 'Account', 'Earnings', 'Page Views', 'Impressions', 'Clicks',
       'CTR', 'RPM', 'eCPM', 'Currency'],
     keyCols: 3,
@@ -193,6 +199,36 @@ const SOURCES = {
       num(x.clicks), num(x.ctr), num(x.rpm), num(x.ecpm), x.currency],
   },
 };
+
+/**
+ * Domain users: read the same scoped grain facts their AdMob / AdSense pages use, cut to the accounts,
+ * apps / ad units / sites the admin assigned. One row per day. Account names are never exposed to them.
+ */
+const sharedCurrency = (accounts) => {
+  const set = new Set(accounts.map((a) => String(a.currencyCode || 'USD').toUpperCase()));
+  return set.size === 1 ? [...set][0] : 'USD';
+};
+
+async function scopedAdmobRows({ range, tenant, scope }) {
+  const allowed = new Set(scope.accountIds);
+  const accounts = (await admobAccountStore.listAccounts(tenant.id)).filter((a) => allowed.has(a.id));
+  if (!accounts.length) return [];
+  const sc = { ...scope, accountIds: accounts.map((a) => a.id) };
+  const trend = await admobGrain.scopedTrend(tenant.id, accounts, { start: range.startDate, end: range.endDate, scope: sc });
+  const cur = sharedCurrency(accounts);
+  return trend.map((t) => [t.date, tenant.label, 'AdMob', num(t.earnings), num(t.impressions), num(t.clicks),
+    num(t.ad_requests), num(t.matched_requests), num(t.ctr), num(t.ecpm), num(t.match_rate), cur]);
+}
+
+async function scopedAdsenseRows({ range, tenant, scope }) {
+  const allowed = new Set(scope.accountIds);
+  const accounts = (await adsenseAccountStore.listAccounts(tenant.id)).filter((a) => allowed.has(a.id));
+  if (!accounts.length) return [];
+  const sc = { ...scope, accountIds: accounts.map((a) => a.id) };
+  const trend = await adsenseGrain.scopedTrend(tenant.id, accounts, { start: range.startDate, end: range.endDate, scope: sc });
+  return trend.map((t) => [t.date, tenant.label, 'AdSense', num(t.earnings), num(t.page_views), num(t.impressions),
+    num(t.clicks), num(t.ctr), num(t.rpm), num(ecpm(t.earnings, t.impressions)), 'USD']);
+}
 
 function colLetter(n) { // 1 -> A
   let s = '';
@@ -305,9 +341,9 @@ async function verifyAccess(spreadsheetId) {
  */
 function resolveScope(user) {
   if (isAdmin(user)) {
-    return { scope: { domains: null, appIds: null, admobIds: null, adsenseIds: null }, skips: {} };
+    return { scope: { domains: null, sites: null, appIds: null, admobIds: null, adsenseIds: null }, skips: {} };
   }
-  const scope = { domains: [], appIds: [], admobIds: [], adsenseIds: [] };
+  const scope = { domains: [], sites: [], appIds: [], admobIds: [], adsenseIds: [], admob: null, adsense: null };
   const skips = {};
   if (!hasFlag(user, 'canDownloadReports') || user.permissions?.canSeeRevenue === false) {
     const msg = 'Your account is not allowed to download revenue reports';
@@ -316,21 +352,22 @@ function resolveScope(user) {
   }
   const inv = getUserInventoryScope(user);
   scope.domains = inv?.domains ? [...inv.domains] : [];
+  scope.sites = inv?.sites ? [...inv.sites] : [];
   scope.appIds = inv?.appIds ? [...inv.appIds] : [];
-  if (!scope.domains.length) skips.domains = 'No domains assigned to your account';
+  if (!scope.domains.length && !scope.sites.length) skips.domains = 'No domains or sites assigned to your account';
   if (!scope.appIds.length) skips.apps = 'No apps assigned to your account';
-  if (!scope.domains.length && !scope.appIds.length) skips.catalog = 'No domains or apps assigned to your account';
+  if (!scope.domains.length && !scope.sites.length && !scope.appIds.length) skips.catalog = 'No domains, sites or apps assigned to your account';
   skips.network = 'Country totals are only available for network-wide (admin) accounts';
 
+  // AdMob / AdSense: any assigned accounts (optionally narrowed to apps / ad units / sites) are exported
+  // through the scoped grain readers, so the sheet matches what the user sees in the app.
   const am = getAdmobScope(user);
   if (!am.accountIds.length) skips.admob = 'No AdMob accounts assigned';
-  else if (am.apps.length || am.adUnits.length || am.filters.length) skips.admob = 'AdMob access is limited to specific apps — not exportable yet';
-  else scope.admobIds = am.accountIds.map(String);
+  else scope.admob = am;
 
   const as = getAdsenseScope(user);
   if (!as.accountIds.length) skips.adsense = 'No AdSense accounts assigned';
-  else if (as.sites.length || as.filters.length) skips.adsense = 'AdSense access is limited to specific sites — not exportable yet';
-  else scope.adsenseIds = as.accountIds.map(String);
+  else scope.adsense = as;
   return { scope, skips };
 }
 
@@ -345,13 +382,37 @@ async function exportDailyToSheets({ startDate, endDate, spreadsheetId, clientId
   const sheets = await getSheetsApi();
 
   // AdMob / AdSense rows belong to the account's hidden publisher workspace, not the GAM network itself.
-  let publisherId;
-  const publisherClientId = async () => {
-    if (publisherId === undefined) {
+  let publisher;
+  const publisherTenant = async () => {
+    if (!publisher) {
       const client = await getClientById(clientId);
-      publisherId = (await resolvePublisherClient(client))?.id || clientId;
+      const ws = await resolvePublisherClient(client);
+      publisher = {
+        id: ws?.id || clientId,
+        label: String(ws?.name || client?.name || '').replace(/\s*·\s*AdMob$/, ''),
+      };
     }
-    return publisherId;
+    return publisher;
+  };
+
+  // GAM tabs cover every network the user can access (admin: all networks of the account;
+  // domain user: the networks they're allowed). The connected network is always included.
+  let networks;
+  const networkIds = async () => {
+    if (!networks) {
+      networks = [clientId];
+      try {
+        const accountId = await getAccountIdForClient(clientId);
+        const all = (await listClientsByAccountId(accountId))
+          .filter((n) => n.id && !n.isPending && !n.publisherParentId && n.isActive !== false);
+        const allowed = getAllowedClientIds(user); // null = admin
+        const picked = all.filter((n) => allowed === null || allowed.includes(n.id)).map((n) => n.id);
+        networks = [...new Set([clientId, ...picked])];
+      } catch (err) {
+        logger.warn(`Sheets export: network lookup failed, using the connected network only: ${err.message}`);
+      }
+    }
+    return networks;
   };
 
   const result = {};
@@ -359,11 +420,25 @@ async function exportDailyToSheets({ startDate, endDate, spreadsheetId, clientId
     if (skips[src.kind]) { result[name] = { skipped: skips[src.kind] }; continue; }
     if (range.startDate > range.endDate) { result[name] = { skipped: 'Date range outside your allowed window' }; continue; }
     try {
-      const tenantId = src.kind === 'admob' || src.kind === 'adsense' ? await publisherClientId() : clientId;
-      const { rows } = await query(src.sql, src.params(range, tenantId, scope));
-      const out = await upsertTab(sheets, spreadsheetId, src, rows.map(src.row));
-      result[name] = { fetched: rows.length, ...out };
-      logger.info(`Sheets export [${name}] user=${user.username} ${range.startDate}→${range.endDate}: ${rows.length} rows (updated ${out.updated}, appended ${out.appended})`);
+      let values;
+      if (src.kind === 'admob' || src.kind === 'adsense') {
+        const tenant = await publisherTenant();
+        if (isAdmin(user)) {
+          const res = await query(src.sql, src.params(range, tenant.id, scope));
+          values = res.rows.map(src.row);
+        } else {
+          values = await src.scopedRows({ range, tenant, scope: src.kind === 'admob' ? scope.admob : scope.adsense });
+        }
+      } else {
+        values = [];
+        for (const tenantId of await networkIds()) {
+          const res = await query(src.sql, src.params(range, tenantId, scope));
+          values.push(...res.rows.map(src.row));
+        }
+      }
+      const out = await upsertTab(sheets, spreadsheetId, src, values);
+      result[name] = { fetched: values.length, ...out };
+      logger.info(`Sheets export [${name}] user=${user.username} ${range.startDate}→${range.endDate}: ${values.length} rows (updated ${out.updated}, appended ${out.appended})`);
     } catch (err) {
       result[name] = { error: err.message };
       logger.error(`Sheets export [${name}] failed: ${err.message}`);

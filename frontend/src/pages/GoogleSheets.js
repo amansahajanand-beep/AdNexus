@@ -179,7 +179,7 @@ export default function GoogleSheets() {
           {error && <div role="alert" style={{ color: 'var(--danger, #b91c1c)' }}>{error}</div>}
 
           <p style={{ margin: 0, opacity: 0.75 }}>
-            These tabs are created in your sheet: <strong>GAM</strong> (daily totals), <strong>GAM Sites</strong>{' '}
+            Data from <strong>all networks you can access</strong> goes in, with a Client column. These tabs are created in your sheet: <strong>GAM</strong> (daily totals), <strong>GAM Sites</strong>{' '}
             (domain and site), <strong>GAM Apps</strong> (app ID and name), <strong>GAM Countries</strong>,{' '}
             <strong>GAM Catalog</strong> (every site, app and ad unit), <strong>AdMob</strong> and <strong>AdSense</strong>.
             Re-running never duplicates rows; recent days are refreshed as Google revises them.
