@@ -19,6 +19,8 @@ const {
 } = require('../utils/permissions');
 const { getDateRestriction, clampDateRange } = require('../utils/dateRestriction');
 const { shiftYMD } = require('../utils/datetime');
+const { getClientById } = require('../models/clientStore');
+const { resolvePublisherClient } = require('../utils/publisherTenant');
 
 const CATALOG_DAYS = 90; // the Catalog tab lists everything that had traffic in this many days
 
@@ -342,12 +344,23 @@ async function exportDailyToSheets({ startDate, endDate, spreadsheetId, clientId
   const { scope, skips } = resolveScope(user);
   const sheets = await getSheetsApi();
 
+  // AdMob / AdSense rows belong to the account's hidden publisher workspace, not the GAM network itself.
+  let publisherId;
+  const publisherClientId = async () => {
+    if (publisherId === undefined) {
+      const client = await getClientById(clientId);
+      publisherId = (await resolvePublisherClient(client))?.id || clientId;
+    }
+    return publisherId;
+  };
+
   const result = {};
   for (const [name, src] of Object.entries(SOURCES)) {
     if (skips[src.kind]) { result[name] = { skipped: skips[src.kind] }; continue; }
     if (range.startDate > range.endDate) { result[name] = { skipped: 'Date range outside your allowed window' }; continue; }
     try {
-      const { rows } = await query(src.sql, src.params(range, clientId, scope));
+      const tenantId = src.kind === 'admob' || src.kind === 'adsense' ? await publisherClientId() : clientId;
+      const { rows } = await query(src.sql, src.params(range, tenantId, scope));
       const out = await upsertTab(sheets, spreadsheetId, src, rows.map(src.row));
       result[name] = { fetched: rows.length, ...out };
       logger.info(`Sheets export [${name}] user=${user.username} ${range.startDate}→${range.endDate}: ${rows.length} rows (updated ${out.updated}, appended ${out.appended})`);
