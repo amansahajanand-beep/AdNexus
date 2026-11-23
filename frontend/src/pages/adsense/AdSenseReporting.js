@@ -15,6 +15,7 @@ import { useAuth } from '../../store/useAuth';
 import usePublisherReport from '../../hooks/usePublisherReport';
 
 const DIM_OPTIONS = [
+  { value: 'date', label: 'Date' },
   { value: 'ad_unit', label: 'Ad unit' },
   { value: 'site', label: 'Site' },
   { value: 'country', label: 'Country' },

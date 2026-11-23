@@ -1052,6 +1052,25 @@ function startCron() {
       maxFix: parseInt(process.env.APP_GRAIN_AUDIT_DEEP_MAX_FIX || '60', 10) || 60,
     });
   }), { timezone: 'Asia/Singapore' });
+  // ── AdMob / AdSense history ──
+  // Today + yesterday are refreshed hourly (:20) and the last 30 days daily (4:15) above. On top of that:
+  // 1) Continuous backfill: every 10 min walks each account's history backwards a couple of chunks at a time until
+  //    it reaches the start of the data, then idles (state in publisher_backfill_state, survives restarts).
+  //    PUBLISHER_BACKFILL=false turns it off.
+  cron.schedule('*/10 * * * *', hourlySafe('publisher backfill', () => require('../services/publisherHistoryService').backfillTick()),
+    { timezone: 'Asia/Singapore' });
+  setTimeout(hourlySafe('publisher boot backfill', () => require('../services/publisherHistoryService').backfillTick()), 120000);
+  // 2) Audit: compares COMPLETE days (so a finished day is checked as soon as it rolls over in the account's own
+  //    timezone) with the live AdMob / AdSense API and re-syncs any day that is missing or differs.
+  //    PUBLISHER_AUDIT=false turns it off.
+  cron.schedule('35 */3 * * *', hourlySafe('publisher audit', () => require('../services/publisherHistoryService').auditAll()),
+    { timezone: 'Asia/Singapore' });
+  // 3) Nightly deep pass over ~6 months (PUBLISHER_AUDIT_DEEP_DAYS, default 180), repairing the worst
+  //    PUBLISHER_AUDIT_DEEP_MAX_FIX (default 40) days per account per night.
+  cron.schedule('55 4 * * *', hourlySafe('publisher deep audit', () => require('../services/publisherHistoryService').auditAll({
+    days: parseInt(process.env.PUBLISHER_AUDIT_DEEP_DAYS || '180', 10) || 180,
+    maxFix: parseInt(process.env.PUBLISHER_AUDIT_DEEP_MAX_FIX || '40', 10) || 40,
+  })), { timezone: 'Asia/Singapore' });
   cron.schedule('50 */3 * * *', hourlySafe('backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })),
     { timezone: 'Asia/Singapore' });
   setTimeout(hourlySafe('boot backfill', () => require('../services/hourlySyncService').ensureHourlyCoverage({ days: 30, maxDays: 6 })), 600000);

@@ -599,6 +599,17 @@ async function tableAdMob(clientId, {
     adUnits, adSources, adSourceInstances, mediationGroups,
   };
   const hasFilters = collectAdMobFilters(opts).hasAny;
+  if (dimKind === 'date') {
+    let dateRows;
+    if (hasFilters) {
+      const trend = (await trendAdMobFiltered(clientId, opts)) || [];
+      dateRows = trend.map((t) => ({ name: t.date, ...t })).reverse().slice(0, cap);
+    } else {
+      dateRows = await dateRowsAdMob(clientId, { accountId, startDate, endDate, limit: cap });
+    }
+    dateRows.resolvedDim = 'date';
+    return dateRows;
+  }
   const order = [];
   const seen = new Set();
   for (const kind of [
@@ -627,6 +638,41 @@ async function tableAdMob(clientId, {
   return dateRows;
 }
 
+async function dateRowsAdSense(clientId, {
+  accountId = null,
+  startDate,
+  endDate,
+  limit = 100,
+} = {}) {
+  const params = [clientId, startDate, endDate];
+  let accountClause = '';
+  if (accountId) {
+    params.push(accountId);
+    accountClause = ` AND account_id = $${params.length}`;
+  }
+  params.push(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500));
+  const { rows } = await query(
+    `SELECT report_date::text AS name,
+            SUM(earnings)::float AS earnings,
+            SUM(page_views)::bigint AS page_views,
+            SUM(impressions)::bigint AS impressions,
+            SUM(clicks)::bigint AS clicks,
+            CASE WHEN SUM(page_views) > 0
+              THEN (SUM(earnings) / SUM(page_views) * 1000) ELSE 0 END AS rpm,
+            CASE WHEN SUM(impressions) > 0
+              THEN (SUM(clicks)::float8 / SUM(impressions) * 100) ELSE 0 END AS ctr
+     FROM adsense_report_daily
+     WHERE client_id = $1
+       AND report_date >= $2::date AND report_date <= $3::date
+       ${accountClause}
+     GROUP BY report_date
+     ORDER BY report_date DESC
+     LIMIT $${params.length}`,
+    params
+  );
+  return rows;
+}
+
 async function tableAdSense(clientId, {
   accountId = null,
   startDate,
@@ -637,6 +683,19 @@ async function tableAdSense(clientId, {
   countries = [],
   platforms = [],
 } = {}) {
+  if (dimKind === 'date') {
+    const cap = Math.min(limit, 500);
+    const fopts = { accountId, startDate, endDate, sites, countries, platforms };
+    let rows;
+    if (collectAdSenseFilters(fopts).primary) {
+      const trend = (await trendAdSenseFiltered(clientId, fopts)) || [];
+      rows = trend.map((t) => ({ name: t.date, ...t })).reverse().slice(0, cap);
+    } else {
+      rows = await dateRowsAdSense(clientId, { accountId, startDate, endDate, limit: cap });
+    }
+    rows.resolvedDim = 'date';
+    return rows;
+  }
   return breakdownAdSense(clientId, {
     accountId, startDate, endDate, dimKind, limit: Math.min(limit, 500),
     sites, countries, platforms,

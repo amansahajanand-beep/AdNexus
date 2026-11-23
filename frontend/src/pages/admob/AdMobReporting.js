@@ -34,7 +34,7 @@ export default function AdMobReporting() {
   const compare = useProductCompareState(user?.id);
   const allowedFilterKeys = useMemo(() => admobFilterKeysForUser(user), [user]);
   const dimOptions = useMemo(() => {
-    if (isAdmin) return DIM_OPTIONS;
+    if (isAdmin) return [...DIM_OPTIONS, { value: 'date', label: 'Date' }];
     const allowed = admobAllowedFilters(user);
     return [
       ...DIM_OPTIONS.filter((o) => allowed.includes(o.value)),
