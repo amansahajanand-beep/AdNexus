@@ -26,6 +26,7 @@ const admobRoutes = require('./routes/admob');
 const adsenseRoutes = require('./routes/adsense');
 const roiRoutes = require('./routes/roi');
 const presetsRoutes = require('./routes/presets');
+const sheetsRoutes = require('./routes/sheets');
 const aiRoutes = require('./routes/ai');
 const { initDB } = require('./models/userStore');
 const onboardRoutes = require('./routes/onboard');
@@ -158,6 +159,7 @@ async function startServer() {
   app.use('/api/adsense', adsenseRoutes);    // AdSense accounts / overview
   app.use('/api/roi', roiRoutes);            // ROI summary
   app.use('/api/presets', presetsRoutes);    // Saved report presets (per user)
+  app.use('/api/sheets', sheetsRoutes);      // Google Sheets export (per-user connected sheet)
   app.use('/api/ai', aiRoutes);              // AI status, settings, feedback, usage
   app.use('/api/auth', sessionRoutes);       // Dashboard user login/session
   app.use('/api/users', usersRoutes);        // Admin user management

@@ -41,6 +41,7 @@ import {
   LogOut,
   Settings,
   UserRound,
+  Table2,
   ShieldAlert,
 } from '../ui/Icon';
 
@@ -759,6 +760,10 @@ export default function Layout() {
                       My Profile
                     </button>
                   )}
+                  <button type="button" className="user-dd-item" onClick={() => go('/google-sheets')}>
+                    <Table2 size={15} strokeWidth={1.75} aria-hidden />
+                    Google Sheets
+                  </button>
                   <button type="button" className="user-dd-item" onClick={handleLogout}>
                     <LogOut size={15} strokeWidth={1.75} aria-hidden />
                     Logout

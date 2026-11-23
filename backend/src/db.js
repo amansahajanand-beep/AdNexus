@@ -1082,6 +1082,27 @@ async function initSchema() {
     logger.warn('user_report_presets schema:', e.message);
   }
 
+  // Google Sheets export: one connected spreadsheet per user (opt-in daily push of their scoped data).
+  try {
+    await schemaQuery(`
+      CREATE TABLE IF NOT EXISTS user_sheet_exports (
+        user_id TEXT PRIMARY KEY,
+        client_id UUID NOT NULL,
+        spreadsheet_id TEXT NOT NULL,
+        spreadsheet_title TEXT NOT NULL DEFAULT '',
+        enabled BOOLEAN NOT NULL DEFAULT true,
+        last_run_at TIMESTAMPTZ,
+        last_status TEXT,
+        last_error TEXT,
+        last_result JSONB,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      )
+    `);
+  } catch (e) {
+    logger.warn('user_sheet_exports schema:', e.message);
+  }
+
   // AI foundation: per-account feature flag, usage log, user feedback.
   try {
     await schemaQuery(`ALTER TABLE gam_clients ADD COLUMN IF NOT EXISTS ai_enabled BOOLEAN`);

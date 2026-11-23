@@ -15,6 +15,7 @@ import UserManagerRoute from './components/routing/UserManagerRoute';
 import DomainUser from './pages/DomainUser';
 import MyAds from './pages/MyAds';
 import Help from './pages/Help';
+import GoogleSheets from './pages/GoogleSheets';
 import AiReport from './pages/AiReport';
 import AiForecast from './pages/AiForecast';
 import PrivacyPolicy from './pages/PrivacyPolicy';
@@ -138,6 +139,7 @@ function AppRoutes() {
         <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
         <Route path="/help" element={<Help />} />
+        <Route path="/google-sheets" element={<GoogleSheets />} />
         <Route path="/ai-report" element={<AdminRoute><AiReport /></AdminRoute>} />
         <Route path="/ai-forecast" element={<AdminRoute><AiForecast /></AdminRoute>} />
 

@@ -524,6 +524,15 @@ export const presetsAPI = {
   ),
 };
 
+/** Google Sheets export: connect your own sheet; daily push of your scoped data. */
+export const sheetsAPI = {
+  status: () => FAST_API.get('/sheets/status'),
+  connect: (spreadsheet) => FAST_API.put('/sheets/connection', { spreadsheet }),
+  setEnabled: (enabled) => FAST_API.patch('/sheets/connection', { enabled }),
+  disconnect: () => FAST_API.delete('/sheets/connection'),
+  runNow: (days) => API.post('/sheets/run', { days }),
+};
+
 /** Campaign → site/app mapping: AI suggestions plus the saved maps (optionally pinned to a workspace). */
 export const mappingAPI = {
   suggest: (payload, clientId) => FAST_API.post('/ai/mapping-suggestions', payload, scopedTo(clientId)),

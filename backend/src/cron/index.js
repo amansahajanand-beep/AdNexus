@@ -741,6 +741,22 @@ function startCron() {
     await enqueueResyncRecentDays({ reason: 'daily-resync-recent' });
   }, { timezone: 'Asia/Singapore' });
 
+  // ── 06:30 daily: push each connected user's scoped data to their Google Sheet ──
+  // Users connect a sheet in the app (Google Sheets page); needs GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON.
+  // Set SHEETS_EXPORT_CRON=false to turn it off.
+  cron.schedule('30 6 * * *', async () => {
+    if (process.env.SHEETS_EXPORT_CRON === 'false' || !process.env.GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON) return;
+    try {
+      const { runAllConnections } = require('../services/sheetsExportService');
+      const days = Math.max(1, parseInt(process.env.SHEETS_EXPORT_LOOKBACK_DAYS || '7', 10));
+      const endDate = shiftYMD(todayInTZ(), -1);
+      const res = await runAllConnections({ startDate: shiftYMD(endDate, -(days - 1)), endDate });
+      logger.info(`Cron: Sheets export done — ${res.filter((r) => r.ok).length}/${res.length} connections ok`);
+    } catch (err) {
+      logger.error(`Cron: Sheets export failed: ${err.message}`);
+    }
+  }, { timezone: 'Asia/Singapore' });
+
   // ── Every 6 hours: yesterday lean + Ads spend yesterday ─────────────────
   cron.schedule('15 */6 * * *', async () => {
     await enqueueLeanYesterdayAndFullToday({ reason: '6h' });
