@@ -251,12 +251,23 @@ async function missingDates(clientId, start, end) {
      FROM generate_series($2::date, $3::date, interval '1 day') d
      LEFT JOIN (
        SELECT report_date, COUNT(DISTINCT hour) FILTER (WHERE kind = 'network') AS hrs,
-              COUNT(DISTINCT hour) FILTER (WHERE kind = 'country_net') AS country_hrs
+              COUNT(DISTINCT hour) FILTER (WHERE kind = 'country_net') AS country_hrs,
+              COUNT(DISTINCT hour) FILTER (WHERE kind = 'inventory') AS inv_hrs,
+              COUNT(DISTINCT hour) FILTER (WHERE kind = 'app') AS app_hrs
        FROM rollup_hourly
-       WHERE client_id = $1::uuid AND kind IN ('network', 'country_net') AND report_date BETWEEN $2::date AND $3::date
+       WHERE client_id = $1::uuid AND kind IN ('network', 'country_net', 'inventory', 'app')
+         AND report_date BETWEEN $2::date AND $3::date
        GROUP BY report_date
      ) h ON h.report_date = d::date
      WHERE COALESCE(h.hrs, 0) < 24 OR COALESCE(h.country_hrs, 0) < 24
+        -- Domain users' numbers come from the site and app hours: a day with holes there must be re-pulled too.
+        -- Only checked for a slice this network has at all, so a network without apps is not re-fetched forever.
+        OR (COALESCE(h.inv_hrs, 0) < 24 AND EXISTS (
+              SELECT 1 FROM rollup_hourly x WHERE x.client_id = $1::uuid AND x.kind = 'inventory'
+                AND x.report_date BETWEEN $2::date AND $3::date))
+        OR (COALESCE(h.app_hrs, 0) < 24 AND EXISTS (
+              SELECT 1 FROM rollup_hourly x WHERE x.client_id = $1::uuid AND x.kind = 'app'
+                AND x.report_date BETWEEN $2::date AND $3::date))
      ORDER BY d`,
     [clientId, start, end]
   );

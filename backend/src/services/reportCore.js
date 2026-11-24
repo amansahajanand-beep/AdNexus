@@ -3364,13 +3364,44 @@ async function prepareTimezoneView(req, res, page, {
   );
   const { startDate, endDate } = asked;
 
-  let coverage = await hv.coverage(clientId, tz, today, srcTz, Date.now(), coverageKind);
+  // A domain user's assigned inventory, resolved the way the normal pages resolve it.
+  const scope = isScoped
+    ? resolveScopedSqlInventoryOpts(req.user, {
+      domain: req.query.domain, site: req.query.site, domainId: req.query.domainId, domainName: req.query.domainName,
+    })
+    : null;
+
+  // A domain user's numbers come from the inventory / app hourly slices, not the network one. A day only counts as
+  // covered when EVERY slice the answer is built from has it; otherwise "all sites" (one set of days) and a single
+  // site (another set) are cut from different data and disagree.
+  const sliceKinds = [coverageKind];
+  if (isScoped && scope) {
+    if (scope.domains?.length || scope.sites?.length) sliceKinds.push('inventory');
+    if (scope.apps?.length) sliceKinds.push('app');
+  }
+  const loadCoverage = async () => {
+    let merged;
+    for (const kind of [...new Set(sliceKinds)]) {
+      const c = await hv.coverage(clientId, tz, today, srcTz, Date.now(), kind);
+      if (!c) return null;
+      merged = merged
+        ? {
+          from: c.from > merged.from ? c.from : merged.from,
+          through: c.through < merged.through ? c.through : merged.through,
+          partialDay: c.partialDay || merged.partialDay,
+        }
+        : c;
+      if (merged.through < merged.from) return null;
+    }
+    return merged || null;
+  };
+  let coverage = await loadCoverage();
   // The range reaches hours the hourly sync has not stored yet (it only runs while the backend is up): fetch the
   // network's latest hours now instead of answering with another timezone's days.
   if ((!coverage || endDate > coverage.through) && endDate >= shiftYMD(today, -2)) {
     const refresh = require('./hourlySyncService').refreshNetworkHours(client);
     const done = await Promise.race([refresh, new Promise((resolve) => setTimeout(() => resolve(false), 30000))]);
-    if (done) coverage = await hv.coverage(clientId, tz, today, srcTz, Date.now(), coverageKind);
+    if (done) coverage = await loadCoverage();
   }
   const cov = coverage?.from || null;
   if (!cov || endDate < cov || endDate > coverage.through) {
@@ -3378,13 +3409,6 @@ async function prepareTimezoneView(req, res, page, {
     markTimezoneNotApplied(res, { tz, srcTz, reason });
     return null;
   }
-
-  // A domain user's assigned inventory, resolved the way the normal pages resolve it.
-  const scope = isScoped
-    ? resolveScopedSqlInventoryOpts(req.user, {
-      domain: req.query.domain, site: req.query.site, domainId: req.query.domainId, domainName: req.query.domainName,
-    })
-    : null;
 
   const legacyEnd = shiftYMD(cov, -1);
   /** Run a normal handler for the days before the hourly data starts (they stay in the network timezone). */
@@ -5485,6 +5509,26 @@ async function handleDetailedReport(req, res) {
       } catch (emptyErr) {
         logger.warn('Reporting empty-check failed, continuing:', emptyErr.message);
       }
+    }
+
+    // ── Domain users see STORED data only ───────────────────────────────────────────────────────────────────
+    // Every stored path above (rollups, ID-filtered grain, lean) found nothing for this user's assignment. The live
+    // Ad Manager ladder below submits one report job after another (~5 s each, minutes in total) and, for a user who
+    // only sees a few apps/sites, nearly always ends in "no data" anyway. Answer now; the hourly / daily syncs fill
+    // anything that is genuinely missing. Admins keep the live fallback. Set SCOPED_STORED_ONLY=false to restore it.
+    if (
+      isScopedChild
+      && !wantsExport
+      && process.env.SCOPED_STORED_ONLY !== 'false'
+      && (domains.length || sites.length || apps.length || adUnitNames.length)
+    ) {
+      logger.info(
+        `Reporting no stored data ${filters.startDate}..${filters.endDate}`
+        + ` user=${req.user?.username} — returning empty without live GAM`
+      );
+      const payload = noDataPayload({});
+      cache.set(detailedRespKey, payload, NO_DATA_RESPONSE_TTL);
+      return res.json(payload);
     }
 
     // ── Miss: sync grain + for Country use live GAM with country-safe dim sets ─

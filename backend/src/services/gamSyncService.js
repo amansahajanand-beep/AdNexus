@@ -4657,7 +4657,10 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
     if (!appFilter.matched) return null;
   }
   const whereRange = `${whereCore} AND g.report_date BETWEEN $2::date AND $3::date`;
-  const whereDay = `${whereCore} AND g.report_date = d.day::date`;
+  // The per-day LATERAL join alone (`= d.day`) cannot prune partitions: Postgres then scanned every monthly
+  // report_grain partition (hundreds of thousands of client rows each, 25-60 s). The fixed BETWEEN lets it prune to
+  // the requested months and use the (client_id, report_date, …) index; `= d.day` still splits the rows per day.
+  const whereDay = `${whereCore} AND g.report_date BETWEEN $2::date AND $3::date AND g.report_date = d.day::date`;
 
   const groupCols = ['g.report_date'];
   const selectIds = [`g.report_date`];
@@ -4708,8 +4711,13 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
   const perDayIdx = fullCountryTable ? -1 : tableParams.length - 1;
   const limitIdx = tableParams.length;
 
+  const qTimes = {};
+  const tq = (label) => (...args) => {
+    const qs = Date.now();
+    return query(...args).then((r) => { qTimes[label] = Date.now() - qs; return r; });
+  };
   const [totalsRes, trendRes, entityRes, tableRes] = await Promise.all([
-    query(
+    tq('totals')(
       `SELECT
          COALESCE(SUM(g.impressions), 0)::float8 AS impressions,
          COALESCE(SUM(g.revenue), 0)::float8 AS revenue,
@@ -4720,7 +4728,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
        WHERE ${whereRange}`,
       params
     ),
-    query(
+    tq('trend')(
       `SELECT
          to_char(g.report_date, 'YYYY-MM-DD') AS date,
          COALESCE(SUM(g.revenue), 0)::float8 AS earning,
@@ -4731,7 +4739,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
        ORDER BY g.report_date`,
       params
     ),
-    query(
+    tq('entity')(
       `SELECT COUNT(*)::int AS n FROM (
          SELECT DISTINCT g.domain_id::text AS k
          FROM report_grain g
@@ -4746,7 +4754,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
       params
     ),
     fullCountryTable
-      ? query(
+      ? tq('table')(
         `SELECT
            to_char(sub.report_date, 'YYYY-MM-DD') AS report_date,
            sub.domain_id, sub.site_id, sub.ad_unit_id,
@@ -4779,7 +4787,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
          LIMIT $${limitIdx}`,
         tableParams
       )
-      : query(
+      : tq('table')(
         `SELECT
            to_char(day_rows.report_date, 'YYYY-MM-DD') AS report_date,
            day_rows.domain_id, day_rows.site_id, day_rows.ad_unit_id,
@@ -4827,7 +4835,9 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
   const t = totalsRes.rows[0] || {};
   const grainCount = Number(t.row_count) || 0;
   const totalDomains = Number(entityRes.rows?.[0]?.n) || 0;
+  const hydrateT0 = Date.now();
   const tableRows = await hydrateGrainIdRows(tableRes.rows || []);
+  qTimes.hydrate = Date.now() - hydrateT0;
   if (!grainCount && !tableRows.length) return null;
 
   let impressions = Number(t.impressions) || 0;
@@ -4863,6 +4873,7 @@ async function fetchReportingIdGrainFromDB(startDate, endDate, opts = {}, t0 = D
     + ` slice=${byApp ? 'app_id' : 'inventory_core'}`
     + `${byCountry ? '+country' : ''}${fullCountryTable ? ' full' : ''}`
     + ` grain≈${grainCount} table=${tableRows.length} in ${Date.now() - t0}ms`
+    + ` [totals=${qTimes.totals}ms trend=${qTimes.trend}ms entity=${qTimes.entity}ms table=${qTimes.table}ms hydrate=${qTimes.hydrate}ms]`
   );
 
   return {

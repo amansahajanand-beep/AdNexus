@@ -1,6 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import PageHeader from '../../components/ui/PageHeader';
+import GoogleSheetsButton from '../../components/ui/GoogleSheetsButton';
 import DataFreshness from '../../components/ui/DataFreshness';
 import SavePresetButton from '../../components/ui/SavePresetButton';
 import ProductReportFilters, { useProductCompareState } from '../../components/ui/ProductReportFilters';
@@ -82,6 +83,7 @@ export default function AdMobReporting() {
           : 'Earnings for your assigned apps — filter and pick a breakdown dimension'}
         summary={report.filterSummary}
       >
+        <GoogleSheetsButton />
         {canFilter && (
           <>
             <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>

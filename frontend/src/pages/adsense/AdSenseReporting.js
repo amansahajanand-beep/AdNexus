@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import PageHeader from '../../components/ui/PageHeader';
+import GoogleSheetsButton from '../../components/ui/GoogleSheetsButton';
 import DataFreshness from '../../components/ui/DataFreshness';
 import SavePresetButton from '../../components/ui/SavePresetButton';
 import ProductReportFilters, { useProductCompareState } from '../../components/ui/ProductReportFilters';
@@ -64,6 +65,7 @@ export default function AdSenseReporting() {
         subtitle="Filter by site, country, or platform — drill into any dimension"
         summary={report.filterSummary}
       >
+        <GoogleSheetsButton />
         {canFilter && (
           <>
             <button type="button" className="btn-reset btn-copy-link" onClick={handleCopyLink}>

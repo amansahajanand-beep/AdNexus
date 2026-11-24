@@ -35,6 +35,11 @@ function num(v) {
 }
 
 const ecpm = (rev, imp) => (Number(imp) > 0 ? (Number(rev) / Number(imp)) * 1000 : 0);
+const pct = (part, whole) => (Number(whole) > 0 ? (Number(part) / Number(whole)) * 100 : 0);
+/** SQL: show the network name, or one "All networks" label when the flag parameter is true (domain users). */
+const CLIENT_LABEL = (flag) => `CASE WHEN ${flag}::boolean THEN 'All networks' ELSE c.name END`;
+/** The hidden publisher workspace is named "<network> · AdMob"; show the real name. */
+const cleanClient = (name) => String(name || '').replace(/\s*·\s*AdMob$/, '');
 
 /**
  * One entry per tab.
@@ -49,17 +54,18 @@ const SOURCES = {
     kind: 'domains',
     header: ['Date', 'Client', 'Revenue', 'Impressions', 'Clicks', 'eCPM', 'Currency'],
     keyCols: 2,
-    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.domains, sc.sites],
+    // $3 = every network to read, $6 = merge them into one "All networks" row set (domain users).
+    params: (r, ids, sc, merged) => [r.startDate, r.endDate, ids, sc.domains, sc.sites, merged],
     sql: `
-      SELECT r.report_date::text AS d, c.name AS client,
+      SELECT r.report_date::text AS d, ${CLIENT_LABEL('$6')} AS client,
              SUM(r.revenue) AS revenue, SUM(r.impressions) AS impressions, SUM(r.clicks) AS clicks,
              MAX(r.currency) AS currency
         FROM rollup_kpi_daily r
         JOIN gam_clients c ON c.id = r.client_id
-       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid AND r.inv_app = ''
+       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = ANY($3::uuid[]) AND r.inv_app = ''
          AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]) OR lower(r.inv_site) = ANY($5::text[]))
-       GROUP BY r.report_date, c.name
-       ORDER BY r.report_date, c.name`,
+       GROUP BY r.report_date, ${CLIENT_LABEL('$6')}
+       ORDER BY r.report_date, client`,
     row: (x) => [x.d, x.client, num(x.revenue), num(x.impressions), num(x.clicks),
       num(ecpm(x.revenue, x.impressions)), x.currency],
   },
@@ -68,18 +74,18 @@ const SOURCES = {
     kind: 'domains',
     header: ['Date', 'Client', 'Domain', 'Site', 'Revenue', 'Impressions', 'Clicks', 'eCPM', 'Currency'],
     keyCols: 4,
-    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.domains, sc.sites],
+    params: (r, ids, sc, merged) => [r.startDate, r.endDate, ids, sc.domains, sc.sites, merged],
     sql: `
-      SELECT r.report_date::text AS d, c.name AS client, r.inv_domain AS domain, r.inv_site AS site,
+      SELECT r.report_date::text AS d, ${CLIENT_LABEL('$6')} AS client, r.inv_domain AS domain, r.inv_site AS site,
              SUM(r.revenue) AS revenue, SUM(r.impressions) AS impressions, SUM(r.clicks) AS clicks,
              MAX(r.currency) AS currency
         FROM rollup_inventory_kpi_daily r
         JOIN gam_clients c ON c.id = r.client_id
-       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid
+       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = ANY($3::uuid[])
          AND (r.inv_domain <> '' OR r.inv_site <> '')
          AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]) OR lower(r.inv_site) = ANY($5::text[]))
-       GROUP BY r.report_date, c.name, r.inv_domain, r.inv_site
-       ORDER BY r.report_date, c.name, r.inv_domain, r.inv_site`,
+       GROUP BY r.report_date, ${CLIENT_LABEL('$6')}, r.inv_domain, r.inv_site
+       ORDER BY r.report_date, client, r.inv_domain, r.inv_site`,
     row: (x) => [x.d, x.client, x.domain, x.site, num(x.revenue), num(x.impressions), num(x.clicks),
       num(ecpm(x.revenue, x.impressions)), x.currency],
   },
@@ -88,20 +94,23 @@ const SOURCES = {
     kind: 'apps',
     header: ['Date', 'Client', 'App ID', 'App Name', 'Revenue', 'Impressions', 'Clicks', 'eCPM', 'Currency'],
     keyCols: 3,
-    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.appIds],
+    params: (r, ids, sc, merged) => [r.startDate, r.endDate, ids, sc.appIds, merged],
     sql: `
-      SELECT r.report_date::text AS d, c.name AS client, r.inv_app AS app_id, COALESCE(n.app_name, '') AS app_name,
-             r.revenue, r.impressions, r.clicks, r.currency
+      SELECT r.report_date::text AS d, ${CLIENT_LABEL('$5')} AS client, r.inv_app AS app_id,
+             COALESCE(MAX(n.app_name), '') AS app_name,
+             SUM(r.revenue) AS revenue, SUM(r.impressions) AS impressions, SUM(r.clicks) AS clicks,
+             MAX(r.currency) AS currency
         FROM rollup_kpi_daily r
         JOIN gam_clients c ON c.id = r.client_id
         LEFT JOIN (
           SELECT lower(app_id) AS k, MAX(app_name) AS app_name FROM rollup_app_country_daily
-           WHERE client_id = $3::uuid GROUP BY lower(app_id)
+           WHERE client_id = ANY($3::uuid[]) GROUP BY lower(app_id)
         ) n ON n.k = lower(r.inv_app)
-       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid
+       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = ANY($3::uuid[])
          AND r.inv_domain = '' AND r.inv_site = '' AND r.inv_ad_unit = '' AND r.inv_app <> ''
          AND ($4::text[] IS NULL OR lower(r.inv_app) = ANY($4::text[]))
-       ORDER BY r.report_date, c.name, r.inv_app`,
+       GROUP BY r.report_date, ${CLIENT_LABEL('$5')}, r.inv_app
+       ORDER BY r.report_date, client, r.inv_app`,
     row: (x) => [x.d, x.client, x.app_id, x.app_name, num(x.revenue), num(x.impressions), num(x.clicks),
       num(ecpm(x.revenue, x.impressions)), x.currency],
   },
@@ -110,17 +119,18 @@ const SOURCES = {
     kind: 'network', // network-wide only: this rollup can't be cut by a user's domains/apps
     header: ['Date', 'Client', 'Country', 'Revenue', 'Impressions', 'Clicks', 'eCPM', 'Currency'],
     keyCols: 3,
-    params: (r, client) => [r.startDate, r.endDate, client],
+    params: (r, ids, sc, merged) => [r.startDate, r.endDate, ids, merged],
     sql: `
-      SELECT r.report_date::text AS d, c.name AS client, COALESCE(NULLIF(dc.name, ''), 'Unknown') AS country,
+      SELECT r.report_date::text AS d, ${CLIENT_LABEL('$4')} AS client,
+             COALESCE(NULLIF(dc.name, ''), 'Unknown') AS country,
              SUM(r.revenue) AS revenue, SUM(r.impressions) AS impressions, SUM(r.clicks) AS clicks,
              MAX(r.currency) AS currency
         FROM rollup_country_device_daily r
         JOIN gam_clients c ON c.id = r.client_id
         LEFT JOIN dim_country dc ON dc.id = r.country_id
-       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid
-       GROUP BY r.report_date, c.name, COALESCE(NULLIF(dc.name, ''), 'Unknown')
-       ORDER BY r.report_date, c.name, country`,
+       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = ANY($3::uuid[])
+       GROUP BY r.report_date, ${CLIENT_LABEL('$4')}, COALESCE(NULLIF(dc.name, ''), 'Unknown')
+       ORDER BY r.report_date, client, country`,
     row: (x) => [x.d, x.client, x.country, num(x.revenue), num(x.impressions), num(x.clicks),
       num(ecpm(x.revenue, x.impressions)), x.currency],
   },
@@ -129,29 +139,30 @@ const SOURCES = {
     kind: 'catalog', // a list, not daily numbers: everything that had traffic in the last CATALOG_DAYS days
     header: ['Type', 'Client', 'Domain', 'Site', 'App ID', 'App Name', 'Ad Unit'],
     keyCols: 7,
-    params: (r, client, sc) => [shiftYMD(r.endDate, -(CATALOG_DAYS - 1)), r.endDate, client, sc.domains, sc.sites, sc.appIds],
+    params: (r, ids, sc, merged) => [shiftYMD(r.endDate, -(CATALOG_DAYS - 1)), r.endDate, ids, sc.domains, sc.sites, sc.appIds, merged],
     sql: `
-      SELECT 'Site' AS type, c.name AS client, r.inv_domain AS domain, r.inv_site AS site,
+      SELECT 'Site' AS type, ${CLIENT_LABEL('$7')} AS client, r.inv_domain AS domain, r.inv_site AS site,
              '' AS app_id, '' AS app_name, r.inv_ad_unit AS ad_unit
         FROM rollup_kpi_daily r
         JOIN gam_clients c ON c.id = r.client_id
-       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid AND r.inv_app = ''
+       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = ANY($3::uuid[]) AND r.inv_app = ''
          AND (r.inv_domain <> '' OR r.inv_site <> '' OR r.inv_ad_unit <> '')
          AND ($4::text[] IS NULL OR lower(r.inv_domain) = ANY($4::text[]) OR lower(r.inv_site) = ANY($5::text[]))
-       GROUP BY c.name, r.inv_domain, r.inv_site, r.inv_ad_unit
+       GROUP BY ${CLIENT_LABEL('$7')}, r.inv_domain, r.inv_site, r.inv_ad_unit
       UNION ALL
-      SELECT 'App', c.name, '', '', a.inv_app, COALESCE(n.app_name, ''), ''
+      SELECT 'App', ${CLIENT_LABEL('$7')}, '', '', a.inv_app, COALESCE(MAX(n.app_name), ''), ''
         FROM (
           SELECT DISTINCT client_id, inv_app FROM rollup_kpi_daily
-           WHERE report_date BETWEEN $1 AND $2 AND client_id = $3::uuid
+           WHERE report_date BETWEEN $1 AND $2 AND client_id = ANY($3::uuid[])
              AND inv_domain = '' AND inv_site = '' AND inv_ad_unit = '' AND inv_app <> ''
              AND ($6::text[] IS NULL OR lower(inv_app) = ANY($6::text[]))
         ) a
         JOIN gam_clients c ON c.id = a.client_id
         LEFT JOIN (
           SELECT lower(app_id) AS k, MAX(app_name) AS app_name FROM rollup_app_country_daily
-           WHERE client_id = $3::uuid GROUP BY lower(app_id)
+           WHERE client_id = ANY($3::uuid[]) GROUP BY lower(app_id)
         ) n ON n.k = lower(a.inv_app)
+       GROUP BY ${CLIENT_LABEL('$7')}, a.inv_app
       ORDER BY 1, 3, 4, 7, 5`,
     row: (x) => [x.type, x.client, x.domain, x.site, x.app_id, x.app_name, x.ad_unit],
   },
@@ -162,20 +173,26 @@ const SOURCES = {
     header: ['Date', 'Client', 'Account', 'Earnings', 'Impressions', 'Clicks', 'Ad Requests',
       'Matched Requests', 'CTR', 'eCPM', 'Match Rate', 'Currency'],
     keyCols: 3,
-    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.admobIds],
+    // $3 is a LIST of client ids: AdMob data lives under the publisher workspace, but older data may sit
+    // under the GAM network itself, so every candidate is read (an account row only exists under one).
+    params: (r, clientIds, sc) => [r.startDate, r.endDate, clientIds, sc.admobIds],
     sql: `
-      SELECT r.report_date::text AS d, c.name AS client,
-             COALESCE(NULLIF(a.descriptive_name, ''), a.account_id) AS account,
-             r.earnings, r.impressions, r.clicks, r.ad_requests, r.matched_requests,
-             r.ctr, r.ecpm, r.match_rate, r.currency
-        FROM admob_rollup_daily r
-        JOIN admob_accounts a ON a.id = r.account_id
-        JOIN gam_clients c ON c.id = r.client_id
-       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid
-         AND ($4::text[] IS NULL OR r.account_id::text = ANY($4::text[]))
-       ORDER BY r.report_date, c.name, account`,
-    row: (x) => [x.d, x.client, x.account, num(x.earnings), num(x.impressions), num(x.clicks),
-      num(x.ad_requests), num(x.matched_requests), num(x.ctr), num(x.ecpm), num(x.match_rate), x.currency],
+      SELECT f.report_date::text AS d, c.name AS client,
+             COALESCE(NULLIF(a.descriptive_name, ''), a.account_id, 'AdMob') AS account,
+             SUM(f.earnings) AS earnings, SUM(f.impressions) AS impressions, SUM(f.clicks) AS clicks,
+             SUM(f.ad_requests) AS ad_requests, SUM(f.matched_requests) AS matched_requests,
+             MAX(a.currency_code) AS currency
+        FROM admob_report_daily f
+        LEFT JOIN admob_accounts a ON a.id = f.account_id
+        JOIN gam_clients c ON c.id = f.client_id
+       WHERE f.report_date BETWEEN $1 AND $2 AND f.client_id = ANY($3::uuid[])
+         AND ($4::text[] IS NULL OR f.account_id::text = ANY($4::text[]))
+       GROUP BY f.report_date, c.name, COALESCE(NULLIF(a.descriptive_name, ''), a.account_id, 'AdMob')
+       ORDER BY f.report_date, c.name, account`,
+    row: (x) => [x.d, cleanClient(x.client), x.account, num(x.earnings), num(x.impressions), num(x.clicks),
+      num(x.ad_requests), num(x.matched_requests),
+      num(pct(x.clicks, x.impressions)), num(ecpm(x.earnings, x.impressions)),
+      num(pct(x.matched_requests, x.ad_requests)), x.currency || 'USD'],
   },
   AdSense: {
     tab: 'AdSense',
@@ -184,19 +201,23 @@ const SOURCES = {
     header: ['Date', 'Client', 'Account', 'Earnings', 'Page Views', 'Impressions', 'Clicks',
       'CTR', 'RPM', 'eCPM', 'Currency'],
     keyCols: 3,
-    params: (r, client, sc) => [r.startDate, r.endDate, client, sc.adsenseIds],
+    params: (r, clientIds, sc) => [r.startDate, r.endDate, clientIds, sc.adsenseIds],
     sql: `
-      SELECT r.report_date::text AS d, c.name AS client,
-             COALESCE(NULLIF(a.descriptive_name, ''), a.account_id) AS account,
-             r.earnings, r.page_views, r.impressions, r.clicks, r.ctr, r.rpm, r.ecpm, r.currency
-        FROM adsense_rollup_daily r
-        JOIN adsense_accounts a ON a.id = r.account_id
-        JOIN gam_clients c ON c.id = r.client_id
-       WHERE r.report_date BETWEEN $1 AND $2 AND r.client_id = $3::uuid
-         AND ($4::text[] IS NULL OR r.account_id::text = ANY($4::text[]))
-       ORDER BY r.report_date, c.name, account`,
-    row: (x) => [x.d, x.client, x.account, num(x.earnings), num(x.page_views), num(x.impressions),
-      num(x.clicks), num(x.ctr), num(x.rpm), num(x.ecpm), x.currency],
+      SELECT f.report_date::text AS d, c.name AS client,
+             COALESCE(NULLIF(a.descriptive_name, ''), a.account_id, 'AdSense') AS account,
+             SUM(f.earnings) AS earnings, SUM(f.page_views) AS page_views,
+             SUM(f.impressions) AS impressions, SUM(f.clicks) AS clicks,
+             MAX(a.currency_code) AS currency
+        FROM adsense_report_daily f
+        LEFT JOIN adsense_accounts a ON a.id = f.account_id
+        JOIN gam_clients c ON c.id = f.client_id
+       WHERE f.report_date BETWEEN $1 AND $2 AND f.client_id = ANY($3::uuid[])
+         AND ($4::text[] IS NULL OR f.account_id::text = ANY($4::text[]))
+       GROUP BY f.report_date, c.name, COALESCE(NULLIF(a.descriptive_name, ''), a.account_id, 'AdSense')
+       ORDER BY f.report_date, c.name, account`,
+    row: (x) => [x.d, cleanClient(x.client), x.account, num(x.earnings), num(x.page_views), num(x.impressions),
+      num(x.clicks), num(pct(x.clicks, x.impressions)), num(ecpm(x.earnings, x.page_views)),
+      num(ecpm(x.earnings, x.impressions)), x.currency || 'USD'],
   },
 };
 
@@ -211,23 +232,35 @@ const sharedCurrency = (accounts) => {
 
 async function scopedAdmobRows({ range, tenant, scope }) {
   const allowed = new Set(scope.accountIds);
-  const accounts = (await admobAccountStore.listAccounts(tenant.id)).filter((a) => allowed.has(a.id));
-  if (!accounts.length) return [];
-  const sc = { ...scope, accountIds: accounts.map((a) => a.id) };
-  const trend = await admobGrain.scopedTrend(tenant.id, accounts, { start: range.startDate, end: range.endDate, scope: sc });
-  const cur = sharedCurrency(accounts);
-  return trend.map((t) => [t.date, tenant.label, 'AdMob', num(t.earnings), num(t.impressions), num(t.clicks),
-    num(t.ad_requests), num(t.matched_requests), num(t.ctr), num(t.ecpm), num(t.match_rate), cur]);
+  const out = [];
+  for (const id of tenant.ids) {
+    const accounts = (await admobAccountStore.listAccounts(id)).filter((a) => allowed.has(a.id));
+    if (!accounts.length) continue;
+    const sc = { ...scope, accountIds: accounts.map((a) => a.id) };
+    const trend = await admobGrain.scopedTrend(id, accounts, { start: range.startDate, end: range.endDate, scope: sc });
+    const cur = sharedCurrency(accounts);
+    for (const t of trend) {
+      out.push([t.date, tenant.label, 'AdMob', num(t.earnings), num(t.impressions), num(t.clicks),
+        num(t.ad_requests), num(t.matched_requests), num(t.ctr), num(t.ecpm), num(t.match_rate), cur]);
+    }
+  }
+  return out;
 }
 
 async function scopedAdsenseRows({ range, tenant, scope }) {
   const allowed = new Set(scope.accountIds);
-  const accounts = (await adsenseAccountStore.listAccounts(tenant.id)).filter((a) => allowed.has(a.id));
-  if (!accounts.length) return [];
-  const sc = { ...scope, accountIds: accounts.map((a) => a.id) };
-  const trend = await adsenseGrain.scopedTrend(tenant.id, accounts, { start: range.startDate, end: range.endDate, scope: sc });
-  return trend.map((t) => [t.date, tenant.label, 'AdSense', num(t.earnings), num(t.page_views), num(t.impressions),
-    num(t.clicks), num(t.ctr), num(t.rpm), num(ecpm(t.earnings, t.impressions)), 'USD']);
+  const out = [];
+  for (const id of tenant.ids) {
+    const accounts = (await adsenseAccountStore.listAccounts(id)).filter((a) => allowed.has(a.id));
+    if (!accounts.length) continue;
+    const sc = { ...scope, accountIds: accounts.map((a) => a.id) };
+    const trend = await adsenseGrain.scopedTrend(id, accounts, { start: range.startDate, end: range.endDate, scope: sc });
+    for (const t of trend) {
+      out.push([t.date, tenant.label, 'AdSense', num(t.earnings), num(t.page_views), num(t.impressions),
+        num(t.clicks), num(t.ctr), num(t.rpm), num(ecpm(t.earnings, t.impressions)), 'USD']);
+    }
+  }
+  return out;
 }
 
 function colLetter(n) { // 1 -> A
@@ -381,20 +414,6 @@ async function exportDailyToSheets({ startDate, endDate, spreadsheetId, clientId
   const { scope, skips } = resolveScope(user);
   const sheets = await getSheetsApi();
 
-  // AdMob / AdSense rows belong to the account's hidden publisher workspace, not the GAM network itself.
-  let publisher;
-  const publisherTenant = async () => {
-    if (!publisher) {
-      const client = await getClientById(clientId);
-      const ws = await resolvePublisherClient(client);
-      publisher = {
-        id: ws?.id || clientId,
-        label: String(ws?.name || client?.name || '').replace(/\s*·\s*AdMob$/, ''),
-      };
-    }
-    return publisher;
-  };
-
   // GAM tabs cover every network the user can access (admin: all networks of the account;
   // domain user: the networks they're allowed). The connected network is always included.
   let networks;
@@ -402,17 +421,32 @@ async function exportDailyToSheets({ startDate, endDate, spreadsheetId, clientId
     if (!networks) {
       networks = [clientId];
       try {
-        const accountId = await getAccountIdForClient(clientId);
+        const client = await getClientById(clientId);
+        // The connected client may itself be the hidden AdMob workspace; its networks hang off the parent account.
+        const accountId = client?.publisherParentId || await getAccountIdForClient(clientId);
         const all = (await listClientsByAccountId(accountId))
-          .filter((n) => n.id && !n.isPending && !n.publisherParentId && n.isActive !== false);
-        const allowed = getAllowedClientIds(user); // null = admin
-        const picked = all.filter((n) => allowed === null || allowed.includes(n.id)).map((n) => n.id);
-        networks = [...new Set([clientId, ...picked])];
+          .filter((n) => n.id && !n.isPending && n.isActive !== false);
+        // A domain user's data is defined by their assigned domains / sites / apps, not by network, so every
+        // network of the account is read and the scope filters decide what they get.
+        networks = [...new Set([clientId, ...all.map((n) => n.id)])];
       } catch (err) {
         logger.warn(`Sheets export: network lookup failed, using the connected network only: ${err.message}`);
       }
     }
     return networks;
+  };
+
+  // AdMob / AdSense rows belong to the account's hidden publisher workspace, not the GAM network itself.
+  // Every candidate client id is read so data is found wherever the sync stored it.
+  let publisher;
+  const publisherTenant = async () => {
+    if (!publisher) {
+      const client = await getClientById(clientId);
+      const ws = await resolvePublisherClient(client);
+      const ids = [...new Set([ws?.id, clientId, ...(await networkIds())].filter(Boolean))];
+      publisher = { ids, label: isAdmin(user) ? cleanClient(ws?.name || client?.name || '') : 'All networks' };
+    }
+    return publisher;
   };
 
   const result = {};
@@ -421,23 +455,29 @@ async function exportDailyToSheets({ startDate, endDate, spreadsheetId, clientId
     if (range.startDate > range.endDate) { result[name] = { skipped: 'Date range outside your allowed window' }; continue; }
     try {
       let values;
+      let scanned;
       if (src.kind === 'admob' || src.kind === 'adsense') {
         const tenant = await publisherTenant();
+        scanned = tenant.ids.length;
         if (isAdmin(user)) {
-          const res = await query(src.sql, src.params(range, tenant.id, scope));
+          const res = await query(src.sql, src.params(range, tenant.ids, scope));
           values = res.rows.map(src.row);
         } else {
           values = await src.scopedRows({ range, tenant, scope: src.kind === 'admob' ? scope.admob : scope.adsense });
         }
       } else {
-        values = [];
-        for (const tenantId of await networkIds()) {
-          const res = await query(src.sql, src.params(range, tenantId, scope));
-          values.push(...res.rows.map(src.row));
-        }
+        const ids = await networkIds();
+        scanned = ids.length;
+        const res = await query(src.sql, src.params(range, ids, scope, !isAdmin(user)));
+        values = res.rows.map(src.row);
       }
       const out = await upsertTab(sheets, spreadsheetId, src, values);
-      result[name] = { fetched: values.length, ...out };
+      result[name] = { fetched: values.length, scanned, ...out };
+      if (!values.length) {
+        result[name].note = src.kind === 'admob' || src.kind === 'adsense'
+          ? `No ${name} rows found for these dates in ${scanned} workspace(s). Check that ${name} accounts are connected and synced.`
+          : `No rows found for these dates across ${scanned} network(s).`;
+      }
       logger.info(`Sheets export [${name}] user=${user.username} ${range.startDate}→${range.endDate}: ${values.length} rows (updated ${out.updated}, appended ${out.appended})`);
     } catch (err) {
       result[name] = { error: err.message };
