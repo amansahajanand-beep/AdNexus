@@ -172,4 +172,4 @@ async function auditAllClients(opts = {}) {
   return results;
 }
 
-module.exports = { auditClient, auditAllClients, findDivergentDays };
+module.exports = { auditClient, auditAllClients, findDivergentDays, repairDay };
