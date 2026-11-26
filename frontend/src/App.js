@@ -44,6 +44,16 @@ import {
 } from './utils/crossTabAuth';
 import './App.css';
 
+/**
+ * Public homepage. Logged-out visitors (and Google's OAuth verification crawler) see the About page,
+ * which explains the app and links to Privacy / Terms. Signed-in users go straight to their dashboard.
+ */
+function RootEntry() {
+  const { isAuthenticated, loading } = useAuth();
+  if (loading) return <div className="app-boot"><div className="spinner" /></div>;
+  return isAuthenticated ? <HomeRedirect /> : <About />;
+}
+
 function AppRoutes() {
   const { logout } = useAuth();
   const navigate = useNavigate();
@@ -122,13 +132,13 @@ function AppRoutes() {
       {/* Public */}
       <Route path="/login" element={<PublicOnlyRoute><Login /></PublicOnlyRoute>} />
       <Route path="/onboard" element={<PublicOnlyRoute><Onboard /></PublicOnlyRoute>} />
+      <Route path="/" element={<RootEntry />} />
       <Route path="/about" element={<About />} />
       <Route path="/privacy" element={<PrivacyPolicy />} />
       <Route path="/terms" element={<TermsOfService />} />
 
       {/* Authenticated app shell */}
       <Route element={<ProtectedRoute><Layout /></ProtectedRoute>}>
-        <Route index element={<HomeRedirect />} />
         <Route path="/dashboard" element={<PermissionRoute page="dashboard"><Dashboard /></PermissionRoute>} />
         <Route path="/reporting" element={<PermissionRoute page="reporting"><Reporting /></PermissionRoute>} />
         <Route path="/roi" element={<PermissionRoute page="roi"><Roi /></PermissionRoute>} />
