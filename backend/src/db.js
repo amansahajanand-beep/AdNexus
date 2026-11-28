@@ -641,6 +641,46 @@ async function initSchema() {
   // Partition conversion creates a fresh report_grain — column ensures run after listen.
   // (Avoid ACCESS EXCLUSIVE waits here during boot.)
 
+  // Market Intel: competitor ads from the Google Ads Transparency Center (via SerpApi). Global, not per-tenant.
+  await schemaQuery(`
+    CREATE TABLE IF NOT EXISTS market_advertisers (
+      advertiser_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL DEFAULT '',
+      country TEXT,
+      tracked BOOLEAN NOT NULL DEFAULT true,
+      last_synced_at TIMESTAMPTZ,
+      last_error TEXT,
+      added_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS market_creatives (
+      ad_creative_id TEXT PRIMARY KEY,
+      advertiser_id TEXT NOT NULL,
+      advertiser_name TEXT NOT NULL DEFAULT '',
+      format TEXT NOT NULL DEFAULT '',
+      target_domain TEXT NOT NULL DEFAULT '',
+      image_url TEXT,
+      preview_url TEXT,
+      width INT,
+      height INT,
+      total_days_shown INT NOT NULL DEFAULT 0,
+      first_shown TIMESTAMPTZ,
+      last_shown TIMESTAMPTZ,
+      details_link TEXT,
+      first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+    ALTER TABLE market_creatives ADD COLUMN IF NOT EXISTS youtube_id TEXT;
+    ALTER TABLE market_creatives ADD COLUMN IF NOT EXISTS app_icon TEXT;
+    ALTER TABLE market_creatives ADD COLUMN IF NOT EXISTS app_name TEXT;
+    ALTER TABLE market_creatives ADD COLUMN IF NOT EXISTS enriched_at TIMESTAMPTZ;
+    ALTER TABLE market_advertisers ADD COLUMN IF NOT EXISTS backfill_token TEXT;
+    ALTER TABLE market_advertisers ADD COLUMN IF NOT EXISTS backfill_pages INT NOT NULL DEFAULT 0;
+    ALTER TABLE market_advertisers ADD COLUMN IF NOT EXISTS backfill_done BOOLEAN NOT NULL DEFAULT false;
+    CREATE INDEX IF NOT EXISTS idx_market_creatives_adv ON market_creatives (advertiser_id);
+    CREATE INDEX IF NOT EXISTS idx_market_creatives_first ON market_creatives (first_shown DESC);
+    CREATE INDEX IF NOT EXISTS idx_market_creatives_last ON market_creatives (last_shown DESC);
+  `);
+
   // Google Ads ROI tables (MCC + client accounts, campaign map, spend, other expenses)
   await schemaQuery(`
     CREATE TABLE IF NOT EXISTS ads_accounts (

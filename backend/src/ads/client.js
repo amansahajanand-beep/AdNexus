@@ -472,6 +472,8 @@ module.exports = {
   getAdsOAuthClient,
   resolveOAuthApp,
   createAdsApi,
+  customerClient,
+  gaqlQuery,
   listAccessibleCustomerIds,
   fetchCustomerInfo,
   listMccChildAccounts,

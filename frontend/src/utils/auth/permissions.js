@@ -266,6 +266,7 @@ export function canAccessPage(user, page) {
     roi: 'canAccessRoi',
     'domain-user': 'canAccessDomainUser',
     'my-ads': 'canAccessMyAds',
+    'ad-insights': 'canAccessMyAds',
   };
   const key = map[page];
   return key ? hasPermission(user, key) : false;

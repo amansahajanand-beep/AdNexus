@@ -83,6 +83,8 @@ export const GAM_NAV_ITEMS = [
   { to: '/reporting', label: 'Reporting', page: 'reporting' },
   { to: '/roi', label: 'ROI', page: 'roi' },
   { to: '/my-ads', label: 'Google Ads', page: 'my-ads' },
+  { to: '/ad-insights', label: 'Ad Insights', page: 'ad-insights' },
+  { to: '/app-building', label: 'App Building', page: 'ad-insights' },
   { to: '/presets', label: 'Presets', page: 'presets' },
   { to: '/ai-forecast', label: 'Forecast', page: 'ai-forecast', adminOnly: true, requiresAi: true },
   { to: '/ai-report', label: 'Weekly report', page: 'ai-report', adminOnly: true, requiresAi: true },

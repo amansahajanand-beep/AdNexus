@@ -415,6 +415,36 @@ export function adsAPIFor(clientId) {
   return clientId ? makeAdsAccountsAPI(clientId) : adsAPI;
 }
 
+export const marketIntelAPI = {
+  creatives: (params) => FAST_API.get('/market-intel/creatives', { params }),
+  summary: (params) => FAST_API.get('/market-intel/summary', { params }),
+  pulse: () => FAST_API.get('/market-intel/pulse'),
+  opps: () => FAST_API.get('/market-intel/opps'),
+  oppsMine: (q) => FAST_API.get('/market-intel/opps/mine', { params: { q } }),
+  bestApps: (params) => FAST_API.get('/market-intel/best-apps', { params }),
+  websites: (params) => FAST_API.get('/market-intel/websites', { params }),
+  otherAssets: (params) => FAST_API.get('/market-intel/other-assets', { params }),
+  explorer: () => FAST_API.get('/market-intel/explorer'),
+  matchVideos: (params) => FAST_API.get('/market-intel/match-videos', { params }),
+  lookup: (q) => FAST_API.get('/market-intel/lookup', { params: { q } }),
+  compare: (ids) => FAST_API.get('/market-intel/compare', { params: { ids } }),
+  groups: (kind) => FAST_API.get('/market-intel/groups', { params: { kind } }),
+  addGroup: (body) => FAST_API.post('/market-intel/groups', body),
+  deleteGroup: (id) => FAST_API.delete(`/market-intel/groups/${id}`),
+  intel: (days) => FAST_API.get('/market-intel/intel', { params: { days } }),
+  search: (params) => FAST_API.get('/market-intel/search', { params }),
+  advertisers: (params) => FAST_API.get('/market-intel/advertisers', { params }),
+  addAdvertisers: (body) => FAST_API.post('/market-intel/advertisers', body),
+  sync: (body) => FAST_API.post('/market-intel/sync', body || {}),
+};
+
+export const adInsightsAPI = {
+  listAccounts: () => FAST_API.get('/ad-insights/accounts'),
+  apps: (params) => FAST_API.get('/ad-insights/apps', { params }),
+  assets: (params) => FAST_API.get('/ad-insights/assets', { params }),
+  keywords: (params) => FAST_API.get('/ad-insights/keywords', { params }),
+};
+
 export const adsAPI = {
   ...makeAdsAccountsAPI(),
   listCampaigns: (id) => FAST_API.get(`/ads/accounts/${id}/campaigns`),

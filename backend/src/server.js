@@ -22,6 +22,8 @@ const ordersRoutes = require('./routes/orders');
 const inventoryRoutes = require('./routes/inventory');
 const networkRoutes = require('./routes/network');
 const adsRoutes = require('./routes/ads');
+const adInsightsRoutes = require('./routes/adInsights');
+const marketIntelRoutes = require('./routes/marketIntel');
 const admobRoutes = require('./routes/admob');
 const adsenseRoutes = require('./routes/adsense');
 const roiRoutes = require('./routes/roi');
@@ -154,6 +156,8 @@ async function startServer() {
   app.use('/auth/adsense', authAdsenseRoutes); // AdSense OAuth
   app.use('/api/onboard', onboardRoutes);    // Public client self-onboard
   app.use('/api/clients', clientsRoutes);    // Client admin credential settings
+  app.use('/api/ad-insights', adInsightsRoutes); // Ads apps / assets / keywords
+  app.use('/api/market-intel', marketIntelRoutes); // Competitor ads (Transparency Center via SerpApi)
   app.use('/api/ads', adsRoutes);            // Google Ads accounts / mapping / expenses
   app.use('/api/admob', admobRoutes);        // AdMob accounts / overview
   app.use('/api/adsense', adsenseRoutes);    // AdSense accounts / overview
@@ -317,6 +321,13 @@ async function startServer() {
       require('./ai/presetAnalysis/prewarm').startPrewarmCron();
     } catch (e) {
       logger.warn('AI pre-warm schedule failed (non-fatal):', e.message);
+    }
+
+    // Competitor ads collection (off unless MARKET_INTEL_SYNC=true).
+    try {
+      require('./services/marketIntelCron').startMarketIntelCron();
+    } catch (e) {
+      logger.warn('Market Intel cron failed to start (non-fatal):', e.message);
     }
 
     // Weekly executive report (off unless AI_REPORT_ENABLED=true).

@@ -14,6 +14,22 @@ import TeamUsers from './pages/TeamUsers';
 import UserManagerRoute from './components/routing/UserManagerRoute';
 import DomainUser from './pages/DomainUser';
 import MyAds from './pages/MyAds';
+import AdInsights from './pages/AdInsights';
+import AdsViewer from './pages/AdsViewer';
+import MarketPulse from './pages/MarketPulse';
+import AppBuildingLayout from './pages/appBuilding/AppBuildingLayout';
+import Advertisers from './pages/appBuilding/Advertisers';
+import WhatToBuild from './pages/appBuilding/WhatToBuild';
+import MarketingIntel from './pages/appBuilding/MarketingIntel';
+import UniversalSearch from './pages/appBuilding/UniversalSearch';
+import BestApps from './pages/appBuilding/BestApps';
+import Websites from './pages/appBuilding/Websites';
+import OtherAssets from './pages/appBuilding/OtherAssets';
+import CreativeExplorer from './pages/appBuilding/CreativeExplorer';
+import MatchVideos from './pages/appBuilding/MatchVideos';
+import AppLookup from './pages/appBuilding/AppLookup';
+import AdCompare from './pages/appBuilding/AdCompare';
+import Groups from './pages/appBuilding/Groups';
 import Help from './pages/Help';
 import GoogleSheets from './pages/GoogleSheets';
 import AiReport from './pages/AiReport';
@@ -52,6 +68,13 @@ function RootEntry() {
   const { isAuthenticated, loading } = useAuth();
   if (loading) return <div className="app-boot"><div className="spinner" /></div>;
   return isAuthenticated ? <HomeRedirect /> : <About />;
+}
+
+/** Admins manage Google Ads in Admin; /my-ads is the domain-user page. */
+function MyAdsEntry() {
+  const { user } = useAuth();
+  if (user?.role === 'admin') return <Navigate to="/admin?tab=ads" replace />;
+  return <PermissionRoute page="my-ads"><MyAds /></PermissionRoute>;
 }
 
 function AppRoutes() {
@@ -146,7 +169,33 @@ function AppRoutes() {
         <Route path="/presets" element={<PermissionRoute page="presets"><Presets /></PermissionRoute>} />
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="/team" element={<UserManagerRoute><TeamUsers /></UserManagerRoute>} />
-        <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />
+        <Route path="/my-ads" element={<MyAdsEntry />} />
+        <Route path="/app-building" element={<PermissionRoute page="ad-insights"><AppBuildingLayout /></PermissionRoute>}>
+          <Route index element={<Navigate to="pulse" replace />} />
+          <Route path="pulse" element={<MarketPulse />} />
+          <Route path="build" element={<WhatToBuild />} />
+          <Route path="viewer" element={<AdsViewer />} />
+          <Route
+            path="top-ads"
+            element={<AdsViewer title="Top Ads" subtitle="Longest-running ads — advertisers keep paying for these, so they tend to be winners." preset={{ seen: "7d", minDays: "60", sort: "longest" }} />}
+          />
+          <Route path="intel" element={<MarketingIntel />} />
+          <Route path="search" element={<UniversalSearch />} />
+          <Route path="advertisers" element={<Advertisers />} />
+          <Route path="best-apps" element={<BestApps />} />
+          <Route path="websites" element={<Websites />} />
+          <Route path="other-assets" element={<OtherAssets />} />
+          <Route path="explorer" element={<CreativeExplorer />} />
+          <Route path="match-videos" element={<MatchVideos />} />
+          <Route path="lookup" element={<AppLookup />} />
+          <Route path="compare" element={<AdCompare />} />
+          <Route path="app-groups" element={<Groups kind="app" />} />
+          <Route path="video-groups" element={<Groups kind="video" />} />
+          <Route path="*" element={<Navigate to="pulse" replace />} />
+        </Route>
+        <Route path="/market-pulse" element={<Navigate to="/app-building/pulse" replace />} />
+        <Route path="/ads-viewer" element={<Navigate to="/app-building/viewer" replace />} />
+        <Route path="/ad-insights" element={<PermissionRoute page="ad-insights"><AdInsights /></PermissionRoute>} />
         <Route path="/domain-user" element={<PermissionRoute page="domain-user"><DomainUser /></PermissionRoute>} />
         <Route path="/help" element={<Help />} />
         <Route path="/google-sheets" element={<GoogleSheets />} />

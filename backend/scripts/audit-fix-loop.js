@@ -35,12 +35,12 @@ async function syncDay(client, day) {
   return null;
 }
 
-async function fixClient(client, { start, minDelta, batch }) {
+async function fixClient(client, { start, end, minDelta, batch }) {
   let clean = 0;
   for (let pass = 1; ; pass += 1) {
     let res;
     try {
-      res = await auditClient(client, { start, maxFix: 1, dryRun: true });
+      res = await auditClient(client, { start, end: end || undefined, maxFix: 1, dryRun: true });
     } catch (e) {
       log(`${client.name}: audit failed (${e.message}); retry in 5 min`);
       await sleep(300000);
@@ -71,6 +71,7 @@ async function fixClient(client, { start, minDelta, batch }) {
 (async () => {
   const only = arg('client').toLowerCase().split(',').map((s) => s.trim()).filter(Boolean);
   const start = arg('start', '2026-05-01');
+  const end = arg('end', '');
   const minDelta = parseFloat(arg('min-delta', '5')) || 5;
   const batch = parseInt(arg('batch', '8'), 10) || 8;
   if (!only.length) { console.error('Usage: node scripts/audit-fix-loop.js --client "<name>[,<name>...]" [--start YYYY-MM-DD] [--min-delta 5] [--batch 8]'); process.exit(1); }
@@ -79,7 +80,7 @@ async function fixClient(client, { start, minDelta, batch }) {
   clients.sort((a, b) => only.findIndex((o) => a.name.toLowerCase().includes(o)) - only.findIndex((o) => b.name.toLowerCase().includes(o)));
   if (!clients.length) { console.error('No active client matches'); process.exit(1); }
   for (const client of clients) {
-    await runWithClient(client, () => fixClient(client, { start, minDelta, batch }));
+    await runWithClient(client, () => fixClient(client, { start, end, minDelta, batch }));
   }
   log('ALL DONE');
   process.exit(0);

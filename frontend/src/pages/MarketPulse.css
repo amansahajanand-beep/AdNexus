@@ -1,0 +1,34 @@
+/* Market Pulse — builds on the shared tokens (App Building shell remaps them to the dark palette) */
+.mp-panel { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-card); box-shadow: var(--shadow-sm); padding: 14px 16px; }
+.mp-panel h3 { margin: 0 0 10px; font-size: 13px; font-weight: 800; color: var(--text); }
+.mp-sub { margin-top: 18px !important; }
+.mp-head { display: flex; justify-content: space-between; align-items: baseline; }
+.mp-link { background: none; border: 0; padding: 0; font: inherit; font-size: 12px; font-weight: 700; color: var(--accent); text-decoration: none; cursor: pointer; }
+.mp-cols { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; align-items: start; }
+.mp-chart { display: flex; align-items: flex-end; gap: 4px; height: 170px; padding-top: 6px; border-bottom: 1px solid var(--border); }
+.mp-bar { flex: 1; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; min-width: 0; border-radius: 3px 3px 0 0; overflow: hidden; }
+.mp-bar:hover { opacity: 0.8; }
+.mp-axis { display: flex; justify-content: space-between; margin-top: 6px; font-size: 11px; color: var(--muted); }
+.mp-axis span { flex: 1; min-width: 0; text-align: left; white-space: nowrap; }
+.mp-seg--video { background: var(--ab-video, #8b7cf6); }
+.mp-seg--image { background: var(--ab-image, #22b8cf); }
+.mp-seg--text { background: var(--ab-text, #3b82f6); }
+.mp-seg { display: block; width: 100%; }
+.mp-mix { display: flex; height: 6px; border-radius: 999px; overflow: hidden; margin-top: 8px; background: var(--bg-soft); }
+.mp-mix i { display: block; height: 100%; }
+.mp-legend { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; margin-top: 10px; font-size: 12px; color: var(--text-secondary); }
+.mp-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; }
+.mp-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.mp-list li { display: flex; align-items: center; gap: 10px; padding: 8px 0; border-top: 1px solid var(--border); }
+.mp-list li:first-child { border-top: 0; }
+.mp-rank { width: 18px; font-size: 12px; font-weight: 700; color: var(--muted); }
+.mp-name { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.mp-name b { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mp-name small { font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mp-num { font-weight: 800; font-size: 13px; color: var(--text); }
+.mp-delta { font-size: 11px; font-weight: 700; color: var(--muted); }
+.mp-delta.is-up { color: var(--success, #1a9d5c); }
+.mp-delta.is-down { color: var(--danger, #d64545); }
+.mp-feed { grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
+.mp-feed .av-card { text-decoration: none; color: inherit; }
+@media (max-width: 900px) { .mp-cols { grid-template-columns: minmax(0, 1fr); } }

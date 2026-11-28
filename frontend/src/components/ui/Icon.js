@@ -49,6 +49,7 @@ const NAV_ICONS = {
   admin: Settings,
   'domain-user': UserRound,
   'my-ads': Megaphone,
+  'ad-insights': Sparkles,
   feedback: MessageSquareText,
   help: CircleHelp,
   'ai-report': FileText,
