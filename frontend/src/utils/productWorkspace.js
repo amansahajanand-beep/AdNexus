@@ -1,5 +1,7 @@
 /** Multi-product workspace: GAM | AdMob | AdSense */
 
+import { MOCK_ENABLED } from '../mocks/mockApi';
+
 export const PRODUCTS = {
   gam: {
     id: 'gam',
@@ -82,6 +84,8 @@ export const GAM_NAV_ITEMS = [
   { to: '/dashboard', label: 'Dashboard', page: 'dashboard' },
   { to: '/reporting', label: 'Reporting', page: 'reporting' },
   { to: '/roi', label: 'ROI', page: 'roi' },
+  // Local mock mode only (REACT_APP_MOCK=true, never in production builds).
+  ...(MOCK_ENABLED ? [{ to: '/apps', label: 'Apps', page: 'apps' }] : []),
   { to: '/my-ads', label: 'Google Ads', page: 'my-ads' },
   { to: '/presets', label: 'Presets', page: 'presets' },
   { to: '/ai-forecast', label: 'Forecast', page: 'ai-forecast', adminOnly: true, requiresAi: true },

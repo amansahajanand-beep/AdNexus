@@ -7,6 +7,7 @@ import {
   clearIntentionalLogout,
   userIdFromToken,
 } from '../../utils/crossTabAuth';
+import { MOCK_ENABLED, MOCK_USER } from '../../mocks/mockApi';
 import { purgePersistedState } from '../persistorRef';
 import { clearReportPages } from '../slices/reportSlice';
 import { getUserFacingMessage, logErrorForDebug } from '../../utils/userFacingError';
@@ -28,6 +29,11 @@ export const authLogoutAction = () => ({ type: AUTH_LOGOUT });
 
 // Restore the session from a stored token (called once on app start).
 export const loadUser = () => async (dispatch) => {
+  // Local UI development only (REACT_APP_MOCK=true, never in production builds): skip sign-in.
+  if (MOCK_ENABLED) {
+    dispatch(authSuccess(MOCK_USER));
+    return;
+  }
   if (isSessionSuperseded()) {
     dispatch(authFailure(null));
     return;

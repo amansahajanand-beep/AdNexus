@@ -28,6 +28,9 @@ import AdSenseDashboard from './pages/adsense/AdSenseDashboard';
 import AdSenseReporting from './pages/adsense/AdSenseReporting';
 import AdSenseRoi from './pages/adsense/AdSenseRoi';
 import PublisherPresets from './pages/PublisherPresets';
+import Apps from './pages/Apps';
+import AppDetail from './pages/AppDetail';
+import { MOCK_ENABLED } from './mocks/mockApi';
 import ProtectedRoute from './components/routing/ProtectedRoute';
 import AdminRoute from './components/routing/AdminRoute';
 import PermissionRoute from './components/routing/PermissionRoute';
@@ -144,6 +147,13 @@ function AppRoutes() {
         <Route path="/roi" element={<PermissionRoute page="roi"><Roi /></PermissionRoute>} />
         <Route path="/roi/sheet/:sheetId" element={<PermissionRoute page="roi"><RoiSheet /></PermissionRoute>} />
         <Route path="/presets" element={<PermissionRoute page="presets"><Presets /></PermissionRoute>} />
+        {/* Apps module: local mock mode only (REACT_APP_MOCK=true, never in production builds) */}
+        {MOCK_ENABLED && (
+          <>
+            <Route path="/apps" element={<PermissionRoute page="apps"><Apps /></PermissionRoute>} />
+            <Route path="/apps/:appId" element={<PermissionRoute page="apps"><AppDetail /></PermissionRoute>} />
+          </>
+        )}
         <Route path="/admin" element={<AdminRoute><Admin /></AdminRoute>} />
         <Route path="/team" element={<UserManagerRoute><TeamUsers /></UserManagerRoute>} />
         <Route path="/my-ads" element={<PermissionRoute page="my-ads"><MyAds /></PermissionRoute>} />

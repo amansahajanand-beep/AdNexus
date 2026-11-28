@@ -155,7 +155,7 @@ export default function UserManagement({
   };
 
   const filteredUsers = useMemo(
-    () => filterRowsBySearch(users, search, (u) => [
+    () => filterRowsBySearch(Array.isArray(users) ? users : [], search, (u) => [
       u.username, u.role, u.id, u.password,
       u.networkName, u.networkCode,
       ...(u.permissions?.allowedDomains || []),

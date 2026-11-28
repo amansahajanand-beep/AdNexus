@@ -1004,7 +1004,7 @@ function ReportingView() {
   useEffect(() => {
     if (!canGenerate) return;
     reportsAPI.getCountries()
-      .then(setCountryOptions)
+      .then((list) => setCountryOptions(Array.isArray(list) ? list : []))
       .catch(() => setCountryOptions([]))
       .finally(() => setCountryLoading(false));
   }, [canGenerate]);

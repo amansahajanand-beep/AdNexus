@@ -4,6 +4,7 @@ import { TOKEN_KEY } from './auth/authConstants';
 import { clearSessionSuperseded, isIntentionalLogout } from './auth/crossTabAuth';
 import { getUserFacingMessage, logErrorForDebug } from './auth/userFacingError';
 import { clearRecentFilters } from './filters/recentFilters';
+import { MOCK_ENABLED, installMockApi } from '../mocks/mockApi';
 
 export { TOKEN_KEY } from './auth/authConstants';
 
@@ -51,6 +52,9 @@ function attachAuth(config) {
   if (token) config.headers.Authorization = `Bearer ${token}`;
   return config;
 }
+
+// Local UI development only (REACT_APP_MOCK=true, never in production builds).
+if (MOCK_ENABLED) installMockApi(API, FAST_API);
 
 API.interceptors.request.use(attachAuth);
 FAST_API.interceptors.request.use(attachAuth);
